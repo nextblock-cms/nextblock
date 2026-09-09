@@ -4,12 +4,18 @@ import Image from 'next/image';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useState, useTransition } from 'react';
-import { Archive, Search, Trash2 } from 'lucide-react';
+import { Archive, ChevronLeft, ChevronRight, Search, Trash2 } from 'lucide-react';
 import {
   Badge,
   Button,
   Checkbox,
   Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  SeoScoreBadge,
   Table,
   TableBody,
   TableCell,
@@ -31,6 +37,7 @@ type ProductRow = {
   stock?: number | null;
   status?: string | null;
   language_id: number;
+  seo_score?: number | null;
   product_media?: Array<{
     media?: {
       file_path?: string | null;
@@ -110,10 +117,25 @@ export function ProductsBulkTable({
       return searchableValue.includes(normalizedQuery);
     });
   }, [languageLabels, products, searchQuery]);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchQuery]);
+
+  const totalFiltered = filteredProducts.length;
+  const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const paginatedProducts = useMemo(() => {
+    const from = (safePage - 1) * pageSize;
+    return filteredProducts.slice(from, from + pageSize);
+  }, [filteredProducts, safePage, pageSize]);
+
   const productIds = useMemo(() => products.map((product) => product.id), [products]);
   const visibleProductIds = useMemo(
-    () => filteredProducts.map((product) => product.id),
-    [filteredProducts]
+    () => paginatedProducts.map((product) => product.id),
+    [paginatedProducts]
   );
   const selectedProducts = useMemo(
     () => products.filter((product) => selectedIds.has(product.id)),
@@ -285,14 +307,15 @@ export function ProductsBulkTable({
             <TableHead>SKU</TableHead>
             <TableHead>Price</TableHead>
             <TableHead>Language</TableHead>
+            <TableHead>SEO</TableHead>
             <TableHead>Stock</TableHead>
             <TableHead>Status</TableHead>
             <TableHead className="text-right">Actions</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          {filteredProducts.length > 0 ? (
-            filteredProducts.map((product) => {
+          {paginatedProducts.length > 0 ? (
+            paginatedProducts.map((product) => {
               const mediaUrl = resolveMediaUrl(
                 product.product_media?.[0]?.media?.file_path ||
                   product.product_media?.[0]?.media?.object_key
@@ -355,6 +378,9 @@ export function ProductsBulkTable({
                       {languageLabels[String(product.language_id)] || 'N/A'}
                     </Badge>
                   </TableCell>
+                  <TableCell>
+                    <SeoScoreBadge score={product.seo_score} />
+                  </TableCell>
                   <TableCell>{product.stock}</TableCell>
                   <TableCell>
                     <span
@@ -393,13 +419,67 @@ export function ProductsBulkTable({
             })
           ) : (
             <TableRow>
-              <TableCell colSpan={9} className="text-center py-10">
+              <TableCell colSpan={10} className="text-center py-10">
                 {products.length === 0 ? 'No products found.' : 'No products match your search.'}
               </TableCell>
             </TableRow>
           )}
         </TableBody>
       </Table>
+      {totalFiltered > 0 && (
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 px-2 py-4 text-sm text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <span>Rows per page:</span>
+            <Select
+              value={String(pageSize)}
+              onValueChange={(val) => {
+                setPageSize(Number(val));
+                setPage(1);
+              }}
+            >
+              <SelectTrigger className="h-8 w-[70px]">
+                <SelectValue placeholder={String(pageSize)} />
+              </SelectTrigger>
+              <SelectContent side="top">
+                {[10, 25, 50, 100].map((size) => (
+                  <SelectItem key={size} value={String(size)}>
+                    {size}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <span className="ml-2">
+              Showing {(safePage - 1) * pageSize + 1} to {Math.min(safePage * pageSize, totalFiltered)} of {totalFiltered} products
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <span>
+              Page {safePage} of {totalPages}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={safePage <= 1}
+              aria-label="Previous page"
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 w-8 p-0"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={safePage >= totalPages}
+              aria-label="Next page"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -35,6 +35,8 @@ import BlockEditorArea from '../../../blocks/components/BlockEditorArea';
 import VisibilityControl from '../../../components/VisibilityControl';
 import RevisionHistoryButton from '../../../revisions/RevisionHistoryButton';
 import { buildViewUrl } from '../../../../../lib/publishing/viewUrl';
+import { PageSeoProvider } from '../../../../../lib/seo/page-audit-context';
+import { PageSeoAuditSection } from '../../../../../components/seo/PageSeoAuditSection';
 
 export default async function EditProductPage({
   params,
@@ -211,8 +213,15 @@ export default async function EditProductPage({
   }
 
   return (
-    <div className="space-y-8 w-full max-w-[1400px] mx-auto px-6 py-8">
-      <CortexAiPageContextRegistrar
+    <PageSeoProvider
+      documentTitle={product.title}
+      documentType="product"
+      initialBlocks={descriptionBlocks}
+      initialMetaDescription={product.meta_description}
+      initialMetaTitle={product.meta_title}
+    >
+      <div className="space-y-8 w-full max-w-[1400px] mx-auto px-6 py-8">
+        <CortexAiPageContextRegistrar
         context={{
           contentType: 'product',
           entityId: product.id,
@@ -356,6 +365,8 @@ export default async function EditProductPage({
         availableCategoriesProp={allCategories}
       />
 
+      <PageSeoAuditSection className="my-6" />
+
       <div className="border-t pt-8">
         <h2 className="text-xl font-bold mb-4">Product Description Blocks</h2>
         <BlockEditorArea
@@ -366,5 +377,6 @@ export default async function EditProductPage({
         />
       </div>
     </div>
+    </PageSeoProvider>
   );
 }

@@ -347,4 +347,72 @@ describe('buildPageSeoDocument feeding the page-level audit', () => {
     expect(oneBlock.issues.map((issue) => issue.id)).toContain('content-thin');
     expect(wholePage.issues.map((issue) => issue.id)).not.toContain('content-thin');
   });
+
+  it('treats post title as H1 when documentType is post', () => {
+    const blocks = [
+      headingBlock(2, 'Overview'),
+      textBlock('<p>Detailed article content goes here.</p>'),
+    ];
+
+    const withoutOptions = buildPageSeoDocument(blocks);
+    expect(withoutOptions.headings.map((h) => h.level)).toEqual([2]);
+
+    const withPost = buildPageSeoDocument(blocks, {
+      documentTitle: 'My Great Article',
+      documentType: 'post',
+    });
+    expect(withPost.headings).toEqual([
+      { level: 1, order: 0, text: 'My Great Article' },
+      { level: 2, order: 1, text: 'Overview' },
+    ]);
+    expect(withPost.words).toContain('my');
+    expect(withPost.words).toContain('article');
+
+    const audit = auditSeo({ document: withPost });
+    expect(audit.issues.map((i) => i.id)).not.toContain('headings-missing-h1');
+  });
+
+  it('handles empty blocks with post title', () => {
+    const doc = buildPageSeoDocument([], {
+      documentTitle: 'Initial Draft Post',
+      documentType: 'post',
+    });
+    expect(doc.headings).toEqual([{ level: 1, order: 0, text: 'Initial Draft Post' }]);
+    expect(doc.text).toBe('Initial Draft Post');
+  });
+
+  it('prepends product title as H1 when documentType is product', () => {
+    const blocks = [
+      {
+        block_type: 'section',
+        content: {
+          column_blocks: [
+            [
+              {
+                block_type: 'heading',
+                content: { level: 2, text_content: 'Features' },
+              },
+            ],
+          ],
+        },
+      },
+    ];
+
+    const withProduct = buildPageSeoDocument(blocks, {
+      documentTitle: 'NextBlock Commerce Pro',
+      documentType: 'product',
+    });
+
+    expect(withProduct.headings).toEqual([
+      { level: 1, order: 0, text: 'NextBlock Commerce Pro' },
+      { level: 2, order: 1, text: 'Features' },
+    ]);
+    expect(withProduct.words).toContain('commerce');
+    expect(withProduct.words).toContain('pro');
+
+    const audit = auditSeo({ document: withProduct });
+    expect(audit.issues.map((i) => i.id)).not.toContain('headings-missing-h1');
+  });
 });
+
+

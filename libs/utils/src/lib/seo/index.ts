@@ -12,7 +12,9 @@ export * from './audit';
 export * from './document';
 export * from './headings';
 export * from './keywords';
+export * from './page-document';
 export * from './readability';
 export * from './redirects';
 export * from './robots';
 export * from './types';
+

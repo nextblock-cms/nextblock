@@ -346,7 +346,7 @@ function toCustomRule(group: CustomRuleGroup): RobotsRule {
       const values = group.other[key];
       other[key] = values.length === 1 ? values[0] : values;
     }
-    rule.other = other;
+    (rule as any).other = other;
   }
 
   return rule;
@@ -476,9 +476,10 @@ export function renderRobotsMetadata(metadata: MetadataRoute.Robots): string {
       content += `Crawl-delay: ${rule.crawlDelay}\n`;
     }
 
-    if (rule.other) {
-      for (const key of Object.keys(rule.other)) {
-        const value = rule.other[key];
+    const ruleOther = (rule as any).other;
+    if (ruleOther) {
+      for (const key of Object.keys(ruleOther)) {
+        const value = ruleOther[key];
         if (value === null || value === undefined) {
           continue;
         }

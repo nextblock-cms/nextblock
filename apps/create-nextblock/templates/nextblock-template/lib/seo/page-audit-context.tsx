@@ -52,6 +52,10 @@ export interface PageSeoSnapshot {
    * content is `Json` and a custom block can carry anything.
    */
   blocks: unknown[];
+  /** Document title for articles / posts where the template renders an H1. */
+  documentTitle: string | null;
+  /** Whether this is a standalone 'page', an editorial 'post', or a store 'product'. */
+  documentType: 'page' | 'post' | 'product';
   metaDescription: string | null;
   metaTitle: string | null;
 }
@@ -60,6 +64,7 @@ export interface PageSeoContextValue {
   /** The focus keyphrase, held here so it survives switching between blocks. */
   keyword: string;
   setBlocks: (blocks: unknown[]) => void;
+  setDocumentTitle: (title: string | null) => void;
   setKeyword: (keyword: string) => void;
   setMeta: (meta: { metaDescription: string | null; metaTitle: string | null }) => void;
   snapshot: PageSeoSnapshot;
@@ -69,6 +74,8 @@ const PageSeoContext = createContext<PageSeoContextValue | null>(null);
 
 export interface PageSeoProviderProps {
   children: ReactNode;
+  documentTitle?: string | null;
+  documentType?: 'page' | 'post' | 'product';
   initialBlocks?: unknown[];
   initialMetaDescription?: string | null;
   initialMetaTitle?: string | null;
@@ -76,16 +83,23 @@ export interface PageSeoProviderProps {
 
 export function PageSeoProvider({
   children,
+  documentTitle: initialDocumentTitle = null,
+  documentType = 'page',
   initialBlocks = [],
   initialMetaDescription = null,
   initialMetaTitle = null,
 }: PageSeoProviderProps) {
   const [blocks, setBlocksState] = useState<unknown[]>(initialBlocks);
+  const [documentTitle, setDocumentTitleState] = useState<string | null>(initialDocumentTitle);
   const [keyword, setKeyword] = useState('');
   const [meta, setMetaState] = useState<{
     metaDescription: string | null;
     metaTitle: string | null;
   }>({ metaDescription: initialMetaDescription, metaTitle: initialMetaTitle });
+
+  const setDocumentTitle = useCallback((next: string | null) => {
+    setDocumentTitleState((previous) => (previous === next ? previous : next));
+  }, []);
 
   // Both setters bail when nothing actually changed. The blocks array is rebuilt on
   // every keystroke in a block editor, so without the length-and-identity check
@@ -114,15 +128,18 @@ export function PageSeoProvider({
     () => ({
       keyword,
       setBlocks,
+      setDocumentTitle,
       setKeyword,
       setMeta,
       snapshot: {
         blocks,
+        documentTitle,
+        documentType,
         metaDescription: meta.metaDescription,
         metaTitle: meta.metaTitle,
       },
     }),
-    [blocks, keyword, meta.metaDescription, meta.metaTitle, setBlocks, setMeta],
+    [blocks, documentTitle, documentType, keyword, meta.metaDescription, meta.metaTitle, setBlocks, setDocumentTitle, setMeta],
   );
 
   return <PageSeoContext.Provider value={value}>{children}</PageSeoContext.Provider>;

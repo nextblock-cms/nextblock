@@ -4,6 +4,7 @@ import React from 'react';
 import { ProductForm } from '@nextblock-cms/ecommerce';
 import MediaPickerDialog from '../media/components/MediaPickerDialog';
 import DraftStatusActions from '../components/DraftStatusActions';
+import { usePageSeo } from '../../../lib/seo/page-audit-context';
 
 type ProductFormProps = React.ComponentProps<typeof ProductForm>;
 type ProductUpdateAction = NonNullable<ProductFormProps['updateAction']>;
@@ -24,6 +25,23 @@ export default function ProductFormClientShell({
   ...props
 }: ProductFormClientShellProps) {
   const [isMounted, setIsMounted] = React.useState(false);
+  const pageSeo = usePageSeo();
+
+  const handleSeoChange = React.useCallback(
+    (values: { title?: string | null; meta_title?: string | null; meta_description?: string | null }) => {
+      if (pageSeo) {
+        if (values.title !== undefined) {
+          pageSeo.setDocumentTitle(values.title || null);
+        }
+        pageSeo.setMeta({
+          metaTitle: values.meta_title || null,
+          metaDescription: values.meta_description || null,
+        });
+      }
+    },
+    [pageSeo]
+  );
+
   // The draft toolbar is gated on the server-computed `hasDraft`, but the form
   // autosave writes a draft WITHOUT revalidating the route (revalidating would
   // re-init the form and loop the autosave — see updateProductAction). Track
@@ -64,6 +82,7 @@ export default function ProductFormClientShell({
         <ProductForm
           {...props}
           hasOpenDraft={hasDraft}
+          onSeoChange={handleSeoChange}
           updateAction={updateAction ? wrappedUpdateAction : undefined}
           mediaPickerNode={
             <MediaPickerDialog

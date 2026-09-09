@@ -336,10 +336,16 @@ export default function PostForm({
    * also bails when the values are unchanged, so nothing here can loop back into a render of
    * this form.
    */
-  const setPageSeoMeta = usePageSeo()?.setMeta;
+  const pageSeo = usePageSeo();
+  const setPageSeoMeta = pageSeo?.setMeta;
+  const setPageSeoDocumentTitle = pageSeo?.setDocumentTitle;
   useEffect(() => {
     setPageSeoMeta?.({ metaDescription, metaTitle });
   }, [metaDescription, metaTitle, setPageSeoMeta]);
+
+  useEffect(() => {
+    setPageSeoDocumentTitle?.(title);
+  }, [title, setPageSeoDocumentTitle]);
 
   // Remove languagesLoading from this condition
   if (authLoading) {

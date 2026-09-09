@@ -102,6 +102,12 @@ interface ProductFormProps {
   availableCategoriesProp?: Array<{ id: string; name: string; slug: string }>;
   /** Whether an unpublished draft is currently open for this product (drives the Freemius sync warning). */
   hasOpenDraft?: boolean;
+  /** Live notification for title or SEO metadata changes in the form. */
+  onSeoChange?: (values: {
+    title?: string | null;
+    meta_title?: string | null;
+    meta_description?: string | null;
+  }) => void;
 }
 
 interface FormSectionProps {
@@ -297,7 +303,8 @@ export function ProductForm({
   createAction,
   updateAction,
   availableCategoriesProp = [],
-  hasOpenDraft = false
+  hasOpenDraft = false,
+  onSeoChange,
 }: ProductFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showVariations, setShowVariations] = useState(() => Boolean(initialData?.variants?.length));
@@ -354,6 +361,18 @@ export function ProductForm({
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
   const allValues = watch();
   const isDirty = form.formState.isDirty;
+
+  const watchedTitle = allValues.title;
+  const watchedMetaTitle = allValues.meta_title;
+  const watchedMetaDescription = allValues.meta_description;
+
+  useEffect(() => {
+    onSeoChange?.({
+      title: watchedTitle,
+      meta_title: watchedMetaTitle,
+      meta_description: watchedMetaDescription,
+    });
+  }, [watchedTitle, watchedMetaTitle, watchedMetaDescription, onSeoChange]);
 
   useEffect(() => {
     if (!isEdit) return;

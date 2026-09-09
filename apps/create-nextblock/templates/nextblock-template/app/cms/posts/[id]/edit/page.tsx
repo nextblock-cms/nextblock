@@ -189,6 +189,8 @@ export default async function EditPostPage(props: { params: Promise<{ id: string
         paint instead of an empty document.
       */}
       <PageSeoProvider
+        documentTitle={postWithBlocks.title}
+        documentType="post"
         initialBlocks={postWithBlocks.blocks}
         initialMetaDescription={postWithBlocks.meta_description}
         initialMetaTitle={postWithBlocks.meta_title}

@@ -51,3 +51,11 @@ changes must be append-only, forward-only, and non-destructive by default.
 
 For more detail, read `docs/04-DATABASE-AND-AUTH.md` and
 `docs/05-DEVELOPER-GUIDE.md` before touching migrations.
+
+## Git & Execution Boundaries
+
+- **Never run `git commit` or `git push`**: The user handles all commits, pushes, and git history modifications.
+- **Git operations requiring approval**: Commands that alter git history or worktree state (e.g., `git merge`, removing tracked files/branches) require explicit confirmation beforehand. Read-only commands (e.g., `git status`, `git diff`, `git log`) are permitted.
+- **Execution mode**: Reversible file edits, refactoring, and code changes are in fast/direct mode ("yolo mode") since the user can revert changes.
+- **Non-revertable operations require confirmation**: Any destructive or irreversible operation (e.g., dropping database tables, permanent data deletions, external/remote side effects) must be confirmed with the user prior to execution.
+

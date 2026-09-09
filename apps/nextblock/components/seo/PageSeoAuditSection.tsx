@@ -152,7 +152,14 @@ export function PageSeoAuditSection({ className }: PageSeoAuditSectionProps) {
   // Memoised because the document's identity is one of the panel's debounce
   // dependencies: a fresh object on every render would reset the panel's timer
   // forever and no score would ever appear.
-  const pageDocument = React.useMemo(() => buildPageSeoDocument(settledBlocks), [settledBlocks]);
+  const pageDocument = React.useMemo(
+    () =>
+      buildPageSeoDocument(settledBlocks, {
+        documentTitle: pageSeo?.snapshot.documentTitle,
+        documentType: pageSeo?.snapshot.documentType,
+      }),
+    [settledBlocks, pageSeo?.snapshot.documentTitle, pageSeo?.snapshot.documentType],
+  );
 
   const handleAuditChange = React.useCallback((next: SeoAuditResult | null) => {
     setAudit(next);

@@ -18,7 +18,7 @@ import {
   PlusCircle,
   Edit3,
   FileText,
-} from "lucide-react"; // Trash2 removed from here
+} from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,56 +26,80 @@ import {
   DropdownMenuButtonTrigger,
   DropdownMenuSeparator,
 } from "@nextblock-cms/ui";
-// Server action `deletePage` is used by DeletePageButtonClient
 import type { Database } from "@nextblock-cms/db";
 import { getActiveLanguagesServerSide } from "@nextblock-cms/db/server";
+import { auditSeo } from "@nextblock-cms/utils/seo";
+import { buildPageSeoDocument } from "../../../lib/seo/page-document";
 
 type Page = Database["public"]["Tables"]["pages"]["Row"];
 import LanguageFilterSelect from "../components/LanguageFilterSelect";
-import DeletePageButtonClient from "./components/DeletePageButtonClient"; // Import the client component
+import DeletePageButtonClient from "./components/DeletePageButtonClient";
 import { ContentTransferControls } from "../import-export/ContentTransferControls";
 import VisibilityBadge from "../components/VisibilityBadge";
+import SeoScoreBadge from "../components/SeoScoreBadge";
+import TablePagination from "../components/TablePagination";
 
 async function getPagesWithDetails(
-  filterLanguageId?: number
-): Promise<{ page: Page; languageCode: string }[]> {
+  filterLanguageId?: number,
+  pageNumber: number = 1,
+  pageSize: number = 25
+): Promise<{
+  items: { page: Page; languageCode: string; seoScore: number }[];
+  totalCount: number;
+}> {
   const supabase = createClient();
   const languages = await getActiveLanguagesServerSide();
   const langMap = new Map(languages.map((l) => [l.id, l.code]));
 
   let query = supabase
     .from("pages")
-    .select("*, languages!inner(code)")
+    .select("*, languages!inner(code), blocks(id, block_type, content, order)", { count: "exact" })
     .order("created_at", { ascending: false });
 
   if (filterLanguageId) {
     query = query.eq("language_id", filterLanguageId);
   }
 
-  const { data: pagesData, error } = await query;
+  const from = (pageNumber - 1) * pageSize;
+  const to = from + pageSize - 1;
+
+  const { data: pagesData, count, error } = await query.range(from, to);
 
   if (error) {
     console.error("Error fetching pages:", error);
-    return [];
+    return { items: [], totalCount: 0 };
   }
-  if (!pagesData) return [];
+  if (!pagesData) return { items: [], totalCount: 0 };
 
-  return pagesData.map((p) => {
+  const items = pagesData.map((p) => {
     const langInfo = p.languages as unknown as { code: string } | null;
+    const rawBlocks = (p.blocks || []) as unknown as Parameters<typeof buildPageSeoDocument>[0];
+    const doc = buildPageSeoDocument(rawBlocks);
+    const auditResult = auditSeo({
+      document: doc,
+      metaTitle: p.meta_title ?? undefined,
+      metaDescription: p.meta_description ?? undefined,
+      scope: "page",
+    });
+
+    const langCode = langInfo?.code || langMap.get(p.language_id) || "N/A";
+
     return {
-      page: p as Page,
-      languageCode:
-        langInfo?.code?.toUpperCase() ||
-        langMap.get(p.language_id)?.toUpperCase() ||
-        "N/A",
+      page: p as unknown as Page,
+      languageCode: String(langCode).toUpperCase(),
+      seoScore: auditResult.score,
     };
   });
+
+  return { items, totalCount: count ?? items.length };
 }
 
 interface CmsPagesListPageProps {
   searchParams?: Promise<{
     lang?: string;
     success?: string;
+    page?: string;
+    pageSize?: string;
   }>;
 }
 
@@ -91,7 +115,18 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
     : true;
   const filterLangId = isValidLangId ? selectedLangId : undefined;
 
-  const pagesWithDetails = await getPagesWithDetails(filterLangId);
+  const pageNumber = searchParams?.page
+    ? Math.max(1, parseInt(searchParams.page, 10) || 1)
+    : 1;
+  const pageSize = searchParams?.pageSize
+    ? Math.max(1, parseInt(searchParams.pageSize, 10) || 25)
+    : 25;
+
+  const { items: pagesWithDetails, totalCount } = await getPagesWithDetails(
+    filterLangId,
+    pageNumber,
+    pageSize
+  );
   const successMessage = searchParams?.success;
 
   return (
@@ -126,7 +161,7 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
         </Alert>
       )}
 
-      {pagesWithDetails.length === 0 ? (
+      {totalCount === 0 ? (
         <div className="text-center py-10 border rounded-lg dark:border-slate-700">
           <FileText className="mx-auto h-12 w-12 text-muted-foreground" />
           <h3 className="mt-2 text-sm font-medium text-foreground">
@@ -150,10 +185,11 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
           <Table>
             <TableHeader>
               <TableRow className="dark:border-slate-700">
-                <TableHead className="w-[300px] sm:w-[400px]">Title</TableHead>
+                <TableHead className="w-[280px] sm:w-[350px]">Title</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Language</TableHead>
                 <TableHead className="hidden md:table-cell">Slug</TableHead>
+                <TableHead>SEO</TableHead>
                 <TableHead className="hidden lg:table-cell">
                   Last Updated
                 </TableHead>
@@ -161,7 +197,7 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {pagesWithDetails.map(({ page, languageCode }) => (
+              {pagesWithDetails.map(({ page, languageCode, seoScore }) => (
                 <TableRow key={page.id} className="dark:border-slate-700">
                   <TableCell className="font-medium">
                     <Link
@@ -187,6 +223,9 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
                   <TableCell className="text-muted-foreground text-xs hidden md:table-cell">
                     /{page.slug}
                   </TableCell>
+                  <TableCell>
+                    <SeoScoreBadge score={seoScore} />
+                  </TableCell>
                   <TableCell className="hidden lg:table-cell text-xs text-muted-foreground">
                     {new Date(page.updated_at).toLocaleDateString()}
                   </TableCell>
@@ -208,7 +247,6 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
                           </Link>
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
-                        {/* Use the Client Component for the delete button */}
                         <DeletePageButtonClient
                           pageId={page.id}
                           pageTitle={page.title}
@@ -220,6 +258,14 @@ export default async function CmsPagesListPage(props: CmsPagesListPageProps) {
               ))}
             </TableBody>
           </Table>
+
+          <TablePagination
+            currentPage={pageNumber}
+            pageSize={pageSize}
+            totalCount={totalCount}
+            basePath="/cms/pages"
+            itemLabel="pages"
+          />
         </div>
       )}
     </div>

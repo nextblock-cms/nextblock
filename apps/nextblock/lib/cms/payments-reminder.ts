@@ -11,7 +11,11 @@ import { getStoreReadiness } from '@nextblock-cms/ecommerce/server';
  */
 export interface PaymentsReminder {
   /** Providers that are not ready, with what each is missing. */
-  blocked: Array<{ provider: 'stripe' | 'freemius'; label: string; missing: string[] }>;
+  blocked: Array<{
+    provider: 'stripe' | 'freemius';
+    label: string;
+    missing: string[];
+  }>;
   /** Published products that currently cannot be bought because of the above. */
   affectedProducts: number;
 }
@@ -51,33 +55,33 @@ export async function getPaymentsReminder(): Promise<PaymentsReminder | null> {
 
     if (unready.length === 0) return null;
 
-    // A provider the store does not sell through is not a problem to be nagged about.
-    // Both providers ship DISABLED (baseline seed), so filtering on readiness alone
-    // would show a permanent "Freemius still needs setting up" banner to every
-    // physical-goods shop that had finished its Stripe setup correctly.
-    //
-    // "In use" means the admin switched the provider on, or the catalogue already
-    // contains products that would need it — counted across ALL statuses, so a shop
-    // building a draft catalogue is warned before it publishes rather than after.
+    // A provider matters to this reminder only when the catalogue contains products
+    // of the type routed through it. Do not treat a stale/accidental provider toggle as
+    // usage: that produced a Stripe warning in digital-only stores with no Stripe keys.
+    // Count across ALL statuses so a shop building a draft catalogue is warned before
+    // it publishes rather than after.
     const usage = await Promise.all(
       unready.map(async (entry) => {
-        const [{ count: totalCount }, { count: activeCount }] = await Promise.all([
-          supabase
-            .from('products')
-            .select('id', { count: 'exact', head: true })
-            .eq('payment_provider', entry.provider),
-          supabase
-            .from('products')
-            .select('id', { count: 'exact', head: true })
-            .eq('status', 'active')
-            .eq('payment_provider', entry.provider),
-        ]);
+        const productType =
+          entry.provider === 'stripe' ? 'physical' : 'digital';
+        const [{ count: totalCount }, { count: activeCount }] =
+          await Promise.all([
+            supabase
+              .from('products')
+              .select('id', { count: 'exact', head: true })
+              .eq('product_type', productType),
+            supabase
+              .from('products')
+              .select('id', { count: 'exact', head: true })
+              .eq('status', 'active')
+              .eq('product_type', productType),
+          ]);
         return {
           entry,
-          inUse: entry.enabled || (totalCount ?? 0) > 0,
+          inUse: (totalCount ?? 0) > 0,
           activeProducts: activeCount ?? 0,
         };
-      })
+      }),
     );
 
     const relevant = usage.filter((item) => item.inUse);
@@ -89,7 +93,10 @@ export async function getPaymentsReminder(): Promise<PaymentsReminder | null> {
         label: entry.label,
         missing: entry.missing,
       })),
-      affectedProducts: relevant.reduce((total, item) => total + item.activeProducts, 0),
+      affectedProducts: relevant.reduce(
+        (total, item) => total + item.activeProducts,
+        0,
+      ),
     };
   } catch {
     // Never let a reminder break the CMS shell.
