@@ -178,11 +178,17 @@ Production rule:
 - Add a new forward-only `.sql` file under
   `libs/db/src/supabase/migrations` for each production schema/data change.
 - Use `npm run db:migrate:check` before `npm run db:migrate`.
-- If `db:migrate:check` lists historical baseline migrations such as
-  `00000000000000_setup_foundation_and_enums.sql` on an existing production database, do
-  not run `db:migrate` yet. Run `npm run db:migrate:repair-history:check`,
-  then `npm run db:migrate:repair-history`, then check again. The expected
-  result after repair is that only new unapplied migrations remain.
+- Migration files are named `GGNNN_<snake_name>.sql` (GG = squash generation, NNN =
+  sequence, contiguous). The next number is the highest sequence on disk + 1 in the same
+  generation; `db:migrate:check` prints it and fails on any other name shape. See
+  [04-DATABASE-AND-AUTH.md](./04-DATABASE-AND-AUTH.md) → "Migration Structure".
+- If `db:migrate:check` lists the generation baseline (`02001_baseline_schema.sql` …) as
+  pending on an existing database whose history is empty, do not run `db:migrate` yet.
+  Run `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`,
+  then check again. If instead it shows retired 14-digit versions "recorded remotely with
+  no local file" beside the pending baseline, the database has not crossed the squash:
+  run `npm run db:migrate:repair-history:check -- --reconcile-squash`, then the same without
+  `:check`. The expected result after either repair is that only new unapplied migrations remain.
 - Do not use `npm run db:reset`, `npm run sandbox:reset`,
   `npm run db:migrate:fresh`, or `npm run db:push:sandbox` against production.
 
@@ -198,9 +204,10 @@ The migration-only script:
 - runs `supabase db push` without `--include-all`
 - never runs a reset, seed script, function deploy, or config push
 
-Because the migration set started as a squashed baseline, contributors should
-treat the existing baseline files as grouped domains. New production changes
-after the baseline should be appended as new migrations.
+The migration set is a squashed baseline (one generation at a time — see
+[04-DATABASE-AND-AUTH.md](./04-DATABASE-AND-AUTH.md) → "Migration Structure"). Treat the
+baseline files as grouped domains and append every new production change as a new
+`GGNNN` migration; never edit the baseline or the catch-up.
 
 ## Sandbox Reset Operations
 

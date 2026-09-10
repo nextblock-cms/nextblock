@@ -1425,8 +1425,10 @@ async function enrichCortexAiProducts(params: {
   const shortDescEn =
     'NextBlock™ Cortex AI is the AI layer for your free CMS. Route any model through your own OpenRouter key inside the editor, or register /api/mcp and let Claude Code, Cursor, and ChatGPT build layouts, inspect your schema, and manage content on the AI subscription you already pay for. Free for 30 days, no credit card.';
 
-  // Copy is mirrored by libs/db/src/supabase/migrations/00000000000041_marketing_review_free_cms_trial.sql
-  // (the migration seeds prod; this function re-seeds the sandbox after every reset). Keep the two in step.
+  // Copy is mirrored by the seeded product blocks in libs/db/src/supabase/migrations/02004_baseline_seed.sql
+  // (originally migration 00000000000041_marketing_review_free_cms_trial, folded into the generation-2
+  // baseline; the seed populates fresh installs, this function re-seeds the sandbox after every reset).
+  // Keep the two in step.
   // ── Section 0: Hero (MCP-native positioning, 30-day trial, two columns) ──
   const cortexS0En = {
     "container_type": "container",

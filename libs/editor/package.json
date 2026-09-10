@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/editor",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "license": "AGPL-3.0-or-later",
   "main": "./index.js",
   "typings": "./index.d.ts",

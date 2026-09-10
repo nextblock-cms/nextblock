@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/template",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",

@@ -278,6 +278,14 @@ types forward while leaving the schema behind — the app would then fail at run
   project → `node_modules/@nextblock-cms/db`), deduping by version, so even a user who only
   ran `npm install` gets the new SQL.
 
+> **Migration squashes.** Every so often the folder is squashed into a new *generation*
+> (`02000`–`02004`, then `02005+`; see [docs/04](./04-DATABASE-AND-AUTH.md) → "Migration
+> Structure"). An install crosses a squash with no manual step: the new generation's files
+> are simply pending, its `GG000_catchup_*` file replays only the retired migrations this
+> database never recorded, the baseline DDL is idempotent, and the seed skips any database
+> that already holds content. Retired files that linger in `<project>/supabase/migrations`
+> are harmless — they are already recorded, so nothing applies them twice.
+
 ### Build-time migrations
 
 A build-time hook ([`apps/nextblock/tools/build-migrate.mjs`](../apps/nextblock/tools/build-migrate.mjs))

@@ -89,7 +89,7 @@ persisting.
 ### Scheduled sales, price changes, and promotions
 
 Products and variants carry a scheduled-pricing layer (migration
-`00000000000025_add_sale_schedule_columns.sql`):
+`libs/db/src/supabase/migrations/02001_baseline_schema.sql` (originally `00000000000025_add_sale_schedule_columns`, folded in by the generation-2 squash)):
 
 - `sale_start_at` / `sale_end_at` — the time window during which `sale_price` /
   `sale_prices` apply. Both null = always-on (back-compat with static sales).

@@ -82,7 +82,7 @@ Known incomplete or future work:
 
 | File | Purpose |
 | --- | --- |
-| `libs/db/src/supabase/migrations/00000000000011_setup_cortex_ai_settings.sql` | RLS hardening for the sensitive `site_settings` Cortex AI key row. |
+| `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` (originally `00000000000011_setup_cortex_ai_settings`, folded in by the generation-2 squash) | RLS hardening for the sensitive `site_settings` Cortex AI key row. |
 | `apps/nextblock/app/api/cron/reset-sandbox/route.ts` | Sandbox reset route. Upserts active package activation for `cortex-ai` when `FREEMIUS_AI_SANDBOX_KEY` exists. |
 | `apps/nextblock/app/api/cron/reset-sandbox/sandboxResetSql.ts` | Generated SQL bundle that includes the Cortex AI migration. |
 
@@ -271,7 +271,7 @@ The value is a JSON envelope:
 }
 ```
 
-The migration `00000000000011_setup_cortex_ai_settings.sql` hardens RLS:
+The migration `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` (originally `00000000000011_setup_cortex_ai_settings`, folded in by the generation-2 squash) hardens RLS:
 
 - Public users can read non-sensitive site settings.
 - The sensitive Cortex AI key row is readable only by authenticated admins.
@@ -1061,7 +1061,7 @@ Cortex can insert real photos into pages at zero inference cost, and external im
 - In `libs/cortex/src/lib/ai-global-agent-tools.ts`; registered in `createCortexGlobalAgentTools`.
 - Input: `{ query: string, count?: 1-15 (default 6), orientation?: 'landscape'|'portrait'|'square' }`.
 - Key resolution: `resolveCortexAiStockPhotoProvider(supabase)` prefers an admin-stored, encrypted key in `site_settings` (`cortex_ai_pexels_api_key` / `cortex_ai_unsplash_access_key`, read via the service-role client), then falls back to the `PEXELS_API_KEY` / `UNSPLASH_ACCESS_KEY` env vars. Pexels wins when both exist. Returns a clear "not configured" message if neither is set. Both are free API keys.
-- The stored keys are protected by migration `00000000000012_cortex_ai_stock_photo_settings.sql`, which adds them to the `site_settings` sensitive-keys RLS group (admin-only read/write, never anon-readable), and encrypted with the same envelope as the OpenRouter BYOK key.
+- The stored keys are protected by migration `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` (originally `00000000000012_cortex_ai_stock_photo_settings`, folded in by the generation-2 squash), which adds them to the `site_settings` sensitive-keys RLS group (admin-only read/write, never anon-readable), and encrypted with the same envelope as the OpenRouter BYOK key.
 - **The model is told up front whether stock photos are available.** The global-agent route resolves the provider and injects it into the system prompt: available → "use search_stock_photos"; not configured → "do NOT call search_stock_photos; use gradient/theme backgrounds." So a missing key never wastes a tool call, and the keys are never mandatory — Cortex builds pages either way.
 - Admin UI: `/cms/settings/cortex-ai` has a Stock Photos card (save/clear Pexels + Unsplash keys, step-by-step, and why) via `saveStockPhotoKeysAction` / `clearStockPhotoKeysAction`.
 - Rate-limit fallback: `resolveCortexAiStockPhotoProviders` returns ALL configured providers ordered Pexels→Unsplash; `executeSearchStockPhotos` tries them in order, falling through to the next on error/HTTP 429/empty results, and returns `attemptedProviders`.
@@ -1106,7 +1106,7 @@ from inside the editor.
 | `apps/nextblock/app/cms/settings/cortex-ai/mcp-actions.ts` | Admin server actions: settings, mint, revoke. |
 | `apps/nextblock/app/cms/settings/cortex-ai/McpServerSettingsCard.tsx` | Settings UI + copy-paste client config. |
 | `apps/nextblock/app/cms/settings/cortex-ai/require-admin.ts` | Shared admin gate (also used by `actions.ts`). |
-| `libs/db/src/supabase/migrations/00000000000017_cortex_ai_mcp_server.sql` | `mcp_access_tokens` table + `cortex_ai_mcp_settings` RLS. |
+| `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` (originally `00000000000017_cortex_ai_mcp_server`, folded in by the generation-2 squash) | `mcp_access_tokens` table + `cortex_ai_mcp_settings` RLS. |
 
 ### Protocol decisions
 
@@ -1241,7 +1241,7 @@ tools cannot read token hashes or insert rows.
 ### Marketing surfaces that describe the MCP server
 
 Three seeded content rows sell the MCP story and are kept at 100/100 in the built-in SEO
-engine (`libs/utils/src/lib/seo`). Migration `00000000000037_reposition_marketing_and_cortex_mcp.sql`
+engine (`libs/utils/src/lib/seo`). Migration `libs/db/src/supabase/migrations/02004_baseline_seed.sql` (originally `00000000000037_reposition_marketing_and_cortex_mcp`, folded in by the generation-2 squash)
 owns them; the sandbox reset route (`enrichCortexAiProducts`) mirrors the product sections
 because it deletes and re-inserts product blocks after the SQL replay, so edit both together.
 

@@ -103,7 +103,10 @@ Both named volumes persist your database and uploaded media across restarts.
 > `public._nextblock_docker_migrations` — a different tracker from the one every other
 > install uses), so applying the same SQL from the updater as well would run it through two
 > trackers. The updater refreshes the SQL on disk and hands the schema step to the stack.
-> Full details in [docs/13](./13-STAYING-UP-TO-DATE.md).
+> Full details in [docs/13](./13-STAYING-UP-TO-DATE.md). Migration squashes (new
+> `GG000`–`GG004` generations, see [docs/04](./04-DATABASE-AND-AUTH.md)) need nothing
+> extra here: the generation's catch-up file consults `public._nextblock_docker_migrations`
+> by file stem, so it replays only what this stack never applied.
 
 ### Ports (override with env vars)
 

@@ -13,8 +13,9 @@
  *
  * WHY THE ROW TYPE IS HAND-WRITTEN. `libs/db`'s generated `Database` type is
  * produced by `npm run db:types` against a live Supabase project. The migration
- * that creates `cms_redirects` (00000000000030_seo_redirects_and_robots.sql) is
- * committed but has not been applied yet, so the generated type does not contain
+ * that created `cms_redirects` (originally 00000000000030_seo_redirects_and_robots.sql,
+ * now part of 02001_baseline_schema.sql) was
+ * committed before it was applied, so the generated type did not contain
  * the table and `Database['public']['Tables']['cms_redirects']` would not compile.
  * Writing the row shape by hand from the migration's DDL keeps this file building
  * today; once the migration is applied and the types are regenerated, this

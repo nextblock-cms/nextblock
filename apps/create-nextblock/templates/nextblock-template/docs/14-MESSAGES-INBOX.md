@@ -285,8 +285,8 @@ Trusted platform headers (`x-vercel-forwarded-for`, `x-real-ip`) are preferred o
 
 ## Files
 
-- `libs/db/src/supabase/migrations/00000000000027_message_threads.sql` — private lane, `form_endpoints`, the form-block data migration
-- `libs/db/src/supabase/migrations/00000000000028_interaction_replies.sql` — `parent_id`, the reply CHECK, and the indexes `cms_interactions` never had
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` (originally `00000000000027_message_threads`, folded in by the generation-2 squash) — private lane, `form_endpoints`, the form-block data migration
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` (originally `00000000000028_interaction_replies`, folded in by the generation-2 squash) — `parent_id`, the reply CHECK, and the indexes `cms_interactions` never had
 - `apps/nextblock/lib/messages/thread-token.ts` (+ `.test.ts`) — mint, parse, verify
 - `apps/nextblock/lib/messages/threads.ts` — thread creation, recipient resolution, both notification emails
 - `apps/nextblock/app/thread/**` — the visitor's page and the token-exchange route

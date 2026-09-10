@@ -25,7 +25,7 @@ revisions without special-casing.
 ## Data Model
 
 The table is created in
-`libs/db/src/supabase/migrations/00000000000023_setup_custom_block_definitions.sql`.
+`libs/db/src/supabase/migrations/02001_baseline_schema.sql` (originally `00000000000023_setup_custom_block_definitions`, folded in by the generation-2 squash).
 
 `public.custom_block_definitions`:
 
