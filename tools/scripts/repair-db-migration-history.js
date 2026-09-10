@@ -19,7 +19,12 @@ const migrationsDir = path.join(workdir, 'supabase/migrations');
 const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const argv = process.argv.slice(2);
 const args = new Set(argv);
-const baselineRepairFirstVersion = '00000000000000';
+const {
+  MIGRATION_FILE_RE,
+  isBaselineMigration,
+  isCatchupMigration,
+  validateMigrationNames,
+} = require('./lib/migration-naming');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -122,6 +127,144 @@ function supabase(commandArgs) {
   run(npxBin, ['supabase', ...commandArgs]);
 }
 
+/** Like run(), but returns the output (null on failure) instead of inheriting stdio. */
+function runCapture(command, commandArgs) {
+  const dbPassword = getDbPassword();
+  const printable = [command, ...commandArgs.map((arg) => (arg === dbPassword ? '<db-password>' : arg))].join(' ');
+  log(`Running: ${printable}`, colors.blue);
+  const result = spawnSync(command, commandArgs, {
+    cwd: repoRoot,
+    env: process.env,
+    shell: process.platform === 'win32',
+    stdio: 'pipe',
+    encoding: 'utf8',
+  });
+  if (result.error || result.status !== 0) {
+    if (result.stderr) process.stderr.write(result.stderr);
+    return null;
+  }
+  return `${result.stdout || ''}${result.stderr || ''}`;
+}
+
+/** The catch-up file names the last version it replays in a header line. */
+function readCatchupThrough(filePath) {
+  const head = fs.readFileSync(filePath, 'utf8').slice(0, 4000);
+  const match = /^--\s*catchup-through:\s*(\d+)/m.exec(head);
+  return match ? match[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// --reconcile-squash: record a migration squash on a live database WITHOUT running SQL.
+//
+// After a squash the folder holds one generation (GG000 catch-up, GG001..GG004 baseline,
+// GG005+ forward) while the remote history still lists the retired versions of the previous
+// generation. The Supabase CLI refuses to push while remote versions have no local file, so:
+//   1. every remote-only (retired) version is marked `reverted` (its history row goes away);
+//   2. the baseline GG001..GG004 is marked `applied` (its DDL is already present; the seed
+//      would skip a populated database anyway);
+//   3. the catch-up GG000 is marked `applied` ONLY when the database was at the end of the
+//      previous generation (its highest retired version equals the catch-up's
+//      `catchup-through` header). A database that sat behind must cross the squash with the
+//      lenient applier first (`npm run update -- --db-only`): that applier tolerates retired
+//      history rows, and the catch-up decides what to replay from those rows — reverting them
+//      first would make it replay every retired migration.
+//   4. nothing else changes: GG005+ stay pending or applied exactly as the history says.
+// ---------------------------------------------------------------------------
+async function reconcileSquash({ dbPassword, isCheck, confirmed, skipPrompt, migrations }) {
+  // Pure helper from the push script; requiring it never touches a database.
+  const { parseMigrationList } = require('./push-db-migrations.js');
+
+  const files = migrations.map((m) => m.fileName);
+  const naming = validateMigrationNames(files);
+  if (naming.errors.length > 0) {
+    log('Migration file names violate the GGNNN scheme (tools/scripts/lib/migration-naming.js):', colors.red);
+    naming.errors.forEach((error) => log(`  - ${error}`, colors.red));
+    process.exit(1);
+  }
+
+  log('Squash reconcile — records the squash in the remote history; runs no migration SQL', colors.green);
+  log(`Target project: ${process.env.SUPABASE_PROJECT_ID}`, colors.dim);
+
+  const listing = runCapture(npxBin, ['supabase', 'migration', 'list', '--workdir', workdir, '--password', dbPassword]);
+  if (!listing) {
+    log('Could not read the remote migration history.', colors.red);
+    log('If this project has never been linked, run `npx supabase link --project-ref <ref> --workdir libs/db/src` once.', colors.yellow);
+    process.exit(1);
+  }
+  const status = parseMigrationList(listing);
+  const pending = new Set(status.pending);
+
+  const baselineVersions = files.filter(isBaselineMigration).map((f) => f.split('_')[0]);
+  const catchupFile = files.find(isCatchupMigration);
+  const catchupVersion = catchupFile ? catchupFile.split('_')[0] : null;
+  const through = catchupFile ? readCatchupThrough(path.join(migrationsDir, catchupFile)) : null;
+
+  const retired = [...status.remoteOnly].sort();
+  const highestRetired = retired.length > 0 ? retired[retired.length - 1] : null;
+
+  const markApplied = baselineVersions.filter((v) => pending.has(v));
+  let catchupNote = null;
+  if (catchupVersion && pending.has(catchupVersion)) {
+    if (!through) {
+      catchupNote = `cannot read the catchup-through header of ${catchupFile}; leaving it pending`;
+    } else if (retired.length === 0) {
+      catchupNote = 'no retired versions in the remote history; leaving it pending (db:migrate runs it — it replays only unrecorded versions)';
+    } else if (highestRetired === through) {
+      markApplied.push(catchupVersion);
+      catchupNote = `database was at ${through}, the end of the previous generation — recorded as applied without running`;
+    } else if (highestRetired < through) {
+      log(`This database is BEHIND the previous generation: highest recorded retired version ${highestRetired} < catchup-through ${through}.`, colors.red);
+      log('Reverting the retired versions now would make the catch-up replay every retired migration (it reads what is recorded).', colors.yellow);
+      log('Cross the squash with the lenient applier first — it tolerates retired history rows and records what it applies:', colors.yellow);
+      log('  npm run update -- --db-only', colors.yellow);
+      log('then re-run this command to clean the retired rows out of the history.', colors.yellow);
+      process.exit(1);
+    } else {
+      log(`The remote history records ${highestRetired}, newer than this checkout's catchup-through ${through}.`, colors.red);
+      log('This checkout is older than the database. Update the checkout before reconciling.', colors.yellow);
+      process.exit(1);
+    }
+  }
+
+  if (retired.length === 0 && markApplied.length === 0) {
+    log('Nothing to reconcile: no retired versions in the remote history and no baseline or catch-up pending.', colors.green);
+    return;
+  }
+
+  const stillPending = status.pending.filter((v) => !markApplied.includes(v));
+  log('Plan:', colors.dim);
+  log(`  revert (remove from history) ${retired.length} retired version(s)${retired.length > 0 ? `: ${retired[0]} … ${highestRetired}` : ''}`, colors.dim);
+  log(`  mark applied (no SQL runs)   ${markApplied.length} file(s): ${markApplied.join(', ') || '—'}`, colors.dim);
+  if (catchupNote) log(`  catch-up: ${catchupNote}`, colors.dim);
+  log(stillPending.length > 0 ? `  left for \`npm run db:migrate\`: ${stillPending.join(', ')}` : '  nothing left pending afterwards', colors.dim);
+
+  if (isCheck || !confirmed) {
+    if (!isCheck) {
+      log('Dry run only. Run `npm run db:migrate:repair-history -- --reconcile-squash` to apply.', colors.yellow);
+    }
+    return;
+  }
+
+  if (!skipPrompt) {
+    const ok = await promptYesNo(
+      `${colors.yellow}Record the squash on project ${process.env.SUPABASE_PROJECT_ID} as planned above? [y/N] ${colors.reset}`,
+    );
+    if (!ok) {
+      log('Aborted. No changes made.', colors.yellow);
+      process.exit(1);
+    }
+  }
+
+  supabase(['link', '--project-ref', process.env.SUPABASE_PROJECT_ID, '--password', dbPassword, '--workdir', workdir, '--yes']);
+  if (retired.length > 0) {
+    supabase(['migration', 'repair', ...retired, '--status', 'reverted', '--password', dbPassword, '--workdir', workdir, '--yes']);
+  }
+  if (markApplied.length > 0) {
+    supabase(['migration', 'repair', ...markApplied, '--status', 'applied', '--password', dbPassword, '--workdir', workdir, '--yes']);
+  }
+  log('Squash recorded. Run `npm run db:migrate:check` next.', colors.green);
+}
+
 // ---------------------------------------------------------------------------
 // Auto-detection of the applied high-water mark.
 //
@@ -143,7 +286,7 @@ function stripSqlComments(sql) {
 function getLocalMigrations() {
   return fs
     .readdirSync(migrationsDir)
-    .filter((fileName) => /^\d{14}_.*\.sql$/.test(fileName))
+    .filter((fileName) => MIGRATION_FILE_RE.test(fileName))
     .sort()
     .map((fileName) => {
       const version = fileName.split('_')[0];
@@ -250,6 +393,11 @@ async function main() {
     process.exit(1);
   }
 
+  if (args.has('--reconcile-squash')) {
+    await reconcileSquash({ dbPassword, isCheck, confirmed, skipPrompt, migrations });
+    return;
+  }
+
   const override = getArgValue('through');
   let ceiling = override;
   let detection = null;
@@ -274,7 +422,7 @@ async function main() {
 
   const versionsToMark = migrations
     .map((m) => m.version)
-    .filter((version) => version >= baselineRepairFirstVersion && version <= ceiling);
+    .filter((version) => version <= ceiling);
   const pendingAfter = migrations.map((m) => m.version).filter((version) => version > ceiling);
 
   if (versionsToMark.length === 0) {
@@ -309,7 +457,7 @@ async function main() {
 
   if (!skipPrompt) {
     const ok = await promptYesNo(
-      `${colors.yellow}Mark 000…${ceiling} as applied on project ${process.env.SUPABASE_PROJECT_ID}? [y/N] ${colors.reset}`,
+      `${colors.yellow}Mark every migration through ${ceiling} as applied on project ${process.env.SUPABASE_PROJECT_ID}? [y/N] ${colors.reset}`,
     );
     if (!ok) {
       log('Aborted. No changes made.', colors.yellow);

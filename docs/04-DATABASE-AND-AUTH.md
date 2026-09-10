@@ -47,7 +47,8 @@ Practical usage in the app is split by trust level:
 The first-user and profile bootstrap logic lives in the database, not in React
 code.
 
-`00000000000005_setup_functions_and_triggers.sql` defines:
+`02001_baseline_schema.sql` (functions) and `02003_baseline_security_and_grants.sql`
+(the trigger) define:
 
 - `handle_new_user()`
 - `on_auth_user_created` trigger on `auth.users`
@@ -80,7 +81,7 @@ than assuming middleware-based route protection is in use.
 
 ### Core platform tables
 
-Defined primarily in `00000000000001_setup_cms_core.sql`:
+Defined in `02001_baseline_schema.sql`:
 
 - `site_settings`
 - `profiles`
@@ -92,7 +93,7 @@ Defined primarily in `00000000000001_setup_cms_core.sql`:
 
 ### Content tables
 
-Defined primarily in `00000000000002_setup_content_tables.sql`:
+Defined in `02001_baseline_schema.sql`:
 
 - `posts`
 - `pages`
@@ -100,12 +101,12 @@ Defined primarily in `00000000000002_setup_content_tables.sql`:
 - `navigation_items`
 - `page_revisions`
 - `post_revisions`
-- `product_revisions` (added in `00000000000016`, alongside `products.version`)
+- `product_revisions` (alongside `products.version`)
 
 ### Commerce tables
 
-All defined in the baseline schema `00000000000000` (the numbers `00000000000003`/
-`00000000000004` in earlier revisions of this doc were pre-re-baseline file names):
+All defined in the baseline schema `02001_baseline_schema.sql` (every table is — the
+per-migration numbers quoted in earlier revisions of this doc were retired by the squashes):
 
 - `products`
 - `product_media`
@@ -125,21 +126,24 @@ All defined in the baseline schema `00000000000000` (the numbers `00000000000003
 - `tax_rates`
 - `currencies`
 
-### Post-baseline tables
+### Tables that arrived after the original schema
 
-Added after the squashed baseline by later migrations:
+All folded into `02001_baseline_schema.sql` by the squashes; listed here because they are
+easy to miss when reading the schema as one blob (their origin migrations live only in git
+history now):
 
 - `categories` and `product_categories` — catalog organization
-  (migration `00000000000019`; translated via `00000000000020`)
 - `custom_block_definitions` — data-driven custom block registry
-  (migration `00000000000023`; see [10-CUSTOM-BLOCKS.md](./10-CUSTOM-BLOCKS.md))
-- `ucp_cart_sessions` — persisted cart sessions (migration `00000000000024`)
-- a `blocks` JSONB column plus `product_id` link for block-based product
-  descriptions (migration `00000000000017`)
+  (see [10-CUSTOM-BLOCKS.md](./10-CUSTOM-BLOCKS.md))
+- `ucp_cart_sessions` — persisted cart sessions
+- a `blocks` JSONB column plus `product_id` link for block-based product descriptions
+- `site_themes`, `site_scripts` + `site_script_revisions`, `product_revisions`,
+  `mcp_access_tokens`, `product_inquiries`, `message_threads` + `thread_messages`,
+  `cms_redirects`, `system_alerts` — generation-1 additions (2026-07 → 2026-09)
 
 ## Row Level Security Patterns
 
-`00000000000006_setup_rls_and_grants.sql` is the consolidated RLS file.
+`02003_baseline_security_and_grants.sql` is the consolidated RLS file.
 
 The high-level access model is:
 
@@ -161,43 +165,90 @@ Commerce-specific policy highlights include:
 
 ## Migration Structure
 
-### Current reality
+### Current reality: squash generations (`GGNNN`)
 
-The folder was **re-baselined in 2026-07**: the previous 45 migrations
-(`00000000000000`–`00000000000044`) were squashed into a four-file idempotent
-baseline, generated from a fresh-apply `pg_dump` by
-`tools/scripts/rebaseline-transform.mjs` and verified byte-identical to the old
-tree. The current sequence is:
+The folder holds exactly **one squash generation**. File names are `GGNNN_name.sql`:
+`GG` is the generation (two digits, `02` and up), `NNN` the sequence inside it (three
+digits, contiguous from `000`), `name` lowercase snake case. The first five slots of every
+generation are fixed:
 
-- `00000000000000_baseline_schema.sql` — enums, functions, tables, sequences
-  (all `IF NOT EXISTS` / `CREATE OR REPLACE`) plus the re-attached `auth.users`
-  → `handle_new_user` trigger.
-- `00000000000001_baseline_constraints_and_indexes.sql` — primary/unique/check
-  and foreign-key constraints (guarded) plus all indexes.
-- `00000000000002_baseline_security_and_grants.sql` — RLS enablement, policies
-  (`DROP … IF EXISTS` first), triggers, and grants.
-- `00000000000003_baseline_seed.sql` — canonical demo content, `ON CONFLICT DO
-  NOTHING` (no users, no secrets).
+| File | What it is |
+| :-- | :-- |
+| `02000_catchup_gen1.sql` | generation 1's forward migrations, replayed **once and version-aware** on databases that sit behind; runs first so the baseline below is a no-op afterwards (details below) |
+| `02001_baseline_schema.sql` | enums, functions, tables, sequences, defaults (`IF NOT EXISTS` / `CREATE OR REPLACE`) plus the re-attached `auth.users` → `handle_new_user` trigger |
+| `02002_baseline_constraints_and_indexes.sql` | primary/unique/check + foreign-key constraints (catalog-guarded) and every index |
+| `02003_baseline_security_and_grants.sql` | RLS enablement, policies (`DROP … IF EXISTS` first), triggers, grants |
+| `02004_baseline_seed.sql` | canonical demo content (no users, no secrets), `ON CONFLICT DO NOTHING`; runs **only on an empty database** and then records the generation it was born at in `site_settings.migration_baseline_generation` |
+| `02005_…` onward | ordinary forward migrations, appended one at a time |
 
-Every file is fully idempotent. Existing databases already have versions
-`000`–`003` recorded, so both appliers skip the baseline — it only runs on a
-fresh/empty database.
+Generation 2 was built on 2026-09-10 from generation 1 — the retired 14-digit files
+`00000000000000`–`00000000000042`, themselves the 2026-07 squash of the original 45 — by
+`tools/scripts/rebaseline-transform.mjs` from a fresh-apply `pg_dump`, and verified against
+that fresh apply (schema byte-identical; data identical except the generation marker). The
+retired files live only in git history.
 
-Seed *data-fix* migrations (the `seed_seo_*` series, `reposition_marketing_*`) must scope
-every UPDATE by **content signature and parent** (`WHERE page_id = v_home AND content::text
-LIKE '%Blazing-Fast%'`), never by a numeric `blocks.id`. `blocks`, `pages` and `posts` ids
-are identity columns, so any install that created or deleted a row since the baseline has
-different ids from the one the migration was written against — including the sandbox, which
-re-creates rows on every reset. `00000000000035` keyed its product-block updates by id and,
-on drifted installs, wrote French Commerce Pro copy over the home-page Live Demo promo and
-over the first block of the French install guide; `00000000000037` carries the
-signature-scoped repair. Signature guards also make a migration idempotent for free: once
-the copy is replaced, the guard no longer matches.
+**The next number is the highest sequence on disk + 1, in the same generation.**
+`npm run db:migrate:check` prints it and refuses to run on a file that does not match the
+scheme (`tools/scripts/lib/migration-naming.js`; the same lint runs in both generators and
+in `tools/scripts/migration-naming.test.ts` against the real folder). Never copy a "next is
+N" out of a doc or a memory, and never use timestamps.
 
-`00000000000004` was the first migration appended after that re-baseline, not the
-one still to be written — the folder has grown well past it. **To find the next
-number, list `libs/db/src/supabase/migrations` and take the one after the highest
-file on disk.** Never copy a hardcoded "next is N" out of a doc.
+Why the scheme looks like this:
+
+- **Digits only.** The Supabase CLI silently skips any file that is not `<digits>_name.sql`
+  (verified on CLI 2.107: `squash2_000_x.sql` is skipped with a warning; `02000_x.sql` is
+  accepted). The CLI is still on the production path (`db:migrate`, history repair).
+- **Fixed width.** Every applier — the CLI's pending walk, Postgres' `ORDER BY` on
+  `supabase_migrations.schema_migrations`, this repo's own appliers — compares versions as
+  plain strings, so `020` and `0200` would interleave.
+- **Second digit never 0.** Every database created before the generation-2 squash still
+  carries the legacy `000000000000xx` versions in its history; `0G…` with `G ≥ 1` sorts
+  after all of them. Timestamps (`2026…`) would still sort after every generation below 20,
+  but the lint rejects them so nobody has to reason about that.
+
+### How a squash crosses live databases
+
+A new generation gets **new versions**, so every one of its files is pending on every
+existing database (production, the sandbox, every downstream install). That is by design,
+and it is safe because of three properties:
+
+- **The catch-up replays only what is missing.** `02000_catchup_gen1.sql` is one
+  `DO` block; each retired file is embedded as a dollar-quoted string and executed only if
+  its version is not recorded in `supabase_migrations.schema_migrations` (or, for Docker
+  installs, its file stem in `public._nextblock_docker_migrations`). A verbatim replay would
+  be wrong: a migration whose guard is "insert unless X exists" fires again once a later
+  migration removed X (generation 1's home promo), and copy-fix chains re-apply on rewritten
+  content — both were observed on a replay over a fully migrated database during the build.
+  The whole block is skipped on an empty database (no schema yet — the baseline follows) and
+  on a database whose `migration_baseline_generation` is already ≥ 2; it sets that marker
+  when it finishes. It runs first because the baseline DDL is idempotent only against the
+  final schema: `CREATE TABLE IF NOT EXISTS` skips an old-shape table and the next comment
+  or index on a newer column fails (observed on a database stopped at generation-1 `020`).
+- **The baseline DDL is idempotent** against the final schema, so on a database the
+  catch-up has just brought to the end of generation 1 it changes nothing.
+- **The seed is guarded.** It runs only when `languages` and `site_settings` are both
+  empty. Its explicit-id `INSERT`s would otherwise re-create demo rows an operator deleted.
+
+What each kind of database needs:
+
+- **Production (was at the end of generation 1):** record the squash, run nothing —
+  `npm run db:migrate:repair-history:check -- --reconcile-squash` prints the plan, the same
+  command without `:check` reverts the retired versions and marks `02000`–`02004` applied.
+  `supabase db push` refuses to run while retired versions remain in the remote history, so
+  this comes first; `db:migrate:check` says so.
+- **A database that sat behind generation 1:** cross with the lenient applier first —
+  `npm run update -- --db-only` — which tolerates retired history rows (the catch-up reads
+  them to decide what to replay) and records what it applies; then reconcile as above.
+  `--reconcile-squash` detects this case and refuses to revert too early.
+- **The sandbox:** its reset payload wipes `public`, replays the folder from empty
+  (seed runs, marker set, catch-up skipped) and re-records the generation's versions.
+- **Downstream installs (Vercel, `npm create nextblock`, Docker):** nothing to do. The
+  `/setup` wizard, the build hook, `npm run update` and the Docker runner all apply pending
+  files in order and cross the squash automatically.
+- **A database whose history was wiped:** `db:migrate` refuses to apply the baseline when
+  the remote history is completely empty, because the catch-up would then replay everything.
+  Repair the history first (`npm run db:migrate:repair-history`), or use
+  `db:migrate:fresh` if the database really is new.
 
 ### Production migration policy
 
@@ -217,12 +268,14 @@ production or shared database change.
   whose 14-digit version is already recorded remotely is skipped in silence — no
   error, no output. That is why the check prints the pending list and warns when a
   version is recorded remotely with no local file behind it.
-- If an existing database lists old baseline files such as
-  `00000000000000_baseline_schema.sql` as pending, do not replay them. Use
-  `npm run db:migrate:repair-history:check`, then
-  `npm run db:migrate:repair-history --through=00000000000003` (the baseline's
-  top file creates no tables, so auto-detection otherwise stops at `000`), then
-  rerun `npm run db:migrate:check`.
+- If an existing database whose history was wiped lists the baseline files
+  (`02001_baseline_schema.sql` …) as pending, do not replay them blindly. Use
+  `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`
+  (it auto-detects the applied high-water mark from the tables that exist; override with
+  `--through=<version>`), then rerun `npm run db:migrate:check`.
+- If the check shows retired 14-digit versions "recorded remotely with no local file" next to
+  a pending `02000`–`02004`, the database has not crossed the squash yet — see "How a
+  squash crosses live databases" above.
 - Use `npm run db:migrate:fresh` only for a brand-new empty database.
 
 #### Why `db:migrate:check` is read-only by construction
@@ -249,35 +302,91 @@ by diffing local files against remote history. Consequences worth keeping:
 If a future CLI upgrade tempts you back toward `db push --dry-run` for previewing:
 don't. A command named `check` must not be able to write.
 
-### Category map
-
-| Migration file | Domain | What it covers |
-| :-- | :-- | :-- |
-| `00000000000000_baseline_schema.sql` | Core, CMS, Commerce | all enums, 40 functions, 49 tables + sequences (idempotent), and the `auth.users` → `handle_new_user` bootstrap trigger |
-| `00000000000001_baseline_constraints_and_indexes.sql` | Core, CMS, Commerce | all primary/unique/check + foreign-key constraints (guarded) and every index |
-| `00000000000002_baseline_security_and_grants.sql` | Security | RLS enablement on every table, all policies, timestamp/business triggers, grants |
-| `00000000000003_baseline_seed.sql` | Seeds | canonical demo content — languages, currencies, site settings, translations, media, pages/posts/blocks, navigation, shipping defaults — all `ON CONFLICT DO NOTHING` |
-
-The pre-2026-07 history (foundation/enums, cms_core, content_tables, catalog,
-fulfillment, functions_and_triggers, rls_and_grants, indexes, the seed files, and
-later additions like custom block definitions, product blocks, categories, cart
-sessions, drafts, privacy/MFA, system alerts, interactions) is all folded into the
-four files above; the earlier per-file boundaries survive only as comment headers
-inside the generated SQL.
-
 ### How to read the folder
 
-Read the migrations in lexical order from `00000000000000` upward.
-
-That sequence is the cleanest under-the-hood blueprint for:
+Read `02001_baseline_schema.sql`, then `02002` and `02003`, then the seed — in that
+order they are the cleanest under-the-hood blueprint for:
 
 - which tables exist
 - what triggers and functions are available
 - what security rules are enforced
 - what default content and configuration are seeded
 
-If you need to understand whether the platform really supports something, check
-the migration file first, then trace the corresponding route or library code.
+Skip `02000_catchup_gen1.sql` unless you are debugging an upgrade: it is generation 1's
+history, kept only so databases that sat behind can converge. Everything from `02005`
+upward is an ordinary forward migration and reads as a changelog.
+
+If you need to understand whether the platform really supports something, check the
+migration file first, then trace the corresponding route or library code.
+
+### Squashing migrations (re-baseline runbook)
+
+Do this rarely — a squash retires every forward migration written since the last one, and
+every live database has to cross it. Downstream installs exist, so **a squash always ships a
+catch-up**. Generation `G` replaces generation `G-1`; the steps below produced generation 2
+and are what the next squash repeats with `G = 3`.
+
+1. **Preconditions.** Production and the sandbox are at the last version of the current
+   generation and `npm run db:migrate:check` is clean. Docker Desktop is running.
+   `psql` and `pg_dump` 17 are on `PATH`. Nothing in this runbook touches a shared
+   database.
+2. **Fresh-apply the current generation** to a throwaway database. The repo's compose file
+   is the easiest source of a real Supabase-shaped Postgres with `auth.users`:
+   `docker compose -p nbsquash --env-file <scratch>/.env up -d db auth` with an env file
+   holding `POSTGRES_PASSWORD`, `JWT_SECRET` (≥ 32 chars), `POSTGRES_PORT_EXTERNAL`
+   (pick a port outside `netsh interface ipv4 show excludedportrange protocol=tcp`; 54329
+   is Hyper-V-reserved on this machine, 15432 worked) and dummy values for the other
+   interpolated variables. Wait until `select to_regclass('auth.users')` is non-null, then
+   apply every file in order with `psql -v ON_ERROR_STOP=1 -1 -f`, recording each version
+   in `supabase_migrations.schema_migrations` exactly like the real appliers do — the
+   catch-up reads that table, so the harness must fill it. **Apply LF-normalized copies**
+   (`tr -d ''`), never the working tree as-is: with `core.autocrlf=true` the tree mixes
+   CRLF (git checkouts) and LF (tool-written files), and a multi-line `replace()` pattern
+   only matches content seeded with the same line endings — building generation 2 from the
+   raw tree silently lost migration 042's copy change. The git-canonical form is LF.
+3. **Dump.** Schema: `pg_dump -n public -s --no-owner --no-tablespaces --no-security-labels
+   --no-publications --no-subscriptions -T public._nextblock_docker_migrations > schema.sql`.
+   Data: `pg_dump -n public -a --column-inserts --on-conflict-do-nothing --no-owner
+   --exclude-table-data=public.profiles -T public._nextblock_docker_migrations > data.sql`.
+4. **Transform.** `node tools/scripts/rebaseline-transform.mjs <dumpDir> <outDir>
+   --generation G --catchup-from libs/db/src/supabase/migrations --catchup-after <the
+   current generation's seed version, e.g. 02004>`. It classifies every statement, adds the
+   idempotency guards, wraps the seed in its empty-database guard, builds the version-aware
+   catch-up, normalizes install-state rows (`is_admin_created` → `false`,
+   `system_configuration` → `{}`), drops `profiles` data and the Docker tracking table,
+   and strips every carriage return (see the comments in the script for why each of these
+   exists — every one closes a defect found while building generation 2). It prints object
+   counts and flags anything it could not classify.
+5. **Validate — all of these, every time.** Recreate the throwaway stack between runs
+   (`docker compose -p nbsquash … down -v`). Apply LF files everywhere and compare
+   `pg_dump` output with comments dropped, carriage returns stripped, apply-time values
+   masked (SQL and JSON timestamps, `form_key`s and `form_endpoints` keys, `site_themes`
+   ids — all generated at seed time), and `INSERT`s sorted. `tools/scripts/rebaseline-harness.sh`
+   does all of this:
+   - fresh new generation **==** fresh old generation (schema identical; data identical
+     except the `migration_baseline_generation` row);
+   - re-applying all five files on that database changes nothing;
+   - old generation applied part-way (e.g. through its 20th file, versions recorded) then
+     the new generation **==** fresh old generation;
+   - old generation applied fully then the new generation **==** fresh old generation;
+   - the same part-way case with versions recorded only in
+     `public._nextblock_docker_migrations` (Docker installs) **==** fresh old generation;
+   - negative seed test: delete a `site_settings` row on a populated database, re-run the
+     seed file, the row stays deleted.
+6. **Swap the folder.** Delete every file of the old generation, copy the five new ones in,
+   run `npx vitest run tools/scripts` (the naming test now enforces the new generation).
+7. **Regenerate the artifacts:** `npm run generate:migrations-bundle && npm run
+   generate:sandbox`. A squash never changes the schema, so `npm run db:types` must
+   produce no diff.
+8. **Update the docs:** this section (generation number, date, the table above),
+   `CLAUDE.md`, `libs/db/CLAUDE.md`, `AGENTS.md`, `docs/05`, the migration table in the
+   technical specification, and any code comment that cites a retired file name.
+9. **Ship:** republish `@nextblock-cms/db` (minor bump — standalone installs get the
+   folder from the package), `npm run sync:create-nextblock`, commit. Publish the package
+   before pushing the template, or `npm create nextblock` pins a version that does not exist.
+10. **Cross the live databases** as described in "How a squash crosses live databases":
+    production via `--reconcile-squash`, the sandbox via its reset.
+11. **The first new migration is `G005`.** Never reuse a retired number.
 
 ## Important Site Settings in Active Use
 

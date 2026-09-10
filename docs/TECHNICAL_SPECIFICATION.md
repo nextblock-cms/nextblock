@@ -27,7 +27,7 @@ The core problem statement — "stop cloning heavy repos; start with our CLI and
 
 ### 1.1.3 Key Stakeholders and Users
 
-The system recognizes three database-enforced user roles (defined as the `user_role` enum `ADMIN`, `WRITER`, `USER` in migration `00000000000000_setup_foundation_and_enums.sql`) and three additional implicit stakeholder classes observable from the scaffolding and documentation artifacts.
+The system recognizes three database-enforced user roles (defined as the `user_role` enum `ADMIN`, `WRITER`, `USER` in migration `02001_baseline_schema.sql`) and three additional implicit stakeholder classes observable from the scaffolding and documentation artifacts.
 
 | Stakeholder | Role / Audience | Primary Entry Point |
 |:--|:--|:--|
@@ -267,7 +267,7 @@ The following architectural invariants are enforced at workspace level and must 
 
 **Editor Capabilities** — The `@nextblock-cms/editor` library exports `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, `HtmlContent`, and `editorExtensions`. Feature set includes Tiptap StarterKit rich text, syntax-highlighted code blocks, tables, task lists, slash commands, drag handles, image handling, character counting, typography, mathematics, emoji, mentions, inline alert and call-to-action widgets, and custom HTML-preserving extensions for `div`, `style`, `script`, `svg`, `span`, and catch-all attribute preservation. A media-picker bridge is exposed via `setOpenImagePicker()`.
 
-**Translation & Localization** — The set of served locales is the active rows of the `languages` table (managed at `/cms/settings/languages`; the proxy reads them with a 60-second in-memory cache and only falls back to the hardcoded `FALLBACK_LOCALES` `en`/`fr` when the DB is unreadable), backed by `languages` and `translations` tables from migration `00000000000001_setup_cms_core.sql`. First-visit language detection is admin-configurable (see F-007): browser `Accept-Language`, IP-country via host geo headers, combined, or always-default — implemented in `apps/nextblock/lib/i18n/detection.ts` and stored in `site_settings.language_detection_settings`. Content revision history is stored as snapshot + JSON Patch diff (enum `revision_type: snapshot, diff`) per migration `00000000000002_setup_content_tables.sql`.
+**Translation & Localization** — The set of served locales is the active rows of the `languages` table (managed at `/cms/settings/languages`; the proxy reads them with a 60-second in-memory cache and only falls back to the hardcoded `FALLBACK_LOCALES` `en`/`fr` when the DB is unreadable), backed by `languages` and `translations` tables from migration `02001_baseline_schema.sql`. First-visit language detection is admin-configurable (see F-007): browser `Accept-Language`, IP-country via host geo headers, combined, or always-default — implemented in `apps/nextblock/lib/i18n/detection.ts` and stored in `site_settings.language_detection_settings`. Content revision history is stored as snapshot + JSON Patch diff (enum `revision_type: snapshot, diff`) per migration `02001_baseline_schema.sql`.
 
 **Page Lifecycle** — Pages move through `draft`, `published`, and `archived` statuses (enum `page_status`).
 
@@ -343,7 +343,7 @@ Profile completion is enforced via a redirect: users without a `full_name` value
 
 #### 1.3.2.3 Geographic and Market Coverage
 
-Shipping resolution operates at country and state granularity. Multi-currency pricing is supported with a configurable default currency seeded in migration `00000000000008_seed_platform_defaults.sql`. The database schema includes a `shipping_zone_locations.postal_code` column for future finer-grained geographic resolution, although the current runtime resolver does not yet consume it.
+Shipping resolution operates at country and state granularity. Multi-currency pricing is supported with a configurable default currency seeded in migration `02001_baseline_schema.sql`. The database schema includes a `shipping_zone_locations.postal_code` column for future finer-grained geographic resolution, although the current runtime resolver does not yet consume it.
 
 #### 1.3.2.4 Data Domains Included
 
@@ -446,11 +446,14 @@ The system does not natively integrate with: alternative payment processors beyo
 
 ### 1.4.5 Database Migrations
 
-- `libs/db/src/supabase/migrations/00000000000000_setup_foundation_and_enums.sql` — Enums: `user_role`, `page_status`, `menu_location`, `revision_type`
-- `libs/db/src/supabase/migrations/00000000000001_setup_cms_core.sql` — Languages, translations, media, profiles, settings
-- `libs/db/src/supabase/migrations/00000000000002_setup_content_tables.sql` — Pages, posts, blocks, navigation, revisions
-- `libs/db/src/supabase/migrations/00000000000008_seed_platform_defaults.sql` — Default settings (footer copyright, payment providers, inventory, invoice settings)
-- Migrations 00000000000003 through 00000000000010 — Commerce catalog, fulfillment, and platform seeds
+One squash generation at a time (`GGNNN_name.sql`; see §6.2.3.1 and docs/04):
+
+- `libs/db/src/supabase/migrations/02000_catchup_gen1.sql` — Version-aware replay of the retired generation-1 forward migrations
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Enums (`user_role`, `page_status`, `menu_location`, `revision_type`, …), functions, every table and sequence
+- `libs/db/src/supabase/migrations/02002_baseline_constraints_and_indexes.sql` — Constraints and indexes
+- `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` — RLS, policies, triggers, grants
+- `libs/db/src/supabase/migrations/02004_baseline_seed.sql` — Default settings (footer copyright, payment providers, inventory, invoice settings), languages, translations, demo content
+- `02005` onward — forward migrations appended since the generation-2 squash
 
 ### 1.4.6 Agent Skill Documents
 
@@ -623,7 +626,7 @@ Served locales are the active rows of the `languages` table, managed at `/cms/se
 
 Locale propagation uses the `NEXT_USER_LOCALE` cookie and the `X-User-Locale` request header, both set by the request proxy. When `rememberVisitorChoice` is `true` (default) the cookie persists for one year (`maxAge: 31_536_000` seconds); when `false` it is a session cookie, so detection re-runs each new browser session (the client `LanguageProvider` mirrors the same expiry for manual switcher choices). A valid cookie always beats detection. The client-side provider chain `LanguageProvider → TranslationsProvider` in `apps/nextblock/app/providers.tsx` bridges server-resolved locale into React context.
 
-**Business Value:** Unlocks multi-market deployments without requiring adopters to integrate a separate i18n library. **User Benefits:** Language switching persists across sessions; same content IDs preserve relationships across translations. **Technical Context:** Implemented at schema level (migration `00000000000001_setup_cms_core.sql`), proxy level, and provider level.
+**Business Value:** Unlocks multi-market deployments without requiring adopters to integrate a separate i18n library. **User Benefits:** Language switching persists across sessions; same content IDs preserve relationships across translations. **Technical Context:** Implemented at schema level (migration `02001_baseline_schema.sql`), proxy level, and provider level.
 
 **Dependencies**
 
@@ -648,7 +651,7 @@ Locale propagation uses the `NEXT_USER_LOCALE` cookie and the `X-User-Locale` re
 
 **Description**
 
-Revisions are implemented in the `page_revisions` and `post_revisions` tables defined in migration `00000000000002_setup_content_tables.sql`, using a hybrid snapshot/diff model. The `revision_type` enum (`snapshot`, `diff`) distinguishes between full snapshots and JSON Patch diffs (generated via `fast-json-patch`). A UNIQUE constraint on `(page_id, version)` ensures monotonically increasing snapshot versions. The CMS surface resides under `apps/nextblock/app/cms/revisions/`.
+Revisions are implemented in the `page_revisions` and `post_revisions` tables defined in migration `02001_baseline_schema.sql`, using a hybrid snapshot/diff model. The `revision_type` enum (`snapshot`, `diff`) distinguishes between full snapshots and JSON Patch diffs (generated via `fast-json-patch`). A UNIQUE constraint on `(page_id, version)` ensures monotonically increasing snapshot versions. The CMS surface resides under `apps/nextblock/app/cms/revisions/`.
 
 **Business Value:** Provides audit trail and rollback capability for authored content. **User Benefits:** Authors can restore prior states; accidental deletions are recoverable. **Technical Context:** Diff generation reduces storage overhead for frequently-updated content.
 
@@ -675,7 +678,7 @@ Revisions are implemented in the `page_revisions` and `post_revisions` tables de
 
 **Description**
 
-Three menu locations are supported: `HEADER`, `FOOTER`, and `SIDEBAR`, encoded by the `menu_location` enum. The `navigation_items` table (migration `00000000000002_setup_content_tables.sql`) supports hierarchical menus through a `parent_id` self-reference, explicit `order` for sibling sorting, translation group affiliation, and optional page references. Administrative CRUD operations reside at `apps/nextblock/app/cms/navigation/`.
+Three menu locations are supported: `HEADER`, `FOOTER`, and `SIDEBAR`, encoded by the `menu_location` enum. The `navigation_items` table (migration `02001_baseline_schema.sql`) supports hierarchical menus through a `parent_id` self-reference, explicit `order` for sibling sorting, translation group affiliation, and optional page references. Administrative CRUD operations reside at `apps/nextblock/app/cms/navigation/`.
 
 **Dependencies**
 
@@ -729,7 +732,7 @@ Authentication is layered over Supabase Auth using `@supabase/ssr` and `@supabas
 
 **Description**
 
-RBAC is enforced through a three-valued `user_role` enum (`ADMIN`, `WRITER`, `USER`) defined in migration `00000000000000_setup_foundation_and_enums.sql`. Route-level enforcement is implemented in `apps/nextblock/proxy.ts` (lines 12–17): `/cms` requires `WRITER` or `ADMIN`; `/cms/admin`, `/cms/users`, and `/cms/settings` require `ADMIN` exclusively. A foundational authorization rule encoded in the `on_auth_user_created` trigger elevates the first registered user to `ADMIN` and assigns all subsequent users the `USER` role, guaranteeing each deployment has exactly one guaranteed administrator at bootstrap. Users without a `full_name` value are redirected to `/profile` before being permitted to access other authenticated surfaces. Database-layer enforcement is provided via Row-Level Security with helper functions `get_current_user_role()` and `is_admin()` (both `SECURITY DEFINER`).
+RBAC is enforced through a three-valued `user_role` enum (`ADMIN`, `WRITER`, `USER`) defined in migration `02001_baseline_schema.sql`. Route-level enforcement is implemented in `apps/nextblock/proxy.ts` (lines 12–17): `/cms` requires `WRITER` or `ADMIN`; `/cms/admin`, `/cms/users`, and `/cms/settings` require `ADMIN` exclusively. A foundational authorization rule encoded in the `on_auth_user_created` trigger elevates the first registered user to `ADMIN` and assigns all subsequent users the `USER` role, guaranteeing each deployment has exactly one guaranteed administrator at bootstrap. Users without a `full_name` value are redirected to `/profile` before being permitted to access other authenticated surfaces. Database-layer enforcement is provided via Row-Level Security with helper functions `get_current_user_role()` and `is_admin()` (both `SECURITY DEFINER`).
 
 **Dependencies**
 
@@ -833,7 +836,7 @@ All features in this section are gated by F-022 (Package Activation) via `verify
 
 **Description**
 
-Products are modeled in migration `00000000000003_setup_catalog_and_licensing.sql` with fields including `sku`, `slug`, `title`, `type` (`physical` | `digital`), `payment_provider` (`stripe` | `freemius`), `price` as an integer in the smallest currency unit, a multi-currency `prices` JSONB column, `stock`, `status` (`draft` | `active` | `archived`), descriptions, Freemius-specific fields, UPC, and an `is_taxable` flag. A CHECK constraint named `products_type_provider_consistency_check` enforces that `physical` products use `stripe` and `digital` products use `freemius`. Related tables `product_media`, `product_attributes`, `product_attribute_terms`, `product_variants`, and `variant_attribute_mapping` model assets and variations. CMS surfaces at `apps/nextblock/app/cms/products/` provide list, create, edit, media, attribute, and variation management flows.
+Products are modeled in migration `02001_baseline_schema.sql` with fields including `sku`, `slug`, `title`, `type` (`physical` | `digital`), `payment_provider` (`stripe` | `freemius`), `price` as an integer in the smallest currency unit, a multi-currency `prices` JSONB column, `stock`, `status` (`draft` | `active` | `archived`), descriptions, Freemius-specific fields, UPC, and an `is_taxable` flag. A CHECK constraint named `products_type_provider_consistency_check` enforces that `physical` products use `stripe` and `digital` products use `freemius`. Related tables `product_media`, `product_attributes`, `product_attribute_terms`, `product_variants`, and `variant_attribute_mapping` model assets and variations. CMS surfaces at `apps/nextblock/app/cms/products/` provide list, create, edit, media, attribute, and variation management flows.
 
 **Dependencies**
 
@@ -858,7 +861,7 @@ Products are modeled in migration `00000000000003_setup_catalog_and_licensing.sq
 
 **Description**
 
-The `inventory_items` table (migration `00000000000003_setup_catalog_and_licensing.sql`) uses SKU as key and enforces `quantity >= 0` via CHECK constraint. Tracking is globally controlled by the `trackQuantities` setting in `ecommerce_inventory_settings`. Inventory deduction during order finalization follows a resilient pattern: the runtime first calls the `apply_order_inventory_deduction()` Postgres RPC, and if that path is unavailable, falls back to direct SQL via the `POSTGRES_URL` or `DATABASE_URL` connection, as coordinated by `libs/ecommerce/src/lib/shared-inventory.ts` and `libs/ecommerce/src/lib/order-inventory.ts`.
+The `inventory_items` table (migration `02001_baseline_schema.sql`) uses SKU as key and enforces `quantity >= 0` via CHECK constraint. Tracking is globally controlled by the `trackQuantities` setting in `ecommerce_inventory_settings`. Inventory deduction during order finalization follows a resilient pattern: the runtime first calls the `apply_order_inventory_deduction()` Postgres RPC, and if that path is unavailable, falls back to direct SQL via the `POSTGRES_URL` or `DATABASE_URL` connection, as coordinated by `libs/ecommerce/src/lib/shared-inventory.ts` and `libs/ecommerce/src/lib/order-inventory.ts`.
 
 **Dependencies**
 
@@ -958,7 +961,7 @@ Freemius integration lives in `libs/ecommerce/src/lib/providers/` and supports d
 
 **Description**
 
-The `currencies` table (migration `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql`) stores `exchange_rate` as a `numeric(20,10)`, a single-row `is_default` constraint, `rounding_mode` (`none`, `nearest`, `up`, `down`, `charm`), `rounding_increment`, `rounding_charm_amount`, and flags `auto_update_exchange_rate` and `auto_sync_product_prices`. The default currency must satisfy `exchange_rate = 1`, `auto_update_exchange_rate = false`, and `auto_sync_product_prices = false`. FX rates are pulled from `https://api.frankfurter.dev` (overridable via `FX_API_BASE_URL`). Operations `syncStoreCurrencyRates()` and `rebaseStoreCurrencyExchangeRates()` are exposed by `libs/ecommerce/src/lib/currency-sync.ts`. A daily cron invokes `/api/cron/sync-currencies` at 18:00 UTC (`vercel.json`). Seed migration `00000000000008_seed_platform_defaults.sql` provides USD as the default.
+The `currencies` table (migration `02001_baseline_schema.sql`) stores `exchange_rate` as a `numeric(20,10)`, a single-row `is_default` constraint, `rounding_mode` (`none`, `nearest`, `up`, `down`, `charm`), `rounding_increment`, `rounding_charm_amount`, and flags `auto_update_exchange_rate` and `auto_sync_product_prices`. The default currency must satisfy `exchange_rate = 1`, `auto_update_exchange_rate = false`, and `auto_sync_product_prices = false`. FX rates are pulled from `https://api.frankfurter.dev` (overridable via `FX_API_BASE_URL`). Operations `syncStoreCurrencyRates()` and `rebaseStoreCurrencyExchangeRates()` are exposed by `libs/ecommerce/src/lib/currency-sync.ts`. A daily cron invokes `/api/cron/sync-currencies` at 18:00 UTC (`vercel.json`). Seed migration `02001_baseline_schema.sql` provides USD as the default.
 
 **Dependencies**
 
@@ -1008,7 +1011,7 @@ Three shipping tables model geographic and rate configurations: `shipping_zones`
 
 **Description**
 
-The `tax_rates` table (migration `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql`) supports two modes: `manual` (keyed on country and state, supporting stacked rates such as GST + PST) and `automatic` (delegated to Stripe Tax via tax codes on line items). Mode selection is controlled by the `enableTaxes` and `taxCalculationMode` properties in `ecommerce_inventory_settings`. Schema constraints require `tax_rate` between 0 and 100 and enforce a uniqueness constraint on `(country_code, state_code, lower(tax_name))`. Implementation lives in `libs/ecommerce/src/lib/tax-calculation.ts` and `libs/ecommerce/src/lib/order-tax-details.ts`.
+The `tax_rates` table (migration `02001_baseline_schema.sql`) supports two modes: `manual` (keyed on country and state, supporting stacked rates such as GST + PST) and `automatic` (delegated to Stripe Tax via tax codes on line items). Mode selection is controlled by the `enableTaxes` and `taxCalculationMode` properties in `ecommerce_inventory_settings`. Schema constraints require `tax_rate` between 0 and 100 and enforce a uniqueness constraint on `(country_code, state_code, lower(tax_name))`. Implementation lives in `libs/ecommerce/src/lib/tax-calculation.ts` and `libs/ecommerce/src/lib/order-tax-details.ts`.
 
 **Dependencies**
 
@@ -1033,7 +1036,7 @@ The `tax_rates` table (migration `00000000000004_setup_fulfillment_shipping_taxe
 
 **Description**
 
-Orders transition through five statuses — `pending`, `paid`, `shipped`, `cancelled`, `refunded` — and store totals (`total`, `subtotal`, `shipping_total`, `tax_total`), a JSONB `tax_details` breakdown, `exchange_rate_at_purchase` as `numeric(20,10)`, `invoice_number`, `paid_at`, and `inventory_deducted_at`. Stable invoice numbering is produced by the `order_invoice_number_seq` sequence. The `invoice_settings` site-setting (seeded by `00000000000008_seed_platform_defaults.sql`) stores business name, email, address, and tax registrations. UI components `InvoiceDocument` and `InvoiceViewerShell` in `libs/ecommerce/src/lib/` render invoices. Customer order history is surfaced via `libs/ecommerce/src/lib/customer-orders.ts`, with admin management at `apps/nextblock/app/cms/orders/` and customer self-service at `apps/nextblock/app/profile/orders/`.
+Orders transition through five statuses — `pending`, `paid`, `shipped`, `cancelled`, `refunded` — and store totals (`total`, `subtotal`, `shipping_total`, `tax_total`), a JSONB `tax_details` breakdown, `exchange_rate_at_purchase` as `numeric(20,10)`, `invoice_number`, `paid_at`, and `inventory_deducted_at`. Stable invoice numbering is produced by the `order_invoice_number_seq` sequence. The `invoice_settings` site-setting (seeded by `02001_baseline_schema.sql`) stores business name, email, address, and tax registrations. UI components `InvoiceDocument` and `InvoiceViewerShell` in `libs/ecommerce/src/lib/` render invoices. Customer order history is surfaced via `libs/ecommerce/src/lib/customer-orders.ts`, with admin management at `apps/nextblock/app/cms/orders/` and customer self-service at `apps/nextblock/app/profile/orders/`.
 
 **Dependencies**
 
@@ -1058,7 +1061,7 @@ Orders transition through five statuses — `pending`, `paid`, `shipped`, `cance
 
 **Description**
 
-The `package_activations` table (migration `00000000000003_setup_catalog_and_licensing.sql`) contains `license_key`, `instance_name`, `package_id`, `status` (defaulting to `active`), `meta`, `last_validated_at`, and a UNIQUE constraint on `(license_key, package_id)`. The helper `verifyPackageOnline(packageId, customClient?)` in `libs/db/src/lib/package-validation.ts` returns a boolean based on `status === 'active'` and uses `unstable_cache` with a 60-second revalidation window. This function is invoked from four surfaces: the CMS commerce navigation visibility check, the checkout API gate at `apps/nextblock/app/api/checkout/route.ts` line 36, premium route wrappers injected during scaffold activation, and the CLI's module activation flows.
+The `package_activations` table (migration `02001_baseline_schema.sql`) contains `license_key`, `instance_name`, `package_id`, `status` (defaulting to `active`), `meta`, `last_validated_at`, and a UNIQUE constraint on `(license_key, package_id)`. The helper `verifyPackageOnline(packageId, customClient?)` in `libs/db/src/lib/package-validation.ts` returns a boolean based on `status === 'active'` and uses `unstable_cache` with a 60-second revalidation window. This function is invoked from four surfaces: the CMS commerce navigation visibility check, the checkout API gate at `apps/nextblock/app/api/checkout/route.ts` line 36, premium route wrappers injected during scaffold activation, and the CLI's module activation flows.
 
 **Dependencies**
 
@@ -1679,7 +1682,7 @@ The following matrix links features to the sections of the technical specificati
 | Package alignment | `@nextblock-cms/ecom` package name vs. `@nextblock-cms/ecommerce` alias (per §1.3.3.1) requires coordination when republished | F-013–F-022 |
 | Locale expansion | Locales are DB-driven: add an active `languages` row (plus translations/content); `FALLBACK_LOCALES` in `proxy.ts` is only a DB-unreachable safety net | F-007 |
 | Block registry updates | New block types must satisfy F-024 contract and register in `blockRegistry.ts` | F-004, F-024 |
-| RLS policy review | Migration `00000000000006_setup_rls_and_grants.sql` should be audited on new table introduction | All DB-backed features |
+| RLS policy review | Migration `02001_baseline_schema.sql` should be audited on new table introduction | All DB-backed features |
 
 ### 2.4.6 Assumptions and Constraints Summary
 
@@ -1726,14 +1729,14 @@ The following matrix links features to the sections of the technical specificati
 - `apps/create-nextblock/bin/create-nextblock.js` — CLI `create` and `activate` commands (F-023)
 - `libs/db/src/lib/package-validation.ts` — `verifyPackageOnline()` with 60 s cache (F-022)
 - `libs/db/src/lib/media-actions.ts` — Role-gated media recording (F-006)
-- `libs/db/src/supabase/migrations/00000000000000_setup_foundation_and_enums.sql` — `user_role`, `page_status`, `menu_location`, `revision_type` enums
-- `libs/db/src/supabase/migrations/00000000000001_setup_cms_core.sql` — languages, translations, media, profiles (F-002, F-006, F-007)
-- `libs/db/src/supabase/migrations/00000000000002_setup_content_tables.sql` — pages, posts, blocks, navigation, revisions (F-004, F-008, F-009)
-- `libs/db/src/supabase/migrations/00000000000003_setup_catalog_and_licensing.sql` — products, variants, attributes, inventory, package_activations (F-013, F-014, F-022)
-- `libs/db/src/supabase/migrations/00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` — orders, shipping zones, tax rates, currencies (F-018–F-021)
-- `libs/db/src/supabase/migrations/00000000000005_setup_functions_and_triggers.sql` — `handle_new_user()`, `on_auth_user_created` (F-002, F-003)
-- `libs/db/src/supabase/migrations/00000000000006_setup_rls_and_grants.sql` — RLS policies and helper functions
-- `libs/db/src/supabase/migrations/00000000000008_seed_platform_defaults.sql` — Default settings, USD currency, `en`/`fr` languages
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `user_role`, `page_status`, `menu_location`, `revision_type` enums
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — languages, translations, media, profiles (F-002, F-006, F-007)
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — pages, posts, blocks, navigation, revisions (F-004, F-008, F-009)
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — products, variants, attributes, inventory, package_activations (F-013, F-014, F-022)
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — orders, shipping zones, tax rates, currencies (F-018–F-021)
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `handle_new_user()`, `on_auth_user_created` (F-002, F-003)
+- `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` — RLS policies and helper functions
+- `libs/db/src/supabase/migrations/02004_baseline_seed.sql` — Default settings, USD currency, `en`/`fr` languages
 - `libs/db/src/supabase/templates/` — Six Supabase Auth email templates (F-002)
 - `libs/editor/README.md` — Public editor surface exports (F-005)
 - `libs/editor/ADVANCED_FEATURES.md` — Enhanced floating menu, placeholder behaviors (F-005)
@@ -2222,14 +2225,14 @@ Supabase PostgreSQL is the authoritative data store for all structured data in t
 
 | Migration File | Purpose |
 |:--|:--|
-| `00000000000000_setup_foundation_and_enums.sql` | Enums: `user_role`, `page_status`, `menu_location`, `revision_type` |
-| `00000000000001_setup_cms_core.sql` | `languages`, `translations`, `media`, `profiles`, `settings`, `logos` |
-| `00000000000002_setup_content_tables.sql` | `pages`, `posts`, `blocks`, `navigation_items`, `page_revisions`, `post_revisions` |
-| `00000000000003_setup_catalog_and_licensing.sql` | `products`, `product_variants`, `inventory_items`, `package_activations` |
-| `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` | `currencies`, `tax_rates`, shipping tables |
+| `02001_baseline_schema.sql` | Enums: `user_role`, `page_status`, `menu_location`, `revision_type` |
+| `02001_baseline_schema.sql` | `languages`, `translations`, `media`, `profiles`, `settings`, `logos` |
+| `02001_baseline_schema.sql` | `pages`, `posts`, `blocks`, `navigation_items`, `page_revisions`, `post_revisions` |
+| `02001_baseline_schema.sql` | `products`, `product_variants`, `inventory_items`, `package_activations` |
+| `02001_baseline_schema.sql` | `currencies`, `tax_rates`, shipping tables |
 | `00000000000005` through `00000000000007` | Commerce extensions |
-| `00000000000006_setup_rls_and_grants.sql` | Row-Level Security policies |
-| `00000000000008_seed_platform_defaults.sql` | Default settings, USD currency, English language |
+| `02001_baseline_schema.sql` | Row-Level Security policies |
+| `02001_baseline_schema.sql` | Default settings, USD currency, English language |
 | `00000000000009` — `00000000000010` | Additional platform seeds |
 | `00000000000011` through `00000000000016` | Cortex AI settings, coupons, audit, drafts, and page feature images |
 | `00000000000017` through `00000000000024` | Product blocks, bot-protection settings, product categories + translations, hero→section migration, Cortex AI guide seed, custom block definitions, and cart sessions |
@@ -4002,14 +4005,14 @@ flowchart LR
 
 #### Database Migrations Referenced
 
-- `00000000000000_setup_foundation_and_enums.sql` - `user_role` enum
-- `00000000000001_setup_cms_core.sql` - Translations schema
-- `00000000000002_setup_content_tables.sql` - Pages, posts, revisions, navigation
-- `00000000000003_setup_catalog_and_licensing.sql` - Products, inventory, package_activations
-- `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` - Orders, tax, shipping, currencies
-- `00000000000005_*.sql` - `on_auth_user_created` trigger (first-user ADMIN rule)
-- `00000000000006_*.sql` - RLS policies and helper functions
-- `00000000000008_seed_platform_defaults.sql` - Default currency, languages, invoice settings
+- `02001_baseline_schema.sql` - `user_role` enum
+- `02001_baseline_schema.sql` - Translations schema
+- `02001_baseline_schema.sql` - Pages, posts, revisions, navigation
+- `02001_baseline_schema.sql` - Products, inventory, package_activations
+- `02001_baseline_schema.sql` - Orders, tax, shipping, currencies
+- `02003_baseline_security_and_grants.sql` - `on_auth_user_created` trigger (first-user ADMIN rule), RLS policies
+- `02001_baseline_schema.sql` - helper functions
+- `02001_baseline_schema.sql` - Default currency, languages, invoice settings
 
 #### Folders Explored
 
@@ -5643,7 +5646,7 @@ The design leans on the Supabase managed platform for replication, connection po
 
 #### 6.2.2.1 Enumerated Types
 
-All domain-specific enumerations are declared in migration `00000000000000_setup_foundation_and_enums.sql` using idempotent `DO $$` guards so re-application is safe. The migration also grants `USAGE` on the `public` schema to the Supabase-managed roles `postgres`, `anon`, `authenticated`, and `service_role`.
+All domain-specific enumerations are declared in migration `02001_baseline_schema.sql` using idempotent `DO $$` guards so re-application is safe. The migration also grants `USAGE` on the `public` schema to the Supabase-managed roles `postgres`, `anon`, `authenticated`, and `service_role`.
 
 | Enum | Values | Usage |
 |------|--------|-------|
@@ -5654,7 +5657,7 @@ All domain-specific enumerations are declared in migration `00000000000000_setup
 
 #### 6.2.2.2 Identity and Core CMS Entities
 
-Declared in migration `00000000000001_setup_cms_core.sql`, these tables bootstrap the authentication mirror, languages, media registry, translations, logos, and the global key/value settings store.
+Declared in migration `02001_baseline_schema.sql`, these tables bootstrap the authentication mirror, languages, media registry, translations, logos, and the global key/value settings store.
 
 | Table | Primary Key | Key Columns / Constraints |
 |-------|-------------|----------------------------|
@@ -5673,7 +5676,7 @@ Declared in migration `00000000000001_setup_cms_core.sql`, these tables bootstra
 
 #### 6.2.2.3 Authoring Content Entities
 
-Declared in migration `00000000000002_setup_content_tables.sql`, these tables form the CMS authoring domain. The relationships are summarized in the ER diagram below.
+Declared in migration `02001_baseline_schema.sql`, these tables form the CMS authoring domain. The relationships are summarized in the ER diagram below.
 
 ```mermaid
 erDiagram
@@ -5760,7 +5763,7 @@ erDiagram
 
 #### 6.2.2.4 Commerce Entities
 
-Declared across migrations `00000000000003_setup_catalog_and_licensing.sql` and `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql`, commerce spans catalog, licensing, orders, shipping, taxation, and currency infrastructure.
+Declared across migration `02001_baseline_schema.sql`, commerce spans catalog, licensing, orders, shipping, taxation, and currency infrastructure.
 
 ```mermaid
 erDiagram
@@ -5896,7 +5899,7 @@ Both `products` and `product_variants` store prices in two redundant shapes — 
 
 #### 6.2.2.5 Indexing Strategy
 
-Migration `00000000000007_setup_indexes.sql` adds 38 secondary indexes. The strategy groups into four categories:
+Migration `02001_baseline_schema.sql` adds 38 secondary indexes. The strategy groups into four categories:
 
 | Category | Representative Indexes | Optimization Target |
 |----------|------------------------|---------------------|
@@ -5967,29 +5970,17 @@ The `backup.js` script reads `POSTGRES_URL` or `DATABASE_URL` via `dotenv`, pars
 
 #### 6.2.3.1 Migration Procedures
 
-Migrations live in `libs/db/src/supabase/migrations/` and are managed via the Supabase CLI. Each file is a single SQL script prefixed by a lexicographically ordered timestamp. The **eleven consolidated migrations** represent merged historical migrations; internal comment headers preserve the original logical ordering within each file.
+Migrations live in `libs/db/src/supabase/migrations/` and are managed via the Supabase CLI plus the repo's own appliers (the `/setup` wizard, the build hook, `npm run update`, the Docker migration runner). The folder holds exactly one **squash generation**; files are named `GGNNN_name.sql` (GG = generation, NNN = contiguous sequence) and applied in lexical order. The current generation is 2 (built 2026-09-10); its first five slots are fixed and everything from `02005` upward is an ordinary forward migration.
 
 | File | Purpose | Key Outputs |
 |------|---------|-------------|
-| `00000000000000_setup_foundation_and_enums.sql` | Foundation grants and enums | `user_role`, `page_status`, `menu_location`, `revision_type` |
-| `00000000000001_setup_cms_core.sql` | Identity + content primitives | `profiles`, `user_addresses`, `languages`, `media`, `translations`, `logos`, `site_settings` |
-| `00000000000002_setup_content_tables.sql` | Authoring domain | `pages`, `posts`, `blocks`, `navigation_items`, `page_revisions`, `post_revisions` |
-| `00000000000003_setup_catalog_and_licensing.sql` | Commerce catalog and license registry | `products`, `product_variants`, `product_attributes`, `product_attribute_terms`, `product_media`, `variant_attribute_mapping`, `inventory_items`, `package_activations`, `freemius_plans`, `freemius_pricing` |
-| `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` | Order lifecycle + shipping/tax + currencies | `orders`, `order_items`, `order_invoice_number_seq`, `shipping_zones`, `shipping_zone_locations`, `shipping_zone_methods`, `tax_rates`, `currencies` + 12 functions + 7 triggers |
-| `00000000000005_setup_functions_and_triggers.sql` | Business logic layer | Auth helpers, first-user bootstrap, timestamp triggers, invoice sequence, inventory RPC |
-| `00000000000006_setup_rls_and_grants.sql` | Security policies | Enables RLS on all tables; declares SELECT/INSERT/UPDATE/DELETE policies |
-| `00000000000007_setup_indexes.sql` | Performance indexes | 38 indexes across all domains |
-| `00000000000008_seed_platform_defaults.sql` | Baseline platform state | English/French languages, USD as default currency, site_settings defaults |
-| `00000000000009_seed_translations.sql` | Internationalization content | Hundreds of en/es/fr i18n rows |
-| `00000000000010_seed_content_scaffold.sql` | Starter content | Default logos, home/articles pages, featured posts, navigation |
-| `00000000000011_setup_cortex_ai_settings.sql` | AI settings | Cortex AI configuration |
-| `00000000000012_setup_commerce_coupons.sql` | Commerce coupons | Coupon tables and constraints |
-| `00000000000013_setup_cortex_ai_db_mutation_audit.sql` | AI audit | Cortex AI database mutation audit support |
-| `00000000000014_setup_content_drafts.sql` | Content drafts | Visual-editing draft support |
-| `00000000000015_setup_product_drafts.sql` | Product drafts | Product draft workflow support |
-| `00000000000016_add_feature_image_to_pages.sql` | CMS page media | Optional page feature image relationship |
+| `02000_catchup_gen1.sql` | Version-aware replay of the retired generation-1 forward migrations | Converges databases that sat behind generation 1; skipped on empty databases and on databases already at generation ≥ 2; sets `site_settings.migration_baseline_generation` |
+| `02001_baseline_schema.sql` | Schema | All enums, functions, tables, sequences and defaults (`IF NOT EXISTS` / `CREATE OR REPLACE`); the `auth.users` → `handle_new_user` trigger |
+| `02002_baseline_constraints_and_indexes.sql` | Integrity + performance | Primary/unique/check/foreign-key constraints (catalog-guarded) and every index |
+| `02003_baseline_security_and_grants.sql` | Security | RLS enablement on every table, all policies, business/timestamp triggers, grants |
+| `02004_baseline_seed.sql` | Seed | Canonical demo content (languages, currencies, site settings, translations, media, pages/posts/blocks, navigation, shipping defaults, themes) — runs only on an empty database |
 
-Per Section 2.4.5, the **numbered migration files in `libs/db/src/supabase/migrations/` must remain applied in order**; out-of-sequence application will violate referential integrity. For live/shared databases, new changes must be appended as new non-destructive migrations. Do not rewrite, recycle, squash, reorder, or delete migrations that may already be recorded in production.
+Per Section 2.4.5, the **numbered migration files in `libs/db/src/supabase/migrations/` must remain applied in order**; out-of-sequence application will violate referential integrity. For live/shared databases, new changes must be appended as new non-destructive migrations. Do not rewrite, recycle, reorder, or delete migration files outside the documented squash runbook (`docs/04-DATABASE-AND-AUTH.md` → "Squashing migrations"); a squash always ships a catch-up so existing databases converge.
 
 ##### 6.2.3.1.1 Migration Command Surface
 
@@ -6000,7 +5991,7 @@ The root `package.json` exposes the following migration-related scripts:
 | `db:migrate:check` | `node tools/scripts/push-db-migrations.js --check` | Dry-run pending remote migrations |
 | `db:migrate` / `db:push` | `node tools/scripts/push-db-migrations.js --confirm` | Apply pending migration files only; no reset, sandbox seed, function deploy, or config push |
 | `db:migrate:repair-history:check` | `node tools/scripts/repair-db-migration-history.js --check` | Preview baseline migration-history repair |
-| `db:migrate:repair-history` | `node tools/scripts/repair-db-migration-history.js --confirm` | Mark existing baseline migrations as applied without running their SQL |
+| `db:migrate:repair-history` | `node tools/scripts/repair-db-migration-history.js --confirm` | Mark existing baseline migrations as applied without running their SQL; with `-- --reconcile-squash`, record a migration squash (revert retired versions, mark the new generation applied) |
 | `db:migrate:fresh` | `node tools/scripts/push-db-migrations.js --confirm --allow-baseline-replay` | Apply the full baseline only to a brand-new empty database |
 | `db:reset` | `supabase db reset --workdir libs/db/src` | Full local reset and replay |
 | `db:link` | `dotenv + supabase-link` via `tools/scripts/supabase-link.js` | Link local workspace to remote project |
@@ -6195,7 +6186,7 @@ Detailed in §6.2.2.8. In summary: Supabase-managed PITR and managed backups (pr
 
 #### 6.2.4.3 Privacy Controls via Row-Level Security
 
-RLS is **enabled on every table** in migration `00000000000006_setup_rls_and_grants.sql`. The policy matrix distributes into four access tiers.
+RLS is **enabled on every table** in migration `02001_baseline_schema.sql`. The policy matrix distributes into four access tiers.
 
 | Access Tier | Representative Scope | Tables |
 |-------------|----------------------|--------|
@@ -6479,17 +6470,17 @@ The local Supabase stack is configured through `libs/db/src/supabase/config.toml
 
 #### 6.2.9.1 Files Examined
 
-- `libs/db/src/supabase/migrations/00000000000000_setup_foundation_and_enums.sql` — Enums and schema grants
-- `libs/db/src/supabase/migrations/00000000000001_setup_cms_core.sql` — Core CMS tables (profiles, media, languages, translations)
-- `libs/db/src/supabase/migrations/00000000000002_setup_content_tables.sql` — Pages, posts, blocks, revisions, navigation
-- `libs/db/src/supabase/migrations/00000000000003_setup_catalog_and_licensing.sql` — Commerce catalog and license registry
-- `libs/db/src/supabase/migrations/00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` — Orders, shipping, tax, currencies
-- `libs/db/src/supabase/migrations/00000000000005_setup_functions_and_triggers.sql` — Business logic functions and triggers
-- `libs/db/src/supabase/migrations/00000000000006_setup_rls_and_grants.sql` — Row-Level Security policy matrix
-- `libs/db/src/supabase/migrations/00000000000007_setup_indexes.sql` — 38 secondary indexes
-- `libs/db/src/supabase/migrations/00000000000008_seed_platform_defaults.sql` — Baseline platform seed
-- `libs/db/src/supabase/migrations/00000000000009_seed_translations.sql` — Internationalization seed
-- `libs/db/src/supabase/migrations/00000000000010_seed_content_scaffold.sql` — Starter content seed
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Enums and schema grants
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Core CMS tables (profiles, media, languages, translations)
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Pages, posts, blocks, revisions, navigation
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Commerce catalog and license registry
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Orders, shipping, tax, currencies
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — Business logic functions and triggers
+- `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` — Row-Level Security policy matrix
+- `libs/db/src/supabase/migrations/02002_baseline_constraints_and_indexes.sql` — 38 secondary indexes
+- `libs/db/src/supabase/migrations/02004_baseline_seed.sql` — Baseline platform seed
+- `libs/db/src/supabase/migrations/02004_baseline_seed.sql` — Internationalization seed
+- `libs/db/src/supabase/migrations/02004_baseline_seed.sql` — Starter content seed
 - `libs/db/src/supabase/config.toml` — Supabase local stack configuration
 - `libs/db/src/lib/supabase/client.ts` — Browser client factory
 - `libs/db/src/lib/supabase/server.ts` — Server / SSR / service-role client factories
@@ -7507,7 +7498,7 @@ Security controls are layered so that the failure of any single layer does not r
 |-------|----------------------|------------------|
 | Edge | Request proxy — session refresh, path-prefix RBAC, security headers, CSP | `apps/nextblock/proxy.ts` |
 | Application | Client-layout role guard, server-action `verifyAdmin()`, role-gated page components | `app/cms/CmsClientLayout.tsx`, `app/cms/users/actions.ts` |
-| Data | Row-Level Security policies, SECURITY DEFINER helpers, service-role bypass | `libs/db/src/supabase/migrations/00000000000006_setup_rls_and_grants.sql` |
+| Data | Row-Level Security policies, SECURITY DEFINER helpers, service-role bypass | `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` |
 | Integration | Webhook signature verification, Bearer-secret cron, HMAC-verified callbacks | `/api/webhooks/*`, `/api/cron/*`, `/api/revalidate/route.ts` |
 
 #### 6.4.1.3 Security Architecture Topology
@@ -7617,7 +7608,7 @@ The system manages three distinct token classes, each with differentiated lifecy
 | OAuth Authorization Code | Short-lived code exchange | URL query parameter, consumed immediately at `/auth/callback` |
 | Supabase Service Role Key | Server-only RLS bypass | Vercel environment variable (`SUPABASE_SERVICE_ROLE_KEY`) |
 
-A **per-request nonce** is generated via `crypto.randomUUID()` in `proxy.ts` and used for the nonce-based CSP (see §6.4.4.5). JWT claims are read inside Postgres by the `get_my_claim(claim text)` SECURITY DEFINER function via `current_setting('request.jwt.claims', true)::jsonb`, which is defined in `libs/db/src/supabase/migrations/00000000000005_setup_functions_and_triggers.sql`.
+A **per-request nonce** is generated via `crypto.randomUUID()` in `proxy.ts` and used for the nonce-based CSP (see §6.4.4.5). JWT claims are read inside Postgres by the `get_my_claim(claim text)` SECURITY DEFINER function via `current_setting('request.jwt.claims', true)::jsonb`, which is defined in `libs/db/src/supabase/migrations/02001_baseline_schema.sql`.
 
 The **service role key** requires two independent compile-time and runtime guards to prevent leakage into the browser bundle:
 
@@ -7715,7 +7706,7 @@ The `resolvePostAuthRedirect` helper enforces four rules as a gate against open-
 
 #### 6.4.3.1 Role-Based Access Control Model
 
-Authorization is driven by the `user_role` enum declared in migration `00000000000000_setup_foundation_and_enums.sql`, which admits three values plus an implicit fourth (Supabase's `service_role`) for server-only privilege elevation:
+Authorization is driven by the `user_role` enum declared in migration `02001_baseline_schema.sql`, which admits three values plus an implicit fourth (Supabase's `service_role`) for server-only privilege elevation:
 
 | Role | Assignment Mechanism | Zone Capabilities |
 |------|---------------------|-------------------|
@@ -7728,7 +7719,7 @@ Role assignment at bootstrap is governed by the `handle_new_user()` SECURITY DEF
 
 #### 6.4.3.2 Permission Management and SECURITY DEFINER Helpers
 
-Role checks executed inside SQL contexts use SECURITY DEFINER helper functions declared in `libs/db/src/supabase/migrations/00000000000005_setup_functions_and_triggers.sql`. SECURITY DEFINER elevates the function's execution privileges to the function owner, bypassing caller-side RLS for the function body while `SET search_path = ''` prevents search-path hijacking attacks.
+Role checks executed inside SQL contexts use SECURITY DEFINER helper functions declared in `libs/db/src/supabase/migrations/02001_baseline_schema.sql`. SECURITY DEFINER elevates the function's execution privileges to the function owner, bypassing caller-side RLS for the function body while `SET search_path = ''` prevents search-path hijacking attacks.
 
 | Function | Purpose | Security Annotation |
 |----------|---------|---------------------|
@@ -7741,7 +7732,7 @@ These helpers form the primitive vocabulary of all RLS policies: a user's effect
 
 #### 6.4.3.3 Resource Authorization Matrix
 
-RLS is enabled on every table in migration `00000000000006_setup_rls_and_grants.sql` (872 lines). The matrix distributes into four access tiers:
+RLS is enabled on every table in migration `02001_baseline_schema.sql` (872 lines). The matrix distributes into four access tiers:
 
 | Access Tier | Typical Policy Predicate | Representative Tables |
 |-------------|--------------------------|------------------------|
@@ -8127,7 +8118,7 @@ The security control matrix below enumerates the principal threats, their mitiga
 
 | Threat | Mitigation | Migration or File |
 |--------|-----------|-------------------|
-| Public data exposure through writes | RLS writes restricted; public read only for intended tables and statuses | `migrations/00000000000006_setup_rls_and_grants.sql` |
+| Public data exposure through writes | RLS writes restricted; public read only for intended tables and statuses | `migrations/02003_baseline_security_and_grants.sql` |
 | Draft content leakage | Anon policy `status='published'` on pages; `status='published' AND published_at<=now()` on posts | `migration 00000000000006` |
 | Path traversal in uploads | `sanitizeFolder()` collapses `../`, strips leading slashes, removes illegal chars | `/api/upload/presigned-url/route.ts` |
 | Search-path hijacking in SECURITY DEFINER | `SET search_path = ''` on auth helper functions | `migration 00000000000005` |
@@ -8226,9 +8217,9 @@ For details beyond the scope of this section, consult:
 
 #### Database Security Surface
 
-- `libs/db/src/supabase/migrations/00000000000000_setup_foundation_and_enums.sql` — `user_role` enum declaration
-- `libs/db/src/supabase/migrations/00000000000005_setup_functions_and_triggers.sql` — `handle_new_user`, `get_current_user_role`, `is_admin`, `get_my_claim` SECURITY DEFINER functions
-- `libs/db/src/supabase/migrations/00000000000006_setup_rls_and_grants.sql` — 872-line RLS policy matrix
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `user_role` enum declaration
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `handle_new_user`, `get_current_user_role`, `is_admin`, `get_my_claim` SECURITY DEFINER functions
+- `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` — 872-line RLS policy matrix
 - `libs/db/src/supabase/config.toml` — 341-line Supabase Auth + MFA + rate-limit configuration
 - `libs/db/src/supabase/templates/` — Six transactional email templates
 
@@ -10787,7 +10778,7 @@ Security is enforced across four layers, with compliance-relevant controls conce
 |:--|:--|:--|
 | Edge | Nonce-based CSP, HSTS, X-Frame-Options SAMEORIGIN, X-Content-Type-Options nosniff, Referrer-Policy origin-when-cross-origin, Permissions-Policy, COOP same-origin | `proxy.ts` |
 | Application | RBAC via `cmsRoutePermissions` (`/cms` ADMIN/WRITER; `/cms/admin`, `/cms/users`, `/cms/settings` ADMIN only); `verifyAdmin()` in server actions | `proxy.ts`, server actions |
-| Data | RLS policies + SECURITY DEFINER helpers (`get_my_claim`, `get_current_user_role`, `is_admin`, `handle_new_user`) | Migration `00000000000006_setup_rls_and_grants.sql` (872 lines) |
+| Data | RLS policies + SECURITY DEFINER helpers (`get_my_claim`, `get_current_user_role`, `is_admin`, `handle_new_user`) | Migration `02001_baseline_schema.sql` (872 lines) |
 | Integration | Stripe `constructEvent` signature verification; Freemius HMAC-SHA-256; `CRON_SECRET` Bearer auth; `REVALIDATE_SECRET_TOKEN` via `x-revalidate-secret` header | Webhook + cron route handlers |
 
 **Service role key hardening**: `SUPABASE_SERVICE_ROLE_KEY` is guarded at runtime via `typeof window !== 'undefined'` checks and build-time via `import 'server-only'` directives to prevent browser exposure.
@@ -11300,7 +11291,7 @@ Per §4.12, the following are the codified timing constraints. Breaches surface 
 | Vercel function invocations | Vercel dashboard | Auto-scaled; `maxDuration` capping |
 | Vercel bandwidth | Vercel dashboard | 1-year image cache TTL, AVIF compression |
 | Vercel image optimization count | Vercel dashboard | `minimumCacheTTL: 31_536_000` |
-| Supabase DB CPU/IO | Supabase dashboard | RLS indexing (`00000000000007_setup_indexes.sql`) |
+| Supabase DB CPU/IO | Supabase dashboard | RLS indexing (`02001_baseline_schema.sql`) |
 | Supabase egress | Supabase dashboard | Server-side aggregation; `count` head queries |
 | R2 storage | Cloudflare dashboard | Folder path sanitization prevents duplicates |
 | R2 Class A writes | Cloudflare dashboard | Single direct-upload via presigned URL (vs through server) |
@@ -11702,15 +11693,15 @@ The following enum types are defined in the eleven canonical SQL migrations loca
 
 | Enum Type | Allowed Values | Migration |
 |:--|:--|:--|
-| `user_role` | `ADMIN`, `WRITER`, `USER` | `00000000000000_setup_foundation_and_enums.sql` |
-| `page_status` | `draft`, `published`, `archived` | `00000000000002_setup_content_tables.sql` |
-| `menu_location` | `header`, `footer`, `sidebar` | `00000000000002_setup_content_tables.sql` |
-| `revision_type` | `snapshot`, `diff` | `00000000000002_setup_content_tables.sql` |
-| `product_type` | `physical`, `digital` | `00000000000003_setup_catalog_and_licensing.sql` |
-| `payment_provider` | `stripe`, `freemius` | `00000000000003_setup_catalog_and_licensing.sql` |
-| `order_status` | `pending`, `paid`, `shipped`, `delivered`, `refunded`, `cancelled` | `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` |
-| `tax_calculation_mode` | `manual`, `automatic` | `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` |
-| `inventory_deduction_method` | `rpc`, `sql-fallback` | `00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` |
+| `user_role` | `ADMIN`, `WRITER`, `USER` | `02001_baseline_schema.sql` |
+| `page_status` | `draft`, `published`, `archived` | `02001_baseline_schema.sql` |
+| `menu_location` | `header`, `footer`, `sidebar` | `02001_baseline_schema.sql` |
+| `revision_type` | `snapshot`, `diff` | `02001_baseline_schema.sql` |
+| `product_type` | `physical`, `digital` | `02001_baseline_schema.sql` |
+| `payment_provider` | `stripe`, `freemius` | `02001_baseline_schema.sql` |
+| `order_status` | `pending`, `paid`, `shipped`, `delivered`, `refunded`, `cancelled` | `02001_baseline_schema.sql` |
+| `tax_calculation_mode` | `manual`, `automatic` | `02001_baseline_schema.sql` |
+| `inventory_deduction_method` | `rpc`, `sql-fallback` | `02001_baseline_schema.sql` |
 
 Cross-reference: Section 6.2 (Database Design), Section 4.11 (Validation Rules and Compliance Checkpoints).
 
@@ -12430,10 +12421,10 @@ The appendices above synthesize material from the following sections of this spe
 
 - `libs/environment.d.ts` — Typed `NodeJS.ProcessEnv` augmentation used to enumerate every environment variable listed in Section 9.1.1
 - `.env.example` — Environment variable inventory and sample values cross-checked against the typed augmentation
-- `libs/db/src/supabase/migrations/00000000000000_setup_foundation_and_enums.sql` — `user_role` enum definition
-- `libs/db/src/supabase/migrations/00000000000002_setup_content_tables.sql` — `page_status`, `menu_location`, `revision_type` enum definitions
-- `libs/db/src/supabase/migrations/00000000000003_setup_catalog_and_licensing.sql` — `product_type`, `payment_provider` enum definitions
-- `libs/db/src/supabase/migrations/00000000000004_setup_fulfillment_shipping_taxes_and_currencies.sql` — `order_status`, `tax_calculation_mode`, `inventory_deduction_method` enum definitions
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `user_role` enum definition
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `page_status`, `menu_location`, `revision_type` enum definitions
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `product_type`, `payment_provider` enum definitions
+- `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `order_status`, `tax_calculation_mode`, `inventory_deduction_method` enum definitions
 - `libs/db/src/supabase/config.toml` — Supabase local port allocation reproduced in Section 9.1.9
 - `apps/nextblock/proxy.ts` — Security header set (Section 9.1.12), prefetch priority mapping (Section 9.1.13), CSP nonce, structured cache observability log schema
 - `apps/nextblock/app/layout.tsx` — `PUBLIC_LAYOUT_REVALIDATE_SECONDS` constant reproduced in SLA ledger

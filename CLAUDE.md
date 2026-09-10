@@ -66,9 +66,13 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 ## Conventions
 
 - Import `z` from the nearest `zod-config.ts` (jitless; the prod CSP forbids eval), not from `zod`.
-- Migrations are append-only: `libs/db/src/supabase/migrations/<14 digits>_<name>.sql`; next
-  number = highest file on disk + 1, then confirm `db:migrate:check` lists it as pending
-  (Supabase matches history by version only; a reused version is skipped silently).
+- Migrations are append-only and named `GGNNN_<snake_name>.sql` (GG = squash generation, NNN =
+  sequence): `02000_catchup_gen1` replays the retired generation (version-aware, runs first),
+  `02001`–`02004` are the generation's baseline, `02005+` are ordinary forward migrations. Next number = highest on disk + 1
+  in the same generation; `npm run db:migrate:check` prints it, fails on any other shape, and
+  must list the new file as pending (Supabase matches history by version only; a reused
+  version is skipped silently). Never use timestamps. Squash runbook: `docs/04` →
+  "Squashing migrations".
 - Seed data-fix migrations scope UPDATEs by content signature + parent (`page_id = v_home AND
   content::text LIKE '%…%'`), never by `blocks.id`; ids drift on every install (035 clobbered
   the home promo that way, 037 repairs it). Verify copy with the SEO engine before writing SQL.

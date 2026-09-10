@@ -15,8 +15,11 @@ Entry points: `@nextblock-cms/db` (browser `createClient`, Row types); `/server`
   Bracket-access undeclared names (`noPropertyAccessFromIndexSignature`).
 - Encryption key chain: `NEXTBLOCK_ENCRYPTION_KEY → CORTEX_AI_ENCRYPTION_KEY → HMAC of the
   service key`; rotating the service key invalidates the derived key.
-- Migrations `src/supabase/migrations/<14 digits>_<name>.sql`: `000`–`003` are the non-replayable
-  baseline; next number = highest on disk + 1; confirm with `npm run db:migrate:check`.
+- Migrations `src/supabase/migrations/GGNNN_<snake_name>.sql` (GG = squash generation, NNN =
+  sequence): `GG000_catchup_gen<G-1>` replays the retired generation version-aware (runs first),
+  `GG001`–`GG004` are the generation's idempotent baseline (seed runs on empty databases only),
+  `GG005+` are forward migrations. Next number = highest on disk + 1, same generation; `npm run db:migrate:check` prints
+  it and fails on any other name shape. Rules + squash runbook: `docs/04-DATABASE-AND-AUTH.md`.
 - `db:types` queries the remote project in `SUPABASE_PROJECT_ID`; unapplied migrations never
   reach `types.ts`.
 

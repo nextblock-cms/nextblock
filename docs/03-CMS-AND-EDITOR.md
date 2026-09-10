@@ -47,7 +47,7 @@ The authoritative type list is `apps/nextblock/lib/blocks/blockTypes.ts`
 A `section` block can contain nested column block arrays, so the page builder
 supports multi-column compositions instead of only flat block lists. Legacy
 `hero` blocks were folded into `section` (carrying an `is_hero` flag) by
-migration `00000000000021_migrate_hero_blocks_to_sections.sql`, so `hero` is no
+migration `libs/db/src/supabase/migrations/02004_baseline_seed.sql` (originally `00000000000021_migrate_hero_blocks_to_sections`, folded in by the generation-2 squash), so `hero` is no
 longer a standalone registered block type.
 
 ### How the CMS uses the registry

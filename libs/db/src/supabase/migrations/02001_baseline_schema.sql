@@ -1,6 +1,7 @@
--- AUTO-GENERATED baseline (re-baseline of migrations 000..044). Idempotent; safe to replay.
--- 00 · schema: enums, functions, tables, sequences, defaults
--- Regenerate via tools/scripts/rebaseline-transform.mjs. Do not hand-edit.
+-- AUTO-GENERATED baseline: squash generation 2 (of migrations 00000000000000..00000000000042).
+-- 001 · schema: enums, functions, tables, sequences, defaults
+-- Idempotent; safe to replay. Regenerate via tools/scripts/rebaseline-transform.mjs — do not hand-edit.
+-- Naming: GGNNN_name.sql (GG = squash generation, NNN = sequence). See docs/04-DATABASE-AND-AUTH.md.
 
 SET check_function_bodies = false;
 
@@ -473,6 +474,20 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION public.handle_default_theme_change() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF NEW.is_default THEN
+    UPDATE public.site_themes
+       SET is_default = false
+     WHERE id <> NEW.id AND is_default;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.handle_inventory_item_change() RETURNS trigger
     LANGUAGE plpgsql
     SET search_path TO 'public'
@@ -534,8 +549,6 @@ DECLARE
   user_role public.user_role;
   v_full_name text;
   v_avatar_url text;
-  v_github_username text;
-  v_provider text;
 BEGIN
   INSERT INTO public.site_settings (key, value)
   VALUES ('is_admin_created', 'false'::jsonb)
@@ -559,35 +572,22 @@ BEGIN
 
   v_full_name := NEW.raw_user_meta_data->>'full_name';
   v_avatar_url := NEW.raw_user_meta_data->>'avatar_url';
-  v_provider := NEW.raw_app_meta_data->>'provider';
-
-  IF v_provider = 'github' OR (NEW.raw_user_meta_data->>'iss') LIKE '%github%' THEN
-    v_github_username := COALESCE(
-      NEW.raw_user_meta_data->>'user_name',
-      NEW.raw_user_meta_data->>'preferred_username'
-    );
-  ELSE
-    v_github_username := NULL;
-  END IF;
 
   INSERT INTO public.profiles (
     id,
     role,
     full_name,
-    avatar_url,
-    github_username
+    avatar_url
   )
   VALUES (
     NEW.id,
     user_role,
     v_full_name,
-    v_avatar_url,
-    v_github_username
+    v_avatar_url
   )
   ON CONFLICT (id) DO UPDATE SET
     full_name = EXCLUDED.full_name,
-    avatar_url = EXCLUDED.avatar_url,
-    github_username = EXCLUDED.github_username;
+    avatar_url = EXCLUDED.avatar_url;
 
   RETURN NEW;
 END;
@@ -751,6 +751,49 @@ CREATE OR REPLACE FUNCTION public.normalize_currency_amount_map(amounts jsonb) R
     )
   END;
 $_$;
+
+CREATE OR REPLACE FUNCTION public.prevent_site_script_revision_rewrite() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+BEGIN
+  RAISE EXCEPTION 'site_script_revisions is append-only; % is not permitted', TG_OP
+    USING ERRCODE = 'restrict_violation';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.prevent_system_theme_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF OLD.is_system THEN
+    RAISE EXCEPTION 'Theme "%" is a system theme and cannot be deleted', OLD.slug
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.prevent_thread_message_rewrite() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'thread_messages is append-only; DELETE is not permitted'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF NEW.body IS DISTINCT FROM OLD.body
+     OR NEW.direction IS DISTINCT FROM OLD.direction
+     OR NEW.thread_id IS DISTINCT FROM OLD.thread_id
+     OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+    RAISE EXCEPTION 'thread_messages content is append-only; only delivery flags may change'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION public.set_currency_defaults() RETURNS trigger
     LANGUAGE plpgsql
@@ -1434,8 +1477,10 @@ CREATE TABLE IF NOT EXISTS public.cms_interactions (
     reactions jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    parent_id uuid,
     CONSTRAINT check_product_or_post CHECK ((((product_id IS NOT NULL) AND (post_id IS NULL)) OR ((post_id IS NOT NULL) AND (product_id IS NULL)))),
-    CONSTRAINT check_rating_only_for_review CHECK ((((type = 'review'::public.interaction_type) AND (rating IS NOT NULL) AND (rating >= 1) AND (rating <= 5)) OR ((type = 'comment'::public.interaction_type) AND (rating IS NULL))))
+    CONSTRAINT check_rating_only_for_review CHECK ((((type = 'review'::public.interaction_type) AND (rating IS NOT NULL) AND (rating >= 1) AND (rating <= 5)) OR ((type = 'comment'::public.interaction_type) AND (rating IS NULL)))),
+    CONSTRAINT cms_interactions_reply_check CHECK (((parent_id IS NULL) OR ((parent_id <> id) AND (rating IS NULL) AND (type = 'comment'::public.interaction_type))))
 );
 
 COMMENT ON TABLE public.cms_interactions IS 'Stores user-submitted product reviews and blog post comments.';
@@ -1445,6 +1490,32 @@ COMMENT ON COLUMN public.cms_interactions.rating IS 'Star rating 1-5, only popul
 COMMENT ON COLUMN public.cms_interactions.user_id IS 'References public.profiles.id';
 
 COMMENT ON COLUMN public.cms_interactions.reactions IS 'JSONB structure tracking counts of reactions (likes, etc.).';
+
+COMMENT ON COLUMN public.cms_interactions.parent_id IS 'Set on a staff reply: points at the review or comment being answered. Replies are always type=comment with a NULL rating, and carry the parent''s product_id/post_id so check_product_or_post still holds.';
+
+CREATE TABLE IF NOT EXISTS public.cms_redirects (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    source_path text NOT NULL,
+    destination_path text NOT NULL,
+    status_code integer DEFAULT 301 NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT cms_redirects_destination_path_check CHECK (((destination_path ~ '^/'::text) OR (destination_path ~ '^https://'::text))),
+    CONSTRAINT cms_redirects_no_self_redirect_check CHECK ((source_path <> destination_path)),
+    CONSTRAINT cms_redirects_source_path_check CHECK ((source_path ~ '^/'::text)),
+    CONSTRAINT cms_redirects_status_code_check CHECK ((status_code = ANY (ARRAY[301, 302])))
+);
+
+COMMENT ON TABLE public.cms_redirects IS 'Operator-managed 301/302 redirects resolved by apps/nextblock/proxy.ts before rendering. Only is_active rows are publicly readable; only ADMIN may write, because a redirect rule is an open-redirect surface.';
+
+COMMENT ON COLUMN public.cms_redirects.source_path IS 'Exact site-relative path to match, normalized to a leading slash and no trailing slash (except root). No wildcards, by design.';
+
+COMMENT ON COLUMN public.cms_redirects.destination_path IS 'Site-relative path or absolute https URL to send the visitor to.';
+
+COMMENT ON COLUMN public.cms_redirects.status_code IS '301 permanent or 302 temporary. 307/308 are not offered by the admin UI.';
+
+COMMENT ON COLUMN public.cms_redirects.is_active IS 'Only active rows are readable by anon, and only active rows are matched by the proxy.';
 
 CREATE TABLE IF NOT EXISTS public.content_drafts (
     id bigint NOT NULL,
@@ -1644,6 +1715,25 @@ CREATE TABLE IF NOT EXISTS public.email_2fa_challenges (
 
 COMMENT ON TABLE public.email_2fa_challenges IS 'Short-lived SHA-256 hashes of 6-digit email verification codes. Readable/writable only by the service role.';
 
+CREATE TABLE IF NOT EXISTS public.form_endpoints (
+    form_key uuid NOT NULL,
+    label text DEFAULT 'Contact form'::text NOT NULL,
+    recipient_email text,
+    fields jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT form_endpoints_fields_array CHECK ((jsonb_typeof(fields) = 'array'::text)),
+    CONSTRAINT form_endpoints_label_not_blank CHECK ((char_length(btrim(label)) > 0))
+);
+
+COMMENT ON TABLE public.form_endpoints IS 'Server-side destination and field manifest for a contact-form block, keyed by the non-secret form_key carried in block content. The address never reaches the browser.';
+
+COMMENT ON COLUMN public.form_endpoints.form_key IS 'Non-secret opaque handle. Safe in the RSC payload: it grants nothing, it is only a lookup key.';
+
+COMMENT ON COLUMN public.form_endpoints.recipient_email IS 'Per-form override. NULL means "use the site contact address" (CMS -> Messages, falling back to the first admin), which is the default and the usual case.';
+
+COMMENT ON COLUMN public.form_endpoints.fields IS 'Snapshot of [{temp_id,label,field_type}] written by the CMS editor, so labels in emails and the inbox are server-trusted.';
+
 CREATE TABLE IF NOT EXISTS public.freemius_plans (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     product_id uuid NOT NULL,
@@ -1722,6 +1812,21 @@ COMMENT ON COLUMN public.logos.name IS 'The name of the brand or company for the
 
 COMMENT ON COLUMN public.logos.media_id IS 'Foreign key to the media table for the logo image.';
 
+CREATE TABLE IF NOT EXISTS public.mcp_access_tokens (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    token_hash text NOT NULL,
+    token_prefix text NOT NULL,
+    scopes text[] DEFAULT ARRAY['read'::text, 'write'::text] NOT NULL,
+    created_by uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone,
+    expires_at timestamp with time zone,
+    revoked_at timestamp with time zone
+);
+
+COMMENT ON TABLE public.mcp_access_tokens IS 'Bearer tokens for the Cortex AI MCP server at /api/mcp. Stores SHA-256 hashes only; plaintext is displayed once at mint time.';
+
 CREATE TABLE IF NOT EXISTS public.media (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     uploader_id uuid,
@@ -1755,6 +1860,40 @@ COMMENT ON COLUMN public.media.variants IS 'Array of image variant objects.';
 COMMENT ON COLUMN public.media.file_path IS 'Full path to the file in the storage bucket.';
 
 COMMENT ON COLUMN public.media.folder IS 'Folder path prefix for the R2 object.';
+
+CREATE TABLE IF NOT EXISTS public.message_threads (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    source text NOT NULL,
+    subject_id uuid,
+    form_key uuid,
+    subject_label text DEFAULT 'Message'::text NOT NULL,
+    sender_name text,
+    sender_email text,
+    locale text,
+    fields jsonb DEFAULT '{}'::jsonb NOT NULL,
+    status text DEFAULT 'open'::text NOT NULL,
+    unread_for_admin boolean DEFAULT true NOT NULL,
+    unread_for_visitor boolean DEFAULT false NOT NULL,
+    token_hash text,
+    token_expires_at timestamp with time zone,
+    token_revoked_at timestamp with time zone,
+    token_last_used_at timestamp with time zone,
+    last_message_at timestamp with time zone DEFAULT now() NOT NULL,
+    ip_masked text,
+    user_agent text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT message_threads_fields_object CHECK ((jsonb_typeof(fields) = 'object'::text)),
+    CONSTRAINT message_threads_source_check CHECK ((source = ANY (ARRAY['product_inquiry'::text, 'contact_form'::text]))),
+    CONSTRAINT message_threads_status_check CHECK ((status = ANY (ARRAY['open'::text, 'closed'::text]))),
+    CONSTRAINT message_threads_subject_check CHECK ((((source = 'product_inquiry'::text) AND (subject_id IS NOT NULL)) OR ((source = 'contact_form'::text) AND (form_key IS NOT NULL))))
+);
+
+COMMENT ON TABLE public.message_threads IS 'Private conversations with anonymous visitors (product enquiries and contact-form submissions). Written by the service role from public server actions; read by ADMINs only. Public reviews and comments are NOT here - they live in cms_interactions.';
+
+COMMENT ON COLUMN public.message_threads.subject_id IS 'product_inquiries.id. Plain uuid, no FK: a conversation outlives the enquiry record it grew from.';
+
+COMMENT ON COLUMN public.message_threads.token_hash IS 'SHA-256 hex of the visitor thread token. The raw token is never stored; it is minted on the first admin reply and mailed once.';
 
 CREATE TABLE IF NOT EXISTS public.navigation_items (
     id bigint NOT NULL,
@@ -1926,7 +2065,9 @@ CREATE TABLE IF NOT EXISTS public.pages (
     translation_group_id uuid DEFAULT gen_random_uuid() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    feature_image_id uuid
+    feature_image_id uuid,
+    custom_canonical text,
+    published_at timestamp with time zone
 );
 
 COMMENT ON TABLE public.pages IS 'Stores static pages for the website.';
@@ -1938,6 +2079,8 @@ COMMENT ON COLUMN public.pages.version IS 'Monotonic version number for hybrid r
 COMMENT ON COLUMN public.pages.translation_group_id IS 'Groups different language versions of the same conceptual page.';
 
 COMMENT ON COLUMN public.pages.feature_image_id IS 'ID of the media item to be used as the page feature image.';
+
+COMMENT ON COLUMN public.pages.published_at IS 'Optional go-live moment. NULL = live as soon as status is published. A future value withholds the page from public reads until it passes (status stays "published"; the CMS renders that pair as "Scheduled").';
 
 DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.pages'::regclass AND attname = 'id' AND attidentity <> '') THEN
@@ -1996,7 +2139,8 @@ CREATE TABLE IF NOT EXISTS public.posts (
     version integer DEFAULT 1 NOT NULL,
     translation_group_id uuid DEFAULT gen_random_uuid() NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    custom_canonical text
 );
 
 COMMENT ON TABLE public.posts IS 'Stores blog posts or news articles.';
@@ -2128,11 +2272,65 @@ CREATE TABLE IF NOT EXISTS public.product_freemius_sale_coupons (
 
 COMMENT ON TABLE public.product_freemius_sale_coupons IS 'Auto-generated, time-bounded Freemius coupons that enforce a scheduled sale on a Freemius product at Freemius-hosted checkout.';
 
+CREATE TABLE IF NOT EXISTS public.product_inquiries (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    product_id uuid,
+    product_slug text,
+    product_title text,
+    sender_name text NOT NULL,
+    sender_email text NOT NULL,
+    message text NOT NULL,
+    locale text,
+    ip_masked text,
+    user_agent text,
+    email_delivered boolean DEFAULT false NOT NULL,
+    is_resolved boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT product_inquiries_message_not_blank CHECK ((char_length(btrim(message)) > 0)),
+    CONSTRAINT product_inquiries_sender_email_not_blank CHECK ((char_length(btrim(sender_email)) > 0)),
+    CONSTRAINT product_inquiries_sender_name_not_blank CHECK ((char_length(btrim(sender_name)) > 0))
+);
+
+COMMENT ON TABLE public.product_inquiries IS 'Visitor purchase enquiries raised when the store cannot take payment. Written by the service role from a public server action; read by ADMINs only.';
+
+COMMENT ON COLUMN public.product_inquiries.product_id IS 'Plain uuid, no FK: an enquiry outlives the product it was about.';
+
+COMMENT ON COLUMN public.product_inquiries.ip_masked IS 'Partially masked IP (e.g. 203.0.113.x) - never store a full address. Also backs the per-IP submission throttle.';
+
+COMMENT ON COLUMN public.product_inquiries.email_delivered IS 'False when the owner notification could not be sent (e.g. SMTP unconfigured); the stored row is then the only record.';
+
 CREATE TABLE IF NOT EXISTS public.product_media (
     product_id uuid NOT NULL,
     media_id uuid NOT NULL,
     sort_order integer DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS public.product_revisions (
+    id bigint NOT NULL,
+    product_id uuid NOT NULL,
+    author_id uuid,
+    version integer NOT NULL,
+    revision_type public.revision_type NOT NULL,
+    content jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+COMMENT ON TABLE public.product_revisions IS 'Hybrid (snapshot/diff) revisions for products.';
+
+COMMENT ON COLUMN public.product_revisions.content IS 'If snapshot: full content; if diff: JSON Patch array.';
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'public.product_revisions'::regclass AND attname = 'id' AND attidentity <> '') THEN
+    ALTER TABLE public.product_revisions ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (
+        SEQUENCE NAME public.product_revisions_id_seq
+        START WITH 1
+        INCREMENT BY 1
+        NO MINVALUE
+        NO MAXVALUE
+        CACHE 1
+    );
+  END IF;
+END $rb$;
 
 CREATE TABLE IF NOT EXISTS public.product_variants (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -2207,6 +2405,9 @@ CREATE TABLE IF NOT EXISTS public.products (
     scheduled_price_at timestamp with time zone,
     average_rating numeric(3,2) DEFAULT 0.00 NOT NULL,
     total_reviews integer DEFAULT 0 NOT NULL,
+    custom_canonical text,
+    published_at timestamp with time zone,
+    version integer DEFAULT 1 NOT NULL,
     CONSTRAINT products_payment_provider_check CHECK ((payment_provider = ANY (ARRAY['stripe'::text, 'freemius'::text]))),
     CONSTRAINT products_prices_is_valid CHECK (public.is_valid_currency_amount_map(prices)),
     CONSTRAINT products_product_type_check CHECK ((product_type = ANY (ARRAY['physical'::text, 'digital'::text]))),
@@ -2237,13 +2438,16 @@ COMMENT ON COLUMN public.products.average_rating IS 'Aggregated average 1-5 rati
 
 COMMENT ON COLUMN public.products.total_reviews IS 'Total count of approved reviews for this product.';
 
+COMMENT ON COLUMN public.products.published_at IS 'Optional go-live moment. NULL = live as soon as status is active. A future value withholds the product from public reads until it passes (status stays "active"; the CMS renders that pair as "Scheduled").';
+
+COMMENT ON COLUMN public.products.version IS 'Monotonic version number for hybrid revisions.';
+
 CREATE TABLE IF NOT EXISTS public.profiles (
     id uuid NOT NULL,
     updated_at timestamp with time zone,
     full_name text,
     avatar_url text,
     website text,
-    github_username text,
     phone text,
     role public.user_role DEFAULT 'USER'::public.user_role NOT NULL
 );
@@ -2308,12 +2512,71 @@ CREATE TABLE IF NOT EXISTS public.shipping_zones (
     updated_at timestamp with time zone DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS public.site_script_revisions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    script_id uuid,
+    script_name text NOT NULL,
+    revision_type text NOT NULL,
+    actor_user_id uuid,
+    source text DEFAULT 'cms'::text NOT NULL,
+    summary text,
+    snapshot jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT site_script_revisions_snapshot_is_object_check CHECK ((jsonb_typeof(snapshot) = 'object'::text)),
+    CONSTRAINT site_script_revisions_source_check CHECK ((source = ANY (ARRAY['cms'::text, 'mcp'::text]))),
+    CONSTRAINT site_script_revisions_type_check CHECK ((revision_type = ANY (ARRAY['create'::text, 'update'::text, 'delete'::text, 'revert'::text])))
+);
+
+COMMENT ON TABLE public.site_script_revisions IS 'Append-only audit log and undo history for site_scripts. Each row is a restorable snapshot. UPDATE and DELETE are blocked by trigger, including for the service role.';
+
+CREATE TABLE IF NOT EXISTS public.site_scripts (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    description text,
+    code text DEFAULT ''::text NOT NULL,
+    src text,
+    placement text DEFAULT 'body_end'::text NOT NULL,
+    load_strategy text DEFAULT 'default'::text NOT NULL,
+    is_active boolean DEFAULT false NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT site_scripts_has_payload_check CHECK (((src IS NOT NULL) OR (length(btrim(code)) > 0))),
+    CONSTRAINT site_scripts_load_strategy_check CHECK ((load_strategy = ANY (ARRAY['default'::text, 'defer'::text, 'async'::text]))),
+    CONSTRAINT site_scripts_placement_check CHECK ((placement = ANY (ARRAY['head'::text, 'body_start'::text, 'body_end'::text]))),
+    CONSTRAINT site_scripts_src_scheme_check CHECK (((src IS NULL) OR (src ~ '^https://'::text)))
+);
+
+COMMENT ON TABLE public.site_scripts IS 'Admin-authored JavaScript injected into the public site by the root layout, with the request CSP nonce applied. Only is_active rows are publicly readable; only ADMIN may write. Distinct from privacy_settings.custom_scripts, which is consent-gated marketing tags.';
+
 CREATE TABLE IF NOT EXISTS public.site_settings (
     key text NOT NULL,
     value jsonb
 );
 
 COMMENT ON TABLE public.site_settings IS 'Key-value store for global site settings. Sensitive keys (Cortex AI BYOK, Bot Protection Secret, Email secret, Payment secret) hold encrypted envelopes and are restricted to ADMIN via row-level policies.';
+
+CREATE TABLE IF NOT EXISTS public.site_themes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    slug text NOT NULL,
+    name text NOT NULL,
+    description text,
+    icon text DEFAULT 'Palette'::text NOT NULL,
+    color_scheme text DEFAULT 'light'::text NOT NULL,
+    tokens jsonb DEFAULT '{}'::jsonb NOT NULL,
+    extra_css text,
+    is_system boolean DEFAULT false NOT NULL,
+    is_default boolean DEFAULT false NOT NULL,
+    is_active boolean DEFAULT true NOT NULL,
+    sort_order integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT site_themes_color_scheme_check CHECK ((color_scheme = ANY (ARRAY['light'::text, 'dark'::text]))),
+    CONSTRAINT site_themes_slug_format_check CHECK ((slug ~ '^[a-z][a-z0-9-]{0,38}[a-z0-9]$'::text)),
+    CONSTRAINT site_themes_tokens_is_object_check CHECK ((jsonb_typeof(tokens) = 'object'::text))
+);
+
+COMMENT ON TABLE public.site_themes IS 'Editable colour themes. Each row renders to a `:root.<slug>` CSS rule injected by the root layout. Publicly readable (anonymous visitors need the palette); only ADMIN may write.';
 
 CREATE TABLE IF NOT EXISTS public.system_alerts (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
@@ -2367,6 +2630,23 @@ COMMENT ON COLUMN public.tax_rates.state_code IS 'Optional state/province code w
 COMMENT ON COLUMN public.tax_rates.tax_name IS 'Display name for the tax component, for example GST, PST, HST, or State Sales Tax.';
 
 COMMENT ON COLUMN public.tax_rates.tax_rate IS 'Percent value, not decimal fraction. Example: 5.0000 means 5%.';
+
+CREATE TABLE IF NOT EXISTS public.thread_messages (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    thread_id uuid NOT NULL,
+    direction text NOT NULL,
+    body text NOT NULL,
+    author_id uuid,
+    author_name text,
+    email_delivered boolean DEFAULT false NOT NULL,
+    email_error text,
+    ip_masked text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT thread_messages_body_not_blank CHECK ((char_length(btrim(body)) > 0)),
+    CONSTRAINT thread_messages_direction_check CHECK ((direction = ANY (ARRAY['inbound'::text, 'outbound'::text])))
+);
+
+COMMENT ON TABLE public.thread_messages IS 'Turns of a private conversation. Content is append-only; only the delivery flags may change after insert.';
 
 CREATE TABLE IF NOT EXISTS public.translations (
     key text NOT NULL,

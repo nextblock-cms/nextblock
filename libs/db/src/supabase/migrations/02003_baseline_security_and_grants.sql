@@ -1,6 +1,7 @@
--- AUTO-GENERATED baseline (re-baseline of migrations 000..044). Idempotent; safe to replay.
--- 02 · row-level security, policies, triggers, grants
--- Regenerate via tools/scripts/rebaseline-transform.mjs. Do not hand-edit.
+-- AUTO-GENERATED baseline: squash generation 2 (of migrations 00000000000000..00000000000042).
+-- 003 · row-level security, policies, triggers, grants
+-- Idempotent; safe to replay. Regenerate via tools/scripts/rebaseline-transform.mjs — do not hand-edit.
+-- Naming: GGNNN_name.sql (GG = squash generation, NNN = sequence). See docs/04-DATABASE-AND-AUTH.md.
 
 DROP TRIGGER IF EXISTS on_blocks_update ON public.blocks;
 CREATE TRIGGER on_blocks_update BEFORE UPDATE ON public.blocks FOR EACH ROW EXECUTE FUNCTION public.handle_blocks_update();
@@ -47,6 +48,21 @@ CREATE TRIGGER on_shipping_zone_locations_write BEFORE INSERT OR UPDATE ON publi
 DROP TRIGGER IF EXISTS on_tax_rates_write ON public.tax_rates;
 CREATE TRIGGER on_tax_rates_write BEFORE INSERT OR UPDATE ON public.tax_rates FOR EACH ROW EXECUTE FUNCTION public.handle_tax_rates_write();
 
+DROP TRIGGER IF EXISTS set_cms_redirects_updated_at ON public.cms_redirects;
+CREATE TRIGGER set_cms_redirects_updated_at BEFORE UPDATE ON public.cms_redirects FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+DROP TRIGGER IF EXISTS set_form_endpoints_updated_at ON public.form_endpoints;
+CREATE TRIGGER set_form_endpoints_updated_at BEFORE UPDATE ON public.form_endpoints FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+DROP TRIGGER IF EXISTS set_message_threads_updated_at ON public.message_threads;
+CREATE TRIGGER set_message_threads_updated_at BEFORE UPDATE ON public.message_threads FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+DROP TRIGGER IF EXISTS set_site_scripts_updated_at ON public.site_scripts;
+CREATE TRIGGER set_site_scripts_updated_at BEFORE UPDATE ON public.site_scripts FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+DROP TRIGGER IF EXISTS set_site_themes_updated_at ON public.site_themes;
+CREATE TRIGGER set_site_themes_updated_at BEFORE UPDATE ON public.site_themes FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
 DROP TRIGGER IF EXISTS set_updated_at ON public.cms_interactions;
 CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.cms_interactions FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
 
@@ -56,11 +72,20 @@ CREATE TRIGGER set_updated_at BEFORE UPDATE ON public.translations FOR EACH ROW 
 DROP TRIGGER IF EXISTS trg_handle_default_currency_change ON public.currencies;
 CREATE TRIGGER trg_handle_default_currency_change AFTER INSERT OR UPDATE ON public.currencies FOR EACH ROW EXECUTE FUNCTION public.handle_default_currency_change();
 
+DROP TRIGGER IF EXISTS trg_handle_default_theme_change ON public.site_themes;
+CREATE TRIGGER trg_handle_default_theme_change AFTER INSERT OR UPDATE OF is_default ON public.site_themes FOR EACH ROW WHEN (new.is_default) EXECUTE FUNCTION public.handle_default_theme_change();
+
 DROP TRIGGER IF EXISTS trg_handle_ucp_cart_sessions_update ON public.ucp_cart_sessions;
 CREATE TRIGGER trg_handle_ucp_cart_sessions_update BEFORE UPDATE ON public.ucp_cart_sessions FOR EACH ROW EXECUTE FUNCTION public.handle_ucp_cart_sessions_update();
 
+DROP TRIGGER IF EXISTS trg_prevent_system_theme_delete ON public.site_themes;
+CREATE TRIGGER trg_prevent_system_theme_delete BEFORE DELETE ON public.site_themes FOR EACH ROW EXECUTE FUNCTION public.prevent_system_theme_delete();
+
 DROP TRIGGER IF EXISTS trg_set_currency_defaults ON public.currencies;
 CREATE TRIGGER trg_set_currency_defaults BEFORE INSERT OR UPDATE ON public.currencies FOR EACH ROW EXECUTE FUNCTION public.set_currency_defaults();
+
+DROP TRIGGER IF EXISTS trg_site_script_revisions_append_only ON public.site_script_revisions;
+CREATE TRIGGER trg_site_script_revisions_append_only BEFORE DELETE OR UPDATE ON public.site_script_revisions FOR EACH ROW EXECUTE FUNCTION public.prevent_site_script_revision_rewrite();
 
 DROP TRIGGER IF EXISTS trg_sync_product_variants_currency_prices ON public.product_variants;
 CREATE TRIGGER trg_sync_product_variants_currency_prices BEFORE INSERT OR UPDATE OF price, sale_price, prices, sale_prices ON public.product_variants FOR EACH ROW EXECUTE FUNCTION public.sync_currency_price_maps();
@@ -73,6 +98,9 @@ CREATE TRIGGER trg_sync_shipping_method_currency_maps BEFORE INSERT OR UPDATE OF
 
 DROP TRIGGER IF EXISTS trg_system_alerts_updated_at ON public.system_alerts;
 CREATE TRIGGER trg_system_alerts_updated_at BEFORE UPDATE ON public.system_alerts FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+DROP TRIGGER IF EXISTS trg_thread_messages_append_only ON public.thread_messages;
+CREATE TRIGGER trg_thread_messages_append_only BEFORE DELETE OR UPDATE ON public.thread_messages FOR EACH ROW EXECUTE FUNCTION public.prevent_thread_message_rewrite();
 
 DROP TRIGGER IF EXISTS trigger_update_product_ratings ON public.cms_interactions;
 CREATE TRIGGER trigger_update_product_ratings AFTER INSERT OR DELETE OR UPDATE ON public.cms_interactions FOR EACH ROW EXECUTE FUNCTION public.update_product_ratings();
@@ -94,6 +122,45 @@ CREATE POLICY "Admin can update categories" ON public.categories FOR UPDATE TO a
 
 DROP POLICY IF EXISTS "Admin can update product_categories" ON public.product_categories;
 CREATE POLICY "Admin can update product_categories" ON public.product_categories FOR UPDATE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE)) WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+DROP POLICY IF EXISTS "Admins delete redirects" ON public.cms_redirects;
+CREATE POLICY "Admins delete redirects" ON public.cms_redirects FOR DELETE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins delete site scripts" ON public.site_scripts;
+CREATE POLICY "Admins delete site scripts" ON public.site_scripts FOR DELETE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins delete themes" ON public.site_themes;
+CREATE POLICY "Admins delete themes" ON public.site_themes FOR DELETE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins insert redirects" ON public.cms_redirects;
+CREATE POLICY "Admins insert redirects" ON public.cms_redirects FOR INSERT TO authenticated WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins insert site script revisions" ON public.site_script_revisions;
+CREATE POLICY "Admins insert site script revisions" ON public.site_script_revisions FOR INSERT TO authenticated WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins insert site scripts" ON public.site_scripts;
+CREATE POLICY "Admins insert site scripts" ON public.site_scripts FOR INSERT TO authenticated WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins insert themes" ON public.site_themes;
+CREATE POLICY "Admins insert themes" ON public.site_themes FOR INSERT TO authenticated WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins read all redirects" ON public.cms_redirects;
+CREATE POLICY "Admins read all redirects" ON public.cms_redirects FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins read all site scripts" ON public.site_scripts;
+CREATE POLICY "Admins read all site scripts" ON public.site_scripts FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins read site script revisions" ON public.site_script_revisions;
+CREATE POLICY "Admins read site script revisions" ON public.site_script_revisions FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins update redirects" ON public.cms_redirects;
+CREATE POLICY "Admins update redirects" ON public.cms_redirects FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins update site scripts" ON public.site_scripts;
+CREATE POLICY "Admins update site scripts" ON public.site_scripts FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS "Admins update themes" ON public.site_themes;
+CREATE POLICY "Admins update themes" ON public.site_themes FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
 
 DROP POLICY IF EXISTS "Allow authenticated read access" ON public.package_activations;
 CREATE POLICY "Allow authenticated read access" ON public.package_activations FOR SELECT TO authenticated USING (true);
@@ -124,6 +191,15 @@ CREATE POLICY "Public read access for freemius_pricing" ON public.freemius_prici
 
 DROP POLICY IF EXISTS "Public read active currencies" ON public.currencies;
 CREATE POLICY "Public read active currencies" ON public.currencies FOR SELECT TO authenticated, anon USING ((is_active = true));
+
+DROP POLICY IF EXISTS "Public read active redirects" ON public.cms_redirects;
+CREATE POLICY "Public read active redirects" ON public.cms_redirects FOR SELECT TO authenticated, anon USING (is_active);
+
+DROP POLICY IF EXISTS "Public read active site scripts" ON public.site_scripts;
+CREATE POLICY "Public read active site scripts" ON public.site_scripts FOR SELECT TO authenticated, anon USING (is_active);
+
+DROP POLICY IF EXISTS "Public read active themes" ON public.site_themes;
+CREATE POLICY "Public read active themes" ON public.site_themes FOR SELECT TO authenticated, anon USING (true);
 
 DROP POLICY IF EXISTS "Public read product_attribute_terms" ON public.product_attribute_terms;
 CREATE POLICY "Public read product_attribute_terms" ON public.product_attribute_terms FOR SELECT USING (true);
@@ -166,6 +242,9 @@ CREATE POLICY "Service role manages all addresses" ON public.user_addresses TO s
 
 DROP POLICY IF EXISTS "Service role manages currencies" ON public.currencies;
 CREATE POLICY "Service role manages currencies" ON public.currencies TO service_role USING (true) WITH CHECK (true);
+
+DROP POLICY IF EXISTS "Service role manages themes" ON public.site_themes;
+CREATE POLICY "Service role manages themes" ON public.site_themes TO service_role USING (true) WITH CHECK (true);
 
 DROP POLICY IF EXISTS "Users can manage own addresses" ON public.user_addresses;
 CREATE POLICY "Users can manage own addresses" ON public.user_addresses TO authenticated USING ((user_id = ( SELECT auth.uid() AS uid))) WITH CHECK ((user_id = ( SELECT auth.uid() AS uid)));
@@ -222,6 +301,8 @@ CREATE POLICY cms_interactions_read_policy ON public.cms_interactions FOR SELECT
 
 DROP POLICY IF EXISTS cms_interactions_update_policy ON public.cms_interactions;
 CREATE POLICY cms_interactions_update_policy ON public.cms_interactions FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role])));
+
+ALTER TABLE public.cms_redirects ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE public.content_drafts ENABLE ROW LEVEL SECURITY;
 
@@ -319,6 +400,17 @@ ALTER TABLE public.email_2fa_challenges ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS email_2fa_challenges_service_role_policy ON public.email_2fa_challenges;
 CREATE POLICY email_2fa_challenges_service_role_policy ON public.email_2fa_challenges TO service_role USING (true) WITH CHECK (true);
 
+ALTER TABLE public.form_endpoints ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS form_endpoints_admin_write_policy ON public.form_endpoints;
+CREATE POLICY form_endpoints_admin_write_policy ON public.form_endpoints TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS form_endpoints_editor_read_policy ON public.form_endpoints;
+CREATE POLICY form_endpoints_editor_read_policy ON public.form_endpoints FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role])));
+
+DROP POLICY IF EXISTS form_endpoints_service_role_policy ON public.form_endpoints;
+CREATE POLICY form_endpoints_service_role_policy ON public.form_endpoints TO service_role USING (true) WITH CHECK (true);
+
 ALTER TABLE public.freemius_plans ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE public.freemius_pricing ENABLE ROW LEVEL SECURITY;
@@ -362,6 +454,20 @@ CREATE POLICY logos_read_policy ON public.logos FOR SELECT USING (true);
 DROP POLICY IF EXISTS logos_update_policy ON public.logos;
 CREATE POLICY logos_update_policy ON public.logos FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
 
+ALTER TABLE public.mcp_access_tokens ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS mcp_access_tokens_admin_delete ON public.mcp_access_tokens;
+CREATE POLICY mcp_access_tokens_admin_delete ON public.mcp_access_tokens FOR DELETE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS mcp_access_tokens_admin_insert ON public.mcp_access_tokens;
+CREATE POLICY mcp_access_tokens_admin_insert ON public.mcp_access_tokens FOR INSERT TO authenticated WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS mcp_access_tokens_admin_select ON public.mcp_access_tokens;
+CREATE POLICY mcp_access_tokens_admin_select ON public.mcp_access_tokens FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS mcp_access_tokens_admin_update ON public.mcp_access_tokens;
+CREATE POLICY mcp_access_tokens_admin_update ON public.mcp_access_tokens FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
 ALTER TABLE public.media ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS media_delete_policy ON public.media;
@@ -378,6 +484,17 @@ CREATE POLICY media_service_role_policy ON public.media TO service_role USING (t
 
 DROP POLICY IF EXISTS media_update_policy ON public.media;
 CREATE POLICY media_update_policy ON public.media FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role])));
+
+ALTER TABLE public.message_threads ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS message_threads_admin_read_policy ON public.message_threads;
+CREATE POLICY message_threads_admin_read_policy ON public.message_threads FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS message_threads_admin_update_policy ON public.message_threads;
+CREATE POLICY message_threads_admin_update_policy ON public.message_threads FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS message_threads_service_role_policy ON public.message_threads;
+CREATE POLICY message_threads_service_role_policy ON public.message_threads TO service_role USING (true) WITH CHECK (true);
 
 ALTER TABLE public.navigation_items ENABLE ROW LEVEL SECURITY;
 
@@ -533,6 +650,17 @@ CREATE POLICY product_freemius_sale_coupons_admin_policy ON public.product_freem
 DROP POLICY IF EXISTS product_freemius_sale_coupons_service_role_policy ON public.product_freemius_sale_coupons;
 CREATE POLICY product_freemius_sale_coupons_service_role_policy ON public.product_freemius_sale_coupons TO service_role USING (true) WITH CHECK (true);
 
+ALTER TABLE public.product_inquiries ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS product_inquiries_admin_read_policy ON public.product_inquiries;
+CREATE POLICY product_inquiries_admin_read_policy ON public.product_inquiries FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS product_inquiries_admin_update_policy ON public.product_inquiries;
+CREATE POLICY product_inquiries_admin_update_policy ON public.product_inquiries FOR UPDATE TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)) WITH CHECK ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS product_inquiries_service_role_policy ON public.product_inquiries;
+CREATE POLICY product_inquiries_service_role_policy ON public.product_inquiries TO service_role USING (true) WITH CHECK (true);
+
 ALTER TABLE public.product_media ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS product_media_delete_policy ON public.product_media;
@@ -543,6 +671,20 @@ CREATE POLICY product_media_insert_policy ON public.product_media FOR INSERT TO 
 
 DROP POLICY IF EXISTS product_media_update_policy ON public.product_media;
 CREATE POLICY product_media_update_policy ON public.product_media FOR UPDATE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE)) WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+ALTER TABLE public.product_revisions ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS product_revisions_delete_policy ON public.product_revisions;
+CREATE POLICY product_revisions_delete_policy ON public.product_revisions FOR DELETE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+DROP POLICY IF EXISTS product_revisions_insert_policy ON public.product_revisions;
+CREATE POLICY product_revisions_insert_policy ON public.product_revisions FOR INSERT TO authenticated WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+DROP POLICY IF EXISTS product_revisions_read_policy ON public.product_revisions;
+CREATE POLICY product_revisions_read_policy ON public.product_revisions FOR SELECT TO authenticated USING (true);
+
+DROP POLICY IF EXISTS product_revisions_update_policy ON public.product_revisions;
+CREATE POLICY product_revisions_update_policy ON public.product_revisions FOR UPDATE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE)) WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
 
 ALTER TABLE public.product_variants ENABLE ROW LEVEL SECURITY;
 
@@ -613,19 +755,25 @@ CREATE POLICY shipping_zones_insert_policy ON public.shipping_zones FOR INSERT T
 DROP POLICY IF EXISTS shipping_zones_update_policy ON public.shipping_zones;
 CREATE POLICY shipping_zones_update_policy ON public.shipping_zones FOR UPDATE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE)) WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
 
+ALTER TABLE public.site_script_revisions ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE public.site_scripts ENABLE ROW LEVEL SECURITY;
+
 ALTER TABLE public.site_settings ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS site_settings_delete_policy ON public.site_settings;
-CREATE POLICY site_settings_delete_policy ON public.site_settings FOR DELETE TO authenticated USING ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
+CREATE POLICY site_settings_delete_policy ON public.site_settings FOR DELETE TO authenticated USING ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
 
 DROP POLICY IF EXISTS site_settings_insert_policy ON public.site_settings;
-CREATE POLICY site_settings_insert_policy ON public.site_settings FOR INSERT TO authenticated WITH CHECK ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
+CREATE POLICY site_settings_insert_policy ON public.site_settings FOR INSERT TO authenticated WITH CHECK ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
 
 DROP POLICY IF EXISTS site_settings_read_policy ON public.site_settings;
-CREATE POLICY site_settings_read_policy ON public.site_settings FOR SELECT USING (((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT auth.role() AS role) = 'authenticated'::text) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
+CREATE POLICY site_settings_read_policy ON public.site_settings FOR SELECT USING (((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text])) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text])) AND (( SELECT auth.role() AS role) = 'authenticated'::text) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
 
 DROP POLICY IF EXISTS site_settings_update_policy ON public.site_settings;
-CREATE POLICY site_settings_update_policy ON public.site_settings FOR UPDATE TO authenticated USING ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)))) WITH CHECK ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
+CREATE POLICY site_settings_update_policy ON public.site_settings FOR UPDATE TO authenticated USING ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role)))) WITH CHECK ((((key <> ALL (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role]))) OR ((key = ANY (ARRAY['cortex_ai_openrouter_api_key'::text, 'bot_protection_secret'::text, 'email_secret'::text, 'payment_secret'::text, 'language_detection_settings'::text, 'cortex_ai_pexels_api_key'::text, 'cortex_ai_unsplash_access_key'::text, 'cortex_ai_mcp_settings'::text, 'seo_robots_settings'::text])) AND (( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role))));
+
+ALTER TABLE public.site_themes ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE public.system_alerts ENABLE ROW LEVEL SECURITY;
 
@@ -662,6 +810,14 @@ CREATE POLICY tax_rates_insert_policy ON public.tax_rates FOR INSERT TO authenti
 
 DROP POLICY IF EXISTS tax_rates_update_policy ON public.tax_rates;
 CREATE POLICY tax_rates_update_policy ON public.tax_rates FOR UPDATE TO authenticated USING ((( SELECT public.is_admin() AS is_admin) IS TRUE)) WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+ALTER TABLE public.thread_messages ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS thread_messages_admin_read_policy ON public.thread_messages;
+CREATE POLICY thread_messages_admin_read_policy ON public.thread_messages FOR SELECT TO authenticated USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = 'ADMIN'::public.user_role));
+
+DROP POLICY IF EXISTS thread_messages_service_role_policy ON public.thread_messages;
+CREATE POLICY thread_messages_service_role_policy ON public.thread_messages TO service_role USING (true) WITH CHECK (true);
 
 ALTER TABLE public.translations ENABLE ROW LEVEL SECURITY;
 
@@ -758,19 +914,19 @@ GRANT ALL ON FUNCTION public.is_valid_custom_block_layout_schema(candidate jsonb
 
 GRANT ALL ON FUNCTION public.is_valid_custom_block_layout_schema(candidate jsonb) TO service_role;
 
-GRANT ALL ON TABLE public.custom_block_definitions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.custom_block_definitions TO anon;
 
-GRANT ALL ON TABLE public.custom_block_definitions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.custom_block_definitions TO authenticated;
 
-GRANT ALL ON TABLE public.custom_block_definitions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.custom_block_definitions TO service_role;
 
 REVOKE ALL ON FUNCTION public.duplicate_block_definition(target_id uuid) FROM PUBLIC;
+
+GRANT ALL ON FUNCTION public.duplicate_block_definition(target_id uuid) TO anon;
 
 GRANT ALL ON FUNCTION public.duplicate_block_definition(target_id uuid) TO authenticated;
 
 GRANT ALL ON FUNCTION public.duplicate_block_definition(target_id uuid) TO service_role;
-
-GRANT ALL ON FUNCTION public.duplicate_block_definition(target_id uuid) TO anon;
 
 GRANT ALL ON FUNCTION public.format_order_invoice_number(p_value bigint) TO anon;
 
@@ -832,6 +988,12 @@ GRANT ALL ON FUNCTION public.handle_default_currency_change() TO authenticated;
 
 GRANT ALL ON FUNCTION public.handle_default_currency_change() TO service_role;
 
+GRANT ALL ON FUNCTION public.handle_default_theme_change() TO anon;
+
+GRANT ALL ON FUNCTION public.handle_default_theme_change() TO authenticated;
+
+GRANT ALL ON FUNCTION public.handle_default_theme_change() TO service_role;
+
 GRANT ALL ON FUNCTION public.handle_inventory_item_change() TO anon;
 
 GRANT ALL ON FUNCTION public.handle_inventory_item_change() TO authenticated;
@@ -865,10 +1027,6 @@ GRANT ALL ON FUNCTION public.handle_navigation_items_update() TO service_role;
 REVOKE ALL ON FUNCTION public.handle_new_user() FROM PUBLIC;
 
 GRANT ALL ON FUNCTION public.handle_new_user() TO service_role;
-
-GRANT ALL ON FUNCTION public.handle_new_user() TO anon;
-
-GRANT ALL ON FUNCTION public.handle_new_user() TO authenticated;
 
 GRANT ALL ON FUNCTION public.handle_pages_update() TO anon;
 
@@ -930,6 +1088,24 @@ GRANT ALL ON FUNCTION public.normalize_currency_amount_map(amounts jsonb) TO aut
 
 GRANT ALL ON FUNCTION public.normalize_currency_amount_map(amounts jsonb) TO service_role;
 
+GRANT ALL ON FUNCTION public.prevent_site_script_revision_rewrite() TO anon;
+
+GRANT ALL ON FUNCTION public.prevent_site_script_revision_rewrite() TO authenticated;
+
+GRANT ALL ON FUNCTION public.prevent_site_script_revision_rewrite() TO service_role;
+
+GRANT ALL ON FUNCTION public.prevent_system_theme_delete() TO anon;
+
+GRANT ALL ON FUNCTION public.prevent_system_theme_delete() TO authenticated;
+
+GRANT ALL ON FUNCTION public.prevent_system_theme_delete() TO service_role;
+
+GRANT ALL ON FUNCTION public.prevent_thread_message_rewrite() TO anon;
+
+GRANT ALL ON FUNCTION public.prevent_thread_message_rewrite() TO authenticated;
+
+GRANT ALL ON FUNCTION public.prevent_thread_message_rewrite() TO service_role;
+
 GRANT ALL ON FUNCTION public.set_currency_defaults() TO anon;
 
 GRANT ALL ON FUNCTION public.set_currency_defaults() TO authenticated;
@@ -978,11 +1154,11 @@ GRANT ALL ON FUNCTION public.upsert_product_with_variants(product_payload jsonb)
 
 GRANT ALL ON FUNCTION public.upsert_product_with_variants(product_payload jsonb) TO service_role;
 
-GRANT ALL ON TABLE public.blocks TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.blocks TO anon;
 
-GRANT ALL ON TABLE public.blocks TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.blocks TO authenticated;
 
-GRANT ALL ON TABLE public.blocks TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.blocks TO service_role;
 
 GRANT ALL ON SEQUENCE public.blocks_id_seq TO anon;
 
@@ -990,23 +1166,29 @@ GRANT ALL ON SEQUENCE public.blocks_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.blocks_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.categories TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.categories TO anon;
 
-GRANT ALL ON TABLE public.categories TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.categories TO authenticated;
 
-GRANT ALL ON TABLE public.categories TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.categories TO service_role;
 
-GRANT ALL ON TABLE public.cms_interactions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_interactions TO anon;
 
-GRANT ALL ON TABLE public.cms_interactions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_interactions TO authenticated;
 
-GRANT ALL ON TABLE public.cms_interactions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_interactions TO service_role;
 
-GRANT ALL ON TABLE public.content_drafts TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_redirects TO anon;
 
-GRANT ALL ON TABLE public.content_drafts TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_redirects TO authenticated;
 
-GRANT ALL ON TABLE public.content_drafts TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cms_redirects TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.content_drafts TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.content_drafts TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.content_drafts TO service_role;
 
 GRANT ALL ON SEQUENCE public.content_drafts_id_seq TO anon;
 
@@ -1014,71 +1196,77 @@ GRANT ALL ON SEQUENCE public.content_drafts_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.content_drafts_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.cortex_ai_db_mutation_audit TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cortex_ai_db_mutation_audit TO anon;
 
-GRANT ALL ON TABLE public.cortex_ai_db_mutation_audit TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cortex_ai_db_mutation_audit TO authenticated;
 
-GRANT ALL ON TABLE public.cortex_ai_db_mutation_audit TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.cortex_ai_db_mutation_audit TO service_role;
 
-GRANT ALL ON TABLE public.coupon_freemius_mappings TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_freemius_mappings TO anon;
 
-GRANT ALL ON TABLE public.coupon_freemius_mappings TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_freemius_mappings TO authenticated;
 
-GRANT ALL ON TABLE public.coupon_freemius_mappings TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_freemius_mappings TO service_role;
 
-GRANT ALL ON TABLE public.coupon_products TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_products TO anon;
 
-GRANT ALL ON TABLE public.coupon_products TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_products TO authenticated;
 
-GRANT ALL ON TABLE public.coupon_products TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_products TO service_role;
 
-GRANT ALL ON TABLE public.coupon_redemptions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_redemptions TO anon;
 
-GRANT ALL ON TABLE public.coupon_redemptions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_redemptions TO authenticated;
 
-GRANT ALL ON TABLE public.coupon_redemptions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupon_redemptions TO service_role;
 
-GRANT ALL ON TABLE public.coupons TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupons TO anon;
 
-GRANT ALL ON TABLE public.coupons TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupons TO authenticated;
 
-GRANT ALL ON TABLE public.coupons TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.coupons TO service_role;
 
-GRANT ALL ON TABLE public.currencies TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.currencies TO anon;
 
-GRANT ALL ON TABLE public.currencies TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.currencies TO authenticated;
 
-GRANT ALL ON TABLE public.currencies TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.currencies TO service_role;
 
-GRANT ALL ON TABLE public.email_2fa_challenges TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.email_2fa_challenges TO anon;
 
-GRANT ALL ON TABLE public.email_2fa_challenges TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.email_2fa_challenges TO authenticated;
 
-GRANT ALL ON TABLE public.email_2fa_challenges TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.email_2fa_challenges TO service_role;
 
-GRANT ALL ON TABLE public.freemius_plans TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.form_endpoints TO anon;
 
-GRANT ALL ON TABLE public.freemius_plans TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.form_endpoints TO authenticated;
 
-GRANT ALL ON TABLE public.freemius_plans TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.form_endpoints TO service_role;
 
-GRANT ALL ON TABLE public.freemius_pricing TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_plans TO anon;
 
-GRANT ALL ON TABLE public.freemius_pricing TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_plans TO authenticated;
 
-GRANT ALL ON TABLE public.freemius_pricing TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_plans TO service_role;
 
-GRANT ALL ON TABLE public.inventory_items TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_pricing TO anon;
 
-GRANT ALL ON TABLE public.inventory_items TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_pricing TO authenticated;
 
-GRANT ALL ON TABLE public.inventory_items TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.freemius_pricing TO service_role;
 
-GRANT ALL ON TABLE public.languages TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.inventory_items TO anon;
 
-GRANT ALL ON TABLE public.languages TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.inventory_items TO authenticated;
 
-GRANT ALL ON TABLE public.languages TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.inventory_items TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.languages TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.languages TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.languages TO service_role;
 
 GRANT ALL ON SEQUENCE public.languages_id_seq TO anon;
 
@@ -1086,23 +1274,35 @@ GRANT ALL ON SEQUENCE public.languages_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.languages_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.logos TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.logos TO anon;
 
-GRANT ALL ON TABLE public.logos TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.logos TO authenticated;
 
-GRANT ALL ON TABLE public.logos TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.logos TO service_role;
 
-GRANT ALL ON TABLE public.media TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.mcp_access_tokens TO anon;
 
-GRANT ALL ON TABLE public.media TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.mcp_access_tokens TO authenticated;
 
-GRANT ALL ON TABLE public.media TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.mcp_access_tokens TO service_role;
 
-GRANT ALL ON TABLE public.navigation_items TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.media TO anon;
 
-GRANT ALL ON TABLE public.navigation_items TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.media TO authenticated;
 
-GRANT ALL ON TABLE public.navigation_items TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.media TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.message_threads TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.message_threads TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.message_threads TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.navigation_items TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.navigation_items TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.navigation_items TO service_role;
 
 GRANT ALL ON SEQUENCE public.navigation_items_id_seq TO anon;
 
@@ -1116,29 +1316,29 @@ GRANT ALL ON SEQUENCE public.order_invoice_number_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.order_invoice_number_seq TO service_role;
 
-GRANT ALL ON TABLE public.order_items TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.order_items TO anon;
 
-GRANT ALL ON TABLE public.order_items TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.order_items TO authenticated;
 
-GRANT ALL ON TABLE public.order_items TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.order_items TO service_role;
 
-GRANT ALL ON TABLE public.orders TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.orders TO anon;
 
-GRANT ALL ON TABLE public.orders TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.orders TO authenticated;
 
-GRANT ALL ON TABLE public.orders TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.orders TO service_role;
 
-GRANT ALL ON TABLE public.package_activations TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.package_activations TO anon;
 
-GRANT ALL ON TABLE public.package_activations TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.package_activations TO authenticated;
 
-GRANT ALL ON TABLE public.package_activations TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.package_activations TO service_role;
 
-GRANT ALL ON TABLE public.page_revisions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.page_revisions TO anon;
 
-GRANT ALL ON TABLE public.page_revisions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.page_revisions TO authenticated;
 
-GRANT ALL ON TABLE public.page_revisions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.page_revisions TO service_role;
 
 GRANT ALL ON SEQUENCE public.page_revisions_id_seq TO anon;
 
@@ -1146,11 +1346,11 @@ GRANT ALL ON SEQUENCE public.page_revisions_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.page_revisions_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.pages TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.pages TO anon;
 
-GRANT ALL ON TABLE public.pages TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.pages TO authenticated;
 
-GRANT ALL ON TABLE public.pages TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.pages TO service_role;
 
 GRANT ALL ON SEQUENCE public.pages_id_seq TO anon;
 
@@ -1158,11 +1358,11 @@ GRANT ALL ON SEQUENCE public.pages_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.pages_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.post_revisions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.post_revisions TO anon;
 
-GRANT ALL ON TABLE public.post_revisions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.post_revisions TO authenticated;
 
-GRANT ALL ON TABLE public.post_revisions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.post_revisions TO service_role;
 
 GRANT ALL ON SEQUENCE public.post_revisions_id_seq TO anon;
 
@@ -1170,11 +1370,11 @@ GRANT ALL ON SEQUENCE public.post_revisions_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.post_revisions_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.posts TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.posts TO anon;
 
-GRANT ALL ON TABLE public.posts TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.posts TO authenticated;
 
-GRANT ALL ON TABLE public.posts TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.posts TO service_role;
 
 GRANT ALL ON SEQUENCE public.posts_id_seq TO anon;
 
@@ -1182,35 +1382,35 @@ GRANT ALL ON SEQUENCE public.posts_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.posts_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.privacy_consent_logs TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.privacy_consent_logs TO anon;
 
-GRANT ALL ON TABLE public.privacy_consent_logs TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.privacy_consent_logs TO authenticated;
 
-GRANT ALL ON TABLE public.privacy_consent_logs TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.privacy_consent_logs TO service_role;
 
-GRANT ALL ON TABLE public.product_attribute_terms TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attribute_terms TO anon;
 
-GRANT ALL ON TABLE public.product_attribute_terms TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attribute_terms TO authenticated;
 
-GRANT ALL ON TABLE public.product_attribute_terms TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attribute_terms TO service_role;
 
-GRANT ALL ON TABLE public.product_attributes TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attributes TO anon;
 
-GRANT ALL ON TABLE public.product_attributes TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attributes TO authenticated;
 
-GRANT ALL ON TABLE public.product_attributes TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_attributes TO service_role;
 
-GRANT ALL ON TABLE public.product_categories TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_categories TO anon;
 
-GRANT ALL ON TABLE public.product_categories TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_categories TO authenticated;
 
-GRANT ALL ON TABLE public.product_categories TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_categories TO service_role;
 
-GRANT ALL ON TABLE public.product_drafts TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_drafts TO anon;
 
-GRANT ALL ON TABLE public.product_drafts TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_drafts TO authenticated;
 
-GRANT ALL ON TABLE public.product_drafts TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_drafts TO service_role;
 
 GRANT ALL ON SEQUENCE public.product_drafts_id_seq TO anon;
 
@@ -1218,115 +1418,157 @@ GRANT ALL ON SEQUENCE public.product_drafts_id_seq TO authenticated;
 
 GRANT ALL ON SEQUENCE public.product_drafts_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.product_freemius_sale_coupons TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_freemius_sale_coupons TO anon;
 
-GRANT ALL ON TABLE public.product_freemius_sale_coupons TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_freemius_sale_coupons TO authenticated;
 
-GRANT ALL ON TABLE public.product_freemius_sale_coupons TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_freemius_sale_coupons TO service_role;
 
-GRANT ALL ON TABLE public.product_media TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_inquiries TO anon;
 
-GRANT ALL ON TABLE public.product_media TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_inquiries TO authenticated;
 
-GRANT ALL ON TABLE public.product_media TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_inquiries TO service_role;
 
-GRANT ALL ON TABLE public.product_variants TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_media TO anon;
 
-GRANT ALL ON TABLE public.product_variants TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_media TO authenticated;
 
-GRANT ALL ON TABLE public.product_variants TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_media TO service_role;
 
-GRANT ALL ON TABLE public.products TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_revisions TO anon;
 
-GRANT ALL ON TABLE public.products TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_revisions TO authenticated;
 
-GRANT ALL ON TABLE public.products TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_revisions TO service_role;
 
-GRANT ALL ON TABLE public.profiles TO anon;
+GRANT ALL ON SEQUENCE public.product_revisions_id_seq TO anon;
 
-GRANT ALL ON TABLE public.profiles TO authenticated;
+GRANT ALL ON SEQUENCE public.product_revisions_id_seq TO authenticated;
 
-GRANT ALL ON TABLE public.profiles TO service_role;
+GRANT ALL ON SEQUENCE public.product_revisions_id_seq TO service_role;
 
-GRANT ALL ON TABLE public.shipping_zone_locations TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_variants TO anon;
 
-GRANT ALL ON TABLE public.shipping_zone_locations TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_variants TO authenticated;
 
-GRANT ALL ON TABLE public.shipping_zone_locations TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.product_variants TO service_role;
 
-GRANT ALL ON TABLE public.shipping_zone_methods TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.products TO anon;
 
-GRANT ALL ON TABLE public.shipping_zone_methods TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.products TO authenticated;
 
-GRANT ALL ON TABLE public.shipping_zone_methods TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.products TO service_role;
 
-GRANT ALL ON TABLE public.shipping_zones TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.profiles TO anon;
 
-GRANT ALL ON TABLE public.shipping_zones TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.profiles TO authenticated;
 
-GRANT ALL ON TABLE public.shipping_zones TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.profiles TO service_role;
 
-GRANT ALL ON TABLE public.site_settings TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_locations TO anon;
 
-GRANT ALL ON TABLE public.site_settings TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_locations TO authenticated;
 
-GRANT ALL ON TABLE public.site_settings TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_locations TO service_role;
 
-GRANT ALL ON TABLE public.system_alerts TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_methods TO anon;
 
-GRANT ALL ON TABLE public.system_alerts TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_methods TO authenticated;
 
-GRANT ALL ON TABLE public.system_alerts TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zone_methods TO service_role;
 
-GRANT ALL ON TABLE public.system_configuration TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zones TO anon;
 
-GRANT ALL ON TABLE public.system_configuration TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zones TO authenticated;
 
-GRANT ALL ON TABLE public.system_configuration TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.shipping_zones TO service_role;
 
-GRANT ALL ON TABLE public.tax_rates TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_script_revisions TO anon;
 
-GRANT ALL ON TABLE public.tax_rates TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_script_revisions TO authenticated;
 
-GRANT ALL ON TABLE public.tax_rates TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_script_revisions TO service_role;
 
-GRANT ALL ON TABLE public.translations TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_scripts TO anon;
 
-GRANT ALL ON TABLE public.translations TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_scripts TO authenticated;
 
-GRANT ALL ON TABLE public.translations TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_scripts TO service_role;
 
-GRANT ALL ON TABLE public.ucp_cart_sessions TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_settings TO anon;
 
-GRANT ALL ON TABLE public.ucp_cart_sessions TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_settings TO authenticated;
 
-GRANT ALL ON TABLE public.ucp_cart_sessions TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_settings TO service_role;
 
-GRANT ALL ON TABLE public.user_addresses TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_themes TO anon;
 
-GRANT ALL ON TABLE public.user_addresses TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_themes TO authenticated;
 
-GRANT ALL ON TABLE public.user_addresses TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.site_themes TO service_role;
 
-GRANT ALL ON TABLE public.user_security_settings TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_alerts TO anon;
 
-GRANT ALL ON TABLE public.user_security_settings TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_alerts TO authenticated;
 
-GRANT ALL ON TABLE public.user_security_settings TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_alerts TO service_role;
 
-GRANT ALL ON TABLE public.user_trusted_devices TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_configuration TO anon;
 
-GRANT ALL ON TABLE public.user_trusted_devices TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_configuration TO authenticated;
 
-GRANT ALL ON TABLE public.user_trusted_devices TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.system_configuration TO service_role;
 
-GRANT ALL ON TABLE public.variant_attribute_mapping TO anon;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.tax_rates TO anon;
 
-GRANT ALL ON TABLE public.variant_attribute_mapping TO authenticated;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.tax_rates TO authenticated;
 
-GRANT ALL ON TABLE public.variant_attribute_mapping TO service_role;
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.tax_rates TO service_role;
 
--- Re-attached: trigger lives on auth.users, which a public-only pg_dump omits (see migration 005).
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.thread_messages TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.thread_messages TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.thread_messages TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.translations TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.translations TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.translations TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.ucp_cart_sessions TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.ucp_cart_sessions TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.ucp_cart_sessions TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_addresses TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_addresses TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_addresses TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_security_settings TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_security_settings TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_security_settings TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_trusted_devices TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_trusted_devices TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.user_trusted_devices TO service_role;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.variant_attribute_mapping TO anon;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.variant_attribute_mapping TO authenticated;
+
+GRANT SELECT,INSERT,REFERENCES,DELETE,TRIGGER,TRUNCATE,UPDATE ON TABLE public.variant_attribute_mapping TO service_role;
+
+-- Re-attached: trigger lives on auth.users, which a public-only pg_dump omits.
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created
   AFTER INSERT ON auth.users

@@ -16,10 +16,13 @@ const repoRoot = path.resolve(__dirname, '../..');
 const workdir = path.join(repoRoot, 'libs/db/src');
 const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const args = new Set(process.argv.slice(2));
-const baselineRepairFirstVersion = '00000000000000';
-// Re-baseline (2026-07): migrations 000..044 were squashed into the idempotent baseline
-// 000..003. That range is the non-replayable baseline; 004+ are normal forward migrations.
-const baselineRepairLastVersion = '00000000000003';
+// File naming (GGNNN squash generations), the baseline/catch-up classification and the
+// directory lint all live in one place so the CLI, the generators and the tests agree.
+const {
+  MIGRATION_FILE_RE,
+  isBaselineMigration,
+  validateMigrationNames,
+} = require('./lib/migration-naming');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -143,11 +146,6 @@ function getMigrationVersion(fileName) {
   return fileName.split('_')[0];
 }
 
-function isHistoricalBaselineMigration(fileName) {
-  const version = getMigrationVersion(fileName);
-  return version >= baselineRepairFirstVersion && version <= baselineRepairLastVersion;
-}
-
 function readLocalMigrationFiles() {
   const dir = path.join(workdir, 'supabase/migrations');
 
@@ -157,11 +155,34 @@ function readLocalMigrationFiles() {
 
   return fs
     .readdirSync(dir)
-    .filter((name) => /^\d{14}_.*\.sql$/.test(name))
+    .filter((name) => MIGRATION_FILE_RE.test(name))
     .sort();
 }
 
-const VERSION_PATTERN = /^\d{14}$/;
+/**
+ * Fail loudly on a badly named migration file before touching any database. The Supabase
+ * CLI skips non-matching names in silence, and a wrong width would sort into the wrong
+ * place, so this is the one check that has to run on every path.
+ */
+function assertMigrationNaming(localFiles) {
+  const naming = validateMigrationNames(localFiles);
+  if (naming.errors.length > 0) {
+    log('Migration file names violate the GGNNN scheme (tools/scripts/lib/migration-naming.js):', colors.red);
+    for (const error of naming.errors) {
+      log(`  - ${error}`, colors.red);
+    }
+    process.exit(1);
+  }
+  log(
+    `Migration generation ${String(naming.generation).padStart(2, '0')} on disk (${localFiles.length} files); the next new migration must be ${naming.next}_<name>.sql.`,
+    colors.dim,
+  );
+  return naming;
+}
+
+// A version is any run of digits: the legacy generation-1 files were 14-digit, the
+// GGNNN scheme is 5-digit, and the remote history can hold both at once during a squash.
+const VERSION_PATTERN = /^\d+$/;
 
 /**
  * Parse `supabase migration list` into local/remote sets.
@@ -291,6 +312,7 @@ function main() {
   const localFiles = readLocalMigrationFiles();
 
   log(isCheck ? 'Supabase migration check (read-only)' : 'Supabase migration-only push', colors.green);
+  assertMigrationNaming(localFiles);
   log(`Target project: ${process.env.SUPABASE_PROJECT_ID}`, colors.dim);
   log(
     isCheck
@@ -377,16 +399,24 @@ function main() {
     process.exit(1);
   }
 
-  const pendingHistoricalBaseline = pendingMigrations.filter(isHistoricalBaselineMigration);
+  // The generation baseline (GG001..GG004) is idempotent DDL plus a seed that runs only on
+  // an empty database, so replaying it on a live database is safe by design — that is how
+  // an install crosses a squash. What is NOT safe is the catch-up (GG000) on a database
+  // whose history was wiped: it decides what to replay from the recorded versions, and with
+  // nothing recorded it would replay every retired migration. So refuse only when baseline
+  // files are pending AND the remote history is completely empty: that is either a
+  // brand-new database (db:migrate:fresh) or a live one that needs repair-history first.
+  const pendingBaseline = pendingMigrations.filter(isBaselineMigration);
+  const remoteHistoryEmpty = status.applied.length === 0 && status.remoteOnly.length === 0;
 
-  if (pendingHistoricalBaseline.length > 0 && !allowBaselineReplay) {
-    log('Refusing to replay historical baseline migrations on this database.', colors.red);
+  if (pendingBaseline.length > 0 && remoteHistoryEmpty && !allowBaselineReplay) {
+    log('Refusing to apply the baseline to a database with an empty migration history.', colors.red);
     log(
-      `The pending list includes ${pendingHistoricalBaseline.length} baseline migration(s) from ${baselineRepairFirstVersion} through ${baselineRepairLastVersion}.`,
+      `The pending list includes ${pendingBaseline.length} baseline file(s) and the remote history records nothing.`,
       colors.yellow,
     );
     log(
-      'If this is an existing production database, repair the migration history first with `npm run db:migrate:repair-history`.',
+      'If this is an existing database whose history was wiped, repair it first with `npm run db:migrate:repair-history`.',
       colors.yellow,
     );
     log(
@@ -396,13 +426,29 @@ function main() {
     process.exit(1);
   }
 
+  if (status.remoteOnly.length > 0) {
+    log('');
+    log(
+      'The remote history holds versions with no local file (a migration squash retired them).',
+      colors.yellow,
+    );
+    log(
+      '`supabase db push` refuses to run while that is the case. Record the squash first with',
+      colors.yellow,
+    );
+    log(
+      '`npm run db:migrate:repair-history -- --reconcile-squash` (read the plan it prints), then re-run this command.',
+      colors.yellow,
+    );
+  }
+
   supabase(pushArgs);
   log('Database migrations applied without running a reset or sandbox seed.', colors.green);
 }
 
 // Pure helpers are exported for tests; `main()` runs only on direct execution so
 // requiring this file never touches a database.
-module.exports = { getMigrationVersion, isHistoricalBaselineMigration, parseMigrationList };
+module.exports = { getMigrationVersion, isBaselineMigration, parseMigrationList };
 
 if (require.main === module) {
   main();

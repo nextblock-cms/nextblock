@@ -1,6 +1,7 @@
--- AUTO-GENERATED baseline (re-baseline of migrations 000..044). Idempotent; safe to replay.
--- 01 · constraints (PK / unique / check / FK) + indexes
--- Regenerate via tools/scripts/rebaseline-transform.mjs. Do not hand-edit.
+-- AUTO-GENERATED baseline: squash generation 2 (of migrations 00000000000000..00000000000042).
+-- 002 · constraints (PK / unique / check / FK) + indexes
+-- Idempotent; safe to replay. Regenerate via tools/scripts/rebaseline-transform.mjs — do not hand-edit.
+-- Naming: GGNNN_name.sql (GG = squash generation, NNN = sequence). See docs/04-DATABASE-AND-AUTH.md.
 
 DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'blocks_pkey' AND conrelid = 'public.blocks'::regclass) THEN
@@ -27,6 +28,20 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cms_interactions_pkey' AND conrelid = 'public.cms_interactions'::regclass) THEN
     ALTER TABLE ONLY public.cms_interactions
         ADD CONSTRAINT cms_interactions_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cms_redirects_pkey' AND conrelid = 'public.cms_redirects'::regclass) THEN
+    ALTER TABLE ONLY public.cms_redirects
+        ADD CONSTRAINT cms_redirects_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cms_redirects_source_path_key' AND conrelid = 'public.cms_redirects'::regclass) THEN
+    ALTER TABLE ONLY public.cms_redirects
+        ADD CONSTRAINT cms_redirects_source_path_key UNIQUE (source_path);
   END IF;
 END $rb$;
 
@@ -115,6 +130,13 @@ DO $rb$ BEGIN
 END $rb$;
 
 DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'form_endpoints_pkey' AND conrelid = 'public.form_endpoints'::regclass) THEN
+    ALTER TABLE ONLY public.form_endpoints
+        ADD CONSTRAINT form_endpoints_pkey PRIMARY KEY (form_key);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'freemius_plans_pkey' AND conrelid = 'public.freemius_plans'::regclass) THEN
     ALTER TABLE ONLY public.freemius_plans
         ADD CONSTRAINT freemius_plans_pkey PRIMARY KEY (id);
@@ -157,6 +179,20 @@ DO $rb$ BEGIN
 END $rb$;
 
 DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'mcp_access_tokens_pkey' AND conrelid = 'public.mcp_access_tokens'::regclass) THEN
+    ALTER TABLE ONLY public.mcp_access_tokens
+        ADD CONSTRAINT mcp_access_tokens_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'mcp_access_tokens_token_hash_key' AND conrelid = 'public.mcp_access_tokens'::regclass) THEN
+    ALTER TABLE ONLY public.mcp_access_tokens
+        ADD CONSTRAINT mcp_access_tokens_token_hash_key UNIQUE (token_hash);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'media_object_key_key' AND conrelid = 'public.media'::regclass) THEN
     ALTER TABLE ONLY public.media
         ADD CONSTRAINT media_object_key_key UNIQUE (object_key);
@@ -167,6 +203,20 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'media_pkey' AND conrelid = 'public.media'::regclass) THEN
     ALTER TABLE ONLY public.media
         ADD CONSTRAINT media_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'message_threads_pkey' AND conrelid = 'public.message_threads'::regclass) THEN
+    ALTER TABLE ONLY public.message_threads
+        ADD CONSTRAINT message_threads_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'message_threads_token_hash_key' AND conrelid = 'public.message_threads'::regclass) THEN
+    ALTER TABLE ONLY public.message_threads
+        ADD CONSTRAINT message_threads_token_hash_key UNIQUE (token_hash);
   END IF;
 END $rb$;
 
@@ -346,9 +396,30 @@ DO $rb$ BEGIN
 END $rb$;
 
 DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_inquiries_pkey' AND conrelid = 'public.product_inquiries'::regclass) THEN
+    ALTER TABLE ONLY public.product_inquiries
+        ADD CONSTRAINT product_inquiries_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_media_pkey' AND conrelid = 'public.product_media'::regclass) THEN
     ALTER TABLE ONLY public.product_media
         ADD CONSTRAINT product_media_pkey PRIMARY KEY (product_id, media_id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_revisions_pkey' AND conrelid = 'public.product_revisions'::regclass) THEN
+    ALTER TABLE ONLY public.product_revisions
+        ADD CONSTRAINT product_revisions_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_revisions_product_version_key' AND conrelid = 'public.product_revisions'::regclass) THEN
+    ALTER TABLE ONLY public.product_revisions
+        ADD CONSTRAINT product_revisions_product_version_key UNIQUE (product_id, version);
   END IF;
 END $rb$;
 
@@ -416,9 +487,37 @@ DO $rb$ BEGIN
 END $rb$;
 
 DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'site_script_revisions_pkey' AND conrelid = 'public.site_script_revisions'::regclass) THEN
+    ALTER TABLE ONLY public.site_script_revisions
+        ADD CONSTRAINT site_script_revisions_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'site_scripts_pkey' AND conrelid = 'public.site_scripts'::regclass) THEN
+    ALTER TABLE ONLY public.site_scripts
+        ADD CONSTRAINT site_scripts_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'site_settings_pkey' AND conrelid = 'public.site_settings'::regclass) THEN
     ALTER TABLE ONLY public.site_settings
         ADD CONSTRAINT site_settings_pkey PRIMARY KEY (key);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'site_themes_pkey' AND conrelid = 'public.site_themes'::regclass) THEN
+    ALTER TABLE ONLY public.site_themes
+        ADD CONSTRAINT site_themes_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'site_themes_slug_key' AND conrelid = 'public.site_themes'::regclass) THEN
+    ALTER TABLE ONLY public.site_themes
+        ADD CONSTRAINT site_themes_slug_key UNIQUE (slug);
   END IF;
 END $rb$;
 
@@ -440,6 +539,13 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'tax_rates_pkey' AND conrelid = 'public.tax_rates'::regclass) THEN
     ALTER TABLE ONLY public.tax_rates
         ADD CONSTRAINT tax_rates_pkey PRIMARY KEY (id);
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thread_messages_pkey' AND conrelid = 'public.thread_messages'::regclass) THEN
+    ALTER TABLE ONLY public.thread_messages
+        ADD CONSTRAINT thread_messages_pkey PRIMARY KEY (id);
   END IF;
 END $rb$;
 
@@ -491,6 +597,16 @@ DO $rb$ BEGIN
         ADD CONSTRAINT variant_attribute_mapping_pkey PRIMARY KEY (variant_id, attribute_term_id);
   END IF;
 END $rb$;
+
+CREATE INDEX IF NOT EXISTS cms_interactions_inbox_idx ON public.cms_interactions USING btree (created_at DESC) WHERE (parent_id IS NULL);
+
+CREATE INDEX IF NOT EXISTS cms_interactions_parent_idx ON public.cms_interactions USING btree (parent_id, created_at) WHERE (parent_id IS NOT NULL);
+
+CREATE INDEX IF NOT EXISTS cms_interactions_post_type_status_idx ON public.cms_interactions USING btree (post_id, type, status, created_at DESC) WHERE (post_id IS NOT NULL);
+
+CREATE INDEX IF NOT EXISTS cms_interactions_product_type_status_idx ON public.cms_interactions USING btree (product_id, type, status, created_at DESC) WHERE (product_id IS NOT NULL);
+
+CREATE INDEX IF NOT EXISTS cms_redirects_active_source_idx ON public.cms_redirects USING btree (source_path) WHERE is_active;
 
 CREATE INDEX IF NOT EXISTS content_drafts_author_id_idx ON public.content_drafts USING btree (author_id);
 
@@ -606,6 +722,10 @@ CREATE INDEX IF NOT EXISTS idx_product_media_media_id ON public.product_media US
 
 CREATE INDEX IF NOT EXISTS idx_product_media_product_id ON public.product_media USING btree (product_id);
 
+CREATE INDEX IF NOT EXISTS idx_product_revisions_author_id ON public.product_revisions USING btree (author_id);
+
+CREATE INDEX IF NOT EXISTS idx_product_revisions_product_id_version ON public.product_revisions USING btree (product_id, version);
+
 CREATE INDEX IF NOT EXISTS idx_product_variants_main_media_id ON public.product_variants USING btree (main_media_id);
 
 CREATE INDEX IF NOT EXISTS idx_product_variants_prices_gin ON public.product_variants USING gin (prices jsonb_path_ops);
@@ -646,13 +766,33 @@ CREATE INDEX IF NOT EXISTS idx_user_trusted_devices_user_id ON public.user_trust
 
 CREATE INDEX IF NOT EXISTS idx_variant_attribute_mapping_attribute_term_id ON public.variant_attribute_mapping USING btree (attribute_term_id);
 
+CREATE INDEX IF NOT EXISTS mcp_access_tokens_created_at_idx ON public.mcp_access_tokens USING btree (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS mcp_access_tokens_token_hash_idx ON public.mcp_access_tokens USING btree (token_hash);
+
 CREATE INDEX IF NOT EXISTS media_folder_idx ON public.media USING btree (folder);
+
+CREATE INDEX IF NOT EXISTS message_threads_last_message_idx ON public.message_threads USING btree (last_message_at DESC);
+
+CREATE INDEX IF NOT EXISTS message_threads_source_last_idx ON public.message_threads USING btree (source, last_message_at DESC);
+
+CREATE INDEX IF NOT EXISTS message_threads_subject_idx ON public.message_threads USING btree (subject_id) WHERE (subject_id IS NOT NULL);
+
+CREATE INDEX IF NOT EXISTS message_threads_unread_idx ON public.message_threads USING btree (last_message_at DESC) WHERE (unread_for_admin = true);
+
+CREATE INDEX IF NOT EXISTS pages_status_published_at_idx ON public.pages USING btree (status, published_at);
 
 CREATE INDEX IF NOT EXISTS product_drafts_author_id_idx ON public.product_drafts USING btree (author_id);
 
 CREATE INDEX IF NOT EXISTS product_drafts_product_id_idx ON public.product_drafts USING btree (product_id);
 
 CREATE INDEX IF NOT EXISTS product_drafts_updated_at_idx ON public.product_drafts USING btree (updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS product_inquiries_created_idx ON public.product_inquiries USING btree (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS product_inquiries_ip_created_idx ON public.product_inquiries USING btree (ip_masked, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS product_inquiries_unresolved_idx ON public.product_inquiries USING btree (created_at DESC) WHERE (is_resolved = false);
 
 CREATE INDEX IF NOT EXISTS product_variants_sale_window_idx ON public.product_variants USING btree (sale_start_at, sale_end_at) WHERE ((sale_start_at IS NOT NULL) OR (sale_end_at IS NOT NULL));
 
@@ -662,7 +802,23 @@ CREATE INDEX IF NOT EXISTS products_sale_window_idx ON public.products USING btr
 
 CREATE INDEX IF NOT EXISTS products_scheduled_price_idx ON public.products USING btree (scheduled_price_at) WHERE (scheduled_price_at IS NOT NULL);
 
+CREATE INDEX IF NOT EXISTS products_status_published_at_idx ON public.products USING btree (status, published_at);
+
+CREATE INDEX IF NOT EXISTS site_script_revisions_created_idx ON public.site_script_revisions USING btree (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS site_script_revisions_script_created_idx ON public.site_script_revisions USING btree (script_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS site_scripts_active_placement_sort_idx ON public.site_scripts USING btree (is_active, placement, sort_order);
+
+CREATE INDEX IF NOT EXISTS site_themes_active_sort_idx ON public.site_themes USING btree (is_active, sort_order);
+
+CREATE UNIQUE INDEX IF NOT EXISTS site_themes_single_default_idx ON public.site_themes USING btree (is_default) WHERE (is_default = true);
+
 CREATE UNIQUE INDEX IF NOT EXISTS tax_rates_country_state_name_key ON public.tax_rates USING btree (country_code, COALESCE(state_code, ''::text), lower(tax_name));
+
+CREATE INDEX IF NOT EXISTS thread_messages_ip_created_idx ON public.thread_messages USING btree (ip_masked, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS thread_messages_thread_created_idx ON public.thread_messages USING btree (thread_id, created_at);
 
 DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'blocks_language_id_fkey' AND conrelid = 'public.blocks'::regclass) THEN
@@ -689,6 +845,13 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'blocks_product_id_fkey' AND conrelid = 'public.blocks'::regclass) THEN
     ALTER TABLE ONLY public.blocks
         ADD CONSTRAINT blocks_product_id_fkey FOREIGN KEY (product_id) REFERENCES public.products(id) ON DELETE CASCADE;
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'cms_interactions_parent_id_fkey' AND conrelid = 'public.cms_interactions'::regclass) THEN
+    ALTER TABLE ONLY public.cms_interactions
+        ADD CONSTRAINT cms_interactions_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.cms_interactions(id) ON DELETE CASCADE;
   END IF;
 END $rb$;
 
@@ -801,6 +964,13 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'logos_media_id_fkey' AND conrelid = 'public.logos'::regclass) THEN
     ALTER TABLE ONLY public.logos
         ADD CONSTRAINT logos_media_id_fkey FOREIGN KEY (media_id) REFERENCES public.media(id) ON DELETE SET NULL;
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'mcp_access_tokens_created_by_fkey' AND conrelid = 'public.mcp_access_tokens'::regclass) THEN
+    ALTER TABLE ONLY public.mcp_access_tokens
+        ADD CONSTRAINT mcp_access_tokens_created_by_fkey FOREIGN KEY (created_by) REFERENCES auth.users(id) ON DELETE SET NULL;
   END IF;
 END $rb$;
 
@@ -994,6 +1164,20 @@ DO $rb$ BEGIN
 END $rb$;
 
 DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_revisions_author_id_fkey' AND conrelid = 'public.product_revisions'::regclass) THEN
+    ALTER TABLE ONLY public.product_revisions
+        ADD CONSTRAINT product_revisions_author_id_fkey FOREIGN KEY (author_id) REFERENCES public.profiles(id) ON DELETE SET NULL;
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_revisions_product_id_fkey' AND conrelid = 'public.product_revisions'::regclass) THEN
+    ALTER TABLE ONLY public.product_revisions
+        ADD CONSTRAINT product_revisions_product_id_fkey FOREIGN KEY (product_id) REFERENCES public.products(id) ON DELETE CASCADE;
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'product_variants_main_media_id_fkey' AND conrelid = 'public.product_variants'::regclass) THEN
     ALTER TABLE ONLY public.product_variants
         ADD CONSTRAINT product_variants_main_media_id_fkey FOREIGN KEY (main_media_id) REFERENCES public.media(id) ON DELETE SET NULL;
@@ -1032,6 +1216,13 @@ DO $rb$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'shipping_zone_methods_zone_id_fkey' AND conrelid = 'public.shipping_zone_methods'::regclass) THEN
     ALTER TABLE ONLY public.shipping_zone_methods
         ADD CONSTRAINT shipping_zone_methods_zone_id_fkey FOREIGN KEY (zone_id) REFERENCES public.shipping_zones(id) ON DELETE CASCADE;
+  END IF;
+END $rb$;
+
+DO $rb$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thread_messages_thread_id_fkey' AND conrelid = 'public.thread_messages'::regclass) THEN
+    ALTER TABLE ONLY public.thread_messages
+        ADD CONSTRAINT thread_messages_thread_id_fkey FOREIGN KEY (thread_id) REFERENCES public.message_threads(id) ON DELETE CASCADE;
   END IF;
 END $rb$;
 

@@ -37,6 +37,17 @@ const files = readdirSync(MIGRATIONS_DIR)
   .filter((name) => /^\d+_.*\.sql$/.test(name))
   .sort();
 
+// Refuse to embed a badly named file (GGNNN scheme; see tools/scripts/lib/migration-naming.js
+// and docs/04). The /setup wizard would apply it in the wrong order or the CLI skip it.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { validateMigrationNames } = require('./lib/migration-naming.js');
+const naming = validateMigrationNames(files);
+if (naming.errors.length > 0) {
+  console.error('[generate-migrations-bundle] migration file names violate the GGNNN scheme:');
+  naming.errors.forEach((error: string) => console.error(`  - ${error}`));
+  process.exit(1);
+}
+
 const entries = files.map((name) => ({
   version: name.split('_')[0],
   name,

@@ -23,7 +23,18 @@ async function generateSandboxReset() {
     .filter(f => f !== '99999999999999_auto_sandbox_reset.sql')
     .sort();
 
-  console.log(`[generate-sandbox-reset] Found ${files.length} standard migrations.`);
+  // Refuse to bake a badly named file into the reset payload (GGNNN scheme; see
+  // tools/scripts/lib/migration-naming.js and docs/04).
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { validateMigrationNames } = require('./lib/migration-naming.js');
+  const naming = validateMigrationNames(files);
+  if (naming.errors.length > 0) {
+    console.error('[generate-sandbox-reset] migration file names violate the GGNNN scheme:');
+    naming.errors.forEach((error: string) => console.error(`  - ${error}`));
+    process.exit(1);
+  }
+
+  console.log(`[generate-sandbox-reset] Found ${files.length} standard migrations (generation ${naming.generation}).`);
 
   let concatenatedSql = '';
   for (const file of files) {
