@@ -183,6 +183,17 @@ Every file is fully idempotent. Existing databases already have versions
 `000`–`003` recorded, so both appliers skip the baseline — it only runs on a
 fresh/empty database.
 
+Seed *data-fix* migrations (the `seed_seo_*` series, `reposition_marketing_*`) must scope
+every UPDATE by **content signature and parent** (`WHERE page_id = v_home AND content::text
+LIKE '%Blazing-Fast%'`), never by a numeric `blocks.id`. `blocks`, `pages` and `posts` ids
+are identity columns, so any install that created or deleted a row since the baseline has
+different ids from the one the migration was written against — including the sandbox, which
+re-creates rows on every reset. `00000000000035` keyed its product-block updates by id and,
+on drifted installs, wrote French Commerce Pro copy over the home-page Live Demo promo and
+over the first block of the French install guide; `00000000000037` carries the
+signature-scoped repair. Signature guards also make a migration idempotent for free: once
+the copy is replaced, the guard no longer matches.
+
 `00000000000004` was the first migration appended after that re-baseline, not the
 one still to be written — the folder has grown well past it. **To find the next
 number, list `libs/db/src/supabase/migrations` and take the one after the highest

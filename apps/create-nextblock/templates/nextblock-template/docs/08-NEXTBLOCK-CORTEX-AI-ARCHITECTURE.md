@@ -1238,6 +1238,25 @@ now carries `PROTECTED_SITE_SETTING_KEYS`, redacted on read and refused on write
 `mcp_access_tokens` is deliberately **absent** from `tableConfigs`, so the generic DB
 tools cannot read token hashes or insert rows.
 
+### Marketing surfaces that describe the MCP server
+
+Three seeded content rows sell the MCP story and are kept at 100/100 in the built-in SEO
+engine (`libs/utils/src/lib/seo`). Migration `00000000000037_reposition_marketing_and_cortex_mcp.sql`
+owns them; the sandbox reset route (`enrichCortexAiProducts`) mirrors the product sections
+because it deletes and re-inserts product blocks after the SQL replay, so edit both together.
+
+| Surface | Focus keyphrase (type it into the audit panel; it is not persisted) | Body format |
+| :-- | :-- | :-- |
+| Home page `home` (EN) — hero, "why" (seven-row prototype-tools-vs-NextBlock chart + pricing tiles), "how MCP works", Cortex promo sections | `AI website builder CMS` | styled HTML in `section` → `text` blocks; 040 added the chart, 041 put the pricing message on every section: CMS free forever, Cortex AI (in-editor AI + MCP server) is the one paid license with a 30-day no-card trial, "deploy to Vercel in one click, up in ten minutes" |
+| Product `nextblock-cortex-ai-cortex-ai-license` (EN) | `Cortex AI MCP server` | styled HTML in five `section` blocks; title "NextBlock™ Cortex AI MCP Server & AI Editor License" (041 — never "copilot", the product is Cortex AI) |
+| Post `cortex-ai-mcp-connection-guide` (EN) | `connect Claude to NextBlock CMS` | styled HTML in one `text` block: comparison chart, a CSS/HTML flow diagram (four cards, `not-prose`), terminal panels; 037 seeded a plain Tiptap doc, 038 replaced it with a rasterised diagram, 041 replaced that with the CSS version and retired the media row |
+| Articles page `articles` (EN + FR) | none set (grades 100 without; EN also 100 with `NextBlock Journal`) | short hero + `posts_grid` + a "What the journal covers" section with four topic cards below the grid (041 moved the ~300-word essay out of the hero) |
+| Posts `how-nextblock-works` / `comment-nextblock-fonctionne` | none set (both grade 100) | styled HTML; 042 replaced the `extensibility.webp` figure with a CSS/HTML architecture diagram (core hub with the site logo, four spokes, three panels, stack strip, tagline) built inside the text block — the image file and media row stay because the sandbox reset registers it as a core asset |
+
+The copy names only the five contract tools above plus the real transport and auth rules
+(Streamable HTTP, bearer tokens, localhost trust in development, Live Draft staging). If any
+of those change, the product page and the guide are the two places that go stale.
+
 ## Advanced Agent Settings
 
 The global agent's model limits are admin-tunable from `/cms/settings/cortex-ai` (collapsible "Advanced settings"), stored as a non-secret JSON `site_settings` row `cortex_ai_agent_settings` and read by the route via `resolveCortexAiAgentSettings(supabase)` (defaults + clamping in `normalizeCortexAiAgentSettings`, `libs/cortex/src/lib/ai-config.ts`):

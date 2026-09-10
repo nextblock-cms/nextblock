@@ -26,6 +26,7 @@ interface PostClientContentProps {
     language_id: number;
     translation_group_id: string;
     feature_image_url?: string | null;
+    feature_image_alt?: string | null;
     feature_image_blur_data_url?: string | null;
     feature_image_width?: number | null;
     feature_image_height?: number | null;
@@ -393,7 +394,7 @@ export default function PostClientContent({ initialPostData, currentSlug, childr
         {currentPostData?.feature_image_url ? (
           <FeatureImageHero
             imageUrl={currentPostData.feature_image_url}
-            alt={`Hero image for ${currentPostData.title}`}
+            alt={currentPostData.feature_image_alt?.trim() || `Hero image for ${currentPostData.title}`}
             width={currentPostData.feature_image_width}
             height={currentPostData.feature_image_height}
             blurDataURL={currentPostData.feature_image_blur_data_url}

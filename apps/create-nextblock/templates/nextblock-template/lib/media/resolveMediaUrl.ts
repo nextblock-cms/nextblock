@@ -6,6 +6,7 @@ const BUNDLED_PUBLIC_MEDIA_KEYS = new Set([
   'images/commerce-wide.webp',
   'images/cortex-ai-square.webp',
   'images/cortex-ai.webp',
+  'images/cortex_post.webp',
   'images/developer.webp',
   'images/extensibility.webp',
   'images/goals.webp',
@@ -17,6 +18,7 @@ const BUNDLED_PUBLIC_MEDIA_KEYS = new Set([
   'images/pants.webp',
   'images/programmer-upscaled.webp',
   'images/t-shirt.webp',
+  'images/update_nextblock.webp',
 ]);
 
 export function resolveMediaUrl(

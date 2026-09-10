@@ -51,6 +51,16 @@ type CmsImageMetadata = {
   height: number;
   sizes: string;
   priority?: boolean;
+  /**
+   * Serve the bundled file as-is instead of through the image optimizer.
+   *
+   * The optimizer re-encodes at `quality` 60 and prefers AVIF, which is the right
+   * trade for photos but smears the fine text and 1px strokes of a rendered
+   * diagram, and its `sizes`-driven variant is then upscaled to the figure width.
+   * A diagram that is already an optimized webp at 2x the widest figure is
+   * sharper and not much heavier served untouched.
+   */
+  unoptimized?: boolean;
 };
 
 type HtmlImageProps = {
@@ -215,6 +225,7 @@ function renderOptimizedCmsImage(attribs: Record<string, string>) {
       height={image.height}
       sizes={sizes}
       quality={60}
+      unoptimized={image.unoptimized === true}
       priority={priority}
       fetchPriority={priority ? 'high' : undefined}
       loading={priority ? undefined : 'lazy'}

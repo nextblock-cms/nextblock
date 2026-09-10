@@ -69,6 +69,9 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - Migrations are append-only: `libs/db/src/supabase/migrations/<14 digits>_<name>.sql`; next
   number = highest file on disk + 1, then confirm `db:migrate:check` lists it as pending
   (Supabase matches history by version only; a reused version is skipped silently).
+- Seed data-fix migrations scope UPDATEs by content signature + parent (`page_id = v_home AND
+  content::text LIKE '%…%'`), never by `blocks.id`; ids drift on every install (035 clobbered
+  the home promo that way, 037 repairs it). Verify copy with the SEO engine before writing SQL.
 - After schema or seed changes regenerate all three artifacts (`db:types`,
   `generate:migrations-bundle`, `generate:sandbox`); the generators fail silently by omission.
 - Server-only modules throw in a browser: Cortex on call, S3 and `server-only` imports on import.

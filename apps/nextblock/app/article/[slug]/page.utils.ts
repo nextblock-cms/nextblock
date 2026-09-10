@@ -14,6 +14,8 @@ type PublicPostData = PostType & {
   language_id: number;
   translation_group_id: string;
   feature_image_url?: string | null;
+  /** The media row's description, used as the hero image alt text when present. */
+  feature_image_alt?: string | null;
   feature_image_blur_data_url?: string | null;
   feature_image_width?: number | null;
   feature_image_height?: number | null;
@@ -249,7 +251,7 @@ export async function getPostDataBySlug(slug: string): Promise<PublicPostData | 
       *,
       languages!inner (id, code),
       blocks (*),
-      media ( object_key, blur_data_url, width, height )
+      media ( object_key, blur_data_url, width, height, description )
     `)
     .eq("slug", slug) // Find the post by its unique slug for this language
     .order('order', { foreignTable: 'blocks', ascending: true });
@@ -320,6 +322,7 @@ export async function getPostDataBySlug(slug: string): Promise<PublicPostData | 
     language_id: langInfo.id,
     translation_group_id: postData.translation_group_id,
     feature_image_url: resolveMediaUrl(postData.media?.object_key),
+    feature_image_alt: postData.media?.description ?? null,
     feature_image_blur_data_url: postData.media?.blur_data_url,
     feature_image_width: postData.media?.width ?? null,
     feature_image_height: postData.media?.height ?? null,
