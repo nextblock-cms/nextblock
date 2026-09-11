@@ -1,6 +1,6 @@
 {
   "name": "create-nextblock",
-  "version": "0.17.1",
+  "version": "0.17.2",
   "description": "Scaffold a production-ready NextBlock CMS project — the open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "main": "index.js",
   "bin": {

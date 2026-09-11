@@ -14,7 +14,7 @@ export default async function SecuritySettingsPage() {
             <CardTitle>Security &amp; 2FA</CardTitle>
             <CardDescription>
               Security settings are disabled in the sandbox/demo environment, which runs on a
-              shared account and resets daily. They are available in a real installation.
+              shared account and resets every 15 minutes. They are available in a real installation.
             </CardDescription>
           </CardHeader>
           <CardContent />

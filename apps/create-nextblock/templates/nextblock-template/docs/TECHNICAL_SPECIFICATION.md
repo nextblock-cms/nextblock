@@ -10,7 +10,7 @@ NextBlock CMS is an AI-Native, Open-Core Content Management System purpose-built
 
 The system's central value proposition — "Speed. Scalability. AI-Readiness (coming soon)." — is encoded directly in its architectural decisions: a Next.js 16 App Router application (`apps/nextblock`) backed by Supabase, leveraging React Server Components, edge caching, and an image-optimization pipeline targeting a default 100/100 Lighthouse Performance score. Users bootstrap new projects in under thirty seconds via the `npm create nextblock@latest` CLI, which produces a standalone, production-ready Next.js application.
 
-A live sandbox instance at `https://cms.nextblock.dev/` (accessible with demo credentials `demo@nextblock.dev` / `password`) resets daily via a cron-triggered endpoint (`/api/cron/reset-sandbox`) to provide evaluators with a clean-state environment.
+A live sandbox instance at `https://cms.nextblock.dev/` (accessible with demo credentials `demo@nextblock.dev` / `password`) resets every 15 minutes via a cron-triggered endpoint (`/api/cron/reset-sandbox`) to provide evaluators with a clean-state environment.
 
 ### 1.1.2 Core Business Problem
 
@@ -247,7 +247,7 @@ The following architectural invariants are enforced at workspace level and must 
 | Media Optimization | Blur placeholders generated for uploaded images | `sharp` + `plaiceholder` pipeline |
 | Developer Adoption | CLI install success rate | `apps/create-nextblock/bin/create-nextblock.js` |
 | Commerce Conversion | Checkout success by provider (Stripe / Freemius) | `app/api/checkout/route.ts` + webhooks |
-| Scheduled Job Health | Daily success of reset-sandbox and sync-currencies | `vercel.json` cron configuration |
+| Scheduled Job Health | Success of reset-sandbox (every 15 min) and sync-currencies (daily) | `vercel.json` cron configuration |
 | Bundle Discipline | Removed console calls in production | `compiler.removeConsole` in `next.config.js` |
 
 ---
@@ -403,7 +403,7 @@ The system does not natively integrate with: alternative payment processors beyo
 - `tsconfig.base.json` — Shared TypeScript strict-mode configuration and `@nextblock-cms/*` path aliases
 - `components.json` — shadcn/ui configuration (Slate base, CSS variables, RSC)
 - `tailwind.config.js` — Root Tailwind CSS theme tokens and dark-mode configuration
-- `vercel.json` — Cron schedule definitions (reset-sandbox at 03:00 UTC, sync-currencies at 18:00 UTC)
+- `vercel.json` — Cron schedule definitions (reset-sandbox every 15 minutes, sync-currencies at 18:00 UTC)
 - `.env.example` — Environment variable reference template
 
 ### 1.4.2 Documentation Hub (`docs/`)
@@ -1163,7 +1163,7 @@ The SDK library at `libs/sdk` provides a typed contract for external block autho
 
 **Description**
 
-Two cron jobs are declared in `vercel.json`. The `/api/cron/reset-sandbox` endpoint runs daily at 03:00 UTC (`0 3 * * *`); it clears R2 storage, executes the generated SQL bootstrap (`SANDBOX_RESET_SQL`), normalizes media records, ensures required assets, seeds commerce and content data, and synchronizes Freemius products (product ID `24851`). The `/api/cron/sync-currencies` endpoint runs daily at 18:00 UTC (`0 18 * * *`) and invokes `syncStoreCurrencyRates()` from `@nextblock-cms/ecommerce/server`. Both endpoints require an `Authorization: Bearer ${CRON_SECRET}` header.
+Two cron jobs are declared in `vercel.json`. The `/api/cron/reset-sandbox` endpoint runs every 15 minutes (`*/15 * * * *`); it clears R2 storage, executes the generated SQL bootstrap (`SANDBOX_RESET_SQL`), normalizes media records, ensures required assets, seeds commerce and content data, and synchronizes Freemius products (product ID `24851`). The `/api/cron/sync-currencies` endpoint runs daily at 18:00 UTC (`0 18 * * *`) and invokes `syncStoreCurrencyRates()` from `@nextblock-cms/ecommerce/server`. Both endpoints require an `Authorization: Bearer ${CRON_SECRET}` header.
 
 **Dependencies**
 
@@ -1188,13 +1188,13 @@ Two cron jobs are declared in `vercel.json`. The `/api/cron/reset-sandbox` endpo
 
 **Description**
 
-Sandbox mode is toggled via the `NEXT_PUBLIC_IS_SANDBOX` environment variable. When enabled, the application renders the `SandboxBanner` and `SandboxCredentialsAlert` components (with demo credentials `demo@nextblock.dev`/`password`), and relaxes Freemius webhook signature verification to tolerate signature mismatches. A live deployment at `https://cms.nextblock.dev/` demonstrates the feature and resets daily via F-025.
+Sandbox mode is toggled via the `NEXT_PUBLIC_IS_SANDBOX` environment variable. When enabled, the application renders the `SandboxBanner` and `SandboxCredentialsAlert` components (with demo credentials `demo@nextblock.dev`/`password`), and relaxes Freemius webhook signature verification to tolerate signature mismatches. A live deployment at `https://cms.nextblock.dev/` demonstrates the feature and resets every 15 minutes via F-025.
 
 **Dependencies**
 
 | Dependency Type | Details |
 |:--|:--|
-| Prerequisite Features | F-025 (for daily reset) |
+| Prerequisite Features | F-025 (for the 15-minute reset) |
 | System Dependencies | None |
 | External Dependencies | None |
 | Integration Requirements | `NEXT_PUBLIC_IS_SANDBOX` flag |
@@ -1425,7 +1425,7 @@ This subsection provides the detailed, testable requirements that operationalize
 | F-023-RQ-002 | `activate ecommerce` MUST install the alias `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest` and inject route wrappers with `verifyPackageOnline()` | Must-Have | High |
 | F-024-RQ-001 | SDK MUST expose `BlockContentSchema`, `BlockData`, `BlockProps`, `BlockEditorProps`, `BlockConfig`, `LucideIcon` | Must-Have | Low |
 | F-024-RQ-002 | External block authoring MUST follow the contract shape documented in `docs/07-BLOCK-SDK-AND-EXTENSIBILITY.md` | Must-Have | Medium |
-| F-025-RQ-001 | `/api/cron/reset-sandbox` MUST run daily at 03:00 UTC with `Bearer CRON_SECRET` authorization | Must-Have | Medium |
+| F-025-RQ-001 | `/api/cron/reset-sandbox` MUST run every 15 minutes with `Bearer CRON_SECRET` authorization | Must-Have | Medium |
 | F-025-RQ-002 | `/api/cron/sync-currencies` MUST run daily at 18:00 UTC with `Bearer CRON_SECRET` authorization | Must-Have | Low |
 | F-026-RQ-001 | Sandbox banner and credential alert MUST render when `NEXT_PUBLIC_IS_SANDBOX === 'true'` | Should-Have | Low |
 | F-027-RQ-001 | `/api/revalidate` MUST validate `REVALIDATE_SECRET_TOKEN` before calling `revalidatePath` | Must-Have | Medium |
@@ -1703,7 +1703,7 @@ The following matrix links features to the sections of the technical specificati
 - `README.md` — Product value proposition, competitive positioning, Lighthouse and CLI claims
 - `package.json` — Workspace dependency versions (Next.js, React, TypeScript, Nx, Tailwind, Tiptap)
 - `nx.json` — Nx plugin and release configuration
-- `vercel.json` — Cron schedule definitions (reset-sandbox 03:00 UTC; sync-currencies 18:00 UTC)
+- `vercel.json` — Cron schedule definitions (reset-sandbox every 15 minutes; sync-currencies 18:00 UTC)
 - `.env.example` — Environment variable reference template
 - `eslint.config.mjs` — `@nx/enforce-module-boundaries` scope-tag rules (F-028)
 - `apps/nextblock/next.config.js` — Image format/device-size config; CSP; `transpilePackages`
@@ -2206,7 +2206,7 @@ The `vercel.json` file declares two scheduled jobs:
 
 | Path | Schedule (UTC) | Purpose |
 |:--|:--|:--|
-| `/api/cron/reset-sandbox` | `0 3 * * *` (03:00 daily) | Resets sandbox R2 + data for the demo deployment (F-025, F-026) |
+| `/api/cron/reset-sandbox` | `*/15 * * * *` (every 15 minutes) | Resets sandbox R2 + data for the demo deployment (F-025, F-026) |
 | `/api/cron/sync-currencies` | `0 18 * * *` (18:00 daily) | FX rate synchronization (F-018, F-025) |
 
 Both endpoints enforce `Authorization: Bearer ${CRON_SECRET}` per the security mitigation in Section 2.4.4.
@@ -2524,7 +2524,7 @@ The premium `libs/ecommerce` is guarded at runtime by the `verifyPackageOnline('
 - `package.json` — Root workspace package metadata, all dependency versions, and npm scripts
 - `nx.json` — Nx workspace configuration, registered plugins, generators, and targets
 - `tsconfig.base.json` — Shared TypeScript strict-mode configuration and monorepo path aliases
-- `vercel.json` — Cron schedules for `reset-sandbox` (03:00 UTC) and `sync-currencies` (18:00 UTC)
+- `vercel.json` — Cron schedules for `reset-sandbox` (every 15 minutes) and `sync-currencies` (18:00 UTC)
 - `tailwind.config.js` — Root Tailwind CSS theme tokens, dark-mode configuration, content globs
 - `postcss.config.js` — PostCSS pipeline with `@tailwindcss/postcss` and `autoprefixer`
 - `eslint.config.mjs` — Flat ESLint configuration with `@nx/enforce-module-boundaries` rules
@@ -3435,7 +3435,7 @@ flowchart LR
 
 ### 4.5.1 Sandbox Reset Cron
 
-The sandbox reset cron at `/api/cron/reset-sandbox/` executes daily at 03:00 UTC and performs a comprehensive environment rebuild: R2 storage deletion and re-seeding, database bootstrap via generated `SANDBOX_RESET_SQL`, and seeding of commerce products, localized content, and navigation entries. The endpoint requires `NEXT_PUBLIC_IS_SANDBOX === 'true'` and rejects execution in production environments.
+The sandbox reset cron at `/api/cron/reset-sandbox/` executes every 15 minutes and performs a comprehensive environment rebuild: R2 storage deletion and re-seeding, database bootstrap via generated `SANDBOX_RESET_SQL`, and seeding of commerce products, localized content, and navigation entries. The endpoint requires `NEXT_PUBLIC_IS_SANDBOX === 'true'` and rejects execution in production environments.
 
 ```mermaid
 flowchart TB
@@ -3926,7 +3926,7 @@ The following table consolidates all documented timing constraints and SLAs acro
 | Sync-Currencies maxDuration | 30 seconds | `api/cron/sync-currencies` |
 | Reset-Sandbox maxDuration | 60 seconds | `api/cron/reset-sandbox` |
 | Currency Sync Schedule | 18:00 UTC daily (`0 18 * * *`) | `vercel.json` |
-| Sandbox Reset Schedule | 03:00 UTC daily (`0 3 * * *`) | `vercel.json` |
+| Sandbox Reset Schedule | every 15 minutes (`*/15 * * * *`) | `vercel.json` |
 | Max Source Image Width | 2560 pixels | `api/process-image` |
 | Image Derivative Widths | 1920, 1280, 768, 384, 128 | `api/process-image` |
 | Lighthouse Performance Target | 100/100 | `README.md` |
@@ -3956,9 +3956,9 @@ flowchart LR
         HstsHeader[HSTS Header<br/>2 years max-age]
     end
     
-    subgraph Scheduled[" Scheduled Daily "]
+    subgraph Scheduled[" Scheduled (Vercel Cron) "]
         CurrencyDay[18:00 UTC<br/>Sync Currencies]
-        ResetDay[03:00 UTC<br/>Sandbox Reset]
+        ResetDay[Every 15 min<br/>Sandbox Reset]
     end
 ```
 
@@ -4197,7 +4197,7 @@ The integration landscape comprises eight external domains declared in `libs/env
 | Freemius | HTTPS + `x-freemius-signature` (HMAC SHA-256) | Sandbox bypass when `NEXT_PUBLIC_IS_SANDBOX===true` |
 | Frankfurter FX | HTTPS (JSON) | Cron runs 18:00 UTC daily; `maxDuration: 30s` |
 | SMTP | SMTP + TLS | Best-effort from server actions |
-| Vercel Cron | HTTPS + Bearer `CRON_SECRET` | 03:00 UTC (reset-sandbox, 60s); 18:00 UTC (sync-currencies, 30s) |
+| Vercel Cron | HTTPS + Bearer `CRON_SECRET` | every 15 min (reset-sandbox, 60s); 18:00 UTC (sync-currencies, 30s) |
 | Google Tag Manager | HTTPS (JS) | GTM id from `privacy_settings` (site_settings); allowlisted in CSP |
 
 ## 5.2 COMPONENT DETAILS
@@ -4641,7 +4641,7 @@ Observability instrumentation includes @vercel/speed-insights for performance me
 | Prefetch Accuracy | Correct `X-Prefetch-Priority` per page-type | `proxy.ts` |
 | Media Optimization | Blur placeholders on uploads | sharp + plaiceholder pipeline |
 | Commerce Conversion | Checkout success by provider | `app/api/checkout/route.ts` + webhooks |
-| Scheduled Job Health | Daily success of sandbox reset + currency sync | `vercel.json` cron configuration |
+| Scheduled Job Health | Success of sandbox reset (every 15 min) + currency sync (daily) | `vercel.json` cron configuration |
 | Bundle Discipline | Removed console calls in production | `compiler.removeConsole` in `next.config.js` |
 
 ### 5.4.2 Logging and Tracing Strategy
@@ -4764,7 +4764,7 @@ Measurable performance objectives include 100/100 Lighthouse performance, a CLI 
 
 #### 5.4.6.1 Sandbox Reset
 
-The `/api/cron/reset-sandbox` endpoint, scheduled daily at 03:00 UTC, reconstructs the demo environment end-to-end: it clears and repopulates Cloudflare R2 media, runs a generated SQL bootstrap (`sandboxResetSql.ts`) against Supabase, normalizes legacy media records, ensures required media assets exist, and seeds commerce/content data. The endpoint only executes when in sandbox mode and after verifying the Bearer `CRON_SECRET`.
+The `/api/cron/reset-sandbox` endpoint, scheduled every 15 minutes, reconstructs the demo environment end-to-end: it clears and repopulates Cloudflare R2 media, runs a generated SQL bootstrap (`sandboxResetSql.ts`) against Supabase, normalizes legacy media records, ensures required media assets exist, and seeds commerce/content data. The endpoint only executes when in sandbox mode and after verifying the Bearer `CRON_SECRET`.
 
 #### 5.4.6.2 Currency Synchronization
 
@@ -4782,8 +4782,8 @@ Supabase provides point-in-time recovery at the platform level; the eleven canon
 
 ```mermaid
 flowchart LR
-    subgraph Scheduled["Daily Schedules (Vercel Cron)"]
-        Reset[03:00 UTC<br/>/api/cron/reset-sandbox<br/>maxDuration 60s]
+    subgraph Scheduled["Schedules (Vercel Cron)"]
+        Reset[Every 15 min<br/>/api/cron/reset-sandbox<br/>maxDuration 60s]
         Sync[18:00 UTC<br/>/api/cron/sync-currencies<br/>maxDuration 30s]
     end
 
@@ -5446,7 +5446,7 @@ Two scheduled recovery flows are declared in `vercel.json` and serve both routin
 ```mermaid
 flowchart LR
     subgraph Schedules["vercel.json crons[]"]
-        Reset03[03:00 UTC daily<br/>/api/cron/reset-sandbox<br/>maxDuration 60s]
+        Reset03[Every 15 min<br/>/api/cron/reset-sandbox<br/>maxDuration 60s]
         Sync18[18:00 UTC daily<br/>/api/cron/sync-currencies<br/>maxDuration 30s]
     end
 
@@ -5483,7 +5483,7 @@ flowchart LR
     C4 --> C5
 ```
 
-The sandbox reset (`apps/nextblock/app/api/cron/reset-sandbox/route.ts`) only executes when in sandbox mode, providing a self-healing loop for the public demo environment. It serves as a **nightly reconstruction rehearsal** that validates the schema migrations and seed scripts.
+The sandbox reset (`apps/nextblock/app/api/cron/reset-sandbox/route.ts`) only executes when in sandbox mode, providing a self-healing loop for the public demo environment. It serves as a **continuous reconstruction rehearsal** that validates the schema migrations and seed scripts.
 
 #### 6.1.6.3 Content Recovery via Revisions
 
@@ -5536,7 +5536,7 @@ Failover behavior is **implicit via Vercel's platform** and **explicit via dual-
 - The workspace uses **library decomposition** (eight components in an Nx monorepo) with boundaries enforced at compile time by ESLint `@nx/enforce-module-boundaries`.
 - **Scalability is platform-delegated**: Vercel provides automatic horizontal scaling of stateless serverless functions. Application-level tuning is confined to cache TTLs, `maxDuration`, and caching layers.
 - **Resilience is expressed at the integration surface** via a five-pattern classification (strict failure, dual-path, and graceful degrade), exemplified by the RPC + SQL fallback inventory deduction.
-- **Disaster recovery** rests on Supabase platform PITR, 11 canonical migrations, `page_revisions`/`post_revisions` hybrid snapshot/diff content history, and a nightly sandbox-reset cron that doubles as a reconstruction rehearsal.
+- **Disaster recovery** rests on Supabase platform PITR, 11 canonical migrations, `page_revisions`/`post_revisions` hybrid snapshot/diff content history, and a 15-minute sandbox-reset cron that doubles as a reconstruction rehearsal.
 
 #### 6.1.7.2 Cross-References
 
@@ -5568,7 +5568,7 @@ Failover behavior is **implicit via Vercel's platform** and **explicit via dual-
 - `apps/nextblock/app/api/checkout/route.ts` — Checkout orchestration with `resolveProviderFromItem` chain and license-gate integration
 - `apps/nextblock/app/api/webhooks/stripe/route.ts` — Stripe signature verification + event dispatch
 - `apps/nextblock/app/api/webhooks/freemius/route.ts` — Freemius HMAC-SHA-256 verification + sandbox bypass
-- `apps/nextblock/app/api/cron/reset-sandbox/route.ts` — Daily sandbox reset flow; R2 clearing, SQL bootstrap, media normalization, seeding
+- `apps/nextblock/app/api/cron/reset-sandbox/route.ts` — 15-minute sandbox reset flow; R2 clearing, SQL bootstrap, media normalization, seeding
 - `apps/nextblock/app/api/cron/sync-currencies/route.ts` — Daily Frankfurter FX sync; Bearer `CRON_SECRET` auth
 - `apps/nextblock/app/api/revalidate/route.ts` — On-demand ISR invalidation from Supabase webhooks
 - `apps/nextblock/app/api/upload/presigned-url/route.ts` — R2 presigned URL generation (300s TTL, 10 MB cap)
@@ -5583,7 +5583,7 @@ Failover behavior is **implicit via Vercel's platform** and **explicit via dual-
 - `libs/db/src/lib/supabase/middleware.ts` — Supabase session synchronization helper
 - `libs/db/project.json` — Nx project definition with `scope:public` tag
 - `libs/environment.d.ts` — NodeJS.ProcessEnv augmentation declaring all external-service env vars
-- `vercel.json` — Two cron schedule declarations (03:00 UTC reset-sandbox; 18:00 UTC sync-currencies)
+- `vercel.json` — Two cron schedule declarations (every-15-minutes reset-sandbox; 18:00 UTC sync-currencies)
 - `nx.json` — Nx workspace orchestration and target defaults
 - `eslint.config.mjs` — `@nx/enforce-module-boundaries` rules for scope:public/scope:premium
 - `tsconfig.base.json` — Path aliases for all `@nextblock-cms/*` packages
@@ -5960,7 +5960,7 @@ flowchart TB
 | Manual restore | `psql` with duplicate-error collapser | `apps/nextblock/scripts/restore.js` |
 | Schema reconstruction | Replay 11 migrations in order | `npm run db:reset` via `supabase db reset --workdir libs/db/src` |
 | Content rollback | Hybrid snapshot/diff revisions | `page_revisions`, `post_revisions` (F-008) |
-| Sandbox rehearsal | Daily 03:00 UTC cron, 60s maxDuration | `/api/cron/reset-sandbox` (§4.5) |
+| Sandbox rehearsal | Every 15 minutes, 60s maxDuration | `/api/cron/reset-sandbox` (§4.5) |
 
 The `backup.js` script reads `POSTGRES_URL` or `DATABASE_URL` via `dotenv`, parses the connection URL, supports a `--name` CLI flag (or interactive prompt) for friendly backup names, creates timestamped directories under `apps/nextblock/backups/`, and spawns `pg_dump` with `PGPASSWORD` and `PGSSLMODE` passed via environment variables.
 
@@ -6182,7 +6182,7 @@ All three paths **fail closed**: missing env vars, query errors, or non-`active`
 
 #### 6.2.4.2 Backup and Fault-Tolerance Policies
 
-Detailed in §6.2.2.8. In summary: Supabase-managed PITR and managed backups (primary DR); `pg_dump` / `psql` scripts (operator-initiated); 11 migrations as schema-of-truth (rebuild); hybrid snapshot/diff revisions (content rollback). The Sandbox Reset Cron at 03:00 UTC daily (60s `maxDuration`) doubles as a reconstruction rehearsal, as documented in §4.5.
+Detailed in §6.2.2.8. In summary: Supabase-managed PITR and managed backups (primary DR); `pg_dump` / `psql` scripts (operator-initiated); 11 migrations as schema-of-truth (rebuild); hybrid snapshot/diff revisions (content rollback). The Sandbox Reset Cron every 15 minutes (60s `maxDuration`) doubles as a reconstruction rehearsal, as documented in §4.5.
 
 #### 6.2.4.3 Privacy Controls via Row-Level Security
 
@@ -6318,7 +6318,7 @@ Application-layer details:
 
 | Batch Workload | Mechanism | Frequency |
 |----------------|-----------|-----------|
-| Sandbox reset (cron) | Service-role client replays seed migrations | Daily 03:00 UTC, 60s `maxDuration` |
+| Sandbox reset (cron) | Service-role client replays seed migrations | Every 15 minutes, 60s `maxDuration` |
 | Currency exchange-rate sync (cron) | Service-role client updates `currencies.exchange_rate` from Frankfurter API | Daily 18:00 UTC, 30s `maxDuration` |
 | Bulk variant upsert | `upsert_product_with_variants(jsonb)` PL/pgSQL function — admin-only via `is_admin()` | Ad-hoc, CMS-triggered |
 | Migration seeds | Direct SQL in migrations `00000000000008` through `00000000000010` with `ON CONFLICT` merge logic preserving existing values | At deploy time |
@@ -6820,7 +6820,7 @@ All "events" in this system are either **HTTP webhooks delivered by external pro
 | Stripe | `checkout.session.completed` (others ignored) | `libs/ecommerce/src/lib/stripe/webhooks.ts` |
 | Freemius | `install.upgraded`, `license.activated` (others ignored) | `apps/nextblock/app/api/webhooks/freemius/route.ts` |
 | Supabase DB Triggers | Row INSERT/UPDATE/DELETE on `pages` / `posts` | `apps/nextblock/app/api/revalidate/route.ts` |
-| Vercel Cron Ticks | Scheduled GET at `0 3 * * *` / `0 18 * * *` | `/api/cron/reset-sandbox`, `/api/cron/sync-currencies` |
+| Vercel Cron Ticks | Scheduled GET at `*/15 * * * *` / `0 18 * * *` | `/api/cron/reset-sandbox`, `/api/cron/sync-currencies` |
 
 ##### 6.3.3.1.2 Stripe Event Dispatcher Discipline
 
@@ -6853,12 +6853,12 @@ The revalidation flow functions as a degenerate "stream" with batch size 1: ever
 
 #### 6.3.3.4 Batch Processing Flows
 
-Two daily Vercel cron jobs constitute the entire batch processing surface, declared explicitly in `vercel.json`:
+Two Vercel cron jobs constitute the entire batch processing surface, declared explicitly in `vercel.json`:
 
 ```mermaid
 flowchart LR
     subgraph CronDecl["vercel.json crons[]"]
-        A[path: /api/cron/reset-sandbox<br/>schedule: 0 3 * * *]
+        A[path: /api/cron/reset-sandbox<br/>schedule: */15 * * * *]
         B[path: /api/cron/sync-currencies<br/>schedule: 0 18 * * *]
     end
 
@@ -6907,7 +6907,7 @@ flowchart LR
     SA6 --> SA7
 ```
 
-##### 6.3.3.4.1 Sandbox Reset Cron (03:00 UTC, maxDuration 60s)
+##### 6.3.3.4.1 Sandbox Reset Cron (every 15 minutes, maxDuration 60s)
 
 Purpose: Reconstruct the public demo environment from scratch so that visitor-driven modifications do not pollute the demo. The handler executes eleven ordered steps including R2 bucket clearing via `ListObjectsV2Command` + `DeleteObjectsCommand`, seed asset re-upload via `PutObjectCommand`, SQL bootstrap via the `postgres` driver, media record normalization, Freemius product synchronization, and commerce catalog seeding. The `finally { db.end() }` block guarantees Postgres connection teardown even on error.
 
@@ -7361,7 +7361,7 @@ Per Section 5.1.4.2, each external integration carries explicit SLA-like propert
 | Freemius | HTTPS + `x-freemius-signature` HMAC-SHA-256 | Sandbox bypass when `NEXT_PUBLIC_IS_SANDBOX===true` |
 | Frankfurter | HTTPS (JSON) | Cron daily 18:00 UTC; `maxDuration: 30s` |
 | SMTP | SMTP + TLS | Best-effort from server actions |
-| Vercel Cron | HTTPS + Bearer CRON_SECRET | 03:00 UTC (reset-sandbox 60s); 18:00 UTC (sync-currencies 30s) |
+| Vercel Cron | HTTPS + Bearer CRON_SECRET | every 15 min (reset-sandbox 60s); 18:00 UTC (sync-currencies 30s) |
 | Google Tag Manager | HTTPS (JS) | GTM id from `privacy_settings` (site_settings); allowlisted in CSP |
 
 #### 6.3.6.2 Known Integration Limitations
@@ -7394,7 +7394,7 @@ The `shipping_zone_locations.postal_code` column exists in the schema but the cu
 - **Four canonical patterns** (outbound HTTPS, signed webhook, token webhook, scheduled cron) cover every integration.
 - **Seven authentication mechanisms** coexist, each tailored to its upstream provider's requirements.
 - **Three-layer authorization** (cookie session → path-prefix guard → RLS + license gate) provides defense in depth.
-- **Batch processing** is limited to two daily Vercel crons (sandbox reset at 03:00 UTC, currency sync at 18:00 UTC).
+- **Batch processing** is limited to two Vercel crons (sandbox reset every 15 minutes, currency sync daily at 18:00 UTC).
 - **Error handling** is classified into strict-fail, dual-path, and best-effort categories with the RPC + SQL fallback for inventory deduction being the most sophisticated resilience primitive.
 - **Known limitations** include incomplete Freemius reconciliation, a package alias mismatch, FX schema coupling, and an unused postal-code column.
 
@@ -7419,7 +7419,7 @@ The `shipping_zone_locations.postal_code` column exists in the schema but the cu
 
 #### Files Examined
 
-- `vercel.json` — Cron schedule declarations (`reset-sandbox` at 03:00 UTC, `sync-currencies` at 18:00 UTC)
+- `vercel.json` — Cron schedule declarations (`reset-sandbox` every 15 minutes, `sync-currencies` at 18:00 UTC)
 - `libs/environment.d.ts` — NodeJS.ProcessEnv augmentation declaring all external-integration environment variables
 - `.env.example` — Authoritative environment variable template
 - `apps/nextblock/proxy.ts` — 272-line request proxy consolidating session sync, RBAC, locale, security headers, CSP, and page-type classification
@@ -8187,7 +8187,7 @@ For details beyond the scope of this section, consult:
 
 - `apps/nextblock/proxy.ts` — 272-line edge proxy (session sync, RBAC, locale, CSP, headers, page-type signaling)
 - `apps/nextblock/next.config.js` — 91-line image security config + `compiler.removeConsole`
-- `apps/nextblock/vercel.json` — Cron schedule declarations (03:00 reset-sandbox, 18:00 sync-currencies)
+- `apps/nextblock/vercel.json` — Cron schedule declarations (every-15-minutes reset-sandbox, 18:00 sync-currencies)
 
 #### Authentication and Authorization
 
@@ -8537,7 +8537,7 @@ No dedicated `/api/health` or `/api/readiness` endpoint exists in the repository
 
 ##### 6.5.3.1.2 Scheduled-Execution Health Signal
 
-The two Vercel cron schedules in `vercel.json` serve a dual purpose: they perform their business function (sandbox reset and currency sync) while simultaneously producing a daily heartbeat that is visible on the Vercel dashboard. A cron invocation that returns HTTP 500 is therefore the closest the system comes to an automated unhealthy signal, because it is automatically surfaced in Vercel's cron execution history.
+The two Vercel cron schedules in `vercel.json` serve a dual purpose: they perform their business function (sandbox reset and currency sync) while simultaneously producing a recurring heartbeat that is visible on the Vercel dashboard. A cron invocation that returns HTTP 500 is therefore the closest the system comes to an automated unhealthy signal, because it is automatically surfaced in Vercel's cron execution history.
 
 #### 6.5.3.2 Performance Metrics
 
@@ -8599,7 +8599,7 @@ SLAs are encoded directly in configuration files (`vercel.json`, `next.config.js
 | Sync-currencies `maxDuration` | 30 seconds | `vercel.json` + route |
 | Reset-sandbox `maxDuration` | 60 seconds | `vercel.json` + route |
 | Currency sync schedule | `0 18 * * *` (18:00 UTC daily) | `vercel.json` |
-| Sandbox reset schedule | `0 3 * * *` (03:00 UTC daily) | `vercel.json` |
+| Sandbox reset schedule | `*/15 * * * *` (every 15 minutes) | `vercel.json` |
 | Max source image width | 2560 pixels | `/api/process-image` |
 | Lighthouse performance target | 100/100 | `README.md` |
 | CLI scaffold target | ≤ 30 seconds | `README.md` |
@@ -8642,9 +8642,9 @@ flowchart LR
         HstsHeader[HSTS Header<br/>2 years max-age]
     end
 
-    subgraph Scheduled[" Scheduled Daily "]
+    subgraph Scheduled[" Scheduled (Vercel Cron) "]
         CurrencyDay[18:00 UTC<br/>Sync Currencies]
-        ResetDay[03:00 UTC<br/>Sandbox Reset]
+        ResetDay[Every 15 min<br/>Sandbox Reset]
     end
 ```
 
@@ -8755,7 +8755,7 @@ Operators have four primary recovery mechanisms, all described in detail in Sect
 1. **Content rollback via revisions.** `page_revisions` and `post_revisions` tables store hybrid snapshot/diff records (JSON Patch via `fast-json-patch`) keyed by `UNIQUE (page_id, version)`. Any published state can be restored without a database restore.
 2. **Supabase Point-in-Time Recovery.** Platform-level PITR is the authoritative recovery path for catastrophic data loss.
 3. **Schema reconstruction from migrations.** The eleven canonical SQL files in `libs/db/src/supabase/migrations/` (`000_foundation_and_enums` through `010_seed_content_scaffold`) allow deterministic schema rebuild on a fresh Supabase project.
-4. **Nightly sandbox reset as reconstruction rehearsal.** The 03:00 UTC `/api/cron/reset-sandbox` job exercises the full R2-clear → SQL-bootstrap → media-normalize → seed pipeline daily, serving as continuous validation that the recovery procedure still works.
+4. **15-minute sandbox reset as reconstruction rehearsal.** The 15-minute `/api/cron/reset-sandbox` job exercises the full R2-clear → SQL-bootstrap → media-normalize → seed pipeline every 15 minutes, serving as continuous validation that the recovery procedure still works.
 
 #### 6.5.4.5 Post-mortem Processes
 
@@ -8847,7 +8847,7 @@ The following observability gaps are acknowledged and documented for honest stak
 - **Alert routing is manual.** The primary alert path is the `FeedbackModal` → `submitFeedback` → SMTP → `feedback@nextblock.dev` flow; platform alerts are configured in Vercel/Supabase consoles.
 - **No distributed tracing, no alert manager, no runbooks, no post-mortems, no persistent audit log table.** These absences are deliberate for the system's scale and are documented as explicit gaps.
 - **SLAs are codified in config, not monitored actively.** The canonical SLA table (Section 4.12) lists all timing constraints; crossings surface as HTTP errors or terminated function invocations in the Vercel log stream.
-- **Disaster recovery rests on Supabase PITR, canonical migrations, content revisions, and the nightly sandbox-reset reconstruction rehearsal** (detailed in Section 6.1.6 and Section 5.4.6).
+- **Disaster recovery rests on Supabase PITR, canonical migrations, content revisions, and the 15-minute sandbox-reset reconstruction rehearsal** (detailed in Section 6.1.6 and Section 5.4.6).
 
 #### 6.5.7.2 Cross-References to Related Sections
 
@@ -8890,7 +8890,7 @@ The following observability gaps are acknowledged and documented for honest stak
 - `libs/ecommerce/src/lib/stripe/webhooks.ts` — Stripe webhook handler with `[Stripe Webhook Error]` prefix; `console.error` on missing `STRIPE_WEBHOOK_SECRET` and on `constructEvent` failure
 - `libs/db/src/lib/package-validation.ts` — License gate with `console.error` and 60-second `unstable_cache` tagged `'package-activation'`
 - `libs/environment.d.ts` — `NodeJS.ProcessEnv` augmentation declaring external-service env vars (Supabase, R2/S3, SMTP, Freemius, OpenRouter/Cortex AI). GTM is no longer env-configured — it lives in `privacy_settings`.
-- `vercel.json` — Two cron schedule declarations: `0 3 * * *` reset-sandbox (60s) and `0 18 * * *` sync-currencies (30s)
+- `vercel.json` — Two cron schedule declarations: `*/15 * * * *` reset-sandbox (60s) and `0 18 * * *` sync-currencies (30s)
 - `package.json` (root) — Dependency declarations including `@vercel/speed-insights` and `@next/third-parties`
 - `apps/nextblock/package.json` — Template-level dependency declarations including `@vercel/analytics` (declared but not imported)
 - `docs/05-DEVELOPER-GUIDE.md` — Operational handbook, deployment notes, sandbox operations
@@ -9093,7 +9093,7 @@ Because no integration test suite exists, there is no dedicated test environment
 |:--|:--|
 | Local Supabase via `libs/db/src/supabase/config.toml` | Developer database for hand-driven verification |
 | Vercel Preview Deployments | Per-branch verification prior to production |
-| Sandbox production environment | End-to-end smoke testing via `NEXT_PUBLIC_IS_SANDBOX=true` flag with nightly reset cron |
+| Sandbox production environment | End-to-end smoke testing via `NEXT_PUBLIC_IS_SANDBOX=true` flag with a 15-minute reset cron |
 
 ---
 
@@ -9103,7 +9103,7 @@ Because no integration test suite exists, there is no dedicated test environment
 
 No E2E test framework (Playwright, Cypress, WebdriverIO, Puppeteer) is installed. This is explicitly documented as the accepted tradeoff in ADR §5.3.1: *"Vitest-only — Limited end-to-end coverage."* The absence is compensated by:
 
-1. **Sandbox reset cron as reconstruction rehearsal.** The `/api/cron/reset-sandbox` endpoint (§6.1.6.2) runs nightly at 03:00 UTC, clearing R2, running `SANDBOX_RESET_SQL`, normalizing legacy media, re-seeding commerce and content. A successful reset validates that the full happy-path data pipeline — migrations, storage, seeding — functions end-to-end.
+1. **Sandbox reset cron as reconstruction rehearsal.** The `/api/cron/reset-sandbox` endpoint (§6.1.6.2) runs every 15 minutes, clearing R2, running `SANDBOX_RESET_SQL`, normalizing legacy media, re-seeding commerce and content. A successful reset validates that the full happy-path data pipeline — migrations, storage, seeding — functions end-to-end.
 2. **Lighthouse performance score targeting 100/100.** Per §5.3.4 and §5.4.5, the 100/100 Lighthouse target provides an observational E2E signal on a per-deployment basis.
 3. **Production monitoring via Vercel Speed Insights + structured `console.warn`/`console.error`.** Per §6.4.3.5, production diagnostics survive `compiler.removeConsole` stripping and provide post-release observability.
 
@@ -9536,7 +9536,7 @@ The accepted tradeoff in §5.3.1 ("Vitest-only — Limited end-to-end coverage")
 - `apps/create-nextblock/package.json` — npm-init stub `"test": "echo \"Error: no test specified\" && exit 1"`
 - `apps/nextblock/project.json` — No test target declared
 - `tools/scripts/release-lib.js` — Library release pipeline; runs `npx nx run ${nxProject}:build --skip-nx-cache --with-deps` with no test invocation
-- `vercel.json` — Cron declarations (03:00 UTC reset-sandbox; 18:00 UTC sync-currencies); no test hooks
+- `vercel.json` — Cron declarations (every-15-minutes reset-sandbox; 18:00 UTC sync-currencies); no test hooks
 - `docs/05-DEVELOPER-GUIDE.md` — Developer command reference; no test commands documented
 - `.agent/skills/nx-operations/SKILL.md` — Front matter mentions tests but body documents only Building, Linting, and Development
 
@@ -10555,7 +10555,7 @@ The repository supports three deployment environments, with promotion driven by 
 | Preview / Staging | Push to non-deployment branch or PR | Vercel Preview Deployment (unique URL per commit) |
 | Production | Push to Vercel-integrated deployment branch (default base: `master`) | Vercel Production Deployment (`NEXT_PUBLIC_URL`) |
 
-A special **Sandbox production environment** is gated by `NEXT_PUBLIC_IS_SANDBOX=true` and is reset nightly at 03:00 UTC via the `/api/cron/reset-sandbox` endpoint. Sandbox serves as a public demonstration site and as a continuous reconstruction rehearsal for the disaster recovery pipeline (see §8.2.2.5).
+A special **Sandbox production environment** is gated by `NEXT_PUBLIC_IS_SANDBOX=true` and is reset every 15 minutes via the `/api/cron/reset-sandbox` endpoint. Sandbox serves as a public demonstration site and as a continuous reconstruction rehearsal for the disaster recovery pipeline (see §8.2.2.5).
 
 #### 8.2.2.4 Environment Promotion Flow Diagram
 
@@ -10566,7 +10566,7 @@ flowchart LR
     Preview[Vercel Preview Deployment<br/>Per-commit URL<br/>Shared Supabase preview]
     Merge[Merge to master]
     Prod[Vercel Production Deployment<br/>NEXT_PUBLIC_URL<br/>Production Supabase]
-    Sandbox[Sandbox Production<br/>NEXT_PUBLIC_IS_SANDBOX=true<br/>Nightly reset 03:00 UTC]
+    Sandbox[Sandbox Production<br/>NEXT_PUBLIC_IS_SANDBOX=true<br/>Reset every 15 min]
     ResetCycle[R2 clear +<br/>SANDBOX_RESET_SQL +<br/>media normalize +<br/>seed content]
 
     Dev --> PR
@@ -10576,7 +10576,7 @@ flowchart LR
     Prod -.parallel branch.-> Sandbox
 
     Sandbox -->|cron/reset-sandbox| ResetCycle
-    ResetCycle -.nightly.-> Sandbox
+    ResetCycle -.every 15 min.-> Sandbox
 
     style Dev fill:#e0f2fe,stroke:#0284c7
     style Preview fill:#fef3c7,stroke:#d97706
@@ -10593,7 +10593,7 @@ Disaster recovery relies on **four compounding recovery mechanisms**, none of wh
 | Supabase Point-in-Time Recovery (PITR) | Catastrophic data loss | Platform-managed by Supabase |
 | Content revisions | Accidental edits / content rollback | `page_revisions` + `post_revisions` tables with JSON Patch diffs (via `fast-json-patch`), `UNIQUE(page_id, version)` |
 | Schema reconstruction from migrations | Cold-start rebuild | 11 canonical SQL files in `libs/db/src/supabase/migrations/` applied in order |
-| Nightly sandbox reset (reconstruction rehearsal) | Continuous validation that recovery pipeline works | `/api/cron/reset-sandbox` at 03:00 UTC |
+| 15-minute sandbox reset (reconstruction rehearsal) | Continuous validation that recovery pipeline works | `/api/cron/reset-sandbox` every 15 minutes |
 
 Backup responsibility matrix:
 
@@ -11038,7 +11038,7 @@ Scheduled jobs deploy automatically with the application via `vercel.json`:
 ```json
 {
   "crons": [
-    {"path": "/api/cron/reset-sandbox", "schedule": "0 3 * * *"},
+    {"path": "/api/cron/reset-sandbox", "schedule": "*/15 * * * *"},
     {"path": "/api/cron/sync-currencies", "schedule": "0 18 * * *"}
   ]
 }
@@ -11046,7 +11046,7 @@ Scheduled jobs deploy automatically with the application via `vercel.json`:
 
 | Cron | Schedule (UTC) | maxDuration | Authentication |
 |:--|:--|:--|:--|
-| `/api/cron/reset-sandbox` | `0 3 * * *` (03:00 daily) | 60s | `Authorization: Bearer ${CRON_SECRET}` |
+| `/api/cron/reset-sandbox` | `*/15 * * * *` (every 15 minutes) | 60s | `Authorization: Bearer ${CRON_SECRET}` |
 | `/api/cron/sync-currencies` | `0 18 * * *` (18:00 daily) | 30s | `Authorization: Bearer ${CRON_SECRET}` |
 
 Purpose: `reset-sandbox` performs R2 clear + `SANDBOX_RESET_SQL` + media normalize + content seed; `sync-currencies` performs Frankfurter FX fetch + currency row update.
@@ -11102,7 +11102,7 @@ flowchart TB
     subgraph CronPipeline["Scheduled Jobs - Vercel Cron"]
         CronDecl[vercel.json crons array]
         CronRuntime[Vercel Cron Dispatcher]
-        ResetJob[/api/cron/reset-sandbox<br/>03:00 UTC]
+        ResetJob[/api/cron/reset-sandbox<br/>every 15 min]
         SyncJob[/api/cron/sync-currencies<br/>18:00 UTC]
     end
 
@@ -11276,7 +11276,7 @@ Per §4.12, the following are the codified timing constraints. Breaches surface 
 | Sync-currencies maxDuration | 30s | `vercel.json` + route export |
 | Reset-sandbox maxDuration | 60s | `vercel.json` + route export |
 | Currency sync schedule | 18:00 UTC daily | `vercel.json` |
-| Sandbox reset schedule | 03:00 UTC daily | `vercel.json` |
+| Sandbox reset schedule | every 15 minutes | `vercel.json` |
 | Max source image width | 2560 px | `/api/process-image` |
 | Image derivative widths | 1920, 1280, 768, 384, 128 | `next.config.js` `deviceSizes`/`imageSizes` |
 | Image quality presets | 60, 75 | `next.config.js` `qualities` |
@@ -11402,7 +11402,7 @@ graph TB
 | Review Vercel log stream | Daily / on-alert | Vercel console |
 | Review Supabase Advisors | Weekly | Supabase console |
 | Review feedback inbox | Daily | `feedback@nextblock.dev` |
-| Sandbox reset validation | Automated | `/api/cron/reset-sandbox` nightly at 03:00 UTC |
+| Sandbox reset validation | Automated | `/api/cron/reset-sandbox` every 15 minutes |
 | FX rate sync | Automated | `/api/cron/sync-currencies` daily at 18:00 UTC |
 | Dependency audit | Per release | `npm audit`, manual review |
 | Security patch review | On advisory | `npm update` + regression testing |
@@ -11534,12 +11534,12 @@ Operators should select tiers based on expected monthly active users, storage fo
 - **Vercel-native, platform-delegated deployment**: no Docker, no Kubernetes, no Terraform, no GitHub Actions — all four absences are intentional ADRs documented in §5.3.7.3 and §3.7.1.
 - **Three managed platform providers** compose the production footprint: Vercel (app + edge + cron + RUM), Supabase (PostgreSQL 17 + Auth + Storage metadata), Cloudflare R2 (S3-compatible object storage).
 - **Hybrid CI/CD** combines Vercel Git integration (for application deployment) with three Node.js release scripts under `tools/scripts/` (for library/CLI/DB releases).
-- **Two Vercel cron schedules** in `vercel.json`: `/api/cron/reset-sandbox` at 03:00 UTC (60s max) and `/api/cron/sync-currencies` at 18:00 UTC (30s max).
+- **Two Vercel cron schedules** in `vercel.json`: `/api/cron/reset-sandbox` every 15 minutes (60s max) and `/api/cron/sync-currencies` at 18:00 UTC (30s max).
 - **Infrastructure as Code is declarative**, distributed across `vercel.json`, `nx.json`, `libs/db/src/supabase/{migrations/, config.toml, templates/}`, `.env.example`, and per-project `project.json` files.
 - **Library publication uses a Twin Package Strategy** for `@nextblock-cms/ecom`: stub to public npm registry + real module to private GitHub Packages.
 - **11 canonical SQL migrations** compose the database schema; re-running them from a fresh Supabase project deterministically reconstructs the system.
 - **Monitoring is intentionally minimal**: Vercel Speed Insights for RUM, GTM for client analytics, structured `console.warn`/`console.error` logs for server-side events. No Prometheus/Grafana/Datadog/PagerDuty.
-- **Disaster recovery relies on four compounding mechanisms**: Supabase PITR, content revisions with JSON Patch diffs, schema reconstruction from migrations, and nightly sandbox reset as a continuous reconstruction rehearsal.
+- **Disaster recovery relies on four compounding mechanisms**: Supabase PITR, content revisions with JSON Patch diffs, schema reconstruction from migrations, and 15-minute sandbox reset as a continuous reconstruction rehearsal.
 - **Cost optimization is designed in**: zero egress on R2, platform-delegated scaling on Vercel, 1-year image cache TTL, daily (not per-request) FX sync.
 
 ### 8.11.2 Cross-References to Other Sections
@@ -11573,7 +11573,7 @@ Operators should select tiers based on expected monthly active users, storage fo
 **Files Examined**
 
 - `.env.example` — Authoritative inventory of 40+ environment variables across 7 categories (Platform, Secrets, FX, Supabase, R2, SMTP, Stripe, Freemius)
-- `vercel.json` — Declarative cron schedule definitions (2 crons: reset-sandbox at 03:00 UTC, sync-currencies at 18:00 UTC)
+- `vercel.json` — Declarative cron schedule definitions (2 crons: reset-sandbox every 15 minutes, sync-currencies at 18:00 UTC)
 - `package.json` (root) — Workspace identity (`nextblock`), 51 npm scripts, Nx plugin versions, dependency overrides, `packageManager`
 - `nx.json` — Workspace orchestration: 6 plugins, `defaultBase: master`, production named-input exclusions, `release.version.preVersionCommand`
 - `apps/nextblock/next.config.js` — Image pipeline config, `compiler.removeConsole`, `transpilePackages`, dynamic `remotePatterns`, `turbopack.resolveAlias`
@@ -11762,7 +11762,7 @@ Reproduced from Section 4.12 for quick reference during operational work. Values
 | Sync-currencies `maxDuration` | 30 seconds | `api/cron/sync-currencies` |
 | Reset-sandbox `maxDuration` | 60 seconds | `api/cron/reset-sandbox` |
 | Currency sync schedule | `0 18 * * *` (18:00 UTC daily) | `vercel.json` |
-| Sandbox reset schedule | `0 3 * * *` (03:00 UTC daily) | `vercel.json` |
+| Sandbox reset schedule | `*/15 * * * *` (every 15 minutes) | `vercel.json` |
 | Max source image width | 2560 pixels | `api/process-image` |
 | Image derivative widths | 1920, 1280, 768, 384, 128 | `api/process-image` |
 | Lighthouse performance target | 100/100 | `README.md` |
@@ -12140,7 +12140,7 @@ The glossary defines domain-specific, product-specific, and platform-specific te
 
 **Sandbox Mode** — The demonstration environment activated by `NEXT_PUBLIC_IS_SANDBOX=true`. The `cms.nextblock.dev` deployment operates in sandbox mode with demo credentials `demo@nextblock.dev` / `password`.
 
-**Sandbox Reset** — The nightly 03:00 UTC cron job at `/api/cron/reset-sandbox` that clears R2, bootstraps SQL, normalizes media, and re-seeds content.
+**Sandbox Reset** — The 15-minute cron job at `/api/cron/reset-sandbox` that clears R2, bootstraps SQL, normalizes media, and re-seeds content.
 
 **Scope Tag** — An Nx project tag (`scope:public` or `scope:premium`) validated by the `@nx/enforce-module-boundaries` ESLint rule. See Section 9.1.5.
 

@@ -167,15 +167,18 @@ the question entirely by resolving everything in-app, so the button prompts for 
 
 ## Cron jobs and the Hobby plan
 
-`vercel.json` declares two crons (`/api/cron/reset-sandbox` at 03:00 and
-`/api/cron/sync-currencies` at 18:00). Vercel's **Hobby (free) tier allows up to 100
-cron jobs, each running at most once per day** — both jobs are daily, so they deploy
-fine on the free tier. (Hobby timing is approximate, ±59 min, which is irrelevant for
-daily jobs; only sub-daily schedules like `0 * * * *` are rejected on Hobby.)
+`vercel.json` declares two crons: `/api/cron/reset-sandbox` **every 15 minutes**
+(`*/15 * * * *`) and `/api/cron/sync-currencies` daily at 18:00 UTC. The 15-minute
+schedule is what keeps the public sandbox at `cms.nextblock.dev` fresh; that project
+runs on **Vercel Pro**, which allows cron schedules down to once per minute with
+per-minute precision.
 
-`reset-sandbox` only does work in sandbox mode — it returns 404 otherwise — so on a
-normal deploy it is a harmless no-op. Delete it from `vercel.json` if you'd rather not
-see it scheduled.
+Vercel’s **Hobby (free) tier only allows cron jobs that run at most once per day**
+(timing is approximate, ±59 min), and **a sub-daily schedule fails the deployment**
+outright. So on a Hobby project you must **delete the `reset-sandbox` entry from
+`vercel.json`** before deploying. Nothing is lost: `reset-sandbox` only does work in
+sandbox mode — it returns 404 otherwise — so on a normal deploy it is a harmless
+no-op anyway. `sync-currencies` is daily and deploys fine on Hobby.
 
 ## After deploy
 

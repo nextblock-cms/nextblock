@@ -36,7 +36,7 @@
 </p>
 
 <p align="center">
-  <sub>Sandbox resets daily &nbsp;·&nbsp; <strong>User:</strong> demo@nextblock.dev &nbsp;·&nbsp; <strong>Pass:</strong> password</sub>
+  <sub>Sandbox resets every 15 minutes &nbsp;·&nbsp; <strong>User:</strong> demo@nextblock.dev &nbsp;·&nbsp; <strong>Pass:</strong> password</sub>
 </p>
 
 </div>

@@ -124,7 +124,7 @@ export type SaveEmailSettingsInput = {
 /**
  * Persist email settings. Public fields always overwrite; secret fields are encrypted
  * and only written when a new value is supplied. Refuses to store real secrets in the
- * sandbox (its DB resets daily). Caller must enforce ADMIN; RLS double-enforces.
+ * sandbox (its DB resets every 15 minutes). Caller must enforce ADMIN; RLS double-enforces.
  */
 export async function saveEmailSettings(input: SaveEmailSettingsInput): Promise<void> {
   const supabase = createClient();

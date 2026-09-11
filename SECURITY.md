@@ -70,7 +70,7 @@ revalidation endpoints, and secrets leaking into client bundles.
 **Out of scope:**
 
 - The public sandbox at `cms.nextblock.dev`, which is deliberately open with
-  published demo credentials and resets daily. Findings there are only
+  published demo credentials and resets every 15 minutes. Findings there are only
   interesting if they also apply to a normal install.
 - Vulnerabilities in Supabase, Vercel, Stripe, Freemius, or other third-party
   services — report those to the vendor directly.
