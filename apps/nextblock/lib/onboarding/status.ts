@@ -3,6 +3,7 @@ import 'server-only';
 // reads public/service-role data only, so it works for both ADMIN and WRITER dashboards.
 import { createClient } from '@nextblock-cms/db/server';
 import { getStoreConfigStatus } from '@nextblock-cms/ecommerce/server';
+import { NEXTBLOCK_PACKAGES, describePackageOffer } from '@nextblock-cms/utils';
 import { getEmailPublicSettings } from '../config/email-settings';
 import { getPrivacySettings } from '../privacy/settings';
 import { getSystemConfiguration } from '../setup/system-config';
@@ -21,6 +22,14 @@ export type OnboardingStep = {
   isExternal?: boolean;
   /** When true, render the device-flow "Connect GitHub" control instead of a link. */
   connectGithub?: boolean;
+  /** When true, render the "Build with Cortex" control that opens the site-builder chat. */
+  openSiteBuilder?: boolean;
+  /** When set, the CTA opens the in-dashboard purchase/trial dialog for this package. */
+  purchasePackageId?: 'cortex-ai' | 'ecommerce';
+  /** Label for the CTA button; defaults to "Set up". */
+  ctaLabel?: string;
+  /** When true, the step is informational for this user: no CTA is rendered. */
+  ctaHidden?: boolean;
 };
 
 export type OnboardingStatus = {
@@ -28,6 +37,14 @@ export type OnboardingStatus = {
   completed: number;
   total: number;
   dismissed: boolean;
+  /** The viewer holds the ADMIN role (package purchases and activation are admin-only). */
+  viewerIsAdmin: boolean;
+  /**
+   * Package the viewer can start a trial of from the dashboard right now (Cortex AI
+   * when it is inactive and the viewer is an admin), independent of checklist state —
+   * the ?cortex=site-builder deep link relies on it even when the checklist is dismissed.
+   */
+  trialOfferPackageId: 'cortex-ai' | null;
 };
 
 // Seeded defaults (libs/db baseline seed 00000000000003 + migration 00000000000004). The
@@ -70,15 +87,32 @@ function extractLogoObjectKey(logoRow: unknown): string | null {
 }
 
 export async function getOnboardingStatus(opts: {
+  isCortexAiActive?: boolean;
   isEcommerceActive: boolean;
 }): Promise<OnboardingStatus> {
   const supabase = createClient();
+
+  // Buying or activating a package is an ADMIN action (the packages page and the server
+  // actions both enforce it), so writers see the Cortex step without a purchase button.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const { data: viewerProfile } = user
+    ? await supabase.from('profiles').select('role').eq('id', user.id).maybeSingle()
+    : { data: null };
+  const viewerIsAdmin = viewerProfile?.role === 'ADMIN';
 
   const [{ data: settingRows }, { data: logoRow }, emailPublic, privacy] = await Promise.all([
     supabase
       .from('site_settings')
       .select('key, value')
-      .in('key', ['footer_copyright', 'bot_protection_public', 'onboarding_state', 'site_title']),
+      .in('key', [
+        'footer_copyright',
+        'bot_protection_public',
+        'cortex_ai_site_brief',
+        'onboarding_state',
+        'site_title',
+      ]),
     supabase
       .from('logos')
       .select('media:media_id(object_key)')
@@ -108,6 +142,15 @@ export async function getOnboardingStatus(opts: {
   const botProvider = typeof botPublic['provider'] === 'string' ? (botPublic['provider'] as string) : 'none';
   const botDone = botProvider !== 'none' && botProvider !== '';
 
+  // The Cortex site build counts as done once a build finished (brief status "built");
+  // a customized site title is the fallback signal for sites set up by hand.
+  const siteBrief = rows.get('cortex_ai_site_brief');
+  const siteBriefBuilt =
+    Boolean(siteBrief) &&
+    typeof siteBrief === 'object' &&
+    (siteBrief as { status?: unknown }).status === 'built';
+  const siteBuildDone = siteBriefBuilt || siteTitleCustomized;
+
   const steps: OnboardingStep[] = [
     {
       key: 'admin',
@@ -117,6 +160,30 @@ export async function getOnboardingStatus(opts: {
       done: true,
       optional: false,
     },
+    opts.isCortexAiActive
+      ? {
+          key: 'cortex-site-builder',
+          title: 'Build your site with Cortex AI',
+          description: `Answer a few questions in the chat and Cortex replaces the NextBlock sample content with your own pages, menus, and branding. A single landing page is fine too.${
+            viewerIsAdmin ? '' : ' An administrator runs the site builder from their dashboard.'
+          }`,
+          href: '/cms/dashboard?cortex=site-builder',
+          done: siteBuildDone,
+          optional: false,
+          // The Cortex chat that receives the "Start" event mounts for admins only.
+          ...(viewerIsAdmin ? { openSiteBuilder: true, ctaLabel: 'Start' } : { ctaHidden: true }),
+        }
+      : {
+          key: 'cortex-site-builder',
+          title: 'Build your site with Cortex AI',
+          description: `${describePackageOffer(NEXTBLOCK_PACKAGES['cortex-ai']).summary} Cortex interviews you about your business and replaces the sample content with your own pages, menus, and branding. A single landing page is fine too.${
+            viewerIsAdmin ? '' : ' Ask an administrator to start the trial from Settings → Packages.'
+          }`,
+          href: '/cms/settings/packages',
+          done: siteBuildDone,
+          optional: true,
+          ...(viewerIsAdmin ? { purchasePackageId: 'cortex-ai' as const, ctaLabel: 'Start free trial' } : { ctaHidden: true }),
+        },
     {
       key: 'branding',
       title: 'Add your branding',
@@ -224,5 +291,7 @@ export async function getOnboardingStatus(opts: {
     completed,
     total: steps.length,
     dismissed: onboardingState['dismissed'] === true,
+    viewerIsAdmin,
+    trialOfferPackageId: !opts.isCortexAiActive && viewerIsAdmin ? 'cortex-ai' : null,
   };
 }

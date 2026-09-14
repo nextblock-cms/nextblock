@@ -14,7 +14,10 @@ import { blockRegistry, BlockType } from '../../../../lib/blocks/blockRegistry';
 // A generic representation of a block object.
 // The modal primarily needs `type` to get the label and `content` for editing.
 export type Block<T = unknown> = {
-  type: BlockType;
+  // A built-in block type, or a custom block definition slug (custom instances are
+  // edited through this modal too; they have no registry entry, so `blockInfo` is
+  // optional below).
+  type: BlockType | string;
   content: T;
   [key: string]: unknown; // Allow other properties from the DB
 };
@@ -171,7 +174,7 @@ export function BlockEditorModal({
     // Potentially add validation here and set isValid
   };
 
-  const blockInfo = blockRegistry[block.type];
+  const blockInfo = blockRegistry[block.type as BlockType] as (typeof blockRegistry)[BlockType] | undefined;
   const displayText = blockInfo?.label || "Block";
   const shouldUseContextualSurface =
     (useContextualSurface ?? true) && block.type === 'text';

@@ -211,6 +211,10 @@ export default function SetupWizard({
       const signInData = new FormData();
       signInData.append('email', admin.email.trim());
       signInData.append('password', admin.password);
+      // Land the new administrator in the Cortex site builder so the first thing they
+      // do is replace the sample content with their own site. When the Cortex AI package
+      // is not active yet, the dashboard opens the free-trial dialog for that query instead.
+      signInData.append('redirect', '/cms/dashboard?cortex=site-builder');
       await signInAction(signInData);
 
       // signInAction redirects on success (and on failure, to /sign-in with a message),
@@ -471,7 +475,7 @@ function stepDescription(step: StepId, channel: DeployChannel): string {
           ? 'Using Supabase Storage (S3-compatible) for media.'
           : 'Bring your own Cloudflare R2 bucket for media storage.';
     case 'admin':
-      return 'Create the first administrator account — the last step. Email, payments, branding, and the rest are configured from your dashboard.';
+      return 'Create the first administrator account — the last step. Then, from your dashboard, let Cortex AI interview you and replace the sample content with your own site; email, payments, and the rest are configured there too.';
     default:
       return '';
   }
@@ -537,11 +541,20 @@ function SetupDone() {
       <CardHeader>
         <CardTitle>🎉 Setup complete!</CardTitle>
         <CardDescription>
-          Your administrator account is ready and the database is seeded.
+          Your administrator account is ready and the database is seeded with sample content.
+          Cortex AI can replace that sample content with your own site: it asks a few questions
+          about your business, proposes a plan, and builds the pages, menus, and branding for you.
+          Cortex AI starts with a free 30-day trial, no credit card required, and costs $250/year
+          after that. The CMS itself is free forever.
         </CardDescription>
       </CardHeader>
-      <CardContent>
-        <Button onClick={() => (window.location.href = '/cms/dashboard')}>Enter your CMS</Button>
+      <CardContent className="flex flex-wrap gap-2">
+        <Button onClick={() => (window.location.href = '/cms/dashboard?cortex=site-builder')}>
+          Build my site with Cortex AI
+        </Button>
+        <Button variant="outline" onClick={() => (window.location.href = '/cms/dashboard')}>
+          Enter your CMS
+        </Button>
       </CardContent>
     </Card>
   );

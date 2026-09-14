@@ -144,7 +144,11 @@ function requireSupabase(context?: ThemingToolContext) {
  * MCP scopes are only read/write and carry no role, so the role has to be resolved
  * from the acting user here. Fails closed: no identity means no write.
  */
-async function requireActorRole(
+/**
+ * Shared by every module whose tools must re-check the actor's CMS role: MCP runs
+ * with the service-role client, so RLS is not an authorization boundary there.
+ */
+export async function requireActorRole(
   context: ThemingToolContext | undefined,
   allowed: readonly string[],
   what: string

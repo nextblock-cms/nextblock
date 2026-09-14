@@ -20,9 +20,12 @@ import {
   executeDatabaseMutation,
   executeDeleteCmsItem,
   executeDeleteCustomBlock,
+  executeFinishSiteBuild,
   executeInsertContentBlock,
+  executeResetSiteContent,
   executeRewritePageDraft,
   executeSetContentImages,
+  executeStartSiteBuild,
   executeTranslatePage,
   executeUpdateContentBlock,
   executeUpdateCmsItemField,
@@ -30,13 +33,19 @@ import {
   executeUpdateFooter,
   executeUpdateNavigationBar,
   executeUpdateSectionColumnBlock,
+  executeUpdateSiteIdentity,
+  formatCortexSiteBriefForPrompt,
   isOpenRouterRateLimitError,
   omitUnsupportedCortexAiModelOptions,
+  readCortexSiteBrief,
   resolveCortexAiAgentSettings,
   resolveCortexAiStockPhotoProvider,
+  resolveCortexBuildSession,
   safeParseCortexAiModelSelection,
   summarizeCortexAiRoutingError,
   type CortexAiPageContext,
+  type CortexBuildSession,
+  type CortexSiteBrief,
   z,
 } from '@nextblock-cms/cortex';
 import { validateBlockContent } from '../../../../lib/blocks/blockRegistry';
@@ -132,8 +141,10 @@ const confirmedToolCallSchema = z.strictObject({
     'execute_database_mutation',
     'execute_cms_action_plan',
     'insert_content_block',
+    'reset_site_content',
     'rewrite_page_draft',
     'set_content_images',
+    'start_site_build',
     'translate_page',
     'update_cms_item_field',
     'update_content_block',
@@ -141,12 +152,23 @@ const confirmedToolCallSchema = z.strictObject({
     'update_footer',
     'update_navigation_bar',
     'update_section_column_block',
+    'update_site_identity',
   ]),
 });
 
 const globalAgentRequestSchema = z.strictObject({
+  /**
+   * The build session the client believes is open (from a start_site_build result).
+   * Honoured only when it matches the session stored server-side for THIS admin and
+   * has not expired; a stale or foreign id simply runs the request in normal mode.
+   */
+  buildSessionId: z.string().min(1).max(120).optional(),
   confirmedToolCall: confirmedToolCallSchema.optional(),
+  /** Stop button: close the build session without a model call. */
+  endBuildSession: z.boolean().optional(),
   messages: z.array(globalAgentMessageSchema).min(1).max(40),
+  /** "site-builder" = the guided interview -> plan -> build flow. */
+  mode: z.enum(['default', 'site-builder']).optional(),
   pageContext: cortexAiPageContextSchema.nullable().optional(),
 });
 
@@ -170,6 +192,7 @@ const GLOBAL_AGENT_SYSTEM_PROMPT = [
   'Use update_footer for public footer links or copyright settings.',
   'For custom/reusable block types (a "custom block", "block type", "widget", or a request to design a new kind of block such as a product card, testimonial, or feature card), use the global custom block tools, which do NOT need an open page/post/product: create_custom_block to build a new block from a description, update_custom_block to edit one by slug, delete_custom_block to remove one, and list_custom_blocks to find a slug. Never tell the user to open a page first for these; never use insert_content_block or page-aware tools to define a new block type. create_custom_block and update_custom_block run immediately; after success, tell the user the block was added to their Custom Blocks library and can now be dropped onto any page.',
   'Distinguish adding content to the current page (page-aware tools, needs page context) from defining a reusable block type (custom block tools, global, no page context).',
+  'PLACING A CUSTOM BLOCK: once a custom block definition exists (list_custom_blocks), put an instance on a page like any other block — blockType is the definition slug and content is the flat { field_key: value } map of its fields (text and rich-text fields take strings, image fields take an uploaded media object or null, relation fields take record ids). This works at the top level of create_cms_page / rewrite_page_draft / insert_content_block and nested inside a section\'s column_blocks; the content is validated against the definition before anything is written.',
   'When editing a CMS page, post, product, or block, use page-aware tools only. Use read_current_cms_item before updating content unless the user provided exact field/block data.',
   'Use update_current_cms_fields for current page/post/product metadata and product description_json. Use update_content_block for top-level page/post blocks. Use update_section_column_block for nested blocks inside section or hero blocks.',
   'When the user asks to add a visible title, heading, intro, description, or copy above/below a form or other block, use insert_content_block with a text or heading block. Do not treat visible page copy as meta_title, meta_description, or SEO metadata unless the user explicitly says SEO/meta.',
@@ -200,10 +223,61 @@ const GLOBAL_AGENT_SYSTEM_PROMPT = [
   'IMAGES: to set a page or post FEATURE image, or a PRODUCT\'s images, on an item that ALREADY exists, call set_content_images with `images` — a list of image URLs (use `mainImage` from fetch_url_content or the `url` values from search_stock_photos) and/or existing media library ids. It targets the open page/post/product by default; pass contentType plus slug/entityId/title to target any other item with no editor open. When you are CREATING the item, do not call it separately — pass `images` to create_cms_product, or feature_image_id to create_cms_page/create_cms_post, in the same call. The FIRST image is the feature image (pages/posts) or the main product image (products); for a product the remaining images become its gallery in order. External URLs are imported into the media library automatically: the CMS tools (create_cms_page, create_cms_post, update_cms_item_field) accept either a media library id or an https URL for feature_image_id and import it for you. The one exception is execute_database_mutation, which writes raw columns with no import step — never put an image URL into a feature_image_id column there, only a media id. A section hero/background image is different — that belongs to the section block and is set with update_content_block or update_section_column_block using an external image URL, not set_content_images.',
   'The home page is the page whose slug is "home" (served at "/"). When the user says "my home page" and no page context is supplied, target rewrite_page_draft with contentType "page" and slug "home".',
   'For order-status questions like "how many pending orders" or "how many trial orders", use the tool result report.matchingOrderStatus or report.orderStatusCounts, and use all_time unless the user names a specific time period.',
+  'SITE-LEVEL REQUESTS: for anything about the site as a whole ("build my website", "set up my site", "update the whole website to…", "what pages do I have?", "make everything match our brand"), call get_site_overview FIRST, then plan across pages. The site tools are update_site_identity (site title, description, keywords, per-language copyright, active logo, and the "Published with NextBlock" footer credit), save_site_brief (remember what the client wants), reset_site_content (remove the NextBlock demo content), start_site_build (approve a whole plan with ONE confirmation, then build unattended) and finish_site_build. A fresh install ships with NextBlock demo pages, posts, menus, images, a logo and the "NextBlock™ CMS" title — "remove the NextBlock content" or "start from scratch" means reset_site_content, or start_site_build with `reset` when a rebuild follows.',
+  'When a SITE BRIEF is present below, it is the client\'s intent for every site-wide change: keep names, copy, tone, colours and languages consistent with it, and update it with save_site_brief when the client changes their mind.',
+  'LANGUAGE PARITY: when more than one language is active, every page you create or rewrite gets its counterpart in each other active language (translate_page or translate_content_bulk with complete translations of every visible string), and the header and footer are updated for every language. Never leave one language with a missing page or a stale menu.',
+  'A one-page landing site is a valid outcome: the whole site is then the "home" page (rewrite_page_draft then publish_content_draft), a header with a few in-page or contact links, and a footer with the copyright line.',
   'Never invent database fields, raw SQL, markdown content, or unsupported tool arguments.',
 ].join(' ');
 
+/**
+ * The guided flow behind "Build your site with Cortex": interview, plan, build.
+ * Appended to the system prompt when the client opens the chat in site-builder mode.
+ */
+const SITE_BUILDER_MODE_PROMPT = [
+  'SITE BUILDER MODE. The operator opened this chat to set up their website from scratch with you, the way an AI website builder works. Run it in three phases and keep every message short and friendly.',
+  'PHASE 1 — INTERVIEW. Call get_site_overview first to learn what exists, which languages are active, and whether the NextBlock demo content is still present. Then ask the discovery questions in ONE message as a short numbered list, and say that short answers or "you decide" are fine: (1) the business or project name and what it does, in one or two sentences; (2) who the visitors are and the one thing they should do (call, book, buy, read, sign up); (3) the site shape: a single landing page, or several pages — and which ones (home, about, services, menu, pricing, contact, blog, shop…); (4) the languages the public site must offer (name the ones currently active); (5) brand: colours (or "pick for me"), light or dark, tone of voice, and whether they have a logo to upload later; (6) contact details and social links to show (email, phone, address, hours); (7) whether anything already on the site should be kept, or everything replaced; (8) a reference or competitor site to draw inspiration from (a URL, fetch it with fetch_url_content), and whether they sell products online. Save every answer with save_site_brief as soon as you have it (mode "merge"). Ask at most one short follow-up round for what is still missing, then choose sensible defaults for the rest and say which defaults you chose.',
+  'PHASE 2 — PLAN. Present the plan in plain language: what will be removed (the demo pages, posts, menus, images, logo and NextBlock title — unless they keep content), then each page with its sections top to bottom, the header and footer menus, the copyright line, the theme colours, and the languages. End with "Shall I build it?". When they agree, call start_site_build with `summary` = that plan, `brief` = the complete brief, and `reset` = { keepLanguages: [the languages they want] } unless they keep existing content (then omit reset). Do not call reset_site_content separately in this mode; start_site_build runs the reset and opens the build session with a single confirmation.',
+  'PHASE 3 — BUILD, as soon as start_site_build succeeds or whenever a build session is active. Work through the plan without pausing and without asking "shall I continue": (a) update_site_identity with site_title, site_description, site_keywords, footer_copyright for every language ("© {year} <name>"), and footer_show_attribution false if they want no NextBlock mention; (b) manage_language for any language that must exist; (c) manage_site_theme with the brand colours as HSL channel triplets, plus update_global_css only if a custom effect is needed; (d) if stock photos are available, search_stock_photos once per page theme and reuse the results; (e) the home page: rewrite_page_draft on contentType "page", slug "home" (it exists and is empty after the reset) with a hero and the agreed sections, then publish_content_draft; (f) every other page: create_cms_page with status "published" and full section blocks, a contact page with a form block; (g) update_navigation_bar with mode "replace" and update_footer for EVERY active language, linking the pages you created (home is "/"); (h) for each extra language, translate_content_bulk with complete translations of every visible string on every page; (i) finish_site_build with a one-paragraph summary, then tell the operator what was built with a link to each page and to /cms/pages, and remind them to upload their logo at /cms/settings/logos. Write real, specific copy from the brief — never lorem ipsum, never placeholders such as "[Your text here]".',
+].join(' ');
+
+/**
+ * Tools that keep their confirmation step even inside an approved build session:
+ * the irreversible ones, and the generic database tools whose payload the plan
+ * could not have described up front.
+ */
+const ALWAYS_CONFIRM_TOOL_NAMES = new Set([
+  'delete_cms_item',
+  'delete_custom_block',
+  'execute_database_action_plan',
+  'execute_database_mutation',
+  'manage_site_script',
+  'reset_site_content',
+  'revert_site_script',
+  'start_site_build',
+]);
+
+/**
+ * A whole-site build needs far more tool rounds than an ordinary edit (identity,
+ * theme, one call per page, publish, navigation per language, translations, finish),
+ * so an active session raises the admin's step budget to at least this.
+ */
+const BUILD_MODE_MIN_STEPS = 40;
+
+function buildBuildSessionPrompt(session: CortexBuildSession) {
+  return [
+    `AUTONOMOUS BUILD SESSION ACTIVE until ${session.expiresAt}. The operator already approved this plan: "${session.summary}".`,
+    'Every mutating tool now executes immediately, without a confirmation phrase, except destructive resets, deletions, site scripts, and raw database mutations, which still confirm.',
+    'Do not ask whether to continue — continue. Complete every remaining step of the plan in this turn, calling tools one after another. If a tool fails, correct the input and retry once, then move on and report it at the end. Never repeat a step that already succeeded (check get_site_overview if unsure). When the plan is complete, call finish_site_build and summarize what was built with links.',
+  ].join(' ');
+}
+
 type CortexAgentStreamEvent =
+  | {
+      active: boolean;
+      expiresAt?: string;
+      type: 'build-session';
+    }
   | {
       credentialSource: string;
       modelId: string;
@@ -320,17 +394,54 @@ function formatPageContextForPrompt(pageContext: CortexAiPageContext | null | un
 
 function buildGlobalAgentSystemPrompt(
   pageContext: CortexAiPageContext | null | undefined,
-  stockPhotoProvider: { provider: string } | null
+  stockPhotoProvider: { provider: string } | null,
+  site: {
+    brief: CortexSiteBrief | null;
+    buildSession: CortexBuildSession | null;
+    mode: 'default' | 'site-builder';
+  }
 ) {
   return [
     GLOBAL_AGENT_SYSTEM_PROMPT,
+    site.mode === 'site-builder' ? SITE_BUILDER_MODE_PROMPT : null,
+    site.buildSession ? buildBuildSessionPrompt(site.buildSession) : null,
+    site.brief
+      ? `SITE BRIEF (what the client wants their website to be; the source of truth for names, copy, languages and style):\n${formatCortexSiteBriefForPrompt(site.brief)}`
+      : 'No site brief is saved yet. If the user describes their business or what the site is for, record it with save_site_brief.',
     formatPageContextForPrompt(pageContext),
     stockPhotoProvider
       ? `Stock photos ARE available (provider: ${stockPhotoProvider.provider}). Use search_stock_photos for real hero and section imagery.`
       : 'No stock photo provider is configured, so DO NOT call search_stock_photos. Use gradient or theme section backgrounds instead, and only add image blocks or image backgrounds when the user supplies an image URL.',
     'When the user says "this page", "this post", "this product", "this field", or "this block", interpret that through the supplied current CMS edit context.',
-    'Do not update content outside the supplied current CMS context.',
-  ].join(' ');
+    'Do not update content outside the supplied current CMS context, except for site-level tools, which act on the whole site by design.',
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(' ');
+}
+
+/**
+ * The tool registry for one request. Inside an approved build session every tool
+ * executes without the confirmation phrase — except the always-confirm set, which is
+ * built from a second context that keeps the phrase protocol on.
+ */
+function createRequestTools(
+  context: Parameters<typeof createCortexGlobalAgentTools>[0],
+  buildSessionActive: boolean
+) {
+  if (!buildSessionActive) {
+    return createCortexGlobalAgentTools(context);
+  }
+
+  const unattended = createCortexGlobalAgentTools({ ...context, skipConfirmation: true });
+  const confirming = createCortexGlobalAgentTools(context);
+
+  for (const name of ALWAYS_CONFIRM_TOOL_NAMES) {
+    if (name in confirming) {
+      (unattended as Record<string, unknown>)[name] = (confirming as Record<string, unknown>)[name];
+    }
+  }
+
+  return unattended;
 }
 
 function serializeStreamError(error: unknown) {
@@ -742,6 +853,36 @@ function getToolCompletionMessage(toolName?: string, output?: unknown) {
       : 'I prepared the CMS action plan.';
   }
 
+  if (toolName === 'get_site_overview') {
+    return 'I reviewed the whole site.';
+  }
+
+  if (toolName === 'save_site_brief') {
+    return 'I saved that to the site brief.';
+  }
+
+  if (toolName === 'update_site_identity') {
+    return mutationExecuted ? 'Done. I updated the site identity.' : 'I prepared the site identity update.';
+  }
+
+  if (toolName === 'reset_site_content') {
+    if (isRecord(output) && output.dryRun === true) {
+      return 'Here is what a reset would remove. Nothing was changed.';
+    }
+
+    return mutationExecuted ? 'Done. I removed the content as planned.' : 'I prepared the site reset.';
+  }
+
+  if (toolName === 'start_site_build') {
+    return mutationExecuted
+      ? 'The plan is approved and the build session is open. Continuing with the build now.'
+      : 'I prepared the site build plan.';
+  }
+
+  if (toolName === 'finish_site_build') {
+    return 'The build session is closed.';
+  }
+
   return 'Done. I completed the requested update.';
 }
 
@@ -805,6 +946,12 @@ async function executeConfirmedToolCall(params: {
       return executeUpdateNavigationBar(params.input as any, params.context);
     case 'update_section_column_block':
       return executeUpdateSectionColumnBlock(params.input as any, params.context);
+    case 'reset_site_content':
+      return executeResetSiteContent(params.input as any, params.context);
+    case 'start_site_build':
+      return executeStartSiteBuild(params.input as any, params.context);
+    case 'update_site_identity':
+      return executeUpdateSiteIdentity(params.input as any, params.context);
   }
 }
 
@@ -942,6 +1089,28 @@ export async function POST(request: Request) {
     const latestUserMessage =
       [...parsedRequest.data.messages].reverse().find((message) => message.role === 'user')
         ?.content ?? '';
+    const serviceClient = getServiceRoleSupabaseClient();
+    const mode = parsedRequest.data.mode ?? 'default';
+
+    // Stop button: close the build session deterministically, no model in the loop.
+    if (parsedRequest.data.endBuildSession) {
+      await executeFinishSiteBuild(
+        { outcome: 'stopped' },
+        { actorUserId: adminAccess.userId, skipConfirmation: true, supabase: serviceClient }
+      );
+
+      return NextResponse.json({ buildSession: null, ok: true });
+    }
+
+    // A session is only honoured when the client presents the id the server issued
+    // to this admin and it has not expired. Anything else is normal mode.
+    const storedBuildSession = parsedRequest.data.buildSessionId
+      ? await resolveCortexBuildSession(serviceClient, adminAccess.userId)
+      : null;
+    const buildSession =
+      storedBuildSession && storedBuildSession.id === parsedRequest.data.buildSessionId
+        ? storedBuildSession
+        : null;
 
     if (parsedRequest.data.confirmedToolCall) {
       const confirmedToolCall = parsedRequest.data.confirmedToolCall;
@@ -1017,27 +1186,50 @@ export async function POST(request: Request) {
       selectedModel: client.modelSelection,
     });
     const modelIds = routingPolicy.modelIds;
-    const tools = createCortexGlobalAgentTools({
-      actorUserId: adminAccess.userId,
-      cortexAiApiKey: sandboxKey,
-      cortexAiModelSelection: sandboxKey && modelSelection ? modelSelection : undefined,
-      importExternalImage: importExternalImageForCortex,
-      latestUserMessage,
-      pageContext,
-      recordRevision: createCortexRevisionRecorder(adminAccess.userId),
-      supabase: getServiceRoleSupabaseClient(),
-      validateBlockContent,
-    });
-    const stockPhotoProvider = await resolveCortexAiStockPhotoProvider(
-      getServiceRoleSupabaseClient()
+    const tools = createRequestTools(
+      {
+        actorUserId: adminAccess.userId,
+        cortexAiApiKey: sandboxKey,
+        cortexAiModelSelection: sandboxKey && modelSelection ? modelSelection : undefined,
+        importExternalImage: importExternalImageForCortex,
+        latestUserMessage,
+        pageContext,
+        recordRevision: createCortexRevisionRecorder(adminAccess.userId),
+        supabase: serviceClient,
+        validateBlockContent,
+      },
+      Boolean(buildSession)
     );
-    const agentSettings = await resolveCortexAiAgentSettings(getServiceRoleSupabaseClient());
-    const systemPrompt = buildGlobalAgentSystemPrompt(pageContext, stockPhotoProvider);
+    const [stockPhotoProvider, agentSettings, siteBrief] = await Promise.all([
+      resolveCortexAiStockPhotoProvider(serviceClient),
+      resolveCortexAiAgentSettings(serviceClient),
+      readCortexSiteBrief(serviceClient),
+    ]);
+    const systemPrompt = buildGlobalAgentSystemPrompt(pageContext, stockPhotoProvider, {
+      brief: siteBrief,
+      buildSession,
+      mode,
+    });
+    const maxSteps = buildSession
+      ? Math.max(agentSettings.maxSteps, BUILD_MODE_MIN_STEPS)
+      : agentSettings.maxSteps;
 
     const stream = new ReadableStream({
       async start(controller) {
         let completed = false;
         let lastError: unknown = null;
+
+        // Tell the client whether the session it presented is still honoured, so a
+        // stale one is dropped from the thread instead of lingering in the banner.
+        if (parsedRequest.data.buildSessionId) {
+          controller.enqueue(
+            encodeStreamEvent(
+              buildSession
+                ? { active: true, expiresAt: buildSession.expiresAt, type: 'build-session' }
+                : { active: false, type: 'build-session' }
+            )
+          );
+        }
 
         for (const [index, modelId] of modelIds.entries()) {
           let textBuffer = '';
@@ -1067,7 +1259,7 @@ export async function POST(request: Request) {
               maxRetries: 0,
               // Admin-tunable step budget (Advanced settings): room for
               // read -> plan -> build/confirm multi-tool sequences.
-              stopWhen: stepCountIs(agentSettings.maxSteps),
+              stopWhen: stepCountIs(maxSteps),
               system: systemPrompt,
               temperature: agentSettings.temperature,
               tools,

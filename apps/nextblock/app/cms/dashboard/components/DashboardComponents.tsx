@@ -1,4 +1,5 @@
 import React from 'react'
+import { NEXTBLOCK_PACKAGES, describePackageOffer } from '@nextblock-cms/utils'
 import { 
   Card, CardContent, CardDescription, CardHeader, CardTitle, 
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
@@ -145,10 +146,17 @@ export function SalesLedger({ sales }: SalesLedgerProps) {
 interface PremiumCTAProps {
   hasCommerce?: boolean
   hasAi?: boolean
+  /** Package purchase and activation are admin-only; others get the public product page. */
+  isAdmin?: boolean
 }
 
-export function PremiumCTA({ hasCommerce, hasAi }: PremiumCTAProps) {
+export function PremiumCTA({ hasCommerce, hasAi, isAdmin = false }: PremiumCTAProps) {
   if (hasCommerce && hasAi) return null
+
+  const cortexOffer = describePackageOffer(NEXTBLOCK_PACKAGES['cortex-ai'])
+  const commerceOffer = describePackageOffer(NEXTBLOCK_PACKAGES.ecommerce)
+  const missing = !hasAi ? NEXTBLOCK_PACKAGES['cortex-ai'] : NEXTBLOCK_PACKAGES.ecommerce
+  const label = !hasAi ? 'Start the free Cortex AI trial' : 'Start the free Commerce Pro trial'
 
   return (
     <Card className="overflow-hidden border-primary/20 bg-gradient-to-br from-white to-slate-50 dark:from-slate-950 dark:to-slate-900">
@@ -158,7 +166,7 @@ export function PremiumCTA({ hasCommerce, hasAi }: PremiumCTAProps) {
         </div>
         <CardTitle className="text-xl">Upgrade to Premium</CardTitle>
         <CardDescription>
-          Unlock the full power of NextBlock™ with advanced capabilities.
+          The CMS is free forever. Add the packages you need, right from this dashboard.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6 pt-2">
@@ -170,30 +178,42 @@ export function PremiumCTA({ hasCommerce, hasAi }: PremiumCTAProps) {
               </div>
               <div>
                 <h4 className="text-sm font-semibold">Commerce Pro</h4>
-                <p className="text-xs text-muted-foreground">Stripe/Freemius integration, multi-currency, and auto-tax sync.</p>
+                <p className="text-xs text-muted-foreground">Stripe/Freemius checkout, multi-currency, coupons, tax and shipping. {commerceOffer.summary}</p>
               </div>
             </div>
           )}
-          
+
           {!hasAi && (
             <div className="flex items-start gap-3">
               <div className="mt-1 rounded-full bg-purple-100 p-1 dark:bg-purple-900/30">
                 <Sparkles className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400" />
               </div>
               <div>
-                <h4 className="text-sm font-semibold">AI Intelligence</h4>
-                <p className="text-xs text-muted-foreground">Bring your own OpenRouter keys. Native JSONB block generation.</p>
+                <h4 className="text-sm font-semibold">Cortex AI</h4>
+                <p className="text-xs text-muted-foreground">Build and update your whole site from a chat or MCP. {cortexOffer.summary}</p>
               </div>
             </div>
           )}
         </div>
 
-        <Button className="w-full shadow-lg shadow-primary/20 group" asChild>
-          <a href="https://nextblock.dev" target="_blank" rel="noopener noreferrer">
-            Get Started
-            <ArrowRight className="ml-2 h-4 w-4 transition-transform group-hover:translate-x-1" />
-          </a>
-        </Button>
+        {isAdmin ? (
+          <Button className="w-full shadow-lg shadow-primary/20 group" asChild>
+            <a href="/cms/settings/packages">
+              {label}
+              <ArrowRight className="ml-2 h-4 w-4 transition-transform group-hover:translate-x-1" />
+            </a>
+          </Button>
+        ) : (
+          <div className="space-y-2">
+            <Button className="w-full shadow-lg shadow-primary/20 group" asChild variant="outline">
+              <a href={missing.purchase_url} target="_blank" rel="noopener noreferrer">
+                See {missing.name} on nextblock.dev
+                <ArrowRight className="ml-2 h-4 w-4 transition-transform group-hover:translate-x-1" />
+              </a>
+            </Button>
+            <p className="text-center text-xs text-muted-foreground">An administrator activates packages from Settings → Packages.</p>
+          </div>
+        )}
       </CardContent>
     </Card>
   )

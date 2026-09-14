@@ -167,12 +167,21 @@ The package registry entry lives in `libs/utils/src/lib/nextblock-packages.ts`:
 'cortex-ai': {
   id: 'cortex-ai',
   name: 'NextBlock Cortex AI',
+  tagline: '…',
   description: 'Native JSONB block generation and OpenRouter integration.',
   fm_product_id: '28609',
   fm_plan_id: '47122',
-  purchase_url: 'https://nextblock.dev',
+  purchase_url: 'https://nextblock.dev/product/nextblock-cortex-ai-cortex-ai-license',
+  pricing: { currency: 'USD', annual: 250 },
+  trial: { days: 30, requiresPaymentMethod: false },
 }
 ```
+
+`pricing` and `trial` are what every dashboard surface quotes (`describePackageOffer`
+renders them as one consistent sentence: "Free 30-day trial, no credit card required,
+then $250/year."). They must match the Freemius plan, which is what the checkout
+actually enforces. Both packages carry the same 30-day no-card trial; a package with
+`trial: null` is quoted as a paid license and gets no trial button.
 
 Activation checks use:
 
@@ -180,12 +189,82 @@ Activation checks use:
 verifyPackageOnline('cortex-ai')
 ```
 
+The read is `unstable_cache`d for 60 s under the `package-activation` tag
+(`PACKAGE_ACTIVATION_CACHE_TAG`); `activatePackage` / `deactivatePackage` call
+`updateTag` on it and revalidate the `/cms` layout, so the chat mounts on the next
+request after a purchase rather than a minute later.
+
 Current usage:
 
 - CMS layout gates the chat with `verifyPackageOnline('cortex-ai')`.
 - Settings page reports package active/inactive.
 - Global agent route rejects requests if Cortex AI is inactive.
 - Dashboard premium CTA checks `stats.isAiActive`, now derived from active package id `cortex-ai`.
+
+### Buying from the dashboard (trial and purchase, auto-activation)
+
+`/cms/settings/packages` and the onboarding step "Build your site with Cortex AI" open
+`PackageCheckoutDialog` (`apps/nextblock/app/cms/settings/packages/PackageCheckoutDialog.tsx`).
+It states the offer (free 30-day trial, no credit card, then $250/year, plus the
+nextblock.dev product link) and opens the Freemius overlay with `@freemius/checkout`
+(`product_id` + `plan_id`, `trial: 'free'` for the trial button, `billing_cycle` for
+purchases; the CSP already allows `https://checkout.freemius.com` in `frame-src`).
+
+The overlay's `purchaseCompleted` / `success` callbacks return only ids
+(`purchase.license_id` or `trial.license_id`, `user.id`, `user.email`,
+`user.resend_email_endpoint`), never the key. Auto-activation therefore goes through
+the vendor:
+
+1. `activatePurchasedPackage` (server action) posts those ids to
+   `${NEXTBLOCK_LICENSE_SERVICE_URL ?? 'https://nextblock.dev'}/api/packages/claim-license`.
+2. That route exists in this codebase (`app/api/packages/claim-license/route.ts`) but
+   answers 404 unless `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true`, which only the vendor
+   deployment sets. With the vendor Freemius credentials it loads the license and its
+   user, and `evaluateFreemiusLicenseClaim` (`libs/ecommerce/src/lib/freemius-license-claim.ts`)
+   accepts the claim only when the license was created within the last 20 minutes
+   (checked first, so nothing about older licenses is revealed), belongs to the
+   product and to the claimed user id, whose email matches, is not cancelled, and has
+   **no activation yet** (the buyer activates right after the claim, so a second claim
+   for the same license is refused). Every refusal is the same 403 with the same
+   message; the reason is only logged on the vendor. Rate-limited per address and
+   per license, best-effort (per process).
+3. The buyer's CMS activates the returned key with `activatePackage` (same Freemius
+   `licenses/activate.json` call as a pasted key), recording `meta.nextblock`
+   `{ source: 'checkout', is_trial, trial_ends_at, plan_id, expiration }`, which the
+   packages page shows as "Trial active · ends <date>".
+
+If the claim cannot be honoured (vendor unreachable, claim refused, sandbox) the dialog
+shows the paste-your-key field and a "Resend the license email" button
+(`resendPurchasedLicenseEmail`, which only ever calls Freemius hosts). After a
+Cortex AI activation from the onboarding step the dialog offers "Build my site with
+Cortex AI now", which loads `/cms/dashboard?cortex=site-builder` so the freshly
+mounted chat starts the interview.
+
+One row per package: `activatePackage` upserts the new row and then deletes the other
+rows for the same package, and `verifyPackageOnline` no longer uses `single()`, so a
+trial-to-paid conversion or a re-purchase never leaves the package reading as inactive.
+
+### Trial expiry is enforced on the buyer's CMS
+
+`verifyPackageOnline` used to trust `status = 'active'` forever. Two things now end a
+trial (or a cancelled paid license) locally:
+
+- `isPackageActivationRowValid` (`libs/db/src/lib/package-validation.ts`) rejects a row
+  whose known expiry (`meta.nextblock.expiration`, `meta.nextblock.trial_ends_at`, or
+  the Freemius `expiration` spread into `meta`) is in the past.
+- `maybeRevalidatePackageActivations` (`apps/nextblock/lib/packages/revalidate-activations.ts`)
+  runs from the CMS layout via `after()`, at most once a day per row, and re-issues the
+  same idempotent `licenses/activate.json` call with the stored uid and key. A valid
+  license gets its expiration refreshed; one Freemius reports as expired, cancelled,
+  revoked or invalid is set to `status = 'expired'` (the packages page then shows
+  "Trial ended" / "License expired" with the buy button). Network trouble leaves the
+  row alone.
+
+Package purchase and activation are ADMIN actions: the server actions re-check the
+caller's role, the onboarding step only shows its "Start free trial" / "Start" control
+to admins, and migration `02014_package_activations_staff_read.sql` narrows the table's
+SELECT policy to ADMIN and WRITER (it was readable by every authenticated user,
+customers included, with the plaintext keys).
 
 ## Environment Variables
 
@@ -1204,7 +1283,8 @@ does not call both.
 ### Resources and prompts
 
 Resources: `cortex://schema/database`, `cortex://schema/blocks`,
-`cortex://schema/custom-blocks`. Prompts: `build-page`, `clone-from-url`,
+`cortex://schema/custom-blocks`. Prompts: `build-site` (the whole-site interview →
+plan → build flow, see "Site builder"), `build-page`, `clone-from-url`,
 `translate-content`.
 
 ### Settings and client configuration
@@ -1726,15 +1806,136 @@ through the dashboard. Rough order for a from-scratch build:
 
 | Step | Tools |
 | --- | --- |
-| Ground yourself | `get_database_schema`, `list_media`, `list_site_themes`, `list_product_categories` |
+| Ground yourself | `get_site_overview` (one call: languages, identity, every page/post/product, menus, themes, custom blocks, drafts, the saved brief, seeded-content detection); `get_database_schema` only for raw table work |
+| Remember the client | `save_site_brief` |
+| Approve the plan | `start_site_build` with `summary`, `brief`, and `reset` (one confirmation opens an unattended build session and removes the demo content) |
+| Identity | `update_site_identity` (title, description, keywords, per-language copyright, logo pin, NextBlock footer credit) |
 | Brand it | `manage_site_theme`, `update_global_css` |
 | Assets | `search_stock_media`, `upload_media` |
 | Catalogue | `manage_product_category`, `create_cms_product`, `manage_product_variants` |
-| Pages | `generate_jsonb_layout` then `publish_content_draft` |
-| Navigation | `update_site_navigation`, `update_footer` |
+| Pages | home: `generate_jsonb_layout` then `publish_content_draft`; others: `create_cms_page` with `status: "published"` |
+| Navigation | `update_site_navigation` (mode `replace`), `update_footer` — for every active language |
 | Locales | `manage_language` then `translate_content_bulk` |
 | Motion | `update_global_css` plus `manage_site_script` |
+| Close | `finish_site_build` |
 
 `manage_language` must run before any translation: `translate_page` and
 `translate_content_bulk` can only target a language that already exists and is
 active.
+
+## Site builder: interview → plan → build
+
+The "Build your site with Cortex AI" flow replaces the seeded NextBlock demo content
+with the client's own site from a single chat, the way AI-first site builders do. It
+is reachable from the dashboard onboarding checklist (first step when Cortex is
+active), from `/cms/dashboard?cortex=site-builder` (the setup wizard's "Build my site"
+button and the sign-in redirect after setup land there), from the empty-chat "Build my
+site with Cortex" button, and over MCP through the `build-site` prompt.
+
+### Pieces
+
+| Piece | Where |
+| --- | --- |
+| Site-level tools | `libs/cortex/src/lib/ai-global-agent-site-tools.ts` — `get_site_overview`, `update_site_identity`, `save_site_brief`, `reset_site_content`, `start_site_build`, `finish_site_build` |
+| Brief + build session schemas | `libs/cortex/src/lib/site-brief.ts` — stored in `site_settings` as `cortex_ai_site_brief` and `cortex_ai_build_session` |
+| Seed signatures | `NEXTBLOCK_SEED_TRANSLATION_GROUP_IDS`, `NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS` in the site tools: the fixed translation groups and bundled image keys from `02004_baseline_seed.sql` (+ `02009`). Seeded rows carry no marker column, so these are the handles |
+| Chat route | `apps/nextblock/app/api/ai/global-agent/route.ts` — `mode: "site-builder"` appends `SITE_BUILDER_MODE_PROMPT`; a valid `buildSessionId` appends the build-session prompt, raises `maxSteps` to at least `BUILD_MODE_MIN_STEPS` (40) and builds the tool registry with `skipConfirmation` for everything except `ALWAYS_CONFIRM_TOOL_NAMES`; `endBuildSession: true` closes the session with no model call; the saved brief is injected into every system prompt |
+| Chat client | `apps/nextblock/app/cms/components/CortexGlobalAgentChat.tsx` — threads carry `mode` and `buildSession`; `CORTEX_OPEN_EVENT` / `openCortexSiteBuilder()` start the flow; the `start_site_build` result's `continuePrompt` is auto-sent so the build begins without another click; a banner shows the live session with a Stop button |
+| Onboarding | `apps/nextblock/lib/onboarding/status.ts` step `cortex-site-builder` (done once the brief reaches status `built`, or the site title was customized by hand) |
+
+### The one-confirmation build
+
+In the dashboard every mutating tool confirms two-step, and a confirmed call runs
+without the model, so a 20-step build would otherwise need 20 clicks. The flow keeps
+ONE confirmation:
+
+1. Phase 1, interview: the model calls `get_site_overview`, asks the discovery
+   questions in one numbered list (business, audience and goal, one page or several,
+   languages, brand, contact details, keep or replace, reference URL / products), and
+   records answers with `save_site_brief` (mode `merge`, so partial answers are safe).
+2. Phase 2, plan: it presents the plan in plain language and calls
+   `start_site_build` with `summary`, the `brief`, and `reset` (`keepLanguages` = the
+   wanted locales). The confirmation preview shows the plan AND the reset counts.
+3. Confirm: `executeStartSiteBuild` saves the brief as `confirmed`, runs
+   `executeResetSiteContent` with `skipConfirmation`, and writes a build session
+   `{ id, actorUserId, createdAt, expiresAt, summary }`. The result carries
+   `buildSession` and `continuePrompt`; the client stores the session on the thread
+   and sends the continue prompt as the next user message.
+4. Phase 3, build: every request in that thread carries `buildSessionId`. The route
+   honours it only when the stored session belongs to the same admin and has not
+   expired (`resolveCortexBuildSession`), then runs identity → languages → theme →
+   pages → publish → navigation → footer → translations → `finish_site_build`
+   unattended. Resets, deletions, site scripts and raw database mutations still
+   confirm inside a session.
+
+Session safety: bound to the actor, time-boxed (default 60 min, max 180), closed by
+`finish_site_build`, the Stop button (`endBuildSession`), or expiry; the
+`cortex_ai_build_session` row is write-protected in the generic database tools so a
+model cannot grant itself one; over MCP confirmation is skipped anyway, so the session
+only persists the brief and runs the reset there.
+
+### reset_site_content
+
+ADMIN only, irreversible, always confirmed (the preview points at
+`/cms/settings/backup-restore`). Defaults: delete every page except the `home`
+translation group (kept but emptied, because `/` resolves by that slug), every post,
+every navigation item, the bundled demo images and the seeded logo, and blank the
+site title / description / keywords / copyright. Options: `keepPageSlugs`,
+`keepLanguages` (other languages are deactivated, never deleted, and their content
+removed), `onlySeeded` (touch only rows matching the seed signatures), `scope` flags
+for products and custom block definitions, `dryRun`. `content_drafts` has no FK to
+pages, and `navigation_items.page_id` is `ON DELETE SET NULL`, so both are deleted
+explicitly; pages/posts cascade their blocks and revisions.
+
+### What `get_site_overview` reports as "seeded"
+
+Pages and posts whose `translation_group_id` is one of the fixed seed UUIDs, media
+whose `object_key` is a bundled `images/*` demo asset, the seeded logo, the
+`NextBlock™ CMS` site title, and a copyright line containing "Nextblock CMS". The
+result's `nextSteps` tell the model what to do about it.
+
+## Validation: what Cortex checks before JSONB reaches the database
+
+The Pydantic-shaped layer here is Zod. Every layer a payload crosses:
+
+1. Tool arguments. Every tool has a `z.strictObject` input schema with `strict: true`;
+   the AI SDK rejects a call that does not match before `execute` runs, and MCP
+   serialises the same schema for `tools/list`.
+2. Block content. The typed content tools (`create_cms_page/post/product`,
+   `rewrite_page_draft`, `insert_content_block`, `update_content_block`,
+   `update_section_column_block`, `translate_page`) normalize each block
+   (`normalizeBlockContentForType`: section defaults, heading/text/button/form
+   aliases) and then validate it. Both routes inject the app's own
+   `validateBlockContent` (`apps/nextblock/lib/blocks/blockRegistry.ts`, the
+   schemas the editor and renderer use); without it the mirrored
+   `fallbackBlockSchemas` in `libs/cortex/src/lib/block-content-schemas.ts` apply.
+   Nested column blocks are validated recursively.
+3. Custom block instances. A `block_type` that is not built in must be a
+   `custom_block_definitions.slug`; the definitions are loaded on demand
+   (`withCustomBlockDefinitions`) and the flat `{ field_key: value }` content is
+   checked against the definition's fields (`validateCustomBlockInstanceContent`:
+   required fields, text / rich-text strings with length limits, image objects,
+   relation ids, no unknown keys). Nested custom blocks inside a section are admitted
+   by both the app schema and the mirror.
+4. Custom block definitions. `create_custom_block` generates JSON with
+   `output: 'no-schema'` and then validates twice (`cortexWidgetDefinitionSchema`,
+   `customBlockDefinitionCreateSchema`); Postgres re-checks `fields` and
+   `layout_schema` with `is_valid_custom_block_fields` / `is_valid_custom_block_layout_schema`.
+5. Product bodies. `description_json` goes through the editor document schema.
+6. Generic database tools. `execute_database_mutation` / `execute_database_action_plan`
+   used to accept any JSON for allow-listed columns. They now validate
+   `blocks.content` against the row's `block_type` (built-in schema or custom
+   definition, including updates, which look up the type of every targeted row) and
+   known `site_settings` values against `SITE_SETTING_VALUE_SCHEMAS`; the
+   `WRITE_PROTECTED_SITE_SETTING_KEYS` (`cortex_ai_build_session`,
+   `is_admin_created`, `migration_baseline_generation`, `security_settings`) are
+   readable but never writable there. Unknown `site_settings` keys stay open, as the
+   bag is by design.
+7. Database. Postgres enforces `check_exactly_one_parent` on `blocks`, the JSONB
+   type checks on `content_drafts`, and the custom block definition checks above.
+   There is no CHECK on `blocks.content` itself: the application layers above are
+   the guard.
+
+What is still trusted: `text.html_content` is arbitrary HTML from a trusted author
+(scripts are nonce-stamped, see "Site scripts and the CSP"), and `site_settings`
+keys without a registered schema.

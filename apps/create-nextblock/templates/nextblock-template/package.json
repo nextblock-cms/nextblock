@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/template",
-  "version": "0.17.7",
+  "version": "0.17.8",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -40,6 +40,7 @@
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
+    "@freemius/checkout": "^1.4.1",
     "@hookform/resolvers": "^5.2.2",
     "@next/third-parties": "^16.3.0",
     "@nextblock-cms/cortex": "workspace:*",

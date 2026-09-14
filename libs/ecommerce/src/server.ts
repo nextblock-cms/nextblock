@@ -10,6 +10,7 @@ export * from './lib/invoice-server';
 export * from './lib/customer-orders';
 export * from './lib/coupon-server';
 export * from './lib/freemius-coupons';
+export * from './lib/freemius-license-claim';
 export * from './lib/customer';
 export * from './lib/customer-addresses';
 export * from './lib/currency';

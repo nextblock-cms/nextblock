@@ -1,4 +1,14 @@
 import { tool } from 'ai';
+
+import {
+  isValidBlockType,
+  loadCustomBlockDefinitions,
+  validateCortexBlockContent,
+  validateCustomBlockInstanceContent,
+  type BlockContentValidator,
+  type CustomBlockDefinitionLike,
+} from './block-content-schemas';
+import { cortexSiteBriefSchema } from './site-brief';
 import { z } from './zod-config';
 
 type SupabaseLike = {
@@ -11,6 +21,12 @@ type ToolExecutionContext = {
   skipAudit?: boolean;
   skipConfirmation?: boolean;
   supabase?: SupabaseLike;
+  /**
+   * The app's block schema validator (apps/nextblock/lib/blocks/blockRegistry.ts),
+   * injected by both routes. When absent the mirrored schemas in
+   * block-content-schemas.ts apply, so `blocks.content` is never written unchecked.
+   */
+  validateBlockContent?: BlockContentValidator;
 };
 
 type TableConfig = {
@@ -45,6 +61,219 @@ const PROTECTED_SITE_SETTING_KEYS: ReadonlySet<string> = new Set([
   'email_secret',
   'payment_secret',
 ]);
+
+/**
+ * `site_settings` rows a model may read but must never write through the generic
+ * tool. None is secret; each one is a control the agent could otherwise use to
+ * change its own authority or the install's provisioning state:
+ *
+ *   cortex_ai_build_session      written only by start_site_build after a human
+ *                                confirmed a plan — a forged row would let a
+ *                                prompt-injected model skip every confirmation
+ *   is_admin_created             provisioning flag read by /setup
+ *   migration_baseline_generation schema generation marker
+ *   security_settings            2FA enforcement and similar
+ */
+const WRITE_PROTECTED_SITE_SETTING_KEYS: ReadonlySet<string> = new Set([
+  'cortex_ai_build_session',
+  'is_admin_created',
+  'migration_baseline_generation',
+  'security_settings',
+]);
+
+/**
+ * Shapes for the `site_settings` values Cortex is most likely to touch. The bag is
+ * open-ended (unknown keys stay allowed), but a known key must carry the shape the
+ * app reads, or the header, footer, or SEO metadata silently breaks.
+ */
+const SITE_SETTING_VALUE_SCHEMAS: Record<string, z.ZodTypeAny> = {
+  active_logo_id: z.string().uuid().nullable(),
+  cortex_ai_site_brief: cortexSiteBriefSchema,
+  footer_copyright: z.record(z.string().trim().min(2).max(12), z.string().max(500)),
+  footer_show_attribution: z.boolean(),
+  global_css: z.string().max(200000),
+  onboarding_state: z.record(z.string(), z.unknown()),
+  site_description: z.string().max(1000),
+  site_keywords: z.string().max(1000),
+  site_title: z.string().max(200),
+};
+
+function formatIssues(issues: Array<{ message: string; path: PropertyKey[] }>) {
+  return issues
+    .map((issue) => {
+      const path = issue.path.map(String).join('.');
+      return path ? `${path}: ${issue.message}` : issue.message;
+    })
+    .join('; ');
+}
+
+function assertValidSiteSettingValue(key: string, value: unknown) {
+  if (WRITE_PROTECTED_SITE_SETTING_KEYS.has(key)) {
+    throw new Error(`The "${key}" site setting cannot be written through Cortex AI database tools.`);
+  }
+
+  const schema = SITE_SETTING_VALUE_SCHEMAS[key];
+
+  if (!schema) {
+    return;
+  }
+
+  const result = schema.safeParse(value);
+
+  if (!result.success) {
+    throw new Error(`Invalid value for site setting "${key}": ${formatIssues(result.error.issues)}`);
+  }
+}
+
+/**
+ * Validate a `blocks.content` payload for its `block_type`: built-in types through
+ * the injected app validator (or the mirrored schemas), custom slugs through their
+ * definition's fields. Definitions are loaded once per call and only when needed.
+ */
+async function assertValidBlockRowContent(params: {
+  blockType: unknown;
+  content: unknown;
+  context?: ToolExecutionContext;
+  definitions: () => Promise<CustomBlockDefinitionLike[]>;
+  label: string;
+}) {
+  const blockType = typeof params.blockType === 'string' ? params.blockType : '';
+
+  if (!blockType) {
+    throw new Error(`${params.label}: block_type is required.`);
+  }
+
+  if (!params.content || typeof params.content !== 'object' || Array.isArray(params.content)) {
+    throw new Error(`${params.label}: content must be a JSON object.`);
+  }
+
+  const content = params.content as Record<string, unknown>;
+
+  if (isValidBlockType(blockType)) {
+    const result = validateCortexBlockContent(blockType, content, params.context);
+
+    if (!result.isValid) {
+      throw new Error(`${params.label}: content is invalid for block type "${blockType}": ${result.errors.join('; ')}`);
+    }
+
+    return;
+  }
+
+  const definition = (await params.definitions()).find((candidate) => candidate.slug === blockType);
+
+  if (!definition) {
+    throw new Error(
+      `${params.label}: "${blockType}" is neither a built-in block type nor a custom block slug. Use list_custom_blocks to see the custom block definitions.`
+    );
+  }
+
+  const result = validateCustomBlockInstanceContent(definition, content);
+
+  if (!result.isValid) {
+    throw new Error(`${params.label}: content is invalid for custom block "${blockType}": ${result.errors.join('; ')}`);
+  }
+}
+
+/**
+ * Content-aware checks that `validateMutationInput` cannot do synchronously:
+ * `blocks.content` against its block type and known `site_settings` values against
+ * their shape. Runs before the confirmation preview so a bad payload never earns a
+ * confirmation phrase.
+ */
+async function validateMutationPayloads(
+  input: z.infer<typeof executeDatabaseMutationInputSchema>,
+  table: TableName,
+  context?: ToolExecutionContext
+) {
+  if (table === 'site_settings') {
+    for (const row of input.rows ?? []) {
+      if (typeof row.key === 'string') {
+        assertValidSiteSettingValue(row.key, row.value);
+      }
+    }
+
+    if (input.operation === 'update' && input.values) {
+      const keyFromValues = typeof input.values.key === 'string' ? input.values.key : null;
+      const keyFromFilter = (input.filters ?? []).find(
+        (filter) => filter.column === 'key' && filter.operator === 'eq' && typeof filter.value === 'string'
+      );
+      const key = keyFromValues ?? (keyFromFilter ? String(keyFromFilter.value) : null);
+
+      if (key) {
+        if ('value' in input.values) {
+          assertValidSiteSettingValue(key, input.values.value);
+        } else if (WRITE_PROTECTED_SITE_SETTING_KEYS.has(key)) {
+          assertValidSiteSettingValue(key, undefined);
+        }
+      }
+    }
+
+    return;
+  }
+
+  if (table !== 'blocks') {
+    return;
+  }
+
+  let cachedDefinitions: Promise<CustomBlockDefinitionLike[]> | null = null;
+  const definitions = () => (cachedDefinitions ??= loadCustomBlockDefinitions(getSupabase(context)));
+
+  if (input.operation === 'insert' || input.operation === 'upsert') {
+    for (const [index, row] of (input.rows ?? []).entries()) {
+      await assertValidBlockRowContent({
+        blockType: row.block_type,
+        content: row.content ?? {},
+        context,
+        definitions,
+        label: `rows[${index}]`,
+      });
+    }
+
+    return;
+  }
+
+  if (input.operation === 'update' && input.values) {
+    const changesContent = 'content' in input.values;
+    const changesType = 'block_type' in input.values;
+
+    if (!changesContent && !changesType) {
+      return;
+    }
+
+    if (changesType && !changesContent) {
+      throw new Error('Changing block_type requires the new content for that type in the same update.');
+    }
+
+    // The new content must fit the type each target row will have after the update.
+    const blockTypes = new Set<string>();
+
+    if (changesType) {
+      blockTypes.add(String(input.values.block_type));
+    } else {
+      let query = getSupabase(context).from('blocks').select('id, block_type').limit(MAX_MUTATION_TARGETS + 1);
+      query = applyFilters(table, query, input.filters ?? []);
+      const { data, error } = await query;
+
+      if (error) {
+        throw new Error(`Failed to read the blocks to update: ${serializeError(error)}`);
+      }
+
+      for (const row of (Array.isArray(data) ? data : []) as Array<{ block_type?: unknown }>) {
+        blockTypes.add(String(row.block_type ?? ''));
+      }
+    }
+
+    for (const blockType of blockTypes) {
+      await assertValidBlockRowContent({
+        blockType,
+        content: input.values.content,
+        context,
+        definitions,
+        label: `values (block_type "${blockType}")`,
+      });
+    }
+  }
+}
 
 const tableConfigs = {
   blocks: {
@@ -989,6 +1218,8 @@ export async function executeDescribeDatabaseSchema(
       'No auth schema access, no arbitrary SQL, no password/secret/API-key fields.',
       'profiles, user_addresses, and cortex_ai_db_mutation_audit are read-only.',
       `Protected site_settings keys (never readable or writable): ${[...PROTECTED_SITE_SETTING_KEYS].sort().join(', ')}.`,
+      `Write-protected site_settings keys (readable, never writable here): ${[...WRITE_PROTECTED_SITE_SETTING_KEYS].sort().join(', ')}.`,
+      'blocks.content is validated against its block_type (built-in schema or custom block definition) before any insert, upsert, or update; prefer the typed content tools, which also normalize and record revisions.',
     ],
     success: true,
     tables,
@@ -1039,6 +1270,7 @@ export async function executeDatabaseMutation(
   const parsed = executeDatabaseMutationInputSchema.parse(input);
   const table = validateMutationInput(parsed);
   const supabase = getSupabase(context);
+  await validateMutationPayloads(parsed, table, context);
   const targetRows =
     parsed.operation === 'update' || parsed.operation === 'delete'
       ? await fetchMutationTargets(supabase, table, parsed.filters ?? [])
@@ -1127,6 +1359,7 @@ export async function executeDatabaseActionPlan(
 
   for (const action of parsed.actions) {
     const table = validateMutationInput(action);
+    await validateMutationPayloads(action, table, context);
     const targetRows =
       action.operation === 'update' || action.operation === 'delete'
         ? await fetchMutationTargets(getSupabase(context), table, action.filters ?? [])

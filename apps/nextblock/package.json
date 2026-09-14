@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/template",
-  "version": "0.17.7",
+  "version": "0.17.8",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -70,6 +70,7 @@
     "@vercel/toolbar": "^0.2.6",
     "ai": "^6.0.170",
     "@ai-sdk/openai-compatible": "^2.0.42",
+    "@freemius/checkout": "^1.4.1",
     "@tiptap/core": "^3.22.5",
     "papaparse": "^5.5.3",
     "fflate": "^0.8.2",

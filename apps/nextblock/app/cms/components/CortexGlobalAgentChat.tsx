@@ -9,6 +9,7 @@ import {
   Loader2,
   MessageSquarePlus,
   Send,
+  Sparkles,
   Trash2,
   Wrench,
   XCircle,
@@ -30,10 +31,20 @@ type ChatMessage = {
   role: ChatRole;
 };
 
+type ChatMode = "default" | "site-builder";
+
+type BuildSessionState = {
+  expiresAt: string;
+  id: string;
+};
+
 type ChatThread = {
+  /** Set while an approved site build runs unattended (see start_site_build). */
+  buildSession?: BuildSessionState | null;
   createdAt: string;
   id: string;
   messages: ChatMessage[];
+  mode?: ChatMode;
   title: string;
   updatedAt: string;
 };
@@ -52,7 +63,20 @@ type ConfirmedToolCall = {
   toolName: string;
 };
 
+type SendMessageOptions = {
+  confirmedToolCall?: ConfirmedToolCall;
+  displayContent?: string;
+  prompt?: string;
+  /** Send into a thread that was created in the same tick and is not in state yet. */
+  threadOverride?: ChatThread;
+};
+
 type CortexAgentStreamEvent =
+  | {
+      active: boolean;
+      expiresAt?: string;
+      type: "build-session";
+    }
   | {
       credentialSource: string;
       modelId: string;
@@ -110,24 +134,96 @@ const MUTATING_TOOL_NAMES = new Set([
   "execute_database_action_plan",
   "execute_database_mutation",
   "execute_cms_action_plan",
+  "finish_site_build",
   "insert_content_block",
+  "manage_language",
+  "manage_product_category",
+  "manage_product_variants",
+  "manage_site_theme",
+  "publish_content_draft",
+  "reset_site_content",
   "rewrite_page_draft",
+  "save_site_brief",
   "set_content_images",
+  "start_site_build",
+  "translate_content_bulk",
   "translate_page",
   "update_cms_item_field",
   "update_current_cms_fields",
   "update_content_block",
   "update_custom_block",
   "update_footer",
+  "update_global_css",
   "update_navigation_bar",
   "update_section_column_block",
+  "update_site_identity",
+  "upload_media",
 ]);
 
 // Window event fired after a Cortex mutation so client-rendered lists that fetch
 // their own data (e.g. the custom blocks library) can refresh without a full reload.
 export const CORTEX_DATA_CHANGED_EVENT = "nextblock:cortex-data-changed";
 
+/**
+ * Window event that opens the chat drawer from anywhere in the CMS. With
+ * `mode: "site-builder"` it starts a fresh thread in the guided interview -> plan ->
+ * build flow and sends the kickoff message. `/cms/dashboard?cortex=site-builder`
+ * does the same for links from the setup wizard.
+ */
+export const CORTEX_OPEN_EVENT = "nextblock:cortex-open";
+export const CORTEX_SITE_BUILDER_QUERY_VALUE = "site-builder";
+
+export function openCortexSiteBuilder() {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.dispatchEvent(new CustomEvent(CORTEX_OPEN_EVENT, { detail: { mode: "site-builder" } }));
+}
+
+const SITE_BUILDER_KICKOFF_PROMPT =
+  "I want to set up my website with you. Look at what the site has now, then interview me about my business so you can plan and build it.";
+const BUILD_CONTINUE_DISPLAY = "Continuing the build…";
+const BUILD_SESSION_STOPPED_MESSAGE =
+  "The build session is stopped. Cortex will ask for confirmation again before changing anything.";
+
 const TOOL_COPY: Record<string, { done: string; running: string }> = {
+  get_site_overview: {
+    done: "Site reviewed",
+    running: "Reviewing the whole site...",
+  },
+  save_site_brief: {
+    done: "Site brief saved",
+    running: "Saving the site brief...",
+  },
+  update_site_identity: {
+    done: "Site identity updated",
+    running: "Updating the site identity...",
+  },
+  reset_site_content: {
+    done: "Site content reset",
+    running: "Resetting the site content...",
+  },
+  start_site_build: {
+    done: "Build session started",
+    running: "Starting the site build...",
+  },
+  finish_site_build: {
+    done: "Build session closed",
+    running: "Closing the build session...",
+  },
+  publish_content_draft: {
+    done: "Draft published",
+    running: "Publishing the draft...",
+  },
+  manage_site_theme: {
+    done: "Theme updated",
+    running: "Updating the theme...",
+  },
+  translate_content_bulk: {
+    done: "Translations created",
+    running: "Translating pages...",
+  },
   search_documentation: {
     done: "Documentation searched",
     running: "Searching documentation...",
@@ -295,16 +391,31 @@ function getThreadTitle(messages: ChatMessage[]) {
   return firstUserMessage.length > 44 ? `${firstUserMessage.slice(0, 41)}...` : firstUserMessage;
 }
 
-function createChatThread(messages: ChatMessage[] = []): ChatThread {
+function createChatThread(messages: ChatMessage[] = [], mode: ChatMode = "default"): ChatThread {
   const now = new Date().toISOString();
 
   return {
+    buildSession: null,
     createdAt: now,
     id: createId(),
     messages,
-    title: getThreadTitle(messages),
+    mode,
+    title: mode === "site-builder" && messages.length === 0 ? "Build my site" : getThreadTitle(messages),
     updatedAt: now,
   };
+}
+
+function isBuildSessionState(value: unknown): value is BuildSessionState {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.expiresAt === "string" &&
+    Number.isFinite(Date.parse(value.expiresAt))
+  );
+}
+
+function isBuildSessionLive(session: BuildSessionState | null | undefined) {
+  return Boolean(session && Date.parse(session.expiresAt) > Date.now());
 }
 
 function isChatThread(thread: unknown): thread is ChatThread {
@@ -329,14 +440,19 @@ function readStoredThreads() {
     const stored = window.localStorage.getItem(THREADS_STORAGE_KEY);
     const parsed = stored ? JSON.parse(stored) : [];
     const threads = Array.isArray(parsed)
-      ? parsed.filter(isChatThread).map((thread) => {
+      ? parsed.filter(isChatThread).map((thread): ChatThread => {
           const messages = sanitizeMessages(thread.messages);
           const now = new Date().toISOString();
 
           return {
+            buildSession:
+              isBuildSessionState(thread.buildSession) && isBuildSessionLive(thread.buildSession)
+                ? thread.buildSession
+                : null,
             createdAt: typeof thread.createdAt === "string" ? thread.createdAt : now,
             id: thread.id,
             messages,
+            mode: thread.mode === "site-builder" ? "site-builder" : "default",
             title: typeof thread.title === "string" ? thread.title : getThreadTitle(messages),
             updatedAt: typeof thread.updatedAt === "string" ? thread.updatedAt : now,
           };
@@ -837,6 +953,9 @@ export function CortexGlobalAgentChat() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const pendingRefreshPathRef = useRef<string | null>(null);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
+  // A site-builder start requested (event or URL) before the threads were loaded.
+  const pendingSiteBuilderRef = useRef(false);
+  const sendMessageRef = useRef<((options?: SendMessageOptions) => Promise<void>) | null>(null);
 
   useEffect(() => {
     const storedThreads = readStoredThreads();
@@ -891,6 +1010,79 @@ export function CortexGlobalAgentChat() {
     pendingRefreshPathRef.current = null;
     router.refresh();
   }, [pathname, router]);
+
+  // Start the guided site build: new thread in site-builder mode, drawer open, and
+  // the kickoff message sent so the interview begins without the user typing.
+  const startSiteBuilder = () => {
+    if (!isMounted) {
+      pendingSiteBuilderRef.current = true;
+      return;
+    }
+
+    if (isStreaming) {
+      return;
+    }
+
+    const thread = createChatThread([], "site-builder");
+
+    setThreads((currentThreads) => [thread, ...currentThreads].slice(0, MAX_STORED_THREADS));
+    setActiveThreadId(thread.id);
+    setInput("");
+    setStreamError(null);
+    setToolActivities([]);
+    setCancelledConfirmationKeys(new Set());
+    setShowHistory(false);
+    setOpen(true);
+    window.setTimeout(() => {
+      void sendMessageRef.current?.({
+        prompt: SITE_BUILDER_KICKOFF_PROMPT,
+        threadOverride: thread,
+      });
+    }, 0);
+  };
+  const startSiteBuilderRef = useRef(startSiteBuilder);
+  startSiteBuilderRef.current = startSiteBuilder;
+
+  useEffect(() => {
+    const handleOpen = (event: Event) => {
+      const detail = (event as CustomEvent<{ mode?: string }>).detail;
+
+      if (detail?.mode === "site-builder") {
+        startSiteBuilderRef.current();
+      } else {
+        setOpen(true);
+      }
+    };
+
+    window.addEventListener(CORTEX_OPEN_EVENT, handleOpen);
+
+    return () => window.removeEventListener(CORTEX_OPEN_EVENT, handleOpen);
+  }, []);
+
+  useEffect(() => {
+    // Read the query from the window rather than useSearchParams so this client
+    // component never forces a Suspense boundary on the CMS pages that mount it.
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+
+    if (params.get("cortex") !== CORTEX_SITE_BUILDER_QUERY_VALUE) {
+      return;
+    }
+
+    // Consume the query so a reload does not restart the interview.
+    router.replace(pathname || "/cms/dashboard");
+    startSiteBuilderRef.current();
+  }, [pathname, router]);
+
+  useEffect(() => {
+    if (isMounted && pendingSiteBuilderRef.current) {
+      pendingSiteBuilderRef.current = false;
+      startSiteBuilderRef.current();
+    }
+  }, [isMounted]);
 
   const activeThread = useMemo(
     () => threads.find((thread) => thread.id === activeThreadId) ?? null,
@@ -964,6 +1156,12 @@ export function CortexGlobalAgentChat() {
 
       return [updatedThread, ...remainingThreads].slice(0, MAX_STORED_THREADS);
     });
+  };
+
+  const patchThread = (threadId: string, patch: Partial<Pick<ChatThread, "buildSession" | "mode">>) => {
+    setThreads((currentThreads) =>
+      currentThreads.map((thread) => (thread.id === threadId ? { ...thread, ...patch } : thread))
+    );
   };
 
   const createNewThread = () => {
@@ -1124,17 +1322,16 @@ export function CortexGlobalAgentChat() {
     }
   };
 
-  const sendMessage = async (options?: {
-    confirmedToolCall?: ConfirmedToolCall;
-    displayContent?: string;
-    prompt?: string;
-  }) => {
+  const sendMessage = async (options?: SendMessageOptions) => {
     const prompt = (options?.prompt ?? input).trim();
     const displayContent = (options?.displayContent ?? prompt).trim();
 
     if (!prompt || isStreaming) {
       return;
     }
+
+    // A thread created in the same tick (site-builder kickoff) is not in state yet.
+    const targetThread = options?.threadOverride ?? activeThread;
 
     const userMessage: ChatMessage = {
       content: displayContent || prompt,
@@ -1146,12 +1343,16 @@ export function CortexGlobalAgentChat() {
       id: createId(),
       role: "assistant",
     };
-    let threadId = activeThread?.id ?? activeThreadId;
-    const currentMessages = activeThread?.messages ?? [];
+    let threadId = targetThread?.id ?? activeThreadId;
+    const currentMessages = targetThread?.messages ?? [];
     const requestMessages = [...currentMessages, userMessage].slice(-20).map(({ content, role }) => ({
       content,
       role,
     }));
+    const threadMode: ChatMode = targetThread?.mode === "site-builder" ? "site-builder" : "default";
+    const threadBuildSession = isBuildSessionLive(targetThread?.buildSession)
+      ? targetThread?.buildSession ?? null
+      : null;
     const abortController = new AbortController();
     let timedOut = false;
     let idleTimeoutId: number | undefined;
@@ -1189,6 +1390,30 @@ export function CortexGlobalAgentChat() {
     setShowHistory(false);
     let shouldRefreshAfterMutation = false;
     let navigationPath: string | null = null;
+    // start_site_build hands back the next instruction once the operator confirmed;
+    // it is sent automatically so the build begins without another click.
+    let continuePrompt: string | null = null;
+    const noteToolResult = (event: Extract<CortexAgentStreamEvent, { type: "tool-result" }>) => {
+      if (!isRecord(event.output) || !threadId) {
+        return;
+      }
+
+      if (event.toolName === "start_site_build" && event.output.mutationExecuted === true) {
+        const session = event.output.buildSession;
+
+        if (isBuildSessionState(session)) {
+          patchThread(threadId, { buildSession: session });
+        }
+
+        if (typeof event.output.continuePrompt === "string" && event.output.continuePrompt.trim()) {
+          continuePrompt = event.output.continuePrompt;
+        }
+      }
+
+      if (event.toolName === "finish_site_build" && event.output.buildSessionEnded === true) {
+        patchThread(threadId, { buildSession: null });
+      }
+    };
 
     try {
       const headers: Record<string, string> = {
@@ -1208,8 +1433,10 @@ export function CortexGlobalAgentChat() {
 
       const response = await fetch("/api/ai/global-agent", {
         body: JSON.stringify({
+          ...(threadBuildSession ? { buildSessionId: threadBuildSession.id } : {}),
           ...(options?.confirmedToolCall ? { confirmedToolCall: options.confirmedToolCall } : {}),
           messages: requestMessages,
+          ...(threadMode === "site-builder" ? { mode: threadMode } : {}),
           ...(pageContext ? { pageContext } : {}),
         }),
         headers,
@@ -1254,6 +1481,19 @@ export function CortexGlobalAgentChat() {
               shouldRefreshAfterMutation = true;
             }
 
+            if (event.type === "tool-result") {
+              noteToolResult(event);
+            }
+
+            if (event.type === "build-session" && threadId) {
+              patchThread(threadId, {
+                buildSession:
+                  event.active && event.expiresAt && threadBuildSession
+                    ? { ...threadBuildSession, expiresAt: event.expiresAt }
+                    : null,
+              });
+            }
+
             applyStreamEvent(event, assistantMessage.id, threadId);
 
             if (event.type === "finish") {
@@ -1276,6 +1516,10 @@ export function CortexGlobalAgentChat() {
           ) {
             navigationPath = getToolOutputNavigationPath(event.output) || navigationPath;
             shouldRefreshAfterMutation = true;
+          }
+
+          if (event.type === "tool-result") {
+            noteToolResult(event);
           }
 
           applyStreamEvent(event, assistantMessage.id, threadId);
@@ -1338,11 +1582,65 @@ export function CortexGlobalAgentChat() {
       setIsStreaming(false);
       abortControllerRef.current = null;
     }
+
+    if (continuePrompt && threadId) {
+      const nextPrompt = continuePrompt;
+      const nextThreadId = threadId;
+
+      // Let React commit the session + messages first, then kick off the build turn.
+      window.setTimeout(() => {
+        setThreads((currentThreads) => {
+          const thread = currentThreads.find((entry) => entry.id === nextThreadId);
+
+          if (thread) {
+            void sendMessageRef.current?.({
+              displayContent: BUILD_CONTINUE_DISPLAY,
+              prompt: nextPrompt,
+              threadOverride: thread,
+            });
+          }
+
+          return currentThreads;
+        });
+      }, 0);
+    }
   };
+  sendMessageRef.current = sendMessage;
 
   const stopStreaming = () => {
     abortControllerRef.current?.abort();
     setIsStreaming(false);
+  };
+
+  const stopBuildSession = async () => {
+    const thread = activeThread;
+
+    if (!thread?.buildSession) {
+      return;
+    }
+
+    abortControllerRef.current?.abort();
+    setIsStreaming(false);
+
+    try {
+      await fetch("/api/ai/global-agent", {
+        body: JSON.stringify({
+          buildSessionId: thread.buildSession.id,
+          endBuildSession: true,
+          messages: [{ content: "Stop the site build.", role: "user" }],
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+    } catch {
+      // The session expires on its own; clearing it locally is what matters here.
+    }
+
+    patchThread(thread.id, { buildSession: null });
+    updateThreadMessages(thread.id, (threadMessages) => [
+      ...threadMessages,
+      { content: BUILD_SESSION_STOPPED_MESSAGE, id: createId(), role: "assistant" },
+    ]);
   };
 
   const cancelToolCall = (activity: ToolActivity) => {
@@ -1433,6 +1731,25 @@ export function CortexGlobalAgentChat() {
           </div>
         </div>
 
+        {activeThread?.buildSession && isBuildSessionLive(activeThread.buildSession) && (
+          <div className="flex items-center gap-2 border-b border-primary/20 bg-primary/5 px-4 py-2 text-xs text-foreground">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-primary" />
+            <span className="min-w-0 flex-1">
+              Building your site — Cortex applies the approved plan without asking. If it stops early,
+              type “continue”. Expires {formatThreadTime(activeThread.buildSession.expiresAt)}.
+            </span>
+            <Button
+              className="h-7 shrink-0 rounded-md px-2.5 text-xs"
+              onClick={() => void stopBuildSession()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              Stop
+            </Button>
+          </div>
+        )}
+
         {showHistory && (
           <div className="max-h-64 overflow-y-auto border-b border-slate-200 bg-slate-50 px-3 py-3 dark:border-slate-800 dark:bg-slate-950">
             <div className="space-y-1">
@@ -1478,8 +1795,21 @@ export function CortexGlobalAgentChat() {
 
         <div ref={scrollAreaRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
           {messages.length === 0 ? (
-            <div className="flex h-full min-h-[320px] items-center justify-center text-center text-sm text-slate-500 dark:text-slate-400">
-              {activeThread?.title || "New chat"}
+            <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-3 text-center text-sm text-slate-500 dark:text-slate-400">
+              <span>{activeThread?.title || "New chat"}</span>
+              {activeThread?.mode !== "site-builder" && (
+                <Button
+                  className="h-8 rounded-md text-xs"
+                  disabled={isStreaming}
+                  onClick={() => startSiteBuilderRef.current()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                  Build my site with Cortex
+                </Button>
+              )}
             </div>
           ) : (
             messages.map((message) => <MessageBubble key={message.id} message={message} />)

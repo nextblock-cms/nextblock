@@ -9,7 +9,10 @@ import { formatPrice } from "@nextblock-cms/utils"
 
 export default async function CmsDashboardPage() {
   const stats = await getDashboardStats();
-  const onboarding = await getOnboardingStatus({ isEcommerceActive: stats.isEcommerceActive });
+  const onboarding = await getOnboardingStatus({
+    isCortexAiActive: stats.isAiActive,
+    isEcommerceActive: stats.isEcommerceActive,
+  });
 
   const isEcommerce = stats.isEcommerceActive;
 
@@ -158,9 +161,10 @@ export default async function CmsDashboardPage() {
 
         {/* Sidebar Section */}
         <div className="space-y-6">
-          <PremiumCTA 
-            hasCommerce={stats.isEcommerceActive} 
-            hasAi={stats.isAiActive} 
+          <PremiumCTA
+            hasCommerce={stats.isEcommerceActive}
+            hasAi={stats.isAiActive}
+            isAdmin={onboarding.viewerIsAdmin}
           />
 
           <Card>

@@ -5,6 +5,7 @@ import CmsClientLayout from "./CmsClientLayout";
 import { verifyPackageOnline, createClient } from '@nextblock-cms/db/server';
 import { evaluateTwoFactor, getStaffTwoFactorReminder } from '../../lib/auth/twoFactor';
 import { maybeRefreshUpstreamStatus } from '../../lib/updates/check-upstream';
+import { maybeRevalidatePackageActivations } from '../../lib/packages/revalidate-activations';
 import { getPaymentsReminder } from '../../lib/cms/payments-reminder';
 import { getUnreadMessageCount } from '../../lib/cms/unread-messages';
 import { getContactReminder } from '../../lib/cms/contact-reminder';
@@ -84,6 +85,9 @@ export default async function CmsLayout({
   // (throttled to ~6h, see maybeRefreshUpstreamStatus). This keeps the banner current
   // without a cron — so it works on Vercel Hobby (limited crons) and self-hosted alike.
   after(() => maybeRefreshUpstreamStatus());
+  // Same pattern for package licenses: once a day, ask Freemius whether each activated
+  // license (a free trial in particular) is still valid, and switch it off when not.
+  after(() => maybeRevalidatePackageActivations());
 
   return (
     <CmsClientLayout

@@ -12617,6 +12617,27 @@ REVOKE EXECUTE ON FUNCTION public.update_product_ratings() FROM PUBLIC, anon, au
 GRANT EXECUTE ON FUNCTION public.update_product_ratings() TO service_role;
 
 
+-- >>> FROM: 02014_package_activations_staff_read.sql <<<
+-- 02014: package_activations is readable by staff only.
+--
+-- The baseline granted SELECT on package_activations to every authenticated user
+-- ("Allow authenticated read access" USING (true)). Public sign-up creates USER-role
+-- accounts, so any storefront customer could read the plaintext license keys and the
+-- Freemius install handles (meta.fm_uid / meta.fm_install_id) of the premium packages —
+-- and the dashboard now buys and stores those keys itself. Only staff surfaces read
+-- this table with the cookie client (the dashboard stats for ADMIN and WRITER, the
+-- packages page for ADMIN); everything else goes through the service role, which is
+-- unaffected. Writes were never allowed to authenticated users and stay that way.
+
+DROP POLICY IF EXISTS "Allow authenticated read access" ON public.package_activations;
+
+CREATE POLICY "Staff read package activations" ON public.package_activations
+  FOR SELECT TO authenticated
+  USING (
+    (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role])
+  );
+
+
   -- Step D: Record the applied migrations in history (truncated in Step B) so
   -- \`npm run db:migrate:check\` reports up to date instead of listing every file as pending.
   INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES
@@ -12633,7 +12654,8 @@ GRANT EXECUTE ON FUNCTION public.update_product_ratings() TO service_role;
     ('02010', 'shop_hero_redesign'),
     ('02011', 'drop_backdrop_blur_on_pages'),
     ('02012', 'drop_variant_backdrop_blur'),
-    ('02013', 'advisor_rls_and_trigger_grants')
+    ('02013', 'advisor_rls_and_trigger_grants'),
+    ('02014', 'package_activations_staff_read')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles

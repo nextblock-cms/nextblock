@@ -137,8 +137,12 @@ const BackgroundSchema = z.object({
   }).optional(),
 });
 
+// A nested block is a built-in type or a custom block definition slug: the
+// SectionBlockRenderer resolves a non-built-in block_type through
+// custom_block_definitions, so the schema must admit those slugs too (pattern
+// mirrors the custom_block_definitions_slug_check constraint).
 const BlockInColumnSchema = z.object({
-  block_type: z.enum(availableBlockTypes),
+  block_type: z.union([z.enum(availableBlockTypes), z.string().regex(/^[a-z][a-z0-9-]*$/)]),
   content: z.record(z.string(), z.any()),
   temp_id: z.string().optional(),
 });

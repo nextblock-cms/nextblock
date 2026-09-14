@@ -20,11 +20,11 @@ export function ActivationForm() {
     setErrorMsg(null);
     try {
       const res = await activatePackage(key);
-      if (res?.error) {
+      if ('error' in res) {
         toast.error(res.error);
         setErrorMsg(res.error);
       } else {
-        toast.success(`Package "${res?.package}" activated successfully!`);
+        toast.success(`Package "${res.package}" activated successfully!`);
         setKey('');
         setErrorMsg(null);
       }

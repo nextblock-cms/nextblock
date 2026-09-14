@@ -1,7 +1,8 @@
 'use client';
 
 import Link from 'next/link';
-import { useTransition } from 'react';
+import { useRouter } from 'next/navigation';
+import { useEffect, useState, useTransition } from 'react';
 import {
   Button,
   Card,
@@ -10,9 +11,12 @@ import {
   CardHeader,
   CardTitle,
 } from '@nextblock-cms/ui';
-import { ArrowRight, CheckCircle2, Circle, X } from 'lucide-react';
+import { ArrowRight, CheckCircle2, Circle, Sparkles, X } from 'lucide-react';
+import { NEXTBLOCK_PACKAGES, type PackageId } from '@nextblock-cms/utils';
 import type { OnboardingStatus } from '../../../../lib/onboarding/status';
 import ConnectGitHubButton from '../../components/ConnectGitHubButton';
+import { CORTEX_SITE_BUILDER_QUERY_VALUE, openCortexSiteBuilder } from '../../components/CortexGlobalAgentChat';
+import { PackageCheckoutDialog } from '../../settings/packages/PackageCheckoutDialog';
 
 export default function DashboardOnboarding({
   status,
@@ -22,8 +26,47 @@ export default function DashboardOnboarding({
   dismissAction: (dismissed: boolean) => Promise<void>;
 }) {
   const [isPending, startTransition] = useTransition();
+  const router = useRouter();
+  const [checkoutPackageId, setCheckoutPackageId] = useState<PackageId | null>(null);
+  const trialOfferPackageId = status.trialOfferPackageId;
 
-  if (status.dismissed) return null;
+  // The setup wizard and the sign-in redirect land on ?cortex=site-builder. When Cortex
+  // is not active yet nothing else consumes that query (the chat is not mounted), so
+  // open the trial dialog here — whatever the checklist state — and clean the URL.
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+
+    if (params.get('cortex') !== CORTEX_SITE_BUILDER_QUERY_VALUE) {
+      return;
+    }
+
+    if (!trialOfferPackageId) {
+      // Cortex is active (the chat handles the query) or the viewer cannot buy: leave it.
+      return;
+    }
+
+    router.replace('/cms/dashboard');
+    setCheckoutPackageId(trialOfferPackageId);
+  }, [router, trialOfferPackageId]);
+
+  const checkoutPackage = checkoutPackageId ? NEXTBLOCK_PACKAGES[checkoutPackageId] : null;
+  const checkoutDialog = checkoutPackage ? (
+    <PackageCheckoutDialog
+      intent={checkoutPackage.id === 'cortex-ai' ? 'site-builder' : 'default'}
+      onOpenChange={(open) => {
+        if (!open) setCheckoutPackageId(null);
+      }}
+      open
+      pkg={checkoutPackage}
+    />
+  ) : null;
+
+  // A dismissed checklist still honours the deep link: the dialog renders on its own.
+  if (status.dismissed) return checkoutDialog;
 
   const pct = status.total > 0 ? Math.round((status.completed / status.total) * 100) : 0;
   const allDone = status.completed >= status.total;
@@ -36,6 +79,7 @@ export default function DashboardOnboarding({
 
   return (
     <Card className="border-primary/30 bg-primary/[0.03]">
+      {checkoutDialog}
       <CardHeader className="pb-3">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
@@ -102,19 +146,41 @@ export default function DashboardOnboarding({
                 </div>
                 <p className="text-xs text-muted-foreground">{step.description}</p>
               </div>
-              {!step.done && step.key !== 'admin' && (
+              {!step.done && step.key !== 'admin' && !step.ctaHidden && (
                 step.connectGithub ? (
                   <ConnectGitHubButton />
+                ) : step.openSiteBuilder ? (
+                  <Button
+                    variant="default"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => openCortexSiteBuilder()}
+                    type="button"
+                  >
+                    <Sparkles className="mr-1 h-3.5 w-3.5" />
+                    {step.ctaLabel ?? 'Start'}
+                  </Button>
+                ) : step.purchasePackageId ? (
+                  <Button
+                    variant="default"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => setCheckoutPackageId(step.purchasePackageId as PackageId)}
+                    type="button"
+                  >
+                    <Sparkles className="mr-1 h-3.5 w-3.5" />
+                    {step.ctaLabel ?? 'Start free trial'}
+                  </Button>
                 ) : (
                   <Button asChild variant="outline" size="sm" className="shrink-0">
                     {step.isExternal ? (
                       <a href={step.href} target="_blank" rel="noopener noreferrer">
-                        Set up
+                        {step.ctaLabel ?? 'Set up'}
                         <ArrowRight className="ml-1 h-3.5 w-3.5" />
                       </a>
                     ) : (
                       <Link href={step.href}>
-                        Set up
+                        {step.ctaLabel ?? 'Set up'}
                         <ArrowRight className="ml-1 h-3.5 w-3.5" />
                       </Link>
                     )}

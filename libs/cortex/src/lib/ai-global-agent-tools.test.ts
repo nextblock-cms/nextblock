@@ -164,6 +164,7 @@ type MockDatabase = {
   blocks: MockRow[];
   content_drafts: MockRow[];
   currencies: MockRow[];
+  custom_block_definitions: MockRow[];
   languages: MockRow[];
   navigation_items: MockRow[];
   pages: MockRow[];
@@ -352,6 +353,7 @@ function createMockSupabase(overrides?: Partial<MockDatabase>) {
     blocks: [],
     content_drafts: [],
     currencies: [{ code: 'USD', id: 1, is_active: true, is_default: true }],
+    custom_block_definitions: [],
     languages: [{ code: 'en', id: 1 }],
     navigation_items: [
       { id: 1, label: 'Old', language_id: 1, menu_key: 'HEADER', order: 0, url: '/old' },
@@ -3588,5 +3590,128 @@ describe('Cortex AI global agent tool executors', () => {
     expect(database.products).toEqual([
       { id: 'prod_2', slug: 'studio-hat', title: 'Studio Hat' },
     ]);
+  });
+});
+
+describe('custom block instances in the typed content tools', () => {
+  const promoCard = {
+    fields: [
+      { key: 'headline', required: true, type: 'text' },
+      { key: 'body', type: 'rich-text' },
+      { key: 'photo', type: 'image_r2' },
+    ],
+    name: 'Promo card',
+    slug: 'promo-card',
+  };
+
+  it('creates a page with a custom block at the top level and nested in a section', async () => {
+    const { database, supabase } = createMockSupabase({ custom_block_definitions: [promoCard] });
+
+    const result = await executeConfirmed(
+      executeCreateCmsPage,
+      {
+        blocks: [
+          {
+            blockType: 'section',
+            content: {
+              column_blocks: [
+                [
+                  { block_type: 'heading', content: { level: 2, text_content: 'Deals' } },
+                  { block_type: 'promo-card', content: { headline: 'Spring sale', body: '<p>20% off</p>' } },
+                ],
+              ],
+            },
+          },
+          { blockType: 'promo-card', content: { headline: 'Members only', photo: null } },
+        ],
+        status: 'published',
+        title: 'Deals',
+      },
+      { actorUserId: 'admin-1', revalidatePath: () => undefined, supabase }
+    );
+
+    expect(result).toMatchObject({ blockCount: 2, mutationExecuted: true, success: true });
+    const blocks = database.blocks.sort((a, b) => a.order - b.order);
+    expect(blocks[0].block_type).toBe('section');
+    expect(blocks[0].content.column_blocks[0][1]).toMatchObject({
+      block_type: 'promo-card',
+      content: { body: '<p>20% off</p>', headline: 'Spring sale' },
+    });
+    expect(blocks[1]).toMatchObject({ block_type: 'promo-card', content: { headline: 'Members only', photo: null } });
+  });
+
+  it('refuses an unknown slug and content that does not match the definition', async () => {
+    const { supabase } = createMockSupabase({ custom_block_definitions: [promoCard] });
+    const context = { actorUserId: 'admin-1', supabase };
+
+    await expect(
+      executeCreateCmsPage(
+        { blocks: [{ blockType: 'no-such-block', content: { headline: 'x' } }], title: 'Bad' },
+        context
+      )
+    ).rejects.toThrow(/unsupported block type "no-such-block"/);
+
+    await expect(
+      executeCreateCmsPage(
+        { blocks: [{ blockType: 'promo-card', content: { title: 'Wrong key' } }], title: 'Bad' },
+        context
+      )
+    ).rejects.toThrow(/Unknown field "title".*Field "headline" is required/);
+
+    await expect(
+      executeCreateCmsPage(
+        {
+          blocks: [
+            {
+              blockType: 'section',
+              content: { column_blocks: [[{ block_type: 'promo-card', content: { headline: 42 } }]] },
+            },
+          ],
+          title: 'Bad',
+        },
+        context
+      )
+    ).rejects.toThrow(/"headline" must be a string/);
+  });
+
+  it('translates the text fields of a custom block when translating a page', async () => {
+    const { database, supabase } = createMockSupabase({
+      blocks: [
+        {
+          block_type: 'promo-card',
+          content: { body: '<p>Fresh bread daily.</p>', headline: 'Spring sale', photo: null },
+          id: 10,
+          language_id: 1,
+          order: 0,
+          page_id: 7,
+          post_id: null,
+        },
+      ],
+      custom_block_definitions: [promoCard],
+      languages: [
+        { code: 'en', id: 1, is_default: true },
+        { code: 'fr', id: 2 },
+      ],
+      pages: [
+        { id: 7, language_id: 1, slug: 'deals', status: 'published', title: 'Deals', translation_group_id: 'group-deals' },
+      ],
+    });
+
+    await executeConfirmed(
+      executeTranslatePage,
+      {
+        targetLanguageCode: 'fr',
+        title: 'Aubaines',
+        translations: { 'Fresh bread daily.': 'Du pain frais chaque jour.', 'Spring sale': 'Vente de printemps' },
+      },
+      { actorUserId: 'admin-1', pageContext: { contentType: 'page', entityId: 7 }, revalidatePath: () => undefined, supabase }
+    );
+
+    const frPage = database.pages.find((page) => page.language_id === 2);
+    const frBlock = database.blocks.find((block) => block.page_id === frPage?.id);
+    expect(frBlock).toMatchObject({
+      block_type: 'promo-card',
+      content: { body: '<p>Du pain frais chaque jour.</p>', headline: 'Vente de printemps', photo: null },
+    });
   });
 });

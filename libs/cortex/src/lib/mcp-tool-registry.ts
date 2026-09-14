@@ -1,5 +1,5 @@
 import { createCortexGlobalAgentTools } from './ai-global-agent-tools';
-import { availableCortexAiBlockTypes } from './ai-global-agent-tools';
+import { availableCortexAiBlockTypes } from './block-content-schemas';
 import { z } from './zod-config';
 import type { CortexAiMcpScope } from './mcp-tokens';
 
@@ -46,6 +46,8 @@ export const CORTEX_MCP_TOOL_KINDS = {
   execute_database_mutation: 'write',
   fetch_ecommerce_stats: 'read',
   fetch_url_content: 'read',
+  finish_site_build: 'write',
+  get_site_overview: 'read',
   insert_content_block: 'write',
   list_custom_blocks: 'read',
   list_media: 'read',
@@ -62,11 +64,14 @@ export const CORTEX_MCP_TOOL_KINDS = {
   publish_content_draft: 'write',
   read_current_cms_item: 'read',
   read_database_records: 'read',
+  reset_site_content: 'write',
   revert_site_script: 'write',
   rewrite_page_draft: 'write',
+  save_site_brief: 'write',
   search_documentation: 'read',
   search_stock_photos: 'read',
   set_content_images: 'write',
+  start_site_build: 'write',
   translate_content_bulk: 'write',
   translate_page: 'write',
   update_cms_item_field: 'write',
@@ -78,6 +83,7 @@ export const CORTEX_MCP_TOOL_KINDS = {
   update_global_css: 'write',
   update_navigation_bar: 'write',
   update_section_column_block: 'write',
+  update_site_identity: 'write',
 } as const satisfies Record<string, CortexAiMcpScope>;
 
 export type CortexMcpCanonicalToolName = keyof typeof CORTEX_MCP_TOOL_KINDS;
@@ -458,6 +464,20 @@ export async function readCortexMcpResource(params: {
 export const CORTEX_MCP_PROMPTS = [
   {
     arguments: [
+      {
+        description:
+          'Everything known about the client and the site they want: business, audience, goals, pages (or "one landing page"), languages, brand, contact details. Leave blank to be asked.',
+        name: 'brief',
+        required: false,
+      },
+    ],
+    description:
+      'Build (or rebuild) the whole NextBlock site from a brief: remove the sample content, set the identity and theme, create and publish every page, the menus, the footer, and the translations.',
+    name: 'build-site',
+    title: 'Build the whole site',
+  },
+  {
+    arguments: [
       { description: 'What the page is for, and any brand or tone notes.', name: 'brief', required: true },
       { description: 'Slug of the page or post to rewrite, e.g. "home".', name: 'slug', required: true },
     ],
@@ -489,6 +509,21 @@ export const CORTEX_MCP_PROMPTS = [
 ] as const;
 
 const PROMPT_BODIES: Record<string, (args: Record<string, string>) => string> = {
+  'build-site': (args) =>
+    [
+      'Build the whole NextBlock site for this client.',
+      '',
+      args['brief']?.trim()
+        ? `Brief:\n${args['brief']}`
+        : 'No brief was given: first ask, in one short numbered list, about the business and what it does, the audience and the one action visitors should take, the site shape (one landing page or which pages), the languages, brand colours and tone, contact details, and whether existing content is kept.',
+      '',
+      'Process:',
+      '1. Call get_site_overview to see what exists, the active languages, and whether the NextBlock demo content is still present. Record what you know with save_site_brief.',
+      '2. Present the plan (what is removed, every page with its sections, menus, footer, theme, languages) and call start_site_build with `summary`, `brief`, and `reset` (keepLanguages = the languages wanted) unless existing content is kept. Over MCP the host approves the call; there is no chat confirmation.',
+      '3. Build: update_site_identity; manage_language as needed; manage_site_theme with the brand colours; search_stock_media for imagery when available; rewrite the empty "home" page with generate_jsonb_layout then publish_content_draft; create_cms_page (status "published") for every other page; update_site_navigation (mode "replace") and update_footer for every language; translate_content_bulk for each extra language.',
+      '4. Call finish_site_build with a summary, then report every page with its URL.',
+      'Write real copy from the brief, never placeholders. Every page must exist in every active language.',
+    ].join('\n'),
   'build-page': (args) =>
     [
       `Build the NextBlock page with slug "${args['slug'] ?? '<slug>'}" from this brief:`,

@@ -270,6 +270,18 @@ On `checkout.session.completed`, the sync layer:
 - assigns invoice metadata
 - applies inventory deduction
 
+## NextBlock package purchases (vendor side)
+
+NextBlock's own premium packages (Commerce Pro 24851, Cortex AI 28609) are sold through
+Freemius as well, and every CMS can buy them from `/cms/settings/packages`. The buyer's
+CMS cannot read the license key from the checkout callback, so the vendor deployment
+(nextblock.dev) exposes `POST /api/packages/claim-license` — enabled only with
+`NEXTBLOCK_LICENSE_CLAIM_ENABLED=true` and the vendor Freemius credentials in
+`FREEMIUS_CHECKOUT_PRODUCTS_JSON` — which verifies the claim
+(`claimFreemiusLicenseKey` in `libs/ecommerce/src/lib/freemius-license-claim.ts`) and
+returns the key so the buyer's install activates automatically. Details:
+docs/08 → "Buying from the dashboard".
+
 ## Freemius Licensing and Product Sync
 
 Freemius currently handles digital-product checkout and product synchronization.

@@ -463,3 +463,204 @@ describe('Cortex AI generic database tools', () => {
     expect(database.cortex_ai_db_mutation_audit[0].tool_name).toBe('execute_database_action_plan');
   });
 });
+
+describe('Cortex AI generic database tools: JSONB payload validation', () => {
+  const heading = { level: 2, text_content: 'Our story' };
+
+  it('rejects a blocks insert whose content does not fit its block_type', async () => {
+    const { supabase } = createMockSupabase({ blocks: [], custom_block_definitions: [] });
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          operation: 'insert',
+          rows: [{ block_type: 'heading', content: { level: 'big' }, language_id: 1, order: 0, page_id: 1 }],
+          table: 'blocks',
+        },
+        { actorUserId: 'user_1', supabase }
+      )
+    ).rejects.toThrow(/content is invalid for block type "heading"/);
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          operation: 'insert',
+          rows: [{ content: heading, language_id: 1, order: 0, page_id: 1 }],
+          table: 'blocks',
+        },
+        { actorUserId: 'user_1', supabase }
+      )
+    ).rejects.toThrow(/block_type is required/);
+  });
+
+  it('accepts a valid built-in block and previews it like any other mutation', async () => {
+    const { supabase } = createMockSupabase({ blocks: [], custom_block_definitions: [] });
+
+    const preview = asDbConfirmation(
+      await executeDatabaseMutation(
+        {
+          operation: 'insert',
+          rows: [{ block_type: 'heading', content: heading, language_id: 1, order: 0, page_id: 1 }],
+          table: 'blocks',
+        },
+        { actorUserId: 'user_1', supabase }
+      )
+    );
+
+    expect(preview.requiresConfirmation).toBe(true);
+  });
+
+  it('prefers the injected app validator when one is supplied', async () => {
+    const { supabase } = createMockSupabase({ blocks: [], custom_block_definitions: [] });
+    const seen: string[] = [];
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          operation: 'insert',
+          rows: [{ block_type: 'heading', content: heading, language_id: 1, order: 0, page_id: 1 }],
+          table: 'blocks',
+        },
+        {
+          actorUserId: 'user_1',
+          supabase,
+          validateBlockContent: (blockType) => {
+            seen.push(blockType);
+            return { errors: ['app says no'], isValid: false, warnings: [] };
+          },
+        }
+      )
+    ).rejects.toThrow(/app says no/);
+
+    expect(seen).toEqual(['heading']);
+  });
+
+  it('validates a custom block instance against its definition', async () => {
+    const { supabase } = createMockSupabase({
+      blocks: [],
+      custom_block_definitions: [
+        {
+          fields: [
+            { key: 'title', required: true, type: 'text' },
+            { key: 'photo', type: 'image_r2' },
+          ],
+          name: 'Promo card',
+          slug: 'promo-card',
+        },
+      ],
+    });
+    const row = (content: Record<string, unknown>, blockType = 'promo-card') => ({
+      block_type: blockType,
+      content,
+      language_id: 1,
+      order: 0,
+      page_id: 1,
+    });
+
+    await expect(
+      executeDatabaseMutation({ operation: 'insert', rows: [row({}, 'no-such-block')], table: 'blocks' }, { supabase })
+    ).rejects.toThrow(/neither a built-in block type nor a custom block slug/);
+
+    await expect(
+      executeDatabaseMutation({ operation: 'insert', rows: [row({ headline: 'Sale' })], table: 'blocks' }, { supabase })
+    ).rejects.toThrow(/Unknown field "headline".*Field "title" is required/);
+
+    await expect(
+      executeDatabaseMutation({ operation: 'insert', rows: [row({ title: 'Sale', photo: 'https://x/y.jpg' })], table: 'blocks' }, { supabase })
+    ).rejects.toThrow(/"photo" must be an uploaded image object/);
+
+    const preview = asDbConfirmation(
+      await executeDatabaseMutation(
+        { operation: 'insert', rows: [row({ title: 'Sale', photo: { object_key: 'uploads/a.jpg', url: 'https://cdn/a.jpg' } })], table: 'blocks' },
+        { supabase }
+      )
+    );
+    expect(preview.requiresConfirmation).toBe(true);
+  });
+
+  it('validates an update against the block type of every targeted row', async () => {
+    const { supabase } = createMockSupabase({
+      blocks: [
+        { id: 10, block_type: 'heading', content: heading, page_id: 1 },
+        { id: 11, block_type: 'text', content: { html_content: '<p>Hi</p>' }, page_id: 1 },
+      ],
+      custom_block_definitions: [],
+    });
+
+    // Content that fits a heading is rejected because a text block is also targeted.
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'page_id', operator: 'eq', value: 1 }],
+          operation: 'update',
+          table: 'blocks',
+          values: { content: heading },
+        },
+        { supabase }
+      )
+    ).rejects.toThrow(/block_type "text"/);
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'id', operator: 'eq', value: 10 }],
+          operation: 'update',
+          table: 'blocks',
+          values: { block_type: 'text' },
+        },
+        { supabase }
+      )
+    ).rejects.toThrow(/requires the new content/);
+
+    const preview = asDbConfirmation(
+      await executeDatabaseMutation(
+        {
+          filters: [{ column: 'id', operator: 'eq', value: 10 }],
+          operation: 'update',
+          table: 'blocks',
+          values: { content: { level: 3, text_content: 'Renamed' } },
+        },
+        { supabase }
+      )
+    );
+    expect(preview.requiresConfirmation).toBe(true);
+  });
+
+  it('checks known site_settings values and refuses write-protected keys', async () => {
+    const { supabase } = createMockSupabase();
+
+    await expect(
+      executeDatabaseMutation(
+        { operation: 'upsert', rows: [{ key: 'footer_copyright', value: 'plain string' }], table: 'site_settings' },
+        { supabase }
+      )
+    ).rejects.toThrow(/Invalid value for site setting "footer_copyright"/);
+
+    await expect(
+      executeDatabaseMutation(
+        { operation: 'upsert', rows: [{ key: 'cortex_ai_build_session', value: { id: 'x' } }], table: 'site_settings' },
+        { supabase }
+      )
+    ).rejects.toThrow(/cannot be written through Cortex AI database tools/);
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'key', operator: 'eq', value: 'is_admin_created' }],
+          operation: 'update',
+          table: 'site_settings',
+          values: { value: 'false' },
+        },
+        { supabase }
+      )
+    ).rejects.toThrow(/cannot be written/);
+
+    const preview = asDbConfirmation(
+      await executeDatabaseMutation(
+        { operation: 'upsert', rows: [{ key: 'footer_copyright', value: { en: '© {year} Acme' } }], table: 'site_settings' },
+        { supabase }
+      )
+    );
+    expect(preview.requiresConfirmation).toBe(true);
+  });
+});

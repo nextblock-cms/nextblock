@@ -29,6 +29,10 @@ declare namespace NodeJS {
     FREEMIUS_ECOMMERCE_SANDBOX_PUBLIC_KEY?: string;
     FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY?: string;
     FREEMIUS_AI_SANDBOX_KEY?: string;
+    /** Vendor side only: enables /api/packages/claim-license (see .env.example). */
+    NEXTBLOCK_LICENSE_CLAIM_ENABLED?: string;
+    /** Where a CMS fetches the key of a license it just bought; defaults to https://nextblock.dev. */
+    NEXTBLOCK_LICENSE_SERVICE_URL?: string;
     FREEMIUS_SANDBOX_ENABLED?: string;
     OPENROUTER_API_KEY?: string;
     CORTEX_AI_ENCRYPTION_KEY?: string;

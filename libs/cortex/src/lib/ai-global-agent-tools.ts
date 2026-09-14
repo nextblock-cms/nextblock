@@ -3,26 +3,22 @@ import { createCortexDatabaseAgentTools } from './ai-global-agent-db-tools';
 import { createCortexCustomBlockTools } from './ai-global-agent-custom-block-tools';
 import { createCortexContentOpsTools } from './ai-global-agent-content-ops-tools';
 import { createCortexThemingTools } from './ai-global-agent-theming-tools';
+import { createCortexSiteTools } from './ai-global-agent-site-tools';
 import { editorDocumentFromHtml } from './editor-document-from-html';
 import { z } from './zod-config';
 
-export const availableCortexAiBlockTypes = [
-  'text',
-  'heading',
-  'image',
-  'button',
-  'posts_grid',
-  'video_embed',
-  'section',
-  'form',
-  'testimonial',
-  'product_grid',
-  'featured_product',
-  'cart',
-  'checkout',
-  'product_details',
-] as const;
-type BlockType = (typeof availableCortexAiBlockTypes)[number];
+import {
+  availableCortexAiBlockTypes,
+  isValidBlockType,
+  loadCustomBlockDefinitions,
+  readCustomBlockFields,
+  validateCortexBlockContent,
+  validateCustomBlockInstanceContent,
+  type BlockContentValidator,
+  type BlockType,
+  type CustomBlockDefinitionLike,
+} from './block-content-schemas';
+
 type ColumnBlock = { block_type: BlockType; content: Record<string, unknown>; temp_id?: string };
 type SectionBlockContent = Record<string, any> & {
   column_blocks: Array<Array<ColumnBlock>>;
@@ -33,10 +29,6 @@ type SupabaseLike = {
 };
 
 type RevalidateFn = (path: string, type?: 'layout' | 'page') => void;
-type BlockContentValidator = (
-  blockType: BlockType,
-  content: Record<string, any>
-) => BlockValidationResult;
 type MenuKey = 'HEADER' | 'FOOTER';
 type CmsContentType = 'page' | 'post' | 'product';
 
@@ -72,6 +64,12 @@ type ToolExecutionContext = {
   actorUserId?: string | null;
   cortexAiApiKey?: string | null;
   cortexAiModelSelection?: unknown;
+  /**
+   * Custom block definitions a `block_type` slug may resolve to. Loaded on demand by
+   * `withCustomBlockDefinitions` when an input (or a stored block) references a
+   * type that is not built in, so requests that only use built-ins pay nothing.
+   */
+  customBlockDefinitions?: CustomBlockDefinitionLike[];
   importExternalImage?: ImportExternalImageFn;
   latestUserMessage?: string | null;
   pageContext?: CortexAiPageContext | null;
@@ -307,16 +305,31 @@ export const updateCurrentCmsFieldsInputSchema = z.strictObject({
     .partial(),
 });
 
+/**
+ * A built-in block type, or the slug of a custom block definition. Custom slugs are
+ * resolved at execution time against `custom_block_definitions` (see
+ * `withCustomBlockDefinitions`), so the schema stays a plain string for the model
+ * while unknown types are still refused before anything is written.
+ */
+const blockTypeInputSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
+  .describe(
+    `A built-in block type (${availableCortexAiBlockTypes.join(', ')}) or the slug of a custom block definition from list_custom_blocks, whose content is the flat { field_key: value } map its fields describe.`
+  );
+
 export const updateContentBlockInputSchema = z.strictObject({
   blockId: z.number().int().positive(),
-  blockType: z.enum(availableCortexAiBlockTypes).optional(),
+  blockType: blockTypeInputSchema.optional(),
   cmsTarget: cmsTargetOverrideSchema,
   content: z.record(z.string(), z.unknown()),
 });
 
 export const updateSectionColumnBlockInputSchema = z.strictObject({
   blockIndex: z.number().int().min(0),
-  blockType: z.enum(availableCortexAiBlockTypes).optional(),
+  blockType: blockTypeInputSchema.optional(),
   cmsTarget: cmsTargetOverrideSchema,
   columnIndex: z.number().int().min(0),
   content: z.record(z.string(), z.unknown()),
@@ -324,7 +337,7 @@ export const updateSectionColumnBlockInputSchema = z.strictObject({
 });
 
 const createCmsBlockInputSchema = z.strictObject({
-  blockType: z.enum(availableCortexAiBlockTypes),
+  blockType: blockTypeInputSchema,
   content: z
     .record(z.string(), z.unknown())
     .describe(
@@ -348,7 +361,7 @@ type SetContentImagesInput = z.input<typeof setContentImagesInputSchema>;
 
 export const insertContentBlockInputSchema = cmsTargetInputSchema.extend({
   anchorBlockId: z.number().int().positive().optional(),
-  anchorBlockType: z.enum(availableCortexAiBlockTypes).optional(),
+  anchorBlockType: blockTypeInputSchema.optional(),
   block: createCmsBlockInputSchema,
   position: z.enum(['before', 'after', 'start', 'end']).default('end'),
 });
@@ -854,199 +867,6 @@ type DocumentationSnippet = {
   url: string;
 };
 
-type BlockValidationResult = {
-  errors: string[];
-  isValid: boolean;
-  warnings: string[];
-};
-
-const cortexAiBlockTypeSchema = z.enum(availableCortexAiBlockTypes);
-const gradientSchema = z.object({
-  direction: z.string().optional(),
-  stops: z.array(z.object({ color: z.string(), position: z.number() })),
-  type: z.enum(['linear', 'radial']),
-});
-const backgroundSchema = z.object({
-  gradient: gradientSchema.optional(),
-  image: z
-    .object({
-      alt_text: z.string().optional(),
-      blur_data_url: z.string().optional(),
-      external_url: z.string().optional(),
-      height: z.number().optional(),
-      media_id: z.string().optional(),
-      object_key: z.string().optional(),
-      overlay: z
-        .object({
-          gradient: gradientSchema,
-          type: z.literal('gradient'),
-        })
-        .optional(),
-      position: z.enum(['center', 'top', 'bottom', 'left', 'right']),
-      quality: z.number().nullable().optional(),
-      size: z.enum(['cover', 'contain']),
-      width: z.number().optional(),
-    })
-    .optional(),
-  min_height: z.string().optional(),
-  solid_color: z.string().optional(),
-  theme: z.enum(['primary', 'secondary', 'muted', 'accent', 'destructive']).optional(),
-  type: z.enum(['none', 'theme', 'solid', 'gradient', 'image']),
-});
-const blockInColumnSchema = z.object({
-  block_type: cortexAiBlockTypeSchema,
-  content: z.record(z.string(), z.any()),
-  temp_id: z.string().optional(),
-});
-const sectionBlockFallbackSchema = z.object({
-  background: backgroundSchema,
-  column_blocks: z.array(z.array(blockInColumnSchema)),
-  column_gap: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
-  container_type: z.enum(['full-width', 'container', 'container-sm', 'container-lg', 'container-xl']),
-  padding: z.object({
-    bottom: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
-    top: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
-  }),
-  responsive_columns: z.object({
-    desktop: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
-    mobile: z.union([z.literal(1), z.literal(2)]),
-    tablet: z.union([z.literal(1), z.literal(2), z.literal(3)]),
-  }),
-  vertical_alignment: z.enum(['start', 'center', 'end', 'stretch']).optional(),
-});
-const fallbackBlockSchemas: Record<BlockType, z.ZodTypeAny> = {
-  button: z.object({
-    position: z.enum(['left', 'center', 'right']).optional(),
-    size: z.enum(['default', 'sm', 'lg', 'full']).optional(),
-    text: z.string(),
-    url: z.string(),
-    variant: z.enum(['default', 'outline', 'secondary', 'ghost', 'link']).optional(),
-  }),
-  cart: z.object({}),
-  checkout: z.object({}),
-  featured_product: z.object({
-    imagePosition: z.enum(['left', 'right']).default('left'),
-    productId: z.string().min(1),
-    showBackground: z.boolean().default(false),
-  }),
-  form: z.object({
-    fields: z.array(
-      z.object({
-        field_type: z.enum(['text', 'email', 'textarea', 'select', 'radio', 'checkbox']),
-        is_required: z.boolean(),
-        label: z.string(),
-        options: z.array(z.object({ label: z.string(), value: z.string() })).optional(),
-        placeholder: z.string().optional(),
-        temp_id: z.string(),
-      })
-    ),
-    // Opaque handle into form_endpoints, which holds the destination server-side.
-    form_key: z.string().optional(),
-    // Legacy. Migration 27 moved every address out of block content; kept optional so
-    // an older payload still validates, and stripped before the block reaches a browser.
-    recipient_email: z.string().email().optional(),
-    submit_button_text: z.string(),
-    success_message: z.string(),
-  }),
-  heading: z.object({
-    level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5), z.literal(6)]),
-    textAlign: z.enum(['left', 'center', 'right', 'justify']).optional(),
-    // Mirrors TextColorSchema in apps/nextblock/lib/blocks/blockRegistry.ts —
-    // a theme token, or a literal CSS colour from the block editor's picker.
-    // libs/* cannot import from the app, so the union is restated here.
-    textColor: z
-      .union([
-        z.enum(['foreground', 'primary', 'secondary', 'accent', 'muted', 'destructive', 'background']),
-        z
-          .string()
-          .regex(
-            /^(#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|rgba?\([^)]+\)|hsla?\([^)]+\))$/i,
-            'Must be a hex, rgb(a) or hsl(a) colour',
-          ),
-      ])
-      .optional()
-      .describe('Prefer a theme token so the heading adapts to dark mode; use a CSS colour only when the brand requires an exact value'),
-    text_content: z.string(),
-  }),
-  image: z.object({
-    alt_text: z.string().optional(),
-    caption: z.string().optional(),
-    external_url: z.string().nullable().optional(),
-    height: z.number().nullable().optional(),
-    media_id: z.string().nullable().optional(),
-    object_key: z.string().nullable().optional(),
-    width: z.number().nullable().optional(),
-  }),
-  posts_grid: z.object({
-    columns: z.number().min(1).max(6),
-    postsPerPage: z.number().min(1).max(50),
-    showPagination: z.boolean(),
-    title: z.string().optional(),
-  }),
-  product_details: z.object({}),
-  product_grid: z.object({
-    categoryId: z.string().optional(),
-    categoryIds: z.array(z.string()).max(20).optional(),
-    // 0 = unlimited (every match on one page).
-    limit: z.number().min(0).max(48).default(6),
-    productIds: z.array(z.string()).max(24).optional(),
-    showPagination: z.boolean().default(false),
-    title: z.string().optional(),
-    type: z.enum(['latest', 'category', 'manual']).default('latest'),
-  }),
-  section: sectionBlockFallbackSchema,
-  testimonial: z.object({
-    author_name: z.string().min(1),
-    author_title: z.string().optional(),
-    image_url: z.string().url().optional().or(z.literal('')),
-    quote: z.string().min(1),
-  }),
-  text: z.object({
-    html_content: z.string(),
-  }),
-  video_embed: z.object({
-    autoplay: z.boolean().optional(),
-    controls: z.boolean().optional(),
-    title: z.string().optional(),
-    url: z.string(),
-  }),
-};
-function isValidBlockType(blockType: string): blockType is BlockType {
-  return (availableCortexAiBlockTypes as readonly string[]).includes(blockType);
-}
-
-function getRuntimeBlockContentValidator(context?: ToolExecutionContext) {
-  return typeof context?.validateBlockContent === 'function'
-    ? context.validateBlockContent
-    : null;
-}
-
-function validateCortexBlockContent(
-  blockType: BlockType,
-  content: Record<string, unknown>,
-  context?: ToolExecutionContext
-) {
-  const runtimeValidator = getRuntimeBlockContentValidator(context);
-
-  if (runtimeValidator) {
-    return runtimeValidator(blockType, content);
-  }
-
-  const result = fallbackBlockSchemas[blockType].safeParse(content);
-
-  if (result.success) {
-    return { errors: [], isValid: true, warnings: [] };
-  }
-
-  return {
-    errors: result.error.issues.map((issue) => {
-      const path = issue.path.join('.');
-      return path ? `${path}: ${issue.message}` : issue.message;
-    }),
-    isValid: false,
-    warnings: [],
-  };
-}
 
 function getEditorBlockDocumentSchema() {
   return z.object({
@@ -1720,18 +1540,94 @@ function assertBlockBelongsToCurrentContext(block: any, pageContext: CortexAiPag
   }
 }
 
-function resolveExistingBlockType(blockType: unknown, label: string): BlockType {
-  const normalizedBlockType = typeof blockType === 'string' ? blockType : '';
+function findCustomBlockDefinition(slug: string, context?: ToolExecutionContext) {
+  return context?.customBlockDefinitions?.find((definition) => definition.slug === slug) ?? null;
+}
 
-  if (!isValidBlockType(normalizedBlockType)) {
-    throw new Error(`${label} has unsupported block type "${normalizedBlockType || 'unknown'}".`);
+/** Every block_type / blockType / anchorBlockType string inside an arbitrary JSON value. */
+function collectReferencedBlockTypes(value: unknown, found = new Set<string>(), depth = 0): Set<string> {
+  if (depth > 12 || !value) {
+    return found;
   }
 
-  return normalizedBlockType;
+  if (typeof value === 'string') {
+    found.add(value);
+    return found;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectReferencedBlockTypes(item, found, depth + 1);
+    }
+    return found;
+  }
+
+  if (typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if ((key === 'block_type' || key === 'blockType' || key === 'anchorBlockType') && typeof nested === 'string') {
+        found.add(nested);
+      } else if (nested && typeof nested === 'object') {
+        collectReferencedBlockTypes(nested, found, depth + 1);
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
+ * Load the custom block definitions once, and only when something in `candidates`
+ * (tool input, stored block rows, nested column blocks) names a block type that is
+ * not built in. Returns the same context otherwise, so built-in-only requests never
+ * touch `custom_block_definitions`.
+ */
+async function withCustomBlockDefinitions(
+  context: ToolExecutionContext | undefined,
+  candidates: unknown
+): Promise<ToolExecutionContext | undefined> {
+  if (context?.customBlockDefinitions || !context?.supabase) {
+    return context;
+  }
+
+  const referenced = collectReferencedBlockTypes(candidates);
+  const needsDefinitions = [...referenced].some((type) => !isValidBlockType(type));
+
+  if (!needsDefinitions) {
+    return context;
+  }
+
+  return {
+    ...context,
+    customBlockDefinitions: await loadCustomBlockDefinitions(context.supabase),
+  };
+}
+
+function resolveExistingBlockType(
+  blockType: unknown,
+  label: string,
+  context?: ToolExecutionContext
+): BlockType {
+  const normalizedBlockType = typeof blockType === 'string' ? blockType.trim() : '';
+
+  if (isValidBlockType(normalizedBlockType)) {
+    return normalizedBlockType;
+  }
+
+  if (normalizedBlockType && findCustomBlockDefinition(normalizedBlockType, context)) {
+    // A custom block slug travels through the same code paths as a built-in type.
+    // Every consumer that must tell them apart asks isValidBlockType first.
+    return normalizedBlockType as BlockType;
+  }
+
+  throw new Error(
+    `${label} has unsupported block type "${normalizedBlockType || 'unknown'}". Built-in types: ${availableCortexAiBlockTypes.join(
+      ', '
+    )}; a custom block must use a slug returned by list_custom_blocks.`
+  );
 }
 
 function assertRequestedBlockTypeMatches(
-  requestedBlockType: BlockType | undefined,
+  requestedBlockType: string | undefined,
   existingBlockType: BlockType,
   label: string
 ) {
@@ -1748,6 +1644,24 @@ function assertValidBlockContent(
   label: string,
   context?: ToolExecutionContext
 ) {
+  if (!isValidBlockType(blockType)) {
+    const definition = findCustomBlockDefinition(blockType, context);
+
+    if (!definition) {
+      throw new Error(`${label} references custom block "${blockType}", which does not exist.`);
+    }
+
+    const validation = validateCustomBlockInstanceContent(definition, content);
+
+    if (!validation.isValid) {
+      throw new Error(
+        `${label} content is invalid for custom block "${blockType}": ${validation.errors.join('; ')}`
+      );
+    }
+
+    return;
+  }
+
   const validation = validateCortexBlockContent(blockType, content, context);
 
   if (!validation.isValid) {
@@ -1823,7 +1737,7 @@ function normalizeNestedColumnBlock(
   }
 
   const rawBlockType = value.block_type ?? value.blockType;
-  const blockType = resolveExistingBlockType(rawBlockType, label);
+  const blockType = resolveExistingBlockType(rawBlockType, label, context);
 
   if (isSectionLikeBlock(blockType)) {
     throw new Error(`${label} cannot be a nested ${blockType} block.`);
@@ -2877,6 +2791,15 @@ function normalizeBlockContentForType(
   label: string,
   context?: ToolExecutionContext
 ) {
+  if (!isValidBlockType(blockType)) {
+    // Custom block instance: the content is the flat field map its definition
+    // describes; nothing to normalize, only to validate.
+    const content = cloneJsonValue(rawContent);
+    assertValidBlockContent(blockType, content, label, context);
+
+    return content;
+  }
+
   if (blockType === 'section') {
     const normalizedSection = normalizeSectionContent(rawContent, label, context);
     assertValidBlockContent(blockType, normalizedSection, label, context);
@@ -2943,15 +2866,16 @@ function normalizeCreateBlock(
   index: number,
   context?: ToolExecutionContext
 ) {
+  const blockType = resolveExistingBlockType(input.blockType, `Block ${index}`, context);
   const content = normalizeBlockContentForType(
-    input.blockType,
+    blockType,
     cloneJsonRecord(input.content, `Block ${index}`),
     `Block ${index}`,
     context
   );
 
   return {
-    block_type: input.blockType,
+    block_type: blockType,
     content,
     order: input.order ?? index,
   };
@@ -4018,8 +3942,9 @@ export async function executeUpdateContentBlock(
   }
 
   assertBlockBelongsToCurrentContext(block, pageContext);
+  context = await withCustomBlockDefinitions(context, [block.block_type, block.content, parsed.content]);
 
-  const existingBlockType = resolveExistingBlockType(block.block_type, `Block ${parsed.blockId}`);
+  const existingBlockType = resolveExistingBlockType(block.block_type, `Block ${parsed.blockId}`, context);
   assertRequestedBlockTypeMatches(parsed.blockType, existingBlockType, `Block ${parsed.blockId}`);
   const existingContent = cloneJsonRecord(block.content, `Block ${parsed.blockId}`);
   const nextContent = buildNextTopLevelBlockContent(
@@ -4109,6 +4034,7 @@ export async function executeInsertContentBlock(
   context?: ToolExecutionContext
 ) {
   const parsed = insertContentBlockInputSchema.parse(input);
+  context = await withCustomBlockDefinitions(context, parsed.block);
   const supabase = getSupabase(context);
   const target = await resolveCmsTarget(parsed, context);
 
@@ -4308,10 +4234,12 @@ export async function executeUpdateSectionColumnBlock(
   }
 
   assertBlockBelongsToCurrentContext(parentBlock, pageContext);
+  context = await withCustomBlockDefinitions(context, [parentBlock.block_type, parentBlock.content, parsed.content]);
 
   const parentBlockType = resolveExistingBlockType(
     parentBlock.block_type,
-    `Parent block ${parsed.parentBlockId}`
+    `Parent block ${parsed.parentBlockId}`,
+    context
   );
 
   if (parentBlockType !== 'section') {
@@ -4342,7 +4270,8 @@ export async function executeUpdateSectionColumnBlock(
 
   const nestedBlockType = resolveExistingBlockType(
     targetNestedBlock.block_type,
-    `Nested block ${parsed.columnIndex}:${parsed.blockIndex}`
+    `Nested block ${parsed.columnIndex}:${parsed.blockIndex}`,
+    context
   );
   assertRequestedBlockTypeMatches(
     parsed.blockType,
@@ -4463,6 +4392,7 @@ export async function executeCreateCmsPage(
   context?: ToolExecutionContext
 ) {
   const parsed = createCmsPageInputSchema.parse(input);
+  context = await withCustomBlockDefinitions(context, parsed.blocks);
   const supabase = getSupabase(context);
   const actorUserId = getActorUserId(context);
   const language = await getDefaultLanguageRecord(supabase, parsed.languageCode);
@@ -4580,6 +4510,7 @@ export async function executeCreateCmsPage(
 
 export async function executeCreateCmsPost(input: CreateCmsPostInput, context?: ToolExecutionContext) {
   const parsed = createCmsPostInputSchema.parse(input);
+  context = await withCustomBlockDefinitions(context, parsed.blocks);
   const supabase = getSupabase(context);
   const actorUserId = getActorUserId(context);
   const language = await getDefaultLanguageRecord(supabase, parsed.languageCode);
@@ -4789,6 +4720,7 @@ function resolveProductDescription(input: {
 
 export async function executeCreateCmsProduct(input: CreateCmsProductInput, context?: ToolExecutionContext) {
   const parsed = createCmsProductInputSchema.parse(input);
+  context = await withCustomBlockDefinitions(context, parsed.blocks);
   const supabase = getSupabase(context);
   const language = await getDefaultLanguageRecord(supabase, parsed.languageCode);
   const slug = slugify(parsed.slug || parsed.title);
@@ -6858,6 +6790,7 @@ export async function executeRewritePageDraft(
   context?: ToolExecutionContext
 ) {
   const parsed = rewritePageDraftInputSchema.parse(input);
+  context = await withCustomBlockDefinitions(context, parsed.blocks);
   const supabase = getSupabase(context);
   const actorUserId = getActorUserId(context);
   const target = await resolveCmsTarget(parsed, context);
@@ -7678,20 +7611,21 @@ function translateString(
 function translateBlockContent(
   content: unknown,
   translations: Record<string, string>,
-  sortedEntries: Array<[string, string]>
+  sortedEntries: Array<[string, string]>,
+  extraTranslatableKeys?: ReadonlySet<string>
 ): unknown {
   if (Array.isArray(content)) {
-    return content.map((item) => translateBlockContent(item, translations, sortedEntries));
+    return content.map((item) => translateBlockContent(item, translations, sortedEntries, extraTranslatableKeys));
   }
 
   if (content && typeof content === 'object') {
     const out: Record<string, unknown> = {};
 
     for (const [key, value] of Object.entries(content as Record<string, unknown>)) {
-      if (typeof value === 'string' && TRANSLATABLE_STRING_FIELDS.has(key)) {
+      if (typeof value === 'string' && (TRANSLATABLE_STRING_FIELDS.has(key) || extraTranslatableKeys?.has(key))) {
         out[key] = translateString(value, translations, sortedEntries);
       } else if (value && typeof value === 'object') {
-        out[key] = translateBlockContent(value, translations, sortedEntries);
+        out[key] = translateBlockContent(value, translations, sortedEntries, extraTranslatableKeys);
       } else {
         out[key] = value;
       }
@@ -7701,6 +7635,25 @@ function translateBlockContent(
   }
 
   return content;
+}
+
+/** The text and rich-text field keys of a custom block, which carry visible copy. */
+function getCustomBlockTranslatableKeys(blockType: unknown, context?: ToolExecutionContext) {
+  if (typeof blockType !== 'string' || isValidBlockType(blockType)) {
+    return undefined;
+  }
+
+  const definition = findCustomBlockDefinition(blockType, context);
+
+  if (!definition) {
+    return undefined;
+  }
+
+  return new Set(
+    readCustomBlockFields(definition)
+      .filter((field) => field.type === 'text' || field.type === 'rich-text')
+      .map((field) => field.key)
+  );
 }
 
 export const translatePageInputSchema = z.strictObject({
@@ -7772,6 +7725,10 @@ export async function executeTranslatePage(
     throw new Error(`The source ${pageContext.contentType} has no content blocks to translate.`);
   }
 
+  // Custom block instances on the source page carry their copy in definition-named
+  // fields; load the definitions so those fields are translated like built-in ones.
+  context = await withCustomBlockDefinitions(context, orderedBlocks);
+
   const translations = parsed.translations || {};
   const sortedEntries = Object.entries(translations)
     .filter(([from]) => Boolean(from))
@@ -7779,7 +7736,12 @@ export async function executeTranslatePage(
 
   const translatedBlocks = orderedBlocks.map((block: any, index: number) => ({
     blockType: block.block_type,
-    content: translateBlockContent(cloneJsonValue(block.content), translations, sortedEntries),
+    content: translateBlockContent(
+      cloneJsonValue(block.content),
+      translations,
+      sortedEntries,
+      getCustomBlockTranslatableKeys(block.block_type, context)
+    ),
     order: index,
   }));
 
@@ -8044,6 +8006,7 @@ export function createCortexGlobalAgentTools(context?: ToolExecutionContext) {
     ...createCortexCustomBlockTools(context),
     ...createCortexContentOpsTools(context),
     ...createCortexThemingTools(context),
+    ...createCortexSiteTools(context),
     fetch_ecommerce_stats: tool({
       description:
         'Fetch quantitative ecommerce statistics and reports from the database. Use this to answer questions about revenue, order counts, order status counts such as pending or trial, and top-selling products over a time range. This tool is read-only and does not require confirmation.',
