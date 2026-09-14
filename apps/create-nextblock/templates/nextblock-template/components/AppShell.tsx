@@ -126,11 +126,14 @@ export function AppShell({
             <footer className="w-full border-t py-6">
               <div className="mx-auto flex flex-col items-center justify-center gap-6 text-center text-xs">
                 <FooterNavigation navItems={footerNavItems} />
+                {/* Corporate line: slate-600 alone is ~2.7:1 on the dark background (a
+                    Lighthouse contrast failure in dark mode); the mailto link inherits
+                    the paragraph colour, so the dark variant covers both. */}
                 {corporateFooter &&
                   (corporateFooter.legalName ||
                     corporateFooter.address ||
                     corporateFooter.supportEmail) && (
-                    <p className="max-w-2xl text-[11px] leading-relaxed text-slate-600">
+                    <p className="max-w-2xl text-[11px] leading-relaxed text-slate-600 dark:text-slate-400">
                       {[corporateFooter.legalName, corporateFooter.address]
                         .filter(Boolean)
                         .join(' · ')}

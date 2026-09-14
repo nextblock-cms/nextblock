@@ -76,6 +76,10 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - Seed data-fix migrations scope UPDATEs by content signature + parent (`page_id = v_home AND
   content::text LIKE '%…%'`), never by `blocks.id`; ids drift on every install (035 clobbered
   the home promo that way, 037 repairs it). Verify copy with the SEO engine before writing SQL.
+- The public site is bilingual: every content change to a page, post or product ships its French
+  equivalent in the same migration (same `translation_group_id`, same block structure, translated
+  text, links to the `-fr` / French slugs). Only `/cms` is English-only. `02008`/`02009` are the
+  model: translate text nodes, keep markup, insert missing FR rows guarded by group + language.
 - After schema or seed changes regenerate all three artifacts (`db:types`,
   `generate:migrations-bundle`, `generate:sandbox`); the generators fail silently by omission.
 - Server-only modules throw in a browser: Cortex on call, S3 and `server-only` imports on import.

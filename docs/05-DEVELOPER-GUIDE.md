@@ -304,6 +304,24 @@ serialiser has no field for the per-rule `other` directives (`Clean-param`, a pe
 `Host`, …) the screen lets operators add; the metadata route dropped them silently.
 `lib/seo/robots-txt.test.ts` pins both facts against Next's real serialiser.
 
+## Bilingual Content Rule
+
+The public site ships in English and French; only `/cms` is English-only. Any migration
+that adds or rewrites content on a page, post or product must carry the French equivalent
+in the same file: same `translation_group_id`, same block sequence and markup, translated
+text nodes and attribute copy (`alt`, `title`, `aria-label`), and links pointing at the
+French slugs (`/accueil`, `/boutique`, `/article/<fr-slug>`, `…-license-fr`). A French row
+that does not exist yet is inserted, guarded by translation group + language so a re-run
+or an already-translated install inserts nothing; `posts_id_seq` / `blocks_id_seq` are
+re-synced first because the seed inserts explicit ids.
+
+`02008_home_fr_parity.sql` and `02009_fr_cortex_posts.sql` are the reference: the English
+block JSON was tokenised into tags and text, every text node translated through a
+text-to-text map, and the markup regenerated untouched, so the French page renders the
+exact same components. Audit parity with the anon REST API (`pages`, `posts`, `products`
+grouped by `translation_group_id`, then `blocks` per row) before shipping a content
+migration — that is how the missing French Cortex posts were found.
+
 ## Current Repo Notes
 
 Two repo facts are worth keeping in mind while contributing:
