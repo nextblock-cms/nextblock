@@ -16,6 +16,7 @@ import postgres from 'postgres';
 
 import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
 import { SANDBOX_RESET_SQL } from './sandboxResetSql';
+import { activateSandboxPackage } from './activate-package';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -2966,175 +2967,281 @@ export async function GET(request: NextRequest) {
       });
 
       if (process.env.FREEMIUS_ECOMMERCE_SANDBOX_KEY) {
-        const { error: activationError } = await supabaseAdmin.from('package_activations').insert({
-          package_id: 'ecommerce',
-          license_key: process.env.FREEMIUS_ECOMMERCE_SANDBOX_KEY,
-          status: 'active',
-          instance_name: siteUrl,
-        });
+        await activateSandboxPackage(
+          db, 'ecommerce', process.env.FREEMIUS_ECOMMERCE_SANDBOX_KEY, siteUrl,
+        );
+        console.log('[Sandbox Reset] Successfully activated ecommerce package.');
         
-        if (activationError) {
-          console.error('[Sandbox Reset] Failed to activate ecommerce package:', activationError.message);
-          throw activationError;
-        } else {
-          console.log('[Sandbox Reset] Successfully activated ecommerce package.');
-          
-          // Dynamically populate the store with Freemius products
+        // Dynamically populate the store with Freemius products
+        try {
+          console.log('[Sandbox Reset] Syncing products from Freemius...');
+          const syncRes = await syncFreemiusProductsToSupabase();
+          console.log(`[Sandbox Reset] Synced ${syncRes?.count || 0} products.`);
+          await db`
+            INSERT INTO public.site_settings (key, value)
+            VALUES (
+              'enabled_payment_providers',
+              '{"stripe": true, "freemius": true}'::jsonb
+            )
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value
+          `;
+
           try {
-            console.log('[Sandbox Reset] Syncing products from Freemius...');
-            const syncRes = await syncFreemiusProductsToSupabase();
-            console.log(`[Sandbox Reset] Synced ${syncRes?.count || 0} products.`);
-            await db`
-              INSERT INTO public.site_settings (key, value)
-              VALUES (
-                'enabled_payment_providers',
-                '{"stripe": true, "freemius": true}'::jsonb
-              )
-              ON CONFLICT (key) DO UPDATE
-              SET value = EXCLUDED.value
-            `;
+            const { enLangId, frLangId } = await getLanguageIds(db);
+            await ensureSandboxCommerceProductSynced({
+              sql: db,
+              enLangId,
+            });
+            const commerceAsset = uploadedAssets.get('images/commerce-square.webp');
 
-            try {
-              const { enLangId, frLangId } = await getLanguageIds(db);
-              await ensureSandboxCommerceProductSynced({
-                sql: db,
-                enLangId,
-              });
-              const commerceAsset = uploadedAssets.get('images/commerce-square.webp');
-
-              if (!commerceAsset) {
-                throw new Error('Missing uploaded Commerce Pro asset after R2 seed step.');
-              }
-
-              await enrichCommerceProducts({
-                sql: db,
-                commerceAsset,
-                enLangId,
-                frLangId,
-              });
-
-              const cortexAsset = uploadedAssets.get('images/cortex-ai-square.webp');
-              if (!cortexAsset) {
-                throw new Error('Missing uploaded Cortex AI asset after R2 seed step.');
-              }
-
-              await enrichCortexAiProducts({
-                sql: db,
-                cortexAsset,
-                enLangId,
-                frLangId,
-              });
-
-              await db.begin(async (sql: any) => {
-                const tx = sql as SqlClient;
-
-                await seedApparelCatalog({
-                  sql: tx,
-                  enLangId,
-                  frLangId,
-                  uploadedAssets,
-                });
-              });
-
-              await ensureShopPagesAndNavigation({
-                sql: db,
-                enLangId,
-                frLangId,
-              });
-
-              await seedCategoriesAndMappings(db);
-            } catch (enrichErr: any) {
-              console.error('[Sandbox Reset] Product enrichment failed:', enrichErr.message || enrichErr);
-              throw enrichErr;
+            if (!commerceAsset) {
+              throw new Error('Missing uploaded Commerce Pro asset after R2 seed step.');
             }
 
-          /*
-          // Post-sync enrichment: Add image and rich description to the Commerce Pro product
-          try {
-            console.log('[Sandbox Reset] Enriching NextBlock™ Commerce Pro...');
-            const commerceLogoKey = 'images/commerce-square.webp';
+            await enrichCommerceProducts({
+              sql: db,
+              commerceAsset,
+              enLangId,
+              frLangId,
+            });
+
+            const cortexAsset = uploadedAssets.get('images/cortex-ai-square.webp');
+            if (!cortexAsset) {
+              throw new Error('Missing uploaded Cortex AI asset after R2 seed step.');
+            }
+
+            await enrichCortexAiProducts({
+              sql: db,
+              cortexAsset,
+              enLangId,
+              frLangId,
+            });
+
+            await db.begin(async (sql: any) => {
+              const tx = sql as SqlClient;
+
+              await seedApparelCatalog({
+                sql: tx,
+                enLangId,
+                frLangId,
+                uploadedAssets,
+              });
+            });
+
+            await ensureShopPagesAndNavigation({
+              sql: db,
+              enLangId,
+              frLangId,
+            });
+
+            await seedCategoriesAndMappings(db);
+          } catch (enrichErr: any) {
+            console.error('[Sandbox Reset] Product enrichment failed:', enrichErr.message || enrichErr);
+            throw enrichErr;
+          }
+
+        /*
+        // Post-sync enrichment: Add image and rich description to the Commerce Pro product
+        try {
+          console.log('[Sandbox Reset] Enriching NextBlock™ Commerce Pro...');
+          const commerceLogoKey = 'images/commerce-square.webp';
+          
+          // 0. Get language IDs
+          const [enLangRaw] = await db`SELECT id FROM public.languages WHERE code = 'en' LIMIT 1`;
+          const [frLangRaw] = await db`SELECT id FROM public.languages WHERE code = 'fr' LIMIT 1`;
+          const enLangId = enLangRaw?.id;
+          const frLangId = frLangRaw?.id;
+
+          // 1. Ensure media record exists for the seeded asset
+          const [mediaRecord] = await db`
+            INSERT INTO public.media (file_name, object_key, file_path, file_type, size_bytes)
+            VALUES ('commerce-square.webp', ${commerceLogoKey}, ${commerceLogoKey}, 'image/webp', 1651652)
+            ON CONFLICT (object_key) DO UPDATE SET file_path = EXCLUDED.file_path
+            RETURNING id
+          `;
+
+          // 2. Find the synced product (NextBlock™ Commerce Pro)
+          const [product] = await db`
+            SELECT * FROM public.products 
+            WHERE freemius_product_id = '24851' AND language_id = ${enLangId}
+            LIMIT 1
+          `;
+
+          if (product && mediaRecord) {
+            // 3. Link media to English product
+            await db`
+              INSERT INTO public.product_media (product_id, media_id, sort_order)
+              VALUES (${product.id}, ${mediaRecord.id}, 0)
+              ON CONFLICT (product_id, media_id) DO NOTHING
+            `;
+
+            // 4. Update English descriptions
+            const shortDescEn = "NextBlock™ Ecommerce is an AI-native, block-based storefront engine for Next.js. Featuring a premium, developer-first aesthetic and high-performance edge rendering.";
             
-            // 0. Get language IDs
-            const [enLangRaw] = await db`SELECT id FROM public.languages WHERE code = 'en' LIMIT 1`;
-            const [frLangRaw] = await db`SELECT id FROM public.languages WHERE code = 'fr' LIMIT 1`;
-            const enLangId = enLangRaw?.id;
-            const frLangId = frLangRaw?.id;
+            const htmlDescriptionEn = {
+              type: "doc",
+              content: [
+                {
+                  type: "heading",
+                  attrs: { level: 2 },
+                  content: [{ type: "text", text: "🚀 The Future of Digital Commerce" }]
+                },
+                {
+                  type: "paragraph",
+                  content: [
+                    {
+                      type: "text",
+                      text: "NextBlock™ Ecommerce bridges the gap between high-performance headless architecture and intuitive visual editing. Built on the NextBlock™ Performance Stack (NPS), it leverages Next.js 16, Supabase, and Tailwind CSS to deliver sub-millisecond latency and a seamless \"Vibe Coding\" experience."
+                    }
+                  ]
+                },
+                {
+                  type: "heading",
+                  attrs: { level: 3 },
+                  content: [{ type: "text", text: "🎨 Notion-Style Editor" }]
+                },
+                {
+                  type: "paragraph",
+                  content: [
+                    {
+                      type: "text",
+                      text: "Stop fighting with complex backends. Our Tiptap-powered editor provides a familiar, block-based interface that allows you to build stunning product pages as easily as writing a document."
+                    }
+                  ]
+                },
+                {
+                  type: "heading",
+                  attrs: { level: 3 },
+                  content: [{ type: "text", text: "🛡️ Secure by Design" }]
+                },
+                {
+                  type: "paragraph",
+                  content: [
+                    {
+                      type: "text",
+                      text: "Integrated with Freemius for cryptographic licensing and recurring billing. Features dual-layer payment strategy with Freemius MoR and native Stripe support."
+                    }
+                  ]
+                },
+                {
+                  type: "heading",
+                  attrs: { level: 3 },
+                  content: [{ type: "text", text: "Key Technical Specs" }]
+                },
+                {
+                  type: "bulletList",
+                  content: [
+                    {
+                      type: "listItem",
+                      content: [
+                        {
+                          type: "paragraph",
+                          content: [{ type: "text", text: "⚡ ISR & Edge Caching: Sub-millisecond Time to First Byte (TTFB) globally." }]
+                        }
+                      ]
+                    },
+                    {
+                      type: "listItem",
+                      content: [
+                        {
+                          type: "paragraph",
+                          content: [{ type: "text", text: "📦 Nx Monorepo: Strictly decoupled architecture for ultimate scalability and code-splitting." }]
+                        }
+                      ]
+                    },
+                    {
+                      type: "listItem",
+                      content: [
+                        {
+                          type: "paragraph",
+                          content: [{ type: "text", text: "🖼️ AVIF Optimization: 20% smaller media payloads with native Next.js Image component integration." }]
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  type: "heading",
+                  attrs: { level: 3 },
+                  content: [{ type: "text", text: "Ready for the \"Vibe Coding\" Era" }]
+                },
+                {
+                  type: "paragraph",
+                  content: [
+                    {
+                      type: "text",
+                      text: "NextBlock™ is built from the ground up to be extendable by AI Agents. Whether you're using Claude, v0, or custom GPTs, our highly typed Block SDK and Zod schema validations ensure every extension stays robust and secure."
+                    }
+                  ]
+                }
+              ]
+            };
 
-            // 1. Ensure media record exists for the seeded asset
-            const [mediaRecord] = await db`
-              INSERT INTO public.media (file_name, object_key, file_path, file_type, size_bytes)
-              VALUES ('commerce-square.webp', ${commerceLogoKey}, ${commerceLogoKey}, 'image/webp', 1651652)
-              ON CONFLICT (object_key) DO UPDATE SET file_path = EXCLUDED.file_path
-              RETURNING id
+            await db`
+              UPDATE public.products 
+              SET short_description = ${shortDescEn}, 
+                  description_json = ${db.json(htmlDescriptionEn)},
+                  product_type = 'digital',
+                  payment_provider = 'freemius'
+              WHERE id = ${product.id}
             `;
 
-            // 2. Find the synced product (NextBlock™ Commerce Pro)
-            const [product] = await db`
-              SELECT * FROM public.products 
-              WHERE freemius_product_id = '24851' AND language_id = ${enLangId}
-              LIMIT 1
-            `;
-
-            if (product && mediaRecord) {
-              // 3. Link media to English product
-              await db`
-                INSERT INTO public.product_media (product_id, media_id, sort_order)
-                VALUES (${product.id}, ${mediaRecord.id}, 0)
-                ON CONFLICT (product_id, media_id) DO NOTHING
-              `;
-
-              // 4. Update English descriptions
-              const shortDescEn = "NextBlock™ Ecommerce is an AI-native, block-based storefront engine for Next.js. Featuring a premium, developer-first aesthetic and high-performance edge rendering.";
+            // 5. Create French Version
+            if (frLangId) {
+              console.log('[Sandbox Reset] Creating French version of NextBlock™ Commerce Pro...');
               
-              const htmlDescriptionEn = {
+              const shortDescFr = "NextBlock™ Ecommerce est un moteur de boutique basé sur des blocs et natif de l'IA pour Next.js. Doté d'une esthétique premium et d'un rendu edge haute performance.";
+              
+              const htmlDescriptionFr = {
                 type: "doc",
                 content: [
                   {
                     type: "heading",
                     attrs: { level: 2 },
-                    content: [{ type: "text", text: "🚀 The Future of Digital Commerce" }]
+                    content: [{ type: "text", text: "🚀 Le futur du commerce numérique" }]
                   },
                   {
                     type: "paragraph",
                     content: [
                       {
                         type: "text",
-                        text: "NextBlock™ Ecommerce bridges the gap between high-performance headless architecture and intuitive visual editing. Built on the NextBlock™ Performance Stack (NPS), it leverages Next.js 16, Supabase, and Tailwind CSS to deliver sub-millisecond latency and a seamless \"Vibe Coding\" experience."
+                        text: "NextBlock™ Ecommerce comble le fossé entre l'architecture headless haute performance et l'édition visuelle intuitive. Construit sur la NextBlock™ Performance Stack (NPS), il exploite Next.js 16, Supabase et Tailwind CSS pour offrir une latence de moins d'une milliseconde."
                       }
                     ]
                   },
                   {
                     type: "heading",
                     attrs: { level: 3 },
-                    content: [{ type: "text", text: "🎨 Notion-Style Editor" }]
+                    content: [{ type: "text", text: "🎨 Éditeur style Notion" }]
                   },
                   {
                     type: "paragraph",
                     content: [
                       {
                         type: "text",
-                        text: "Stop fighting with complex backends. Our Tiptap-powered editor provides a familiar, block-based interface that allows you to build stunning product pages as easily as writing a document."
+                        text: "Arrêtez de vous battre avec des backends complexes. Notre éditeur propulsé par Tiptap offre une interface familière basée sur des blocs qui vous permet de créer de superbes pages produits aussi facilement qu'un document."
                       }
                     ]
                   },
                   {
                     type: "heading",
                     attrs: { level: 3 },
-                    content: [{ type: "text", text: "🛡️ Secure by Design" }]
+                    content: [{ type: "text", text: "🛡️ Sécurisé par conception" }]
                   },
                   {
                     type: "paragraph",
                     content: [
                       {
                         type: "text",
-                        text: "Integrated with Freemius for cryptographic licensing and recurring billing. Features dual-layer payment strategy with Freemius MoR and native Stripe support."
+                        text: "Intégré avec Freemius pour les licences cryptographiques et la facturation récurrente. Stratégie de paiement à double couche avec Freemius MoR et support natif Stripe."
                       }
                     ]
                   },
                   {
                     type: "heading",
                     attrs: { level: 3 },
-                    content: [{ type: "text", text: "Key Technical Specs" }]
+                    content: [{ type: "text", text: "Spécifications techniques clés" }]
                   },
                   {
                     type: "bulletList",
@@ -3144,7 +3251,7 @@ export async function GET(request: NextRequest) {
                         content: [
                           {
                             type: "paragraph",
-                            content: [{ type: "text", text: "⚡ ISR & Edge Caching: Sub-millisecond Time to First Byte (TTFB) globally." }]
+                            content: [{ type: "text", text: "⚡ ISR & Mise en cache Edge : Temps de premier octet (TTFB) inférieur à la milliseconde." }]
                           }
                         ]
                       },
@@ -3153,7 +3260,7 @@ export async function GET(request: NextRequest) {
                         content: [
                           {
                             type: "paragraph",
-                            content: [{ type: "text", text: "📦 Nx Monorepo: Strictly decoupled architecture for ultimate scalability and code-splitting." }]
+                            content: [{ type: "text", text: "📦 Monorepo Nx : Architecture strictement découplée pour une évolutivité ultime." }]
                           }
                         ]
                       },
@@ -3162,393 +3269,260 @@ export async function GET(request: NextRequest) {
                         content: [
                           {
                             type: "paragraph",
-                            content: [{ type: "text", text: "🖼️ AVIF Optimization: 20% smaller media payloads with native Next.js Image component integration." }]
+                            content: [{ type: "text", text: "🖼️ Optimisation AVIF : Payloads média 20 % plus petits avec Next.js Image." }]
                           }
                         ]
-                      }
-                    ]
-                  },
-                  {
-                    type: "heading",
-                    attrs: { level: 3 },
-                    content: [{ type: "text", text: "Ready for the \"Vibe Coding\" Era" }]
-                  },
-                  {
-                    type: "paragraph",
-                    content: [
-                      {
-                        type: "text",
-                        text: "NextBlock™ is built from the ground up to be extendable by AI Agents. Whether you're using Claude, v0, or custom GPTs, our highly typed Block SDK and Zod schema validations ensure every extension stays robust and secure."
                       }
                     ]
                   }
                 ]
               };
 
-              await db`
-                UPDATE public.products 
-                SET short_description = ${shortDescEn}, 
-                    description_json = ${db.json(htmlDescriptionEn)},
-                    product_type = 'digital',
-                    payment_provider = 'freemius'
-                WHERE id = ${product.id}
+              const [frProduct] = await db`
+                INSERT INTO public.products (
+                  sku, title, slug, price, sale_price, stock, status, 
+                  short_description, description_json, 
+                  product_type, payment_provider,
+                  language_id, translation_group_id,
+                  freemius_product_id, freemius_plan_id,
+                  trial_period_days, trial_requires_payment_method
+                )
+                VALUES (
+                  ${product.sku}, 'NextBlock™ Commerce Pro - Licence Commerce', ${product.slug + '-fr'}, 
+                  ${product.price}, ${product.sale_price}, ${product.stock || 99}, ${product.status},
+                  ${shortDescFr}, ${db.json(htmlDescriptionFr)},
+                  'digital', 'freemius',
+                  ${frLangId}, ${product.translation_group_id},
+                  ${product.freemius_product_id}, ${product.freemius_plan_id},
+                  ${product.trial_period_days ?? 0}, ${product.trial_requires_payment_method ?? false}
+                )
+                ON CONFLICT ON CONSTRAINT products_language_id_slug_key DO UPDATE
+                SET
+                  title = EXCLUDED.title,
+                  short_description = EXCLUDED.short_description,
+                  description_json = EXCLUDED.description_json,
+                  product_type = EXCLUDED.product_type,
+                  payment_provider = EXCLUDED.payment_provider,
+                  trial_period_days = EXCLUDED.trial_period_days,
+                  trial_requires_payment_method = EXCLUDED.trial_requires_payment_method
+                RETURNING id
               `;
 
-              // 5. Create French Version
-              if (frLangId) {
-                console.log('[Sandbox Reset] Creating French version of NextBlock™ Commerce Pro...');
-                
-                const shortDescFr = "NextBlock™ Ecommerce est un moteur de boutique basé sur des blocs et natif de l'IA pour Next.js. Doté d'une esthétique premium et d'un rendu edge haute performance.";
-                
-                const htmlDescriptionFr = {
-                  type: "doc",
-                  content: [
+              if (frProduct) {
+                 await db`
+                  INSERT INTO public.product_media (product_id, media_id, sort_order)
+                  VALUES (${frProduct.id}, ${mediaRecord.id}, 0)
+                  ON CONFLICT (product_id, media_id) DO NOTHING
+                `;
+              }
+            }
+            console.log('[Sandbox Reset] Successfully enriched commerce products (EN & FR).');
+          }
+
+
+          // 6. Add Shop Pages & Navigation Items
+          console.log('[Sandbox Reset] Adding Shop Pages and navigation items...');
+          let globalShopGroupId: string | undefined;
+          
+          if (enLangId) {
+            const langId = enLangId;
+            
+            // Insert Page
+            const [existingPage] = await db`SELECT id, translation_group_id FROM public.pages WHERE language_id = ${langId} AND slug = 'shop'`;
+            let pageId = existingPage?.id;
+            globalShopGroupId = existingPage?.translation_group_id;
+            
+            if (!pageId) {
+              const [newPage] = await db`
+                INSERT INTO public.pages (language_id, title, slug, status, meta_title, meta_description)
+                VALUES (${langId}, 'Shop Our Products', 'shop', 'published', 'Shop NextBlock™ Modules | Official Store', 'Browse official commercial modules and licenses for NextBlock CMS. Get instant access to NextBlock Commerce and Cortex AI with secure checkout.')
+                RETURNING id, translation_group_id
+              `;
+              pageId = newPage.id;
+              globalShopGroupId = newPage?.translation_group_id;
+
+              const heroContent = {
+                is_hero: true,
+                container_type: "full-width",
+                background: {
+                  type: "theme",
+                  theme: "primary"
+                },
+                responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
+                column_gap: "lg",
+                padding: { top: "xl", bottom: "xl" },
+                vertical_alignment: "center",
+                column_blocks: [
+                  [
                     {
-                      type: "heading",
-                      attrs: { level: 2 },
-                      content: [{ type: "text", text: "🚀 Le futur du commerce numérique" }]
+                      block_type: "heading",
+                      content: {
+                        level: 1,
+                        text_content: "NextBlock™ Store",
+                        textAlign: "center",
+                        textColor: "background"
+                      }
                     },
                     {
-                      type: "paragraph",
-                      content: [
-                        {
-                          type: "text",
-                          text: "NextBlock™ Ecommerce comble le fossé entre l'architecture headless haute performance et l'édition visuelle intuitive. Construit sur la NextBlock™ Performance Stack (NPS), il exploite Next.js 16, Supabase et Tailwind CSS pour offrir une latence de moins d'une milliseconde."
-                        }
-                      ]
-                    },
-                    {
-                      type: "heading",
-                      attrs: { level: 3 },
-                      content: [{ type: "text", text: "🎨 Éditeur style Notion" }]
-                    },
-                    {
-                      type: "paragraph",
-                      content: [
-                        {
-                          type: "text",
-                          text: "Arrêtez de vous battre avec des backends complexes. Notre éditeur propulsé par Tiptap offre une interface familière basée sur des blocs qui vous permet de créer de superbes pages produits aussi facilement qu'un document."
-                        }
-                      ]
-                    },
-                    {
-                      type: "heading",
-                      attrs: { level: 3 },
-                      content: [{ type: "text", text: "🛡️ Sécurisé par conception" }]
-                    },
-                    {
-                      type: "paragraph",
-                      content: [
-                        {
-                          type: "text",
-                          text: "Intégré avec Freemius pour les licences cryptographiques et la facturation récurrente. Stratégie de paiement à double couche avec Freemius MoR et support natif Stripe."
-                        }
-                      ]
-                    },
-                    {
-                      type: "heading",
-                      attrs: { level: 3 },
-                      content: [{ type: "text", text: "Spécifications techniques clés" }]
-                    },
-                    {
-                      type: "bulletList",
-                      content: [
-                        {
-                          type: "listItem",
-                          content: [
-                            {
-                              type: "paragraph",
-                              content: [{ type: "text", text: "⚡ ISR & Mise en cache Edge : Temps de premier octet (TTFB) inférieur à la milliseconde." }]
-                            }
-                          ]
-                        },
-                        {
-                          type: "listItem",
-                          content: [
-                            {
-                              type: "paragraph",
-                              content: [{ type: "text", text: "📦 Monorepo Nx : Architecture strictement découplée pour une évolutivité ultime." }]
-                            }
-                          ]
-                        },
-                        {
-                          type: "listItem",
-                          content: [
-                            {
-                              type: "paragraph",
-                              content: [{ type: "text", text: "🖼️ Optimisation AVIF : Payloads média 20 % plus petits avec Next.js Image." }]
-                            }
-                          ]
-                        }
-                      ]
+                      block_type: "text",
+                      content: {
+                        html_content: "<p style=\"text-align: center; color: var(--background); opacity: 0.9\">Discover our selection of official commercial add-ons and developer tools for NextBlock CMS.</p><div class='mt-8 text-slate-300 space-y-4 max-w-3xl mx-auto text-left'><h2 class='text-2xl font-bold text-white mb-4'>Power Up Your Web Projects</h2><p>Welcome to the official NextBlock™ digital store. Here you can purchase licenses for our premium packages, including NextBlock™ Commerce and NextBlock™ Cortex AI. Every commercial license helps fund full-time open-source development on our core CMS while giving your team advanced tools to launch high-performance websites faster.</p><p>Our premium modules are designed to feel native from day one. You get clean code that fits right into your existing NextBlock project without third-party plugins or complex configuration. When you purchase a license from our store, you receive instant access to everything you need:</p><ul class='space-y-2 list-disc pl-5'><li><strong>Full Source Code:</strong> Inspect, customize, and adapt the modules to your exact requirements.</li><li><strong>Perpetual Use:</strong> Use the software for your project with full peace of mind.</li><li><strong>Automated Updates:</strong> Enjoy smooth updates that match each new release of NextBlock and Next.js.</li><li><strong>Secure Checkout:</strong> Payments are processed safely with Stripe and Freemius with instant receipt generation.</li></ul><p>Whether you need multi-currency store features, automated sales tax calculations, or AI block generation in your editor, our modules deliver tested solutions that keep your Lighthouse scores at 100%.</p><p>All purchases include dedicated onboarding resources, detailed developer docs, and friendly technical support. If you ever run into an issue or need help wiring up a provider webhook, our core engineers are ready to assist you. We also offer a thirty-day refund policy so you can try our tools risk-free.</p><p>Have questions about license tiers, volume pricing, team seats, or custom agency usage? Contact our support team anytime. Our team is here to answer your questions and help your developers succeed. We are happy to help you pick the best plan for your company. Browse our featured products below to get started today.</p></div>"
+                      }
                     }
                   ]
-                };
+                ]
+              };
 
-                const [frProduct] = await db`
-                  INSERT INTO public.products (
-                    sku, title, slug, price, sale_price, stock, status, 
-                    short_description, description_json, 
-                    product_type, payment_provider,
-                    language_id, translation_group_id,
-                    freemius_product_id, freemius_plan_id,
-                    trial_period_days, trial_requires_payment_method
-                  )
-                  VALUES (
-                    ${product.sku}, 'NextBlock™ Commerce Pro - Licence Commerce', ${product.slug + '-fr'}, 
-                    ${product.price}, ${product.sale_price}, ${product.stock || 99}, ${product.status},
-                    ${shortDescFr}, ${db.json(htmlDescriptionFr)},
-                    'digital', 'freemius',
-                    ${frLangId}, ${product.translation_group_id},
-                    ${product.freemius_product_id}, ${product.freemius_plan_id},
-                    ${product.trial_period_days ?? 0}, ${product.trial_requires_payment_method ?? false}
-                  )
-                  ON CONFLICT ON CONSTRAINT products_language_id_slug_key DO UPDATE
-                  SET
-                    title = EXCLUDED.title,
-                    short_description = EXCLUDED.short_description,
-                    description_json = EXCLUDED.description_json,
-                    product_type = EXCLUDED.product_type,
-                    payment_provider = EXCLUDED.payment_provider,
-                    trial_period_days = EXCLUDED.trial_period_days,
-                    trial_requires_payment_method = EXCLUDED.trial_requires_payment_method
-                  RETURNING id
-                `;
+              const sectionContent = {
+                container_type: "container",
+                background: { type: "none" },
+                responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
+                column_gap: "none",
+                padding: { top: "xl", bottom: "xl" },
+                column_blocks: [
+                  [
+                    {
+                      block_type: "heading",
+                      content: {
+                        level: 2,
+                        text_content: "Featured Products",
+                        textAlign: "center"
+                      }
+                    },
+                    {
+                      block_type: "product_grid",
+                      content: {
+                        type: "latest",
+                        limit: 6
+                      }
+                    }
+                  ]
+                ]
+              };
 
-                if (frProduct) {
-                   await db`
-                    INSERT INTO public.product_media (product_id, media_id, sort_order)
-                    VALUES (${frProduct.id}, ${mediaRecord.id}, 0)
-                    ON CONFLICT (product_id, media_id) DO NOTHING
-                  `;
-                }
-              }
-              console.log('[Sandbox Reset] Successfully enriched commerce products (EN & FR).');
+              await db`
+                INSERT INTO public.blocks (page_id, language_id, block_type, content, "order")
+                VALUES 
+                (${pageId}, ${langId}, 'section', ${db.json(heroContent as any)}, 0),
+                (${pageId}, ${langId}, 'section', ${db.json(sectionContent as any)}, 1)
+              `;
             }
 
+            const [exists] = await db`SELECT id FROM public.navigation_items WHERE language_id = ${langId} AND url = '/shop'`;
+            if (!exists) {
+              await db`
+                INSERT INTO public.navigation_items (language_id, menu_key, label, url, "order")
+                VALUES (${langId}, 'HEADER', 'Shop', '/shop', 2)
+              `;
+            }
+          }
 
-            // 6. Add Shop Pages & Navigation Items
-            console.log('[Sandbox Reset] Adding Shop Pages and navigation items...');
-            let globalShopGroupId: string | undefined;
+          if (frLangId) {
+            const langId = frLangId;
+
+            // Insert French Page (keep slug 'boutique' matching original nav link)
+            const [existingPage] = await db`SELECT id FROM public.pages WHERE language_id = ${langId} AND slug = 'boutique'`;
+            let pageId = existingPage?.id;
             
-            if (enLangId) {
-              const langId = enLangId;
-              
-              // Insert Page
-              const [existingPage] = await db`SELECT id, translation_group_id FROM public.pages WHERE language_id = ${langId} AND slug = 'shop'`;
-              let pageId = existingPage?.id;
-              globalShopGroupId = existingPage?.translation_group_id;
-              
-              if (!pageId) {
-                const [newPage] = await db`
-                  INSERT INTO public.pages (language_id, title, slug, status, meta_title, meta_description)
-                  VALUES (${langId}, 'Shop Our Products', 'shop', 'published', 'Shop NextBlock™ Modules | Official Store', 'Browse official commercial modules and licenses for NextBlock CMS. Get instant access to NextBlock Commerce and Cortex AI with secure checkout.')
-                  RETURNING id, translation_group_id
-                `;
-                pageId = newPage.id;
-                globalShopGroupId = newPage?.translation_group_id;
+            if (!pageId) {
+              const [newPage] = await db`
+                INSERT INTO public.pages (language_id, title, slug, status, meta_title, meta_description, translation_group_id)
+                VALUES (${langId}, 'Boutique en Ligne', 'boutique', 'published', 'Boutique NextBlock™ | Modules et Licences Officielles', 'Achetez des licences et extensions officielles pour NextBlock CMS. Accédez à NextBlock Commerce et Cortex AI avec un paiement simple et sécurisé.', ${globalShopGroupId ?? null})
+                RETURNING id
+              `;
+              pageId = newPage.id;
 
-                const heroContent = {
-                  is_hero: true,
-                  container_type: "full-width",
-                  background: {
-                    type: "theme",
-                    theme: "primary"
-                  },
-                  responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
-                  column_gap: "lg",
-                  padding: { top: "xl", bottom: "xl" },
-                  vertical_alignment: "center",
-                  column_blocks: [
-                    [
-                      {
-                        block_type: "heading",
-                        content: {
-                          level: 1,
-                          text_content: "NextBlock™ Store",
-                          textAlign: "center",
-                          textColor: "background"
-                        }
-                      },
-                      {
-                        block_type: "text",
-                        content: {
-                          html_content: "<p style=\"text-align: center; color: var(--background); opacity: 0.9\">Discover our selection of official commercial add-ons and developer tools for NextBlock CMS.</p><div class='mt-8 text-slate-300 space-y-4 max-w-3xl mx-auto text-left'><h2 class='text-2xl font-bold text-white mb-4'>Power Up Your Web Projects</h2><p>Welcome to the official NextBlock™ digital store. Here you can purchase licenses for our premium packages, including NextBlock™ Commerce and NextBlock™ Cortex AI. Every commercial license helps fund full-time open-source development on our core CMS while giving your team advanced tools to launch high-performance websites faster.</p><p>Our premium modules are designed to feel native from day one. You get clean code that fits right into your existing NextBlock project without third-party plugins or complex configuration. When you purchase a license from our store, you receive instant access to everything you need:</p><ul class='space-y-2 list-disc pl-5'><li><strong>Full Source Code:</strong> Inspect, customize, and adapt the modules to your exact requirements.</li><li><strong>Perpetual Use:</strong> Use the software for your project with full peace of mind.</li><li><strong>Automated Updates:</strong> Enjoy smooth updates that match each new release of NextBlock and Next.js.</li><li><strong>Secure Checkout:</strong> Payments are processed safely with Stripe and Freemius with instant receipt generation.</li></ul><p>Whether you need multi-currency store features, automated sales tax calculations, or AI block generation in your editor, our modules deliver tested solutions that keep your Lighthouse scores at 100%.</p><p>All purchases include dedicated onboarding resources, detailed developer docs, and friendly technical support. If you ever run into an issue or need help wiring up a provider webhook, our core engineers are ready to assist you. We also offer a thirty-day refund policy so you can try our tools risk-free.</p><p>Have questions about license tiers, volume pricing, team seats, or custom agency usage? Contact our support team anytime. Our team is here to answer your questions and help your developers succeed. We are happy to help you pick the best plan for your company. Browse our featured products below to get started today.</p></div>"
-                        }
+              const heroContent = {
+                is_hero: true,
+                container_type: "full-width",
+                background: {
+                  type: "theme",
+                  theme: "primary"
+                },
+                responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
+                column_gap: "lg",
+                padding: { top: "xl", bottom: "xl" },
+                vertical_alignment: "center",
+                column_blocks: [
+                  [
+                    {
+                      block_type: "heading",
+                      content: {
+                        level: 1,
+                        text_content: "Boutique NextBlock™",
+                        textAlign: "center",
+                        textColor: "background"
                       }
-                    ]
-                  ]
-                };
-
-                const sectionContent = {
-                  container_type: "container",
-                  background: { type: "none" },
-                  responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
-                  column_gap: "none",
-                  padding: { top: "xl", bottom: "xl" },
-                  column_blocks: [
-                    [
-                      {
-                        block_type: "heading",
-                        content: {
-                          level: 2,
-                          text_content: "Featured Products",
-                          textAlign: "center"
-                        }
-                      },
-                      {
-                        block_type: "product_grid",
-                        content: {
-                          type: "latest",
-                          limit: 6
-                        }
+                    },
+                    {
+                      block_type: "text",
+                      content: {
+                        html_content: "<p style=\"text-align: center; color: var(--background); opacity: 0.9\">Découvrez nos extensions officielles et nos outils pour développeurs conçus pour le CMS NextBlock.</p><div class='mt-8 text-slate-300 space-y-4 max-w-3xl mx-auto text-left'><h2 class='text-2xl font-bold text-white mb-4'>Accélérez vos projets web</h2><p>Bienvenue sur la boutique officielle de NextBlock™. Vous pouvez acheter ici des licences pour nos modules professionnels, comme NextBlock™ Commerce et NextBlock™ Cortex AI. Chaque achat aide à financer le travail open-source sur le cœur du CMS. Il donne aussi à votre équipe des outils de pointe pour créer des sites rapides et fiables.</p><p>Nos modules premium s'intègrent sans effort à votre projet existant. Vous profitez d'un code propre et bien testé, sans plugin externe lourd ni réglage complexe. En choisissant nos outils, vous profitez immédiatement de nombreux avantages :</p><ul class='space-y-2 list-disc pl-5'><li><strong>Code source complet :</strong> Lisez, adaptez et faites évoluer chaque bloc selon vos besoins métier.</li><li><strong>Licence perpétuelle :</strong> Utilisez le code sur votre projet en toute sérénité.</li><li><strong>Mises à jour suivies :</strong> Recevez les nouvelles versions au rythme de Next.js et de NextBlock.</li><li><strong>Paiement sécurisé :</strong> Les achats passent par Stripe et Freemius avec facture instantanée.</li></ul><p>Vous voulez vendre dans plusieurs devises ? Vous avez besoin du calcul automatique des taxes ? Vous voulez générer des blocs avec l'IA ? Nos modules offrent des solutions prêtes à l'emploi qui préservent vos scores Lighthouse à 100%.</p><p>Chaque commande donne accès à une documentation claire et à notre support technique. Si vous avez besoin d'aide pour brancher un webhook ou un mode de paiement, nos développeurs vous répondent rapidement. Notre équipe est à vos côtés pour vous faire gagner du temps. Nous proposons aussi une garantie satisfait ou remboursé de trente jours.</p><p>Vous avez des questions sur nos tarifs, les licences agence ou les remises en volume ? Écrivez à notre équipe à tout moment. Nous vous guiderons avec grand plaisir vers l'offre idéale pour votre entreprise. Découvrez dès aujourd'hui l'ensemble de nos produits ci-dessous pour bien démarrer votre projet.</p></div>"
                       }
-                    ]
+                    }
                   ]
-                };
+                ]
+              };
 
-                await db`
-                  INSERT INTO public.blocks (page_id, language_id, block_type, content, "order")
-                  VALUES 
-                  (${pageId}, ${langId}, 'section', ${db.json(heroContent as any)}, 0),
-                  (${pageId}, ${langId}, 'section', ${db.json(sectionContent as any)}, 1)
-                `;
-              }
+              const sectionContent = {
+                container_type: "container",
+                background: { type: "none" },
+                responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
+                column_gap: "none",
+                padding: { top: "xl", bottom: "xl" },
+                column_blocks: [
+                  [
+                    {
+                      block_type: "heading",
+                      content: {
+                        level: 2,
+                        text_content: "Produits Vedettes",
+                        textAlign: "center"
+                      }
+                    },
+                    {
+                      block_type: "product_grid",
+                      content: {
+                        type: "latest",
+                        limit: 6
+                      }
+                    }
+                  ]
+                ]
+              };
 
-              const [exists] = await db`SELECT id FROM public.navigation_items WHERE language_id = ${langId} AND url = '/shop'`;
-              if (!exists) {
-                await db`
-                  INSERT INTO public.navigation_items (language_id, menu_key, label, url, "order")
-                  VALUES (${langId}, 'HEADER', 'Shop', '/shop', 2)
-                `;
-              }
+              await db`
+                INSERT INTO public.blocks (page_id, language_id, block_type, content, "order")
+                VALUES 
+                (${pageId}, ${langId}, 'section', ${db.json(heroContent as any)}, 0),
+                (${pageId}, ${langId}, 'section', ${db.json(sectionContent as any)}, 1)
+              `;
             }
 
-            if (frLangId) {
-              const langId = frLangId;
-
-              // Insert French Page (keep slug 'boutique' matching original nav link)
-              const [existingPage] = await db`SELECT id FROM public.pages WHERE language_id = ${langId} AND slug = 'boutique'`;
-              let pageId = existingPage?.id;
-              
-              if (!pageId) {
-                const [newPage] = await db`
-                  INSERT INTO public.pages (language_id, title, slug, status, meta_title, meta_description, translation_group_id)
-                  VALUES (${langId}, 'Boutique en Ligne', 'boutique', 'published', 'Boutique NextBlock™ | Modules et Licences Officielles', 'Achetez des licences et extensions officielles pour NextBlock CMS. Accédez à NextBlock Commerce et Cortex AI avec un paiement simple et sécurisé.', ${globalShopGroupId ?? null})
-                  RETURNING id
-                `;
-                pageId = newPage.id;
-
-                const heroContent = {
-                  is_hero: true,
-                  container_type: "full-width",
-                  background: {
-                    type: "theme",
-                    theme: "primary"
-                  },
-                  responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
-                  column_gap: "lg",
-                  padding: { top: "xl", bottom: "xl" },
-                  vertical_alignment: "center",
-                  column_blocks: [
-                    [
-                      {
-                        block_type: "heading",
-                        content: {
-                          level: 1,
-                          text_content: "Boutique NextBlock™",
-                          textAlign: "center",
-                          textColor: "background"
-                        }
-                      },
-                      {
-                        block_type: "text",
-                        content: {
-                          html_content: "<p style=\"text-align: center; color: var(--background); opacity: 0.9\">Découvrez nos extensions officielles et nos outils pour développeurs conçus pour le CMS NextBlock.</p><div class='mt-8 text-slate-300 space-y-4 max-w-3xl mx-auto text-left'><h2 class='text-2xl font-bold text-white mb-4'>Accélérez vos projets web</h2><p>Bienvenue sur la boutique officielle de NextBlock™. Vous pouvez acheter ici des licences pour nos modules professionnels, comme NextBlock™ Commerce et NextBlock™ Cortex AI. Chaque achat aide à financer le travail open-source sur le cœur du CMS. Il donne aussi à votre équipe des outils de pointe pour créer des sites rapides et fiables.</p><p>Nos modules premium s'intègrent sans effort à votre projet existant. Vous profitez d'un code propre et bien testé, sans plugin externe lourd ni réglage complexe. En choisissant nos outils, vous profitez immédiatement de nombreux avantages :</p><ul class='space-y-2 list-disc pl-5'><li><strong>Code source complet :</strong> Lisez, adaptez et faites évoluer chaque bloc selon vos besoins métier.</li><li><strong>Licence perpétuelle :</strong> Utilisez le code sur votre projet en toute sérénité.</li><li><strong>Mises à jour suivies :</strong> Recevez les nouvelles versions au rythme de Next.js et de NextBlock.</li><li><strong>Paiement sécurisé :</strong> Les achats passent par Stripe et Freemius avec facture instantanée.</li></ul><p>Vous voulez vendre dans plusieurs devises ? Vous avez besoin du calcul automatique des taxes ? Vous voulez générer des blocs avec l'IA ? Nos modules offrent des solutions prêtes à l'emploi qui préservent vos scores Lighthouse à 100%.</p><p>Chaque commande donne accès à une documentation claire et à notre support technique. Si vous avez besoin d'aide pour brancher un webhook ou un mode de paiement, nos développeurs vous répondent rapidement. Notre équipe est à vos côtés pour vous faire gagner du temps. Nous proposons aussi une garantie satisfait ou remboursé de trente jours.</p><p>Vous avez des questions sur nos tarifs, les licences agence ou les remises en volume ? Écrivez à notre équipe à tout moment. Nous vous guiderons avec grand plaisir vers l'offre idéale pour votre entreprise. Découvrez dès aujourd'hui l'ensemble de nos produits ci-dessous pour bien démarrer votre projet.</p></div>"
-                        }
-                      }
-                    ]
-                  ]
-                };
-
-                const sectionContent = {
-                  container_type: "container",
-                  background: { type: "none" },
-                  responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
-                  column_gap: "none",
-                  padding: { top: "xl", bottom: "xl" },
-                  column_blocks: [
-                    [
-                      {
-                        block_type: "heading",
-                        content: {
-                          level: 2,
-                          text_content: "Produits Vedettes",
-                          textAlign: "center"
-                        }
-                      },
-                      {
-                        block_type: "product_grid",
-                        content: {
-                          type: "latest",
-                          limit: 6
-                        }
-                      }
-                    ]
-                  ]
-                };
-
-                await db`
-                  INSERT INTO public.blocks (page_id, language_id, block_type, content, "order")
-                  VALUES 
-                  (${pageId}, ${langId}, 'section', ${db.json(heroContent as any)}, 0),
-                  (${pageId}, ${langId}, 'section', ${db.json(sectionContent as any)}, 1)
-                `;
-              }
-
-              const [exists] = await db`SELECT id FROM public.navigation_items WHERE language_id = ${langId} AND url = '/boutique'`;
-              if (!exists) {
-                await db`
-                  INSERT INTO public.navigation_items (language_id, menu_key, label, url, "order")
-                  VALUES (${langId}, 'HEADER', 'Boutique', '/boutique', 2)
-                `;
-              }
+            const [exists] = await db`SELECT id FROM public.navigation_items WHERE language_id = ${langId} AND url = '/boutique'`;
+            if (!exists) {
+              await db`
+                INSERT INTO public.navigation_items (language_id, menu_key, label, url, "order")
+                VALUES (${langId}, 'HEADER', 'Boutique', '/boutique', 2)
+              `;
             }
-            console.log('[Sandbox Reset] Successfully created Shop pages and navigation.');
-          } catch (enrichErr: any) {
-            console.error('[Sandbox Reset] Product enrichment failed:', enrichErr.message || enrichErr);
           }
-          */
-          } catch (syncErr: any) {
-            console.error('[Sandbox Reset] Failed to sync Freemius products:', syncErr.message || syncErr);
-            throw syncErr;
-          }
+          console.log('[Sandbox Reset] Successfully created Shop pages and navigation.');
+        } catch (enrichErr: any) {
+          console.error('[Sandbox Reset] Product enrichment failed:', enrichErr.message || enrichErr);
+        }
+        */
+        } catch (syncErr: any) {
+          console.error('[Sandbox Reset] Failed to sync Freemius products:', syncErr.message || syncErr);
+          throw syncErr;
         }
       }
 
       if (process.env.FREEMIUS_AI_SANDBOX_KEY) {
-        const { error: cortexActivationError } = await supabaseAdmin
-          .from('package_activations')
-          .upsert(
-            {
-              package_id: CORTEX_AI_PACKAGE_ID,
-              license_key: process.env.FREEMIUS_AI_SANDBOX_KEY,
-              status: 'active',
-              instance_name: siteUrl,
-              last_validated_at: new Date().toISOString(),
-            },
-            { onConflict: 'license_key, package_id' }
-          );
-
-        if (cortexActivationError) {
-          console.error(
-            '[Sandbox Reset] Failed to activate Cortex AI package:',
-            cortexActivationError.message
-          );
-          throw cortexActivationError;
-        } else {
-          console.log('[Sandbox Reset] Successfully activated Cortex AI package.');
-        }
+        await activateSandboxPackage(
+          db, CORTEX_AI_PACKAGE_ID, process.env.FREEMIUS_AI_SANDBOX_KEY, siteUrl,
+        );
+        console.log('[Sandbox Reset] Successfully activated Cortex AI package.');
       }
 
       // Seed additional store data: Branding, Demo Account, and Fake Orders

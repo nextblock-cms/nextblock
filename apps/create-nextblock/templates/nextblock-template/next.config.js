@@ -132,7 +132,8 @@ const nextConfig = {
     remotePatterns: getRemotePatterns(),
   },
   compiler: {
-    removeConsole: process.env.NODE_ENV === 'production',
+    // Keep operational failures visible in deployed function logs.
+    removeConsole: process.env.NODE_ENV === 'production' ? { exclude: ['error', 'warn'] } : false,
   },
   turbopack: {
     // Work around Turbopack subpath resolution for the latest y-protocols package.

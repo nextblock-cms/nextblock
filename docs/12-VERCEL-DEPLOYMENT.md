@@ -180,6 +180,15 @@ outright. So on a Hobby project you must **delete the `reset-sandbox` entry from
 sandbox mode — it returns 404 otherwise — so on a normal deploy it is a harmless
 no-op anyway. `sync-currencies` is daily and deploys fine on Hobby.
 
+### Debugging sandbox reset failures
+
+A cron invocation returning 500 reached the route; inspect its function error logs.
+Production builds retain `console.error` and `console.warn`. If an external call
+returns 504, expand it to identify the service and path. Package activations use
+the reset's direct PostgreSQL connection so they do not depend on Supabase REST
+availability after rebuilding the schema. Other integrations still require their
+respective services to be available.
+
 ## After deploy
 
 Visit the deployment URL — it redirects to `/setup` until the first admin exists.
