@@ -14,6 +14,8 @@ interface TextBlockRendererProps {
   languageId: number;
   visualEditAttributes?: VisualEditAttributes;
   renderContext?: 'prose' | 'section';
+  /** Above-the-fold block: the first YouTube embed's poster is preloaded (LCP). */
+  priority?: boolean;
 }
 
 const TextBlockRenderer: React.FC<TextBlockRendererProps> = async ({
@@ -21,6 +23,7 @@ const TextBlockRenderer: React.FC<TextBlockRendererProps> = async ({
   languageId,
   visualEditAttributes,
   renderContext = 'prose',
+  priority = false,
 }) => {
   const hdrs = await headers();
   const nonce = hdrs.get('x-nonce') || '';
@@ -36,6 +39,7 @@ const TextBlockRenderer: React.FC<TextBlockRendererProps> = async ({
       languageId={languageId}
       visualEditAttributes={visualEditAttributes}
       renderContext={renderContext}
+      priority={priority}
     />
   );
 };

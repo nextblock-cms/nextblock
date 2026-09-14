@@ -353,8 +353,11 @@ function toCustomRule(group: CustomRuleGroup): RobotsRule {
 }
 
 /**
- * The `MetadataRoute.Robots` object served at /robots.txt by `app/robots.ts`, and the
- * object {@link buildRobotsTxt} renders for the admin preview.
+ * The `MetadataRoute.Robots` object behind /robots.txt — `app/robots.txt/route.ts`
+ * renders it with {@link renderRobotsMetadata}, and so does {@link buildRobotsTxt} for
+ * the admin preview. Per-rule `other` entries carry the directives Next's own type has
+ * no field for; that is why the file is served by a route handler and not by a
+ * metadata route (see the route for the full reasoning).
  *
  * Empty `allow` / `disallow` arrays are omitted rather than passed through: Next
  * renders each entry as its own line, so an empty array contributes nothing while
@@ -402,13 +405,12 @@ export function buildRobotsMetadata(
 }
 
 /**
- * The literal robots.txt text for a settings object — what the admin preview shows.
+ * The literal robots.txt text for a settings object — what the admin preview shows AND
+ * what `app/robots.txt/route.ts` serves.
  *
- * This is {@link buildRobotsMetadata} put through {@link renderRobotsMetadata}, which
- * is what makes the preview incapable of disagreeing with the served file: there is
- * one object, one renderer, and the renderer is Next's own algorithm. The route
- * itself still returns the metadata object rather than this string, so caching,
- * revalidation and content type are handled exactly the way they are for the sitemap.
+ * This is {@link buildRobotsMetadata} put through {@link renderRobotsMetadata}. The
+ * route handler returns this exact string, which is what makes the preview incapable
+ * of disagreeing with the served file: one object, one renderer, one call site each.
  */
 export function buildRobotsTxt(settings: RobotsSettings, options: RobotsTxtOptions): string {
   return renderRobotsMetadata(buildRobotsMetadata(settings, options));
@@ -440,15 +442,17 @@ export function listUnservedCustomRuleLines(
 }
 
 /**
- * Serialises a `MetadataRoute.Robots` object exactly as Next.js does.
+ * Serialises a `MetadataRoute.Robots` object exactly as Next.js does, plus the per-rule
+ * `other` map Next has no field for.
  *
  * This is a deliberate port of `resolveRobots` in
  * `next/dist/build/webpack/loaders/metadata/resolve-route-data`, down to the
  * capitalised `User-Agent:`, the blank line after every group including the last, and
- * the order of fields within a group. It exists so the admin preview can be the
- * served bytes rather than an approximation of them; the colocated test asserts the
- * two agree by importing Next's serialiser directly, so a change to Next's rendering
- * fails a test here instead of silently turning the preview back into a lie.
+ * the order of fields within a group. The colocated test asserts the two agree for
+ * every typed field by importing Next's serialiser directly, so a change to Next's
+ * rendering fails a test here instead of drifting unnoticed. The `other` entries are
+ * the one documented divergence — Next drops them, which is why /robots.txt is served
+ * by a route handler running this function rather than by a metadata route.
  */
 export function renderRobotsMetadata(metadata: MetadataRoute.Robots): string {
   let content = '';

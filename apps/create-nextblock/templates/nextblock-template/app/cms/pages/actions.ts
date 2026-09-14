@@ -7,6 +7,7 @@ import { redirect } from "next/navigation";
 import type { Database } from "@nextblock-cms/db";
 import { v4 as uuidv4 } from 'uuid';
 import { getOrCreateContentDraft } from "../../../lib/visual-editing/draft-content";
+import { revalidatePublicContent } from "../../../lib/public-content-cache";
 import { getHomepageTranslationGroupId } from "../../lib/homepage";
 
 type PageStatus = Database['public']['Enums']['page_status'];
@@ -31,6 +32,9 @@ function revalidatePublicPageSlug(
   if (isHomepage || slug === "home" || slug === "accueil") {
     revalidatePath("/");
   }
+  // The public page reads are cached (lib/public-content-cache.ts); evict them so the
+  // change is visible on the next request from every path the page is served at.
+  revalidatePublicContent("pages");
 }
 
 export async function createPage(formData: FormData) {

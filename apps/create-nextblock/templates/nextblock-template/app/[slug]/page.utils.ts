@@ -2,7 +2,12 @@
 import { createClient, getSsgSupabaseClient } from "@nextblock-cms/db/server";
 import type { Database } from "@nextblock-cms/db";
 import { buildPublishedAtOrFilter } from "@nextblock-cms/utils";
+import { unstable_cache } from "next/cache";
 import { draftMode } from "next/headers";
+import {
+  PUBLIC_CONTENT_REVALIDATE_SECONDS,
+  PUBLIC_PAGES_CACHE_TAG,
+} from "../../lib/public-content-cache";
 import { resolveMediaUrl } from "../../lib/media/resolveMediaUrl";
 import { getContentDraft } from "../../lib/visual-editing/draft-content";
 import type { ContentDraftRow, DraftBlockSnapshot } from "../../lib/visual-editing/types";
@@ -248,14 +253,72 @@ function mapMediaDataToBlock(
   return block;
 }
 
+type PublicSupabaseClient = ReturnType<typeof createClient> | ReturnType<typeof getSsgSupabaseClient>;
+
+/**
+ * Public page data for a slug.
+ *
+ * Draft mode (the Live Draft preview) reads the live tables through the cookie-scoped
+ * client on every request. Everything else is served from `unstable_cache`: see
+ * lib/public-content-cache.ts for the lifetime and how CMS writes evict it. Before this
+ * every public request paid these Supabase round trips, which showed up as 0.5-6 s of
+ * body time on the home page.
+ */
 export async function getPageDataBySlug(
   slug: string,
   preferredLanguageCode?: string,
 ): Promise<PublicPageData | null> {
   const draft = await draftMode();
-  const isDraftModeEnabled = draft.isEnabled;
-  const supabase = isDraftModeEnabled ? createClient() : getSsgSupabaseClient();
+  if (draft.isEnabled) {
+    return loadPageData(createClient(), slug, preferredLanguageCode, true);
+  }
+  return getCachedPublishedPageData(slug, preferredLanguageCode ?? null);
+}
 
+const getCachedPublishedPageData = unstable_cache(
+  async (slug: string, preferredLanguageCode: string | null): Promise<PublicPageData | null> =>
+    loadPageData(getSsgSupabaseClient(), slug, preferredLanguageCode ?? undefined, false),
+  ['public-page-data'],
+  { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_PAGES_CACHE_TAG] },
+);
+
+/**
+ * `language code -> slug` for every published page in a translation group. Feeds the
+ * hreflang alternates, the "/" homepage locale resolution and the client language
+ * switcher; cached and evicted together with the page data.
+ */
+export const getCachedPublishedPageTranslatedSlugs = unstable_cache(
+  async (translationGroupId: string): Promise<Record<string, string>> => {
+    const supabase = getSsgSupabaseClient();
+    const { data, error } = await supabase
+      .from('pages')
+      .select('slug, languages!inner(code)')
+      .eq('translation_group_id', translationGroupId)
+      .eq('status', 'published')
+      .or(buildPublishedAtOrFilter());
+
+    if (error || !data) return {};
+
+    const slugs: Record<string, string> = {};
+    for (const row of data as Array<{
+      slug: string | null;
+      languages: { code: string } | { code: string }[] | null;
+    }>) {
+      const language = Array.isArray(row.languages) ? row.languages[0] : row.languages;
+      if (language?.code && row.slug) slugs[language.code] = row.slug;
+    }
+    return slugs;
+  },
+  ['public-page-translated-slugs'],
+  { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_PAGES_CACHE_TAG] },
+);
+
+async function loadPageData(
+  supabase: PublicSupabaseClient,
+  slug: string,
+  preferredLanguageCode: string | undefined,
+  isDraftModeEnabled: boolean,
+): Promise<PublicPageData | null> {
   const baseSelect = `
       id, slug, title, meta_title, meta_description, custom_canonical, feature_image_id, status, language_id, translation_group_id, author_id, created_at, updated_at,
       language_details:languages!inner(id, code),

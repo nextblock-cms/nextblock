@@ -8,8 +8,11 @@ import type {
   VisualEditingDocumentContext,
 } from "../lib/visual-editing/types";
 import { getPublicBlockRendererLoader } from "./blocks/publicRendererLoaders";
-import { createClient as createSupabaseServerClient } from "@nextblock-cms/db/server";
+import { getSsgSupabaseClient } from "@nextblock-cms/db/server";
+import { unstable_cache } from "next/cache";
 import { headers } from "next/headers";
+import { SITE_SETTINGS_CACHE_TAG } from "../app/lib/site-settings";
+import { PUBLIC_CONTENT_REVALIDATE_SECONDS } from "../lib/public-content-cache";
 
 type Block = Database['public']['Tables']['blocks']['Row'];
 import SectionBlockRenderer from "./blocks/renderers/SectionBlockRenderer"; // Static import for LCP
@@ -27,6 +30,36 @@ const ECOMMERCE_BLOCK_TYPES = new Set([
   "checkout",
   "product_details",
 ]);
+
+type BotProtectionPublicSettings = {
+  provider: 'none' | 'turnstile' | 'recaptcha';
+  siteKey: string;
+};
+
+/**
+ * The public half of the bot-protection settings (provider + site key), read through
+ * the anon client — `bot_protection_public` is outside the sensitive-key list of
+ * `site_settings_read_policy`, and it is the same value every visitor receives. Cached
+ * like the other public reads; the settings action revalidates the root layout, whose
+ * implicit tag covers this entry.
+ */
+const getCachedBotProtectionPublic = unstable_cache(
+  async (): Promise<BotProtectionPublicSettings | undefined> => {
+    const { data } = await getSsgSupabaseClient()
+      .from('site_settings')
+      .select('value')
+      .eq('key', 'bot_protection_public')
+      .maybeSingle();
+    if (!data?.value) return undefined;
+    const publicVal = data.value as Record<string, any>;
+    return {
+      provider: publicVal.provider || 'none',
+      siteKey: publicVal.siteKey || '',
+    };
+  },
+  ['public-bot-protection'],
+  { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [SITE_SETTINGS_CACHE_TAG] },
+);
 
 function loadEcommerceBlockRenderer(blockType: string) {
   return import("./blocks/ecommerceRendererLoaders").then((module) =>
@@ -162,6 +195,8 @@ async function renderLoadedBlock({
         content={{ ...(textContent as any), html_content: html }}
         languageId={languageId}
         visualEditAttributes={visualEditAttributes}
+        // First top-level block is above the fold: preload its first embed's poster.
+        priority={blockIndex === 0}
       />
     );
   }
@@ -262,19 +297,7 @@ export default async function BlockRenderer({
   }
 
   try {
-    const supabase = createSupabaseServerClient();
-    const { data: publicSetting } = await supabase
-      .from('site_settings')
-      .select('value')
-      .eq('key', 'bot_protection_public')
-      .maybeSingle();
-    if (publicSetting?.value) {
-      const publicVal = publicSetting.value as Record<string, any>;
-      botProtectionPublic = {
-        provider: publicVal.provider || 'none',
-        siteKey: publicVal.siteKey || '',
-      };
-    }
+    botProtectionPublic = await getCachedBotProtectionPublic();
   } catch (e) {
     console.error("[Bot Protection] Error loading settings in BlockRenderer:", e);
   }

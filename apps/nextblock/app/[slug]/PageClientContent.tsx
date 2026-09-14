@@ -15,6 +15,12 @@ type BlockType = Database['public']['Tables']['blocks']['Row'];
 
 interface PageClientContentProps {
   initialPageData: (PageType & {
+    /**
+     * Intentionally empty when rendered from the page routes: the blocks are
+     * server-rendered and passed as `children`, and shipping them here again
+     * would duplicate the whole page in the RSC payload. Only the locale
+     * refetch path (getPublishedPageForLocale) fills this in.
+     */
     blocks: BlockType[];
     language_code: string;
     language_id: number;

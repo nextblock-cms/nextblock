@@ -408,8 +408,8 @@ export async function toggleRedirect(id: string, isActive: boolean): Promise<Set
  * dropped, and a rule with no user agent — which would render a `User-agent:` line
  * applying to nobody and silently orphan every directive under it — is removed. Writing
  * the canonical form means the file an operator previewed is the file that gets served,
- * and it means anything else reading this row later (an export, an MCP tool, a future
- * `app/robots.ts`) does not have to repeat the cleanup.
+ * and it means anything else reading this row later (an export, an MCP tool, the
+ * `app/robots.txt/route.ts` handler) does not have to repeat the cleanup.
  */
 export async function saveRobotsSettings(settings: RobotsSettings): Promise<SettingsActionResult> {
   const { error: authError, supabase } = await requireAdminOrMessage();

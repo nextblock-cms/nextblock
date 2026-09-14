@@ -70,7 +70,7 @@ async function safe(
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
   // Disposable sandbox deployments should not advertise an indexable sitemap
-  // (mirrors the legacy app/sitemap.xml route and app/robots.ts).
+  // (mirrors the legacy app/sitemap.xml route and app/robots.txt/route.ts).
   if (process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') {
     return [];
   }

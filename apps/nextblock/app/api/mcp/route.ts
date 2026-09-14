@@ -5,6 +5,7 @@ import {
   getServiceRoleSupabaseClient,
   verifyPackageOnline,
 } from '@nextblock-cms/db/server';
+import { revalidatePublicContent } from '../../../lib/public-content-cache';
 import {
   CORTEX_AI_PACKAGE_ID,
   handleCortexMcpMessage,
@@ -292,7 +293,14 @@ function buildToolContext(auth: McpAuth): CortexMcpToolContext {
     // (`cmsTarget`, `slug`, `entityId`) rather than inheriting one from a UI.
     pageContext: null,
     recordRevision: createMcpRevisionRecorder(auth.actorUserId),
-    revalidatePath,
+    // Tools revalidate the public path they changed. The cached page/post reads
+    // (lib/public-content-cache.ts) are evicted by tag as well, because a path call
+    // cannot know a page's aliases — any homepage variant is also served at "/".
+    revalidatePath: (path: string, type?: 'layout' | 'page') => {
+      revalidatePath(path, type);
+      revalidatePublicContent('pages');
+      revalidatePublicContent('posts');
+    },
     skipConfirmation: MCP_SKIP_CONFIRMATION,
     supabase: getServiceRoleSupabaseClient(),
     validateBlockContent,

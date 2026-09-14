@@ -251,6 +251,59 @@ If you are configuring hosted Supabase auth email settings, use:
 npm run configure:supabase-auth
 ```
 
+## Public Page Performance Budget
+
+Every public route is rendered per request (the CSP nonce and the locale cookie make
+the layout dynamic), and Next.js streams the whole page as one burst after the data
+arrives, followed by the inline React Server Components payload
+(`self.__next_f.push(...)`). That inline script blocks the HTML parser while it is
+evaluated, so the already-parsed hero does not paint until it finishes: on the home
+page a 214 KB payload cost ~250 ms of blank viewport at 1x CPU and ~800 ms at 4x.
+Everything a server component hands to a client component is serialized into it, so
+keep these rules when touching the public surface:
+
+- **Only pass a client component what it reads.** `PageClientContent` receives the
+  page row with `blocks: []`; the blocks are already rendered as `children`. The
+  article route still passes `blocks` because `PostClientContent` derives the read
+  time from them.
+- **Translations are trimmed per locale.** `app/layout.tsx` passes the `translations`
+  table through `lib/i18n/slim-translations.ts` (active locale + `en` fallback, no
+  timestamps). A language switch uses `router.refresh()`, which re-runs the layout,
+  so the client never needs the other locales.
+- **Above-the-fold media gets `priority`.** `BlockRenderer` flags the first top-level
+  block and `SectionBlockRenderer` flags hero sections; text renderers forward it so
+  the first YouTube embed in that HTML preloads its poster instead of lazy-loading it
+  (`components/media/youtube-embed-replace.tsx`). The poster is routinely the LCP
+  element.
+- **Public reads are cached, and `fetchCache` is off-limits.** `getPageDataBySlug`,
+  `getPostDataBySlug`, the translated-slug maps and the bot-protection site key sit
+  behind `unstable_cache` (`lib/public-content-cache.ts`: 60 s, the same lifetime as the
+  layout's navigation/translations/themes). Draft mode bypasses the cache automatically.
+  Eviction is `revalidatePath('/<slug>')` (implicit route tags, which every writer and
+  every Cortex/MCP tool already call) plus `revalidatePublicContent('pages' | 'posts')`
+  from the CMS writers, because one page can be served from several paths (any
+  homepage variant is also `/`). A direct database edit that revalidates nothing is
+  visible within 60 s. Never add `export const fetchCache = 'force-no-store'` to a public
+  segment: Next disables `unstable_cache` under it — that single line had switched off
+  all layout caching on `/[slug]`, `/article/[slug]` and `/product/[slug]`.
+- **Measure before and after.** `npx lighthouse <url> --preset=desktop` (and the
+  default mobile run) against a production build; decode the payload size from the
+  `__next_f` script and check `observedFirstContentfulPaint` vs `observedFirstPaint`
+  in the JSON — a gap there is the parser-blocking symptom above. Locally, start the
+  build with `next start apps/nextblock` (the Nx `dist/` copy can be stale from another
+  checkout, and `next start` on a stale copy crashes in `setupFsCheck`).
+
+Seeded marketing copy is content, not code: colour-contrast or markup fixes to it are
+forward-only data migrations scoped by content signature (see `02006`), never edits
+to the baseline seed.
+
+`/robots.txt` is a route handler (`app/robots.txt/route.ts`) that serves
+`buildRobotsTxt` — the same function the SEO screen previews — with `force-static` and
+an hourly revalidate. It is not an `app/robots.ts` metadata route because Next's
+serialiser has no field for the per-rule `other` directives (`Clean-param`, a per-group
+`Host`, …) the screen lets operators add; the metadata route dropped them silently.
+`lib/seo/robots-txt.test.ts` pins both facts against Next's real serialiser.
+
 ## Current Repo Notes
 
 Two repo facts are worth keeping in mind while contributing:

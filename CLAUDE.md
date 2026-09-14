@@ -90,6 +90,13 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   `vite.config.mts` (see `./seo`); the published `./*` wildcard only maps files.
 - Publish order utils → ui → sdk → db → editor → ecommerce → cortex → CLI; npm 2FA needs
   an OTP per publish and piping output breaks the prompt (`EOTP`).
+- Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`
+  (`lib/public-content-cache.ts`, 60 s, evicted by `revalidatePath` + `revalidatePublicContent`).
+  `export const fetchCache = 'force-no-store'` on a route segment silently disables every
+  `unstable_cache` under it, the layout's included; `dynamic = 'force-dynamic'` is enough.
+- `/robots.txt` is a route handler (`app/robots.txt/route.ts`) serving `buildRobotsTxt`, not an
+  `app/robots.ts` metadata route: Next's serialiser drops the per-rule `other` directives the
+  SEO screen lets operators add. The two cannot coexist.
 
 ## Do not modify
 

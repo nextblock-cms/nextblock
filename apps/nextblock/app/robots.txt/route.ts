@@ -1,36 +1,32 @@
-import type { MetadataRoute } from 'next';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
 import { normalizeRobotsSettings, type RobotsSettings } from '@nextblock-cms/utils/seo';
-import { buildRobotsMetadata } from '../lib/seo/robots-txt';
-import { resolveSiteUrl, hasResolvedSiteUrl } from '../lib/site-url';
+import { buildRobotsTxt } from '../../lib/seo/robots-txt';
+import { hasResolvedSiteUrl, resolveSiteUrl } from '../../lib/site-url';
 
 /**
  * /robots.txt, generated from the operator's stored settings.
  *
- * This replaces the hand-rolled `app/robots.txt/route.ts` that used to live here,
- * and the two CANNOT coexist: Next's `normalizeMetadataRoute` rewrites the page
- * `/robots` to `/robots.txt` and then appends `/route`, which is character for
- * character the app path the old handler occupied. Keeping both would be a
- * duplicate-route collision, not a fallback — so the old file was deleted in the
- * same change that added this one. The externally visible path is unchanged, which
- * is why `isSetupAllowlisted()` in proxy.ts still allowlists the literal
- * '/robots.txt' and needed no edit.
+ * This is a route handler rather than an `app/robots.ts` metadata route on purpose.
+ * The metadata route hands a `MetadataRoute.Robots` object to Next's own serialiser,
+ * and that serialiser (`resolveRobots`, Next 16.2) knows only `User-Agent`, `Allow`,
+ * `Disallow`, `Crawl-delay`, `Host` and `Sitemap`. Every non-standard directive an
+ * operator types into the SEO screen — `Clean-param`, `Request-rate`, a per-group
+ * `Host` — was rendered in the CMS preview and then silently dropped from the served
+ * file, which is exactly the "preview that lies" the SEO screen exists to prevent.
  *
- * The move from a route handler to the metadata route is what buys the caching
- * below. Everything else about the response — the served path, the content type, the
- * sandbox behaviour — is identical to what shipped before.
- */
-
-/**
- * Cache the generated file and rebuild it at most once an hour, mirroring
- * app/sitemap.ts. Crawlers get a fast, statically-served response while a change an
- * operator saves in /cms/settings still takes effect without a redeploy.
+ * Serving `buildRobotsTxt` directly makes the preview the served bytes by
+ * construction: same settings, same renderer (`renderRobotsMetadata`, Next's algorithm
+ * plus the `other` escape hatch). The two files cannot coexist — Next rewrites
+ * `app/robots.ts` to this very path — so `app/robots.ts` was removed in the same change.
+ * The externally visible path is unchanged; `isSetupAllowlisted()` in proxy.ts still
+ * allowlists the literal '/robots.txt'.
  *
- * NextBlock does not enable Next.js Cache Components, so the route-segment
- * `revalidate` config is the idiomatic caching control here. If `cacheComponents`
- * were turned on, the equivalent would be a `'use cache'` body paired with
- * `cacheLife('hours')` instead of this export.
+ * Caching matches what the metadata route had: the response is static, rebuilt at
+ * most hourly, and `revalidateRobotsFile()` in cms/settings/seo/actions.ts evicts it
+ * by path the moment an operator saves. `force-static` is explicit because a GET
+ * route handler is dynamic by default and nothing here reads request data.
  */
+export const dynamic = 'force-static';
 export const revalidate = 3600;
 
 /**
@@ -51,20 +47,13 @@ const ROBOTS_SETTINGS_KEY = 'seo_robots_settings';
  * service-role client to a route that anonymous crawlers hit would be a needless
  * escalation.
  *
- * That read has to stay anonymous, which is why migration 31 tightened only the
- * INSERT/UPDATE/DELETE policies and left `site_settings_read_policy` alone. Adding
- * this key to the read policy's sensitive array would not fail loudly — the query
- * below would simply return no row, every crawler would be served the permissive
- * defaults, and the operator's configuration would stop applying without a single
- * error anywhere.
- *
  * The failure handling matters more than it looks. A crawler that receives a 500 for
  * robots.txt may treat the entire site as disallowed until it next succeeds, so an
- * unreachable database — or a `cms_redirects`-era install that has not yet run
- * `npm run db:migrate`, where this settings row does not exist — must produce a
- * valid, permissive file rather than an error. `normalizeRobotsSettings` handles the
- * other half of that: whatever jsonb hands back, including null, a string or a
- * half-migrated object, becomes a complete `RobotsSettings`.
+ * unreachable database — or an install that has not yet run `npm run db:migrate`,
+ * where this settings row does not exist — must produce a valid, permissive file
+ * rather than an error. `normalizeRobotsSettings` handles the other half of that:
+ * whatever jsonb hands back, including null, a string or a half-migrated object,
+ * becomes a complete `RobotsSettings`.
  */
 async function loadRobotsSettings(): Promise<RobotsSettings> {
   try {
@@ -89,17 +78,15 @@ async function loadRobotsSettings(): Promise<RobotsSettings> {
   }
 }
 
-export default async function robots(): Promise<MetadataRoute.Robots> {
+async function renderRobotsFile(): Promise<string> {
   const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
   // The sandbox answer ignores every stored setting, so there is nothing to read.
   // Skipping the query keeps a disposable deployment's robots.txt working even when
-  // its database is asleep or being reset by the cron job. The reasoning for why the
-  // sandbox ALLOWS crawling rather than disallowing it lives on SANDBOX_USER_AGENT_RULE
-  // in lib/seo/robots-txt.ts — it is the counter-intuitive part of this feature and
-  // that is where it is written down in full.
+  // its database is asleep or being reset by the cron job. Why the sandbox ALLOWS
+  // crawling is written down on SANDBOX_USER_AGENT_RULE in lib/seo/robots-txt.ts.
   if (isSandbox) {
-    return buildRobotsMetadata(normalizeRobotsSettings(undefined), {
+    return buildRobotsTxt(normalizeRobotsSettings(undefined), {
       isSandbox: true,
       sitemapUrl: null,
     });
@@ -116,8 +103,21 @@ export default async function robots(): Promise<MetadataRoute.Robots> {
 
   const settings = await loadRobotsSettings();
 
-  return buildRobotsMetadata(settings, {
+  return buildRobotsTxt(settings, {
     isSandbox: false,
     sitemapUrl: `${siteUrl}/sitemap.xml`,
+  });
+}
+
+export async function GET(): Promise<Response> {
+  const body = await renderRobotsFile();
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      // The same content type and cache header Next's metadata route loader emits.
+      'Content-Type': 'text/plain',
+      'Cache-Control': 'public, max-age=0, must-revalidate',
+    },
   });
 }

@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { MetadataRoute } from 'next';
-// The serialiser Next itself runs for a dynamic `robots.ts`: the route module the
-// metadata loader generates is literally
-// `const data = await handler(); const content = resolveRouteData(data, fileType)`,
-// importing this exact specifier (see
-// next/dist/build/webpack/loaders/next-metadata-route-loader.js). Importing it here
-// rather than restating its behaviour is the point of these tests — the preview is
-// only provably the served file if the comparison uses the real thing. If a Next
-// upgrade moves or changes it, this import (or the assertions below) fail loudly,
-// which is the signal we want.
+// The serialiser Next itself runs for a dynamic `robots.ts` metadata route (see
+// next/dist/build/webpack/loaders/next-metadata-route-loader.js). /robots.txt is NOT
+// served that way any more — app/robots.txt/route.ts serves `buildRobotsTxt` directly,
+// so preview and file are the same string by construction — but `renderRobotsMetadata`
+// is still a port of this serialiser, and these tests pin that the port matches it for
+// every field Next models. The one deliberate divergence is the per-rule `other` map:
+// Next drops those directives, which is precisely why the route handler exists. If a
+// Next upgrade moves or changes the serialiser, this import (or the assertions below)
+// fail loudly, which is the signal we want.
 import { resolveRobots as nextResolveRobots } from 'next/dist/build/webpack/loaders/metadata/resolve-route-data';
 import { DEFAULT_ROBOTS_SETTINGS, type RobotsSettings } from '@nextblock-cms/utils/seo';
 
@@ -57,18 +57,6 @@ describe('renderRobotsMetadata', () => {
       },
       name: 'a crawl delay, an empty disallow and two sitemaps',
     },
-    {
-      metadata: {
-        host: 'example.com',
-        rules: [
-          {
-            other: { 'Clean-param': ['ref /articles/', 'utm_source /'], 'Request-Rate': '10/1m' },
-            userAgent: 'Yandex',
-          },
-        ],
-      },
-      name: 'non-standard directives carried by `other`',
-    },
   ];
 
   for (const { metadata, name } of cases) {
@@ -76,6 +64,27 @@ describe('renderRobotsMetadata', () => {
       expect(renderRobotsMetadata(metadata)).toBe(nextResolveRobots(metadata));
     });
   }
+
+  it('carries non-standard directives via `other`, which Next has no field for', () => {
+    const metadata = {
+      host: 'example.com',
+      rules: [
+        {
+          other: { 'Clean-param': ['ref /articles/', 'utm_source /'], 'Request-Rate': '10/1m' },
+          userAgent: 'Yandex',
+        },
+      ],
+    } as MetadataRoute.Robots;
+
+    expect(renderRobotsMetadata(metadata)).toBe(
+      'User-Agent: Yandex\nClean-param: ref /articles/\nClean-param: utm_source /\nRequest-Rate: 10/1m\n\n' +
+        'Host: example.com\n'
+    );
+    // Next's own serialiser drops them. This is the divergence that makes /robots.txt a
+    // route handler running our renderer instead of a metadata route: were it the
+    // latter, every `other` line the preview shows would vanish from the served file.
+    expect(nextResolveRobots(metadata)).toBe('User-Agent: Yandex\n\nHost: example.com\n');
+  });
 
   it("emits Next's exact shape, blank trailing line and all", () => {
     expect(renderRobotsMetadata({ rules: [{ allow: '/', userAgent: '*' }] })).toBe(
@@ -153,15 +162,18 @@ describe('buildRobotsTxt', () => {
 
   it('serves the non-standard directives it shows, via the per-rule `other` escape hatch', () => {
     // These are the lines that used to appear in the preview and vanish from the
-    // file. `Clean-param`, `Request-rate` and a second `Sitemap` have no typed field
-    // in `MetadataRoute.Robots`, so before the fix the metadata route dropped them.
+    // file. `Clean-param`, `Request-rate` and a per-group `Host` have no typed field
+    // in `MetadataRoute.Robots`, so a metadata route drops them — proven right here,
+    // against Next's real serialiser. app/robots.txt/route.ts serves `buildRobotsTxt`
+    // itself, which is what keeps them in the file crawlers receive.
     const custom = settings({
       customRules:
         'User-agent: Yandex\nClean-param: ref /articles/\nClean-param: utm_source /\nHost: example.com',
       sitemapEnabled: false,
     });
 
-    expect(buildRobotsTxt(custom, LIVE)).toBe(served(custom, LIVE));
+    expect(served(custom, LIVE)).not.toContain('Clean-param');
+    expect(listUnservedCustomRuleLines(custom, LIVE)).toEqual([]);
     expect(buildRobotsTxt(custom, LIVE)).toBe(
       'User-Agent: *\nAllow: /\n\n' +
         'User-Agent: Yandex\nClean-param: ref /articles/\nClean-param: utm_source /\n' +

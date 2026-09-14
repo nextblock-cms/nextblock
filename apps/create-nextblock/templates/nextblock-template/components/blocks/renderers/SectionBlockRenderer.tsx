@@ -274,6 +274,8 @@ async function renderNestedBlock({
         languageId={languageId}
         visualEditAttributes={visualEditAttributes}
         renderContext="section"
+        // Hero copy routinely carries the demo video; its poster is the LCP element.
+        priority={priority}
       />
     );
   }

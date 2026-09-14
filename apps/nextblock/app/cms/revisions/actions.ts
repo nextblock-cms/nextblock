@@ -3,6 +3,7 @@
 
 import { revalidatePath } from "next/cache";
 import { createClient } from "@nextblock-cms/db/server";
+import { revalidatePublicContent } from "../../../lib/public-content-cache";
 import {
   restorePageToVersion,
   restorePostToVersion,
@@ -233,6 +234,7 @@ export async function restorePageVersion(pageId: number, targetVersion: number) 
   revalidatePath('/', 'layout');
   if (before?.slug) revalidatePath(`/${before.slug}`);
   if (after?.slug && after.slug !== before?.slug) revalidatePath(`/${after.slug}`);
+  revalidatePublicContent('pages');
 
   return result;
 }
@@ -256,6 +258,7 @@ export async function restorePostVersion(postId: number, targetVersion: number) 
   revalidatePath('/articles');
   if (before?.slug) revalidatePath(`/article/${before.slug}`);
   if (after?.slug && after.slug !== before?.slug) revalidatePath(`/article/${after.slug}`);
+  revalidatePublicContent('posts');
 
   return result;
 }

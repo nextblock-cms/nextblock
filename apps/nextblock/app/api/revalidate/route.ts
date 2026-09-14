@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { revalidatePath } from 'next/cache';
 import { resolveRevalidateSecret } from '../../../lib/app-secrets';
+import { revalidatePublicContent } from '../../../lib/public-content-cache';
 
 // Define the expected structure of the Supabase webhook payload
 interface SupabaseWebhookPayload {
@@ -59,7 +60,10 @@ export async function POST(request: NextRequest) {
       
       // Revalidate the specific path.
       // Using 'page' type for revalidation as we are revalidating individual content pages.
-      await revalidatePath(normalizedPath, 'page'); 
+      await revalidatePath(normalizedPath, 'page');
+      // The public reads behind that path are cached by tag as well; a row changed
+      // directly in the database (which is what this webhook reports) must evict them.
+      revalidatePublicContent(table === 'pages' ? 'pages' : 'posts');
       console.log(`Successfully revalidated path: ${normalizedPath}`);
       
       // Additionally, if it's an article, you might want to revalidate the main listing page.

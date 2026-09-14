@@ -193,11 +193,11 @@ export function RobotsCard({
 
   // Lines from the "extra lines" box that the served file cannot carry — comments,
   // and anything without a `directive: value` shape. The public file is produced by
-  // Next's metadata route, which emits only the directives it models, so a line that
-  // survives in this component's text preview would not necessarily survive to a
-  // crawler. Showing the difference is the whole point: a preview an operator trusts
-  // and that quietly drops a directive is worse than no preview at all, because they
-  // walk away believing a rule is live.
+  // app/robots.txt/route.ts running the very same `buildRobotsTxt`, so every directive
+  // the preview shows is served; what is listed here never made it into the preview
+  // either. Showing the difference is the whole point: a preview an operator trusts
+  // and that quietly drops a line is worse than no preview at all, because they walk
+  // away believing a rule is live.
   const unservedCustomLines = useMemo(
     () => listUnservedCustomRuleLines(draftSettings, { isSandbox, sitemapUrl }),
     [draftSettings, isSandbox, sitemapUrl]

@@ -2,10 +2,12 @@ import React from 'react';
 import { cookies, draftMode, headers } from 'next/headers';
 import { notFound } from 'next/navigation';
 import type { Metadata } from 'next';
-import { createClient, getSsgSupabaseClient } from '@nextblock-cms/db/server';
-import { buildPublishedAtOrFilter } from '@nextblock-cms/utils';
+import { createClient } from '@nextblock-cms/db/server';
 import PageClientContent from './[slug]/PageClientContent';
-import { getPageDataBySlug } from './[slug]/page.utils';
+import {
+  getCachedPublishedPageTranslatedSlugs,
+  getPageDataBySlug,
+} from './[slug]/page.utils';
 import BlockRenderer from '../components/BlockRenderer';
 import {
   resolveMetaTitle,
@@ -17,18 +19,12 @@ import {
 import { getSiteSettings } from './lib/site-settings';
 import { getRequestOrigin } from '../lib/visual-editing/edit-info';
 import { isSupabaseConfigured } from '../lib/setup/env-status';
+import { resolveSiteUrl } from '../lib/site-url';
 
 const DEFAULT_LOCALE = 'en';
 const LANGUAGE_COOKIE_KEY = 'NEXT_USER_LOCALE';
 
 export const revalidate = 360;
-
-interface PageTranslation {
-  slug: string;
-  languages: {
-    code: string;
-  }[];
-}
 
 // Resolve the homepage for a given locale WITHOUT assuming a per-locale slug.
 // The homepage is, by convention, the default-language page at slug "home".
@@ -48,20 +44,23 @@ async function resolveHomepageData(preferredLocale: string) {
   // draft (preview) mode we include unpublished siblings; otherwise only published.
   if (defaultHome?.translation_group_id) {
     const draft = await draftMode();
-    const supabase = draft.isEnabled ? createClient() : getSsgSupabaseClient();
-    let siblingQuery = supabase
-      .from('pages')
-      .select('slug, languages!inner(code)')
-      .eq('translation_group_id', defaultHome.translation_group_id)
-      .eq('languages.code', preferredLocale)
-      .limit(1);
+    let localizedSlug: string | undefined;
 
-    if (!draft.isEnabled) {
-      siblingQuery = siblingQuery.eq('status', 'published').or(buildPublishedAtOrFilter());
+    if (draft.isEnabled) {
+      const { data: sibling } = await createClient()
+        .from('pages')
+        .select('slug, languages!inner(code)')
+        .eq('translation_group_id', defaultHome.translation_group_id)
+        .eq('languages.code', preferredLocale)
+        .limit(1)
+        .maybeSingle();
+      localizedSlug = (sibling as { slug?: string } | null)?.slug;
+    } else {
+      // Published siblings come from the same cached map the hreflang alternates use.
+      const slugs = await getCachedPublishedPageTranslatedSlugs(defaultHome.translation_group_id);
+      localizedSlug = slugs[preferredLocale];
     }
 
-    const { data: sibling } = await siblingQuery.maybeSingle();
-    const localizedSlug = (sibling as { slug?: string } | null)?.slug;
     if (localizedSlug) {
       const localized = await getPageDataBySlug(localizedSlug, preferredLocale);
       if (localized) {
@@ -123,30 +122,15 @@ export async function generateMetadata(): Promise<Metadata> {
     return { title: 'Homepage Not Found' };
   }
 
-  const siteUrl = process.env.NEXT_PUBLIC_URL || '';
-  const supabase = getSsgSupabaseClient();
-
-  const [languagesResult, pageTranslationsResult] = await Promise.all([
-    supabase.from('languages').select('id, code'),
-    supabase
-      .from('pages')
-      .select('language_id, slug')
-      .eq('translation_group_id', pageData.translation_group_id)
-      .eq('status', 'published')
-      .or(buildPublishedAtOrFilter()),
-  ]);
-
-  const { data: languages } = languagesResult;
-  const { data: pageTranslations } = pageTranslationsResult;
-
+  // No trailing slash: NEXT_PUBLIC_URL is often set as "https://host/", which made
+  // hreflang and JSON-LD URLs come out as "https://host//slug".
+  const siteUrl = resolveSiteUrl('');
   const alternates: { [key: string]: string } = {};
-  if (languages && pageTranslations) {
-    pageTranslations.forEach((pageTranslation) => {
-      const language = languages.find((candidate) => candidate.id === pageTranslation.language_id);
-      if (language) {
-        alternates[language.code] = `${siteUrl}/${pageTranslation.slug}`;
-      }
-    });
+  if (pageData.translation_group_id) {
+    const slugs = await getCachedPublishedPageTranslatedSlugs(pageData.translation_group_id);
+    for (const [code, slug] of Object.entries(slugs)) {
+      alternates[code] = `${siteUrl}/${slug}`;
+    }
   }
 
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
@@ -183,30 +167,17 @@ export default async function RootPage() {
 
   const homepageSlug = pageData.slug;
 
-  const translatedSlugs: { [key: string]: string } = {};
-  if (pageData.translation_group_id) {
-    const supabase = getSsgSupabaseClient();
-    const { data: translations } = await supabase
-      .from('pages')
-      .select('slug, languages!inner(code)')
-      .eq('translation_group_id', pageData.translation_group_id)
-      .eq('status', 'published')
-      .or(buildPublishedAtOrFilter());
-
-    if (translations) {
-      translations.forEach((translation: PageTranslation) => {
-        if (translation.languages && translation.languages.length > 0 && translation.slug) {
-          translatedSlugs[translation.languages[0].code] = translation.slug;
-        }
-      });
-    }
-  }
+  const translatedSlugs: { [key: string]: string } = pageData.translation_group_id
+    ? await getCachedPublishedPageTranslatedSlugs(pageData.translation_group_id)
+    : {};
 
   const requestOrigin = await getRequestOrigin();
   const draft = await draftMode();
   const visualEditingEnabled =
     draft.isEnabled || process.env.NEXTBLOCK_VISUAL_EDITING_ENABLED === 'true';
-  const siteUrl = process.env.NEXT_PUBLIC_URL || '';
+  // No trailing slash: NEXT_PUBLIC_URL is often set as "https://host/", which made
+  // hreflang and JSON-LD URLs come out as "https://host//slug".
+  const siteUrl = resolveSiteUrl('');
   const nonce = (await headers()).get('x-nonce') || undefined;
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
   const description = resolvePageMetaDescription(pageData.meta_description, pageData.blocks);
@@ -243,7 +214,10 @@ export default async function RootPage() {
         dangerouslySetInnerHTML={{ __html: stringifyJsonLd(pageJsonLd) }}
       />
       <PageClientContent
-        initialPageData={pageData}
+        // The blocks are already rendered above as server components; sending them
+        // again as a client prop only bloats the RSC payload (they were ~45 KB of
+        // it on the home page). PageClientContent never reads them.
+        initialPageData={{ ...pageData, blocks: [] }}
         currentSlug={homepageSlug}
         translatedSlugs={translatedSlugs}
       >

@@ -1,7 +1,12 @@
 // app/article/[slug]/page.utils.ts
 import { createClient, getSsgSupabaseClient } from "@nextblock-cms/db/server";
 import type { Database } from "@nextblock-cms/db";
+import { unstable_cache } from "next/cache";
 import { draftMode } from "next/headers";
+import {
+  PUBLIC_CONTENT_REVALIDATE_SECONDS,
+  PUBLIC_POSTS_CACHE_TAG,
+} from "../../../lib/public-content-cache";
 import { resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
 import { getContentDraft } from "../../../lib/visual-editing/draft-content";
 import type { ContentDraftRow, DraftBlockSnapshot } from "../../../lib/visual-editing/types";
@@ -240,11 +245,59 @@ function mapMediaDataToBlock(
   return block;
 }
 
+type PublicSupabaseClient = ReturnType<typeof createClient> | ReturnType<typeof getSsgSupabaseClient>;
+
+/**
+ * Public post data for a slug. Draft mode reads live through the cookie-scoped client;
+ * the published path is served from `unstable_cache` (see lib/public-content-cache.ts).
+ */
 export async function getPostDataBySlug(slug: string): Promise<PublicPostData | null> {
   const draft = await draftMode();
-  const isDraftModeEnabled = draft.isEnabled;
-  const supabase = isDraftModeEnabled ? createClient() : getSsgSupabaseClient();
+  if (draft.isEnabled) {
+    return loadPostData(createClient(), slug, true);
+  }
+  return getCachedPublishedPostData(slug);
+}
 
+const getCachedPublishedPostData = unstable_cache(
+  async (slug: string): Promise<PublicPostData | null> =>
+    loadPostData(getSsgSupabaseClient(), slug, false),
+  ['public-post-data'],
+  { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_POSTS_CACHE_TAG] },
+);
+
+/** `language code -> slug` for the published posts of a translation group; cached. */
+export const getCachedPublishedPostTranslatedSlugs = unstable_cache(
+  async (translationGroupId: string): Promise<Record<string, string>> => {
+    const supabase = getSsgSupabaseClient();
+    const { data, error } = await supabase
+      .from("posts")
+      .select("slug, languages!inner(code)")
+      .eq("translation_group_id", translationGroupId)
+      .eq("status", "published")
+      .or(`published_at.is.null,published_at.lte.${new Date().toISOString()}`);
+
+    if (error || !data) return {};
+
+    const slugs: Record<string, string> = {};
+    for (const row of data as Array<{
+      slug: string | null;
+      languages: { code: string } | { code: string }[] | null;
+    }>) {
+      const language = Array.isArray(row.languages) ? row.languages[0] : row.languages;
+      if (language?.code && row.slug) slugs[language.code] = row.slug;
+    }
+    return slugs;
+  },
+  ['public-post-translated-slugs'],
+  { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_POSTS_CACHE_TAG] },
+);
+
+async function loadPostData(
+  supabase: PublicSupabaseClient,
+  slug: string,
+  isDraftModeEnabled: boolean,
+): Promise<PublicPostData | null> {
   let postQuery = supabase
     .from("posts")
     .select(`

@@ -2,6 +2,7 @@ import "server-only";
 
 import { revalidatePath, revalidateTag } from "next/cache";
 import { v4 as uuidv4 } from "uuid";
+import { revalidatePublicContent } from "../public-content-cache";
 import type { Json } from "@nextblock-cms/db";
 import {
   createClient,
@@ -1221,10 +1222,12 @@ async function applyContentImport(params: {
   if (item.contentType === "pages") {
     if (slug) revalidatePath(`/${slug}`);
     if (item.oldSlug && item.oldSlug !== slug) revalidatePath(`/${item.oldSlug}`);
+    revalidatePublicContent("pages");
   } else {
     revalidatePath("/articles");
     if (slug) revalidatePath(`/article/${slug}`);
     if (item.oldSlug && item.oldSlug !== slug) revalidatePath(`/article/${item.oldSlug}`);
+    revalidatePublicContent("posts");
   }
 }
 

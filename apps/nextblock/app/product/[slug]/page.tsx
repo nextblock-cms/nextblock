@@ -36,7 +36,8 @@ type BlockType = Database['public']['Tables']['blocks']['Row'];
 export const dynamicParams = true;
 export const revalidate = 360;
 export const dynamic = 'force-dynamic'; // keeps per-request locale; paired with short revalidate
-export const fetchCache = 'force-no-store';
+// No `fetchCache = 'force-no-store'`: Next disables `unstable_cache` under it, which switched
+// off the root layout's cached reads (navigation, translations, themes) on product pages.
 
 interface ProductPageProps {
   params: Promise<{

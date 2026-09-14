@@ -7,6 +7,7 @@ import { redirect } from "next/navigation";
 import type { Database } from "@nextblock-cms/db";
 import { v4 as uuidv4 } from 'uuid';
 import { getOrCreateContentDraft } from "../../../lib/visual-editing/draft-content";
+import { revalidatePublicContent } from "../../../lib/public-content-cache";
 
 type PageStatus = Database['public']['Enums']['page_status'];
 import { encodedRedirect } from "@nextblock-cms/utils/server"; // Ensure this is correctly imported
@@ -58,6 +59,8 @@ export async function publishPost(postId: number): Promise<{ error?: string } | 
   revalidatePath(`/cms/posts/${postId}/edit`);
   revalidatePath(`/article/${post.slug}`);
   revalidatePath("/articles");
+  // The public post read is cached (lib/public-content-cache.ts).
+  revalidatePublicContent("posts");
   return {};
 }
 
@@ -163,6 +166,7 @@ export async function createPost(formData: FormData) {
   revalidatePath("/cms/posts");
   if (newPost?.slug) revalidatePath(`/article/${newPost.slug}`);
   revalidatePath("/articles");
+  revalidatePublicContent("posts");
 
   if (newPost?.id) {
     redirect(`/cms/posts/${newPost.id}/edit?success=${encodeURIComponent(successMessage)}`);
@@ -316,6 +320,7 @@ export async function deletePost(postId: number) {
     });
   }
   revalidatePath("/articles");
+  revalidatePublicContent("posts");
 
   // 5. Update Redirect Message
   redirect(`/cms/posts?success=${encodeURIComponent("Post and all its translations were deleted successfully.")}`);

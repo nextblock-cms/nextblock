@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import type { Metadata } from 'next';
 import PostClientContent from "./PostClientContent";
 
-import { getPostDataBySlug } from "./page.utils";
+import { getCachedPublishedPostTranslatedSlugs, getPostDataBySlug } from "./page.utils";
 import BlockRenderer from "../../../components/BlockRenderer";
 import { getSsgSupabaseClient } from "@nextblock-cms/db/server"; // Correct import
 import type { SectionBlockContent } from '../../../lib/blocks/blockRegistry';
@@ -27,7 +27,8 @@ export const revalidate = 3600;
 // so attempting a statically-cached render throws DYNAMIC_SERVER_USAGE (500). Matches the sibling
 // content routes /[slug] and /product/[slug], which already force dynamic for the same reason.
 export const dynamic = 'force-dynamic';
-export const fetchCache = 'force-no-store';
+// No `fetchCache = 'force-no-store'`: Next disables `unstable_cache` under it, which would
+// switch off the cached post read below AND the root layout's cached reads on this route.
 
 interface ResolvedPostParams {
   slug: string;
@@ -36,24 +37,6 @@ interface ResolvedPostParams {
 interface PostPageProps {
   params: Promise<ResolvedPostParams>;
 }
-
-interface PostTranslation {
-  slug: string;
-  languages: {
-    code: string;
-  }[] | { code: string };
-}
-
-const resolveLanguageCode = (languagesField: PostTranslation["languages"]): string | null => {
-  if (!languagesField) return null;
-  if (Array.isArray(languagesField)) {
-    return languagesField[0]?.code ?? null;
-  }
-  if (typeof languagesField === 'object' && 'code' in languagesField) {
-    return (languagesField as { code?: string }).code ?? null;
-  }
-  return null;
-};
 
 export async function generateStaticParams(): Promise<ResolvedPostParams[]> {
   // Cookie-free SSG client. getSsgSupabaseClient() resolves the Supabase URL/anon key
@@ -143,23 +126,10 @@ export default async function DynamicPostPage({ params: paramsPromise }: PostPag
     notFound();
   }
 
-  const supabase = getSsgSupabaseClient(); // Use SSG client
-  const translatedSlugs: { [key: string]: string } = {};
-  if (initialPostData.translation_group_id) {
-    const { data: translations } = await supabase
-      .from("posts")
-      .select("slug, languages!inner(code)")
-      .eq("translation_group_id", initialPostData.translation_group_id)
-      .eq("status", "published")
-      .or(`published_at.is.null,published_at.lte.${new Date().toISOString()}`);
-
-    if (translations) {
-      translations.forEach((translation: PostTranslation) => {
-        const code = resolveLanguageCode(translation.languages);
-        if (code && translation.slug) translatedSlugs[code] = translation.slug;
-      });
-    }
-  }
+  // Cached alongside the post itself (see lib/public-content-cache.ts).
+  const translatedSlugs: { [key: string]: string } = initialPostData.translation_group_id
+    ? await getCachedPublishedPostTranslatedSlugs(initialPostData.translation_group_id)
+    : {};
 
   let lcpImageUrl: string | null = null;
 

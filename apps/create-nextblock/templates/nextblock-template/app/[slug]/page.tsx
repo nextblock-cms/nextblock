@@ -5,7 +5,7 @@ import { buildPublishedAtOrFilter } from "@nextblock-cms/utils";
 import { notFound } from "next/navigation";
 import type { Metadata } from 'next';
 import PageClientContent from "./PageClientContent";
-import { getPageDataBySlug } from "./page.utils";
+import { getCachedPublishedPageTranslatedSlugs, getPageDataBySlug } from "./page.utils";
 import BlockRenderer from "../../components/BlockRenderer";
 import { cookies, draftMode, headers } from "next/headers";
 import {
@@ -18,11 +18,14 @@ import {
 } from "../lib/seo";
 import { getSiteSettings } from "../lib/site-settings";
 import { getRequestOrigin } from "../../lib/visual-editing/edit-info";
+import { resolveSiteUrl } from "../../lib/site-url";
 
 export const dynamicParams = true;
 export const revalidate = 360;
 export const dynamic = 'force-dynamic'; // keeps per-request locale; paired with short revalidate
-export const fetchCache = 'force-no-store';
+// No `fetchCache = 'force-no-store'` here: Next disables `unstable_cache` under it, which
+// silently turned off the root layout's cached reads (navigation, translations, themes)
+// on every page served by this route. `force-dynamic` already keeps fetch() uncached.
 
 interface ResolvedPageParams {
   slug: string;
@@ -30,13 +33,6 @@ interface ResolvedPageParams {
 
 interface PageProps {
   params: Promise<ResolvedPageParams>;
-}
-
-interface PageTranslation {
-  slug: string;
-  languages: {
-    code: string;
-  }[];
 }
 
 export async function generateStaticParams(): Promise<ResolvedPageParams[]> {
@@ -96,32 +92,18 @@ export async function generateMetadata(
     return { title: "Page Not Found" };
   }
 
-  const siteUrl = process.env.NEXT_PUBLIC_URL || "";
-  const supabase = getSsgSupabaseClient();
-  
-  // Parallel queries for better performance
-  const [languagesResult, pageTranslationsResult] = await Promise.all([
-    supabase.from('languages').select('id, code'),
-    supabase
-      .from('pages')
-      .select('language_id, slug')
-      .eq('translation_group_id', pageData.translation_group_id)
-      .eq('status', 'published')
-      // Never advertise a scheduled translation via hreflang.
-      .or(buildPublishedAtOrFilter())
-  ]);
+  // No trailing slash: NEXT_PUBLIC_URL is often set as "https://host/", which made
+  // hreflang, canonical and JSON-LD URLs come out as "https://host//slug".
+  const siteUrl = resolveSiteUrl('');
 
-  const { data: languages } = languagesResult;
-  const { data: pageTranslations } = pageTranslationsResult;
-
+  // Cached `code -> slug` map of the published translations (a scheduled one is never
+  // advertised via hreflang); shared with the page body and the language switcher.
   const alternates: { [key: string]: string } = {};
-  if (languages && pageTranslations) {
-    pageTranslations.forEach(pt => {
-      const langInfo = languages.find(l => l.id === pt.language_id);
-      if (langInfo) {
-        alternates[langInfo.code] = `${siteUrl}/${pt.slug}`;
-      }
-    });
+  if (pageData.translation_group_id) {
+    const slugs = await getCachedPublishedPageTranslatedSlugs(pageData.translation_group_id);
+    for (const [code, slug] of Object.entries(slugs)) {
+      alternates[code] = `${siteUrl}/${slug}`;
+    }
   }
 
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
@@ -177,24 +159,9 @@ export default async function DynamicPage({ params: paramsPromise }: PageProps) 
     notFound();
   }
 
-  const translatedSlugs: { [key: string]: string } = {};
-  if (pageData.translation_group_id) {
-    const supabase = getSsgSupabaseClient();
-    const { data: translations } = await supabase
-      .from("pages")
-      .select("slug, languages!inner(code)")
-      .eq("translation_group_id", pageData.translation_group_id)
-      .eq("status", "published")
-      .or(buildPublishedAtOrFilter());
-
-    if (translations) {
-      translations.forEach((translation: PageTranslation) => {
-        if (translation.languages && translation.languages.length > 0 && translation.slug) {
-          translatedSlugs[translation.languages[0].code] = translation.slug;
-        }
-      });
-    }
-  }
+  const translatedSlugs: { [key: string]: string } = pageData.translation_group_id
+    ? await getCachedPublishedPageTranslatedSlugs(pageData.translation_group_id)
+    : {};
 
 
 
@@ -202,7 +169,9 @@ export default async function DynamicPage({ params: paramsPromise }: PageProps) 
   const draft = await draftMode();
   const visualEditingEnabled =
     draft.isEnabled || process.env.NEXTBLOCK_VISUAL_EDITING_ENABLED === 'true';
-  const siteUrl = process.env.NEXT_PUBLIC_URL || "";
+  // No trailing slash: NEXT_PUBLIC_URL is often set as "https://host/", which made
+  // hreflang, canonical and JSON-LD URLs come out as "https://host//slug".
+  const siteUrl = resolveSiteUrl('');
   const nonce = (await headers()).get('x-nonce') || undefined;
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
   const description = resolvePageMetaDescription(pageData.meta_description, pageData.blocks);
@@ -238,7 +207,13 @@ export default async function DynamicPage({ params: paramsPromise }: PageProps) 
         suppressHydrationWarning
         dangerouslySetInnerHTML={{ __html: stringifyJsonLd(pageJsonLd) }}
       />
-      <PageClientContent initialPageData={pageData} currentSlug={params.slug} translatedSlugs={translatedSlugs}>
+      {/* Blocks are rendered above as server components; re-sending them as a client
+          prop only bloats the RSC payload. PageClientContent never reads them. */}
+      <PageClientContent
+        initialPageData={{ ...pageData, blocks: [] }}
+        currentSlug={params.slug}
+        translatedSlugs={translatedSlugs}
+      >
         {pageBlocks}
       </PageClientContent>
     </>

@@ -23,6 +23,7 @@ import {
   type VisibilityState,
 } from "@nextblock-cms/utils";
 import { getHomepageTranslationGroupId } from "../lib/homepage";
+import { revalidatePublicContent } from "../../lib/public-content-cache";
 
 export interface VisibilityResult {
   error?: string;
@@ -132,6 +133,12 @@ export async function setContentVisibility(
 
   if (updated.slug) {
     revalidatePath(publicPath(type, updated.slug));
+  }
+
+  // The public page/post reads are cached (lib/public-content-cache.ts): evict them so
+  // the new visibility is what the very next request sees, from every path.
+  if (type === "page" || type === "post") {
+    revalidatePublicContent(type === "page" ? "pages" : "posts");
   }
 
   // Every language variation of the homepage is also served at "/", whatever its

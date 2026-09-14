@@ -18,6 +18,12 @@ interface ClientTextBlockRendererProps {
   languageId: number;
   visualEditAttributes?: VisualEditAttributes;
   renderContext?: 'prose' | 'section';
+  /**
+   * Above-the-fold block (hero section / first top-level block). The first YouTube
+   * embed in the HTML then gets a preloaded, high-priority poster instead of a
+   * lazy one: that poster is usually the page's LCP element.
+   */
+  priority?: boolean;
 }
 
 function normalizeHtmlEncodingArtifacts(html: string): string {
@@ -243,6 +249,7 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
   languageId,
   visualEditAttributes,
   renderContext = 'prose',
+  priority = false,
 }) => {
   void languageId;
   const normalizedHtml = normalizeHtmlEncodingArtifacts(content.html_content || "");
@@ -250,6 +257,9 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
     renderContext === 'section'
       ? 'w-full min-w-0'
       : 'my-4 prose dark:prose-invert container mx-auto';
+  // Only the first embed of a priority block is the LCP candidate; a second one
+  // must not compete for bandwidth with it.
+  let priorityEmbedClaimed = false;
   const options: HTMLReactParserOptions = {
     replace: (domNode) => {
       if (domNode instanceof Element && domNode.attribs) {
@@ -262,8 +272,12 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
 
         // Swap YouTube iframes for a click-to-play facade so no youtube.com
         // resource loads before user interaction (Lighthouse `inspector-issues`).
-        const youTubeFacade = replaceYouTubeIframe(domNode);
-        if (youTubeFacade) return youTubeFacade;
+        const claimPriority = priority && !priorityEmbedClaimed;
+        const youTubeFacade = replaceYouTubeIframe(domNode, { priority: claimPriority });
+        if (youTubeFacade) {
+          if (claimPriority) priorityEmbedClaimed = true;
+          return youTubeFacade;
+        }
 
         if (domNode.name === 'img') {
           return renderOptimizedCmsImage(domNode.attribs);

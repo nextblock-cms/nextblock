@@ -28,6 +28,7 @@ import {
   loadProductVisualEditingField,
   publishProductVisualEditingDraft,
 } from "../../lib/visual-editing/product-drafts";
+import { revalidatePublicContent } from "../../lib/public-content-cache";
 import type {
   ContentDraftRow,
   DraftBlockSnapshot,
@@ -319,6 +320,9 @@ export async function publishVisualEditingDraft(parentType: NextblockDocumentTyp
       revalidateVisualEditingPath(getPublicPath(parentType, slug));
     }
     revalidateVisualEditingPath(parentType === "page" ? `/cms/pages/${parentId}/edit` : `/cms/posts/${parentId}/edit`);
+    // The published read is cached; the path call above misses aliases (any homepage
+    // variant is also "/"), so evict the whole kind. See lib/public-content-cache.ts.
+    revalidatePublicContent(parentType === "page" ? "pages" : "posts");
 
     if (revisionWarning) {
       return { success: true, warning: `Published, but history was not recorded: ${revisionWarning}` };
