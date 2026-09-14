@@ -163,6 +163,21 @@ Commerce-specific policy highlights include:
 - service-role management access for orders, order items, inventory, taxes, and
   currencies
 
+Supabase Advisor hygiene (kept clean since `02013`; re-check the dashboard after any policy
+change):
+
+- Call `auth.uid()` / `auth.jwt()` / `get_current_user_role()` inside a policy as
+  `(select …)` so Postgres evaluates it once per statement instead of once per row.
+- Keep exactly one permissive policy per role + command. A `FOR ALL` admin policy overlaps
+  a `FOR SELECT` editor policy; a "Public read active" policy `TO anon, authenticated`
+  overlaps an "Admins read all" policy `TO authenticated`. Split by role (`TO anon` /
+  `TO authenticated USING (is_active OR admin)`) or by command instead.
+- `SECURITY DEFINER` trigger functions (`handle_new_user()`, `update_product_ratings()`)
+  must not be executable by `anon` or `authenticated`. Triggers fire regardless of the
+  caller's EXECUTE privilege, so revoke it. Note that a database which recorded the
+  baseline without running it (production after a squash) keeps the old grants until a
+  forward migration revokes them.
+
 ## Migration Structure
 
 ### Current reality: squash generations (`GGNNN`)
