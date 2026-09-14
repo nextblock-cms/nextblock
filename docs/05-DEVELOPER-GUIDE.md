@@ -277,8 +277,22 @@ keep these rules when touching the public surface:
   element.
 - **Public reads are cached, and `fetchCache` is off-limits.** `getPageDataBySlug`,
   `getPostDataBySlug`, the translated-slug maps and the bot-protection site key sit
-  behind `unstable_cache` (`lib/public-content-cache.ts`: 60 s, the same lifetime as the
-  layout's navigation/translations/themes). Draft mode bypasses the cache automatically.
+  behind `unstable_cache` (`lib/public-content-cache.ts`: 5 min, the same lifetime as
+  the layout's navigation/translations/themes), each wrapped in React `cache()` so
+  `generateMetadata` and the page body share one Data Cache hop per request. The
+  layout fetches its locale-independent chrome in a single `Promise.all`; on Vercel
+  every sequential `unstable_cache` read is a network round trip, and a cold refill
+  showed up in Lighthouse as a 633 ms body delay. Draft mode bypasses the cache
+  automatically.
+- **Keep the first frame cheap for the compositor.** `SectionBlockRenderer` promotes a
+  section to its own GPU layer (`transform-gpu`, `preserve-3d`) only when it has a
+  background image; every other section is a plain `isolate`. Hero cards must not use
+  `backdrop-blur-*` (02011/02012 stripped them): behind them is a smooth gradient, so
+  the blur is invisible, yet in Lighthouse's trace the GPU process spent ~390 ms drawing
+  the first frame — the gap between the hero being laid out and the first contentful
+  paint. The next lever is the 613 KB stylesheet: `lib/custom-block-safelist.ts` forces
+  every colour utility (gradient stops alone are ~200 KB) so DB-authored classes work
+  without a redeploy; narrowing it is a product decision, not a bug fix.
   Eviction is `revalidatePath('/<slug>')` (implicit route tags, which every writer and
   every Cortex/MCP tool already call) plus `revalidatePublicContent('pages' | 'posts')`
   from the CMS writers, because one page can be served from several paths (any

@@ -2,6 +2,7 @@
 import { createClient, getSsgSupabaseClient } from "@nextblock-cms/db/server";
 import type { Database } from "@nextblock-cms/db";
 import { buildPublishedAtOrFilter } from "@nextblock-cms/utils";
+import { cache } from "react";
 import { unstable_cache } from "next/cache";
 import { draftMode } from "next/headers";
 import {
@@ -264,7 +265,7 @@ type PublicSupabaseClient = ReturnType<typeof createClient> | ReturnType<typeof 
  * every public request paid these Supabase round trips, which showed up as 0.5-6 s of
  * body time on the home page.
  */
-export async function getPageDataBySlug(
+export const getPageDataBySlug = cache(async function getPageDataBySlug(
   slug: string,
   preferredLanguageCode?: string,
 ): Promise<PublicPageData | null> {
@@ -272,8 +273,10 @@ export async function getPageDataBySlug(
   if (draft.isEnabled) {
     return loadPageData(createClient(), slug, preferredLanguageCode, true);
   }
+  // React `cache()` memoises per request: generateMetadata and the page body both
+  // resolve the same page, and on Vercel every unstable_cache read is a network hop.
   return getCachedPublishedPageData(slug, preferredLanguageCode ?? null);
-}
+});
 
 const getCachedPublishedPageData = unstable_cache(
   async (slug: string, preferredLanguageCode: string | null): Promise<PublicPageData | null> =>
@@ -287,7 +290,7 @@ const getCachedPublishedPageData = unstable_cache(
  * hreflang alternates, the "/" homepage locale resolution and the client language
  * switcher; cached and evicted together with the page data.
  */
-export const getCachedPublishedPageTranslatedSlugs = unstable_cache(
+export const getCachedPublishedPageTranslatedSlugs = cache(unstable_cache(
   async (translationGroupId: string): Promise<Record<string, string>> => {
     const supabase = getSsgSupabaseClient();
     const { data, error } = await supabase
@@ -311,7 +314,7 @@ export const getCachedPublishedPageTranslatedSlugs = unstable_cache(
   },
   ['public-page-translated-slugs'],
   { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_PAGES_CACHE_TAG] },
-);
+));
 
 async function loadPageData(
   supabase: PublicSupabaseClient,

@@ -26,8 +26,14 @@ import { revalidateTag } from 'next/cache';
  *
  * Do NOT set `fetchCache = 'force-no-store'` on a public route segment: Next disables
  * `unstable_cache` under it, for the layout's reads as well as these.
+ *
+ * Lifetime: five minutes. Every CMS writer evicts explicitly (see above), so the TTL
+ * only bounds staleness for edits made directly in the database. A short TTL was
+ * costing more than it bought: on Vercel a cold entry means a sequential Supabase
+ * round trip during the request, and Lighthouse happened to measure exactly such a
+ * refill (633 ms body delay against a ~200 ms norm) — the remaining LCP points.
  */
-export const PUBLIC_CONTENT_REVALIDATE_SECONDS = 60;
+export const PUBLIC_CONTENT_REVALIDATE_SECONDS = 300;
 
 export const PUBLIC_PAGES_CACHE_TAG = 'public-pages';
 export const PUBLIC_POSTS_CACHE_TAG = 'public-posts';

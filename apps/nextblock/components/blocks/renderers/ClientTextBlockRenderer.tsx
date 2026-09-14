@@ -210,7 +210,7 @@ function getKnownCmsImage(src: string | undefined) {
   return entry?.[1] ?? null;
 }
 
-function renderOptimizedCmsImage(attribs: Record<string, string>) {
+function renderOptimizedCmsImage(attribs: Record<string, string>, forcePriority = false) {
   const image = getKnownCmsImage(attribs.src);
 
   if (!image) {
@@ -221,7 +221,9 @@ function renderOptimizedCmsImage(attribs: Record<string, string>) {
   const props = attributesToProps(attribs) as HtmlImageProps;
   const alt = typeof props.alt === 'string' ? props.alt : '';
   const sizes = typeof props.sizes === 'string' ? props.sizes : image.sizes;
-  const priority = image.priority === true;
+  // The registry marks images that are always above the fold; a hero / first block
+  // additionally promotes its first image (the likely LCP element) at render time.
+  const priority = image.priority === true || forcePriority;
 
   return (
     <Image
@@ -257,9 +259,10 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
     renderContext === 'section'
       ? 'w-full min-w-0'
       : 'my-4 prose dark:prose-invert container mx-auto';
-  // Only the first embed of a priority block is the LCP candidate; a second one
-  // must not compete for bandwidth with it.
+  // Only the first embed / first image of a priority block is the LCP candidate; a
+  // second one must not compete for bandwidth with it.
   let priorityEmbedClaimed = false;
+  let priorityImageClaimed = false;
   const options: HTMLReactParserOptions = {
     replace: (domNode) => {
       if (domNode instanceof Element && domNode.attribs) {
@@ -280,7 +283,10 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
         }
 
         if (domNode.name === 'img') {
-          return renderOptimizedCmsImage(domNode.attribs);
+          const claimImagePriority = priority && !priorityImageClaimed;
+          const rendered = renderOptimizedCmsImage(domNode.attribs, claimImagePriority);
+          if (rendered && claimImagePriority) priorityImageClaimed = true;
+          return rendered;
         } else if (domNode.attribs['fetchpriority']) {
           domNode.attribs.fetchPriority = domNode.attribs['fetchpriority'];
           delete domNode.attribs['fetchpriority'];

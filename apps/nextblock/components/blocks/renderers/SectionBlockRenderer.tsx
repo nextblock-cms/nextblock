@@ -23,6 +23,18 @@ import { StockPhotoCredit } from "./StockPhotoCredit";
 const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || "";
 const BACKGROUND_COMPOSITING_CLASSES =
   "isolate transform-gpu [backface-visibility:hidden] [transform-style:preserve-3d]";
+
+/**
+ * GPU-layer promotion is only worth paying for on sections with a background IMAGE
+ * (it keeps the `inset-[-1px]` image layer seam-free while scrolling). Applied to
+ * every section it promoted eighteen full-width layers on the home page, and the
+ * compositor spent ~390 ms drawing the first frame in Lighthouse's trace, delaying
+ * the first contentful paint well past the moment the hero was parsed and laid out.
+ * Plain `isolate` keeps the stacking context the background layers rely on.
+ */
+function sectionCompositingClasses(hasBackgroundImage: boolean) {
+  return hasBackgroundImage ? BACKGROUND_COMPOSITING_CLASSES : "isolate";
+}
 const ABSOLUTE_BACKGROUND_CLASSES =
   "pointer-events-none absolute inset-[-1px] -z-10 transform-gpu [backface-visibility:hidden] [transform-style:preserve-3d]";
 const ECOMMERCE_BLOCK_TYPES = new Set([
@@ -470,7 +482,7 @@ export default async function SectionBlockRenderer({
         return (
           <div
             key={`slide-${slideIndex}`}
-            className={`relative w-full flex items-center ${BACKGROUND_COMPOSITING_CLASSES} ${paddingTopClass} ${paddingBottomClass} ${slideBgClassName}`}
+            className={`relative w-full flex items-center ${sectionCompositingClasses(slideBackground.type === 'image')} ${paddingTopClass} ${paddingBottomClass} ${slideBgClassName}`}
             style={{
               ...slideBgStyles,
               minHeight: formatMinHeight(slideBackground.min_height) || '400px'
@@ -505,6 +517,8 @@ export default async function SectionBlockRenderer({
       })
     );
 
+    const hasSlideImage = content.slides.some((slide) => slide.background?.type === 'image');
+
     // Determine the slider's container min-height from configured slides
     let sliderMinHeight = '400px';
     if (content.slides && content.slides.length > 0) {
@@ -518,7 +532,7 @@ export default async function SectionBlockRenderer({
 
     return (
       <section
-        className={`relative w-full overflow-hidden ${BACKGROUND_COMPOSITING_CLASSES}`}
+        className={`relative w-full overflow-hidden ${sectionCompositingClasses(hasSlideImage)}`}
         {...visualEditAttributes}
       >
         <SectionSlider
@@ -572,7 +586,7 @@ export default async function SectionBlockRenderer({
 
   return (
     <section
-      className={`relative w-full ${BACKGROUND_COMPOSITING_CLASSES} ${paddingTopClass} ${paddingBottomClass} ${backgroundClassName}`.trim()}
+      className={`relative w-full ${sectionCompositingClasses(content.background?.type === 'image')} ${paddingTopClass} ${paddingBottomClass} ${backgroundClassName}`.trim()}
       style={{
         ...styles,
         minHeight: formatMinHeight(content.background?.min_height)

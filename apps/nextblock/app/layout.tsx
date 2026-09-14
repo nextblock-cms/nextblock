@@ -39,7 +39,7 @@ import {
   DEFAULT_OG_IMAGE_HEIGHT,
 } from './lib/seo';
 import { resolveActiveLogo } from '../lib/logos/active-logo';
-import { slimTranslationsForLocale } from '../lib/i18n/slim-translations';
+import { compactTranslationsForLocale } from '../lib/i18n/slim-translations';
 import {
   isSupabaseConfigured,
   resolveSupabaseAnonKey,
@@ -57,7 +57,10 @@ import {
 const defaultUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
 
 const DEFAULT_LOCALE_FOR_LAYOUT = 'en';
-const PUBLIC_LAYOUT_REVALIDATE_SECONDS = 60;
+// Five minutes, like lib/public-content-cache.ts: every settings action evicts by tag
+// or path, so the TTL only bounds direct database edits, and a cold entry is a
+// sequential Supabase round trip inside the request on Vercel.
+const PUBLIC_LAYOUT_REVALIDATE_SECONDS = 300;
 const PUBLIC_LAYOUT_LOGO_CACHE_TAG = 'public-layout-logo';
 const TRUSTED_TYPES_SCRIPT_STRATEGY =
   process.env.NODE_ENV === 'production' ? 'beforeInteractive' : 'afterInteractive';
@@ -385,6 +388,9 @@ async function loadLayoutData() {
     isEcommerceActive,
     privacySettings,
     languageDetectionSettings,
+    logo,
+    { siteTitle },
+    footerAttributionEnabled,
   ] = await Promise.all([
     supabase.auth.getUser(),
     getCachedLanguages().catch(() => getActiveLanguagesServerSide().catch(() => [])),
@@ -401,6 +407,12 @@ async function loadLayoutData() {
     getCachedLanguageDetectionSettings().catch(() => ({
       ...DEFAULT_LANGUAGE_DETECTION_SETTINGS,
     })),
+    // Locale-independent reads belong in this first wave: on Vercel each cached read
+    // is a Data Cache round trip, and these three used to run one after another
+    // AFTER the second wave, adding ~3 sequential hops to every public request.
+    getCachedActiveLogo().catch(() => null),
+    getSiteSettings(),
+    getCachedFooterAttribution().catch(() => true),
   ]);
 
   // Serve only active languages, matching the proxy's detection set (is_active
@@ -434,17 +446,15 @@ async function loadLayoutData() {
 
   const hasSupabaseEnv = isSupabaseConfigured();
 
-  const [profile, headerNavItems, footerNavItems, logo] = await Promise.all([
+  // Second wave: only what genuinely depends on the validated locale or the user.
+  const [profile, headerNavItems, footerNavItems] = await Promise.all([
     user ? getProfileWithRoleServerSide(user.id) : Promise.resolve(null),
     getCachedNavigationMenu('HEADER', serverDeterminedLocale).catch(() => []),
     getCachedNavigationMenu('FOOTER', serverDeterminedLocale).catch(() => []),
-    getCachedActiveLogo().catch(() => null),
   ]);
 
   const role = profile?.role ?? null;
   const canAccessCms = role === 'ADMIN' || role === 'WRITER';
-  const { siteTitle } = await getSiteSettings();
-  const footerAttributionEnabled = await getCachedFooterAttribution().catch(() => true);
 
   return {
     user,
@@ -628,8 +638,9 @@ export default async function RootLayout({
           // The raw table (every locale + timestamps) was ~88 KB of RSC payload on
           // every public page. The client only reads the active locale plus the 'en'
           // fallback, and a language switch goes through router.refresh(), which
-          // re-runs this layout for the new locale.
-          translations={slimTranslationsForLocale(translations, serverDeterminedLocale)}
+          // re-runs this layout for the new locale. Shipped as `[key, value]` tuples:
+          // the row objects cost another ~12 KB of JSON scaffolding.
+          translations={compactTranslationsForLocale(translations, serverDeterminedLocale)}
           nonce={nonce}
           themeSlugs={themeSlugs}
           initialTheme={initialTheme}

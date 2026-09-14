@@ -1,4 +1,5 @@
 import 'server-only';
+import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 import { createClient as createSupabaseJsClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db';
@@ -51,7 +52,10 @@ export function createStaticSupabaseClient() {
  * from the `site_settings` key-value store. This is the single source of truth
  * used for both `<title>`/OpenGraph metadata and the header brand.
  */
-export const getSiteSettings = unstable_cache(
+// React `cache()` memoises the call per request: the root layout, a page's
+// generateMetadata and the page body all ask for this, and on Vercel every
+// `unstable_cache` read is a round trip to the Data Cache.
+export const getSiteSettings = cache(unstable_cache(
   async (): Promise<SiteSettings> => {
     const fallback: SiteSettings = {
       siteTitle: DEFAULT_SITE_TITLE,
@@ -102,4 +106,4 @@ export const getSiteSettings = unstable_cache(
   },
   ['public-site-settings'],
   { revalidate: SITE_SETTINGS_REVALIDATE_SECONDS, tags: [SITE_SETTINGS_CACHE_TAG] }
-);
+));

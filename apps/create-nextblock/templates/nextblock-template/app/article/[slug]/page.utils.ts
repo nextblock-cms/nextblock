@@ -1,6 +1,7 @@
 // app/article/[slug]/page.utils.ts
 import { createClient, getSsgSupabaseClient } from "@nextblock-cms/db/server";
 import type { Database } from "@nextblock-cms/db";
+import { cache } from "react";
 import { unstable_cache } from "next/cache";
 import { draftMode } from "next/headers";
 import {
@@ -251,13 +252,16 @@ type PublicSupabaseClient = ReturnType<typeof createClient> | ReturnType<typeof 
  * Public post data for a slug. Draft mode reads live through the cookie-scoped client;
  * the published path is served from `unstable_cache` (see lib/public-content-cache.ts).
  */
-export async function getPostDataBySlug(slug: string): Promise<PublicPostData | null> {
+export const getPostDataBySlug = cache(async function getPostDataBySlug(
+  slug: string,
+): Promise<PublicPostData | null> {
   const draft = await draftMode();
   if (draft.isEnabled) {
     return loadPostData(createClient(), slug, true);
   }
+  // Memoised per request (generateMetadata + page body share one Data Cache hop).
   return getCachedPublishedPostData(slug);
-}
+});
 
 const getCachedPublishedPostData = unstable_cache(
   async (slug: string): Promise<PublicPostData | null> =>
@@ -267,7 +271,7 @@ const getCachedPublishedPostData = unstable_cache(
 );
 
 /** `language code -> slug` for the published posts of a translation group; cached. */
-export const getCachedPublishedPostTranslatedSlugs = unstable_cache(
+export const getCachedPublishedPostTranslatedSlugs = cache(unstable_cache(
   async (translationGroupId: string): Promise<Record<string, string>> => {
     const supabase = getSsgSupabaseClient();
     const { data, error } = await supabase
@@ -291,7 +295,7 @@ export const getCachedPublishedPostTranslatedSlugs = unstable_cache(
   },
   ['public-post-translated-slugs'],
   { revalidate: PUBLIC_CONTENT_REVALIDATE_SECONDS, tags: [PUBLIC_POSTS_CACHE_TAG] },
-);
+));
 
 async function loadPostData(
   supabase: PublicSupabaseClient,
