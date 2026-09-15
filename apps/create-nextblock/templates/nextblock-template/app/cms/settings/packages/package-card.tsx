@@ -41,7 +41,7 @@ export function PackageCard({ pkg, isActive, isExpired = false, licenseKey, prov
         setLoading(true);
         try {
             const res = await deactivatePackage(pkg.id);
-            if (res?.error) {
+            if (res && 'error' in res) {
                 toast.error(res.error);
             } else {
                 toast.success('Package deactivated.');
