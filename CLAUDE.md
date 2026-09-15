@@ -102,8 +102,9 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   get GPU-layer classes when they have a background image (first-frame compositing cost).
 - `vercel.json` on `master` must never declare `crons`: it ships to every Vercel 1-click
   install and Hobby fails the deployment on any sub-daily schedule. The sandbox's 15-min
-  reset lives on the generated `sandbox` branch (`.github/workflows/sandbox-branch.yml`);
-  FX rates refresh from the CMS layout via `after()` (`lib/commerce/currency-rates-refresh.ts`).
+  reset is a pg_cron job in the sandbox DB (`npm run sandbox:schedule`, not a branch:
+  every Vercel project builds every branch); FX rates refresh from the CMS layout via
+  `after()` (`lib/commerce/currency-rates-refresh.ts`).
 - `/robots.txt` is a route handler (`app/robots.txt/route.ts`) serving `buildRobotsTxt`, not an
   `app/robots.ts` metadata route: Next's serialiser drops the per-rule `other` directives the
   SEO screen lets operators add. The two cannot coexist.

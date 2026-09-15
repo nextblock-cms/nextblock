@@ -183,14 +183,16 @@ The two jobs that used to be crons are handled like this:
   upstream-update check). Installs without commerce never touch the FX provider.
   `GET /api/cron/sync-currencies` still exists for operators who want a precise
   external schedule (a Pro cron they add themselves, or any HTTP scheduler).
-- **Sandbox reset** — only the public sandbox (`cms.nextblock.dev`, Vercel Pro) needs
-  the 15-minute `/api/cron/reset-sandbox` schedule, so it lives on a generated
-  **`sandbox` branch**, not on `master`. The `sandbox-branch.yml` workflow runs on every
-  push to `master` in the upstream repo only, rewrites `vercel.json` with the cron
-  (`tools/scripts/write-sandbox-vercel-config.js`) and force-pushes `master` + that one
-  commit as `sandbox`. The sandbox Vercel project's **Production Branch** is set to
-  `sandbox`; never commit to that branch by hand. In a 1-click copy the workflow is
-  skipped, and the route returns 404 outside sandbox mode anyway.
+- **Sandbox reset** — only the public sandbox (`cms.nextblock.dev`) needs the
+  15-minute `/api/cron/reset-sandbox` schedule, so it is a **pg_cron job inside the
+  sandbox's own Supabase database**, the one place only the sandbox has. `npm run
+  sandbox:schedule` (`tools/scripts/schedule-sandbox-reset.js`) enables `pg_cron` +
+  `pg_net`, stores `CRON_SECRET` in Supabase Vault and schedules an HTTP call to the
+  route every 15 minutes; `--status` shows the last runs and responses, `--remove`
+  unschedules. The job survives the reset itself (which drops only `public`). A branch
+  carrying the cron was tried first and rejected: every Vercel project on the repo builds
+  every branch, so each release produced a second, useless build in the other project.
+  On a normal install the route returns 404 anyway.
 
 ### Debugging sandbox reset failures
 

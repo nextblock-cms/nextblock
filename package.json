@@ -1,6 +1,6 @@
 {
   "name": "nextblock",
-  "version": "0.17.10",
+  "version": "0.17.11",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -81,6 +81,7 @@
     "verify:cortex-ai-build-widget": "npx tsx --tsconfig tsconfig.base.json --conditions=react-server apps/nextblock/scripts/verify-cortex-ai-build-widget.tsx",
     "verify:editor-block-schema": "npx tsx apps/nextblock/scripts/validate-editor-block-schema.ts",
     "sandbox:reset": "node tools/scripts/reset-sandbox.js",
+    "sandbox:schedule": "node tools/scripts/schedule-sandbox-reset.js",
     "stripe": "stripe listen --forward-to localhost:4200/api/webhooks/stripe",
     "setup": "node tools/scripts/setup.mjs",
     "docker:setup": "node tools/scripts/docker-setup.mjs",
