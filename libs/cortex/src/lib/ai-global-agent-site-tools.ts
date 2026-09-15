@@ -420,14 +420,15 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
     await Promise.all([
       supabase.from('languages').select('id, code, name, is_default, is_active').order('id'),
       readSettings(supabase, [...IDENTITY_SETTING_KEYS, CORTEX_AI_SITE_BRIEF_SETTING_KEY, CORTEX_AI_BUILD_SESSION_SETTING_KEY]),
+      // `count: 'exact'` so the totals are the site's, not the capped list's.
       supabase
         .from('pages')
-        .select('id, slug, title, status, language_id, translation_group_id, author_id, updated_at')
+        .select('id, slug, title, status, language_id, translation_group_id, author_id, updated_at', { count: 'exact' })
         .order('id')
         .limit(parsed.limit),
       supabase
         .from('posts')
-        .select('id, slug, title, status, language_id, translation_group_id, author_id, published_at')
+        .select('id, slug, title, status, language_id, translation_group_id, author_id, published_at', { count: 'exact' })
         .order('id')
         .limit(parsed.limit),
       supabase.from('site_themes').select('slug, name, is_default, is_active, color_scheme').order('sort_order'),
@@ -572,8 +573,8 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
       customBlocks: ((customBlocksResult.data ?? []) as any[]).length,
       drafts: ((draftsResult.data ?? []) as any[]).length,
       media: media.length,
-      pages: pages.length,
-      posts: posts.length,
+      pages: typeof pagesResult.count === 'number' ? pagesResult.count : pages.length,
+      posts: typeof postsResult.count === 'number' ? postsResult.count : posts.length,
       products: products.length,
     },
     customBlocks: ((customBlocksResult.data ?? []) as any[]).map((row) => ({
@@ -644,6 +645,93 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
       slug: String(row.slug),
     })),
   };
+}
+
+export type CortexSiteOverview = Awaited<ReturnType<typeof executeGetSiteOverview>>;
+
+const OVERVIEW_PROMPT_PAGE_LIMIT = 30;
+
+/**
+ * Compact, prompt-ready rendering of a site overview (≈ 1200 characters at most on a
+ * typical install). The chat route fetches the overview itself when the site
+ * builder opens, so the model's first turn can be the plan instead of a tool call
+ * followed by a questionnaire. Facts only, no JSON.
+ */
+export function formatCortexSiteOverviewForPrompt(overview: CortexSiteOverview): string {
+  const { counts, seeded } = overview;
+  const lines: string[] = [];
+
+  lines.push(
+    `Counts: ${counts.pages} pages, ${counts.posts} posts, ${counts.products} products, ${counts.media} media, ${counts.customBlocks} custom blocks, ${counts.drafts} drafts.`
+  );
+
+  const activeLanguages = overview.languages.filter((language) => language.isActive);
+  const languageList = (activeLanguages.length > 0 ? activeLanguages : overview.languages)
+    .map((language) => `${language.code}${language.isDefault ? ' (default)' : ''}`)
+    .join(', ');
+  lines.push(`Languages: ${languageList || 'none'}.`);
+
+  if (seeded.anyPresent) {
+    const parts = [
+      seeded.pages > 0 ? `${seeded.pages} demo pages` : null,
+      seeded.posts > 0 ? `${seeded.posts} demo posts` : null,
+      seeded.media > 0 ? `${seeded.media} bundled images` : null,
+      seeded.logo ? 'the NextBlock logo' : null,
+      seeded.siteTitle ? 'the default site title' : null,
+      seeded.copyright ? 'the default copyright' : null,
+    ].filter((part): part is string => Boolean(part));
+    lines.push(`NextBlock demo content: present (${parts.join(', ')}).`);
+  } else {
+    lines.push('NextBlock demo content: none detected.');
+  }
+
+  const home = overview.homePage;
+  lines.push(
+    home
+      ? `Home page: "${home.title}" (/${home.slug}) ${home.status}, ${home.blockCount} blocks${home.isSeeded ? ', seeded demo content' : ''}.`
+      : 'Home page: missing in the default language ("/" returns 404).'
+  );
+
+  const identity = overview.identity;
+  const logo = identity.activeLogo
+    ? `logo "${identity.activeLogo.name || identity.activeLogo.id}"${identity.activeLogo.isSeeded ? ' (NextBlock demo logo)' : ''}`
+    : 'no logo';
+  lines.push(`Site title: ${identity.siteTitle ? `"${identity.siteTitle}"` : 'not set'}; ${logo}.`);
+
+  if (overview.themes.length > 0) {
+    lines.push(
+      `Themes: ${overview.themes
+        .map(
+          (theme) =>
+            `${theme.name || theme.slug} (${theme.colorScheme}${theme.isDefault ? ', default' : ''}${
+              theme.isActive ? '' : ', inactive'
+            })`
+        )
+        .join('; ')}.`
+    );
+  }
+
+  lines.push(overview.brief ? `Site brief: saved (status ${overview.brief.status}).` : 'Site brief: none saved.');
+  lines.push(
+    overview.buildSession
+      ? `Build session: active until ${overview.buildSession.expiresAt}.`
+      : 'Build session: none.'
+  );
+
+  if (overview.pages.length > 0) {
+    const shown = overview.pages.slice(0, OVERVIEW_PROMPT_PAGE_LIMIT);
+    // Against the site total, not the capped list, so "+N more" is honest past the limit.
+    const rest = Math.max(counts.pages, overview.pages.length) - shown.length;
+    lines.push(
+      `Pages: ${shown.map((page) => `${page.title || page.slug} (/${page.slug}) [${page.languageCode}]`).join(', ')}${
+        rest > 0 ? `, +${rest} more` : ''
+      }.`
+    );
+  } else {
+    lines.push('Pages: none.');
+  }
+
+  return lines.join('\n');
 }
 
 /* -------------------------------------------------------------------------- */

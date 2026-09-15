@@ -127,7 +127,7 @@ Known incomplete or future work:
 | `apps/nextblock/app/cms/settings/cortex-ai/page.tsx` | Settings page for activation/key status, BYOK forms, and compatible model selection. |
 | `apps/nextblock/app/cms/settings/cortex-ai/CortexAiSettingsClient.tsx` | The single settings UI. One component for production **and** sandbox — see below. |
 | `apps/nextblock/app/cms/settings/cortex-ai/actions.ts` | Server actions for reading, saving, and clearing BYOK keys and model selections. |
-| `apps/nextblock/app/cms/settings/cortex-ai/setup/` | The first-run wizard (`page.tsx`, `CortexSetupWizard.tsx`, `actions.ts`) — see "First-run setup wizard" below. |
+| `apps/nextblock/app/cms/settings/cortex-ai/setup/` | The first-run wizard (`page.tsx`, `CortexSetupWizard.tsx`, `actions.ts`, `SiteBriefForm.tsx` + `brief-actions.ts` for the Brief step) — see "First-run setup wizard" below. |
 | `apps/nextblock/lib/cortex-ai/setup-state.ts` + `setup-status.ts` | Pure `deriveCortexSetupState` (when the wizard is owed) and the server loader the settings page, the wizard, and the CMS layout share. |
 | `apps/nextblock/app/cms/settings/cortex-ai/mcp-client-snippets.ts` | The one builder for the Claude Code / Claude Desktop / Cursor / VS Code MCP configs, used by the MCP card and the wizard. |
 | `libs/cortex/src/lib/ai-key-verification.ts` | Live checks of an OpenRouter, Pexels, or Unsplash key against its provider before it is stored. |
@@ -169,7 +169,7 @@ server on with a token. Before the wizard, "Build my site with Cortex AI now" la
 chat, which fired the kickoff prompt and showed "Cortex AI requires OPENROUTER_API_KEY…" as a
 red banner; the only way out was the full settings page.
 
-The wizard is three screens, one decision each, every one skippable:
+The wizard is four screens, one decision each, every one skippable:
 
 1. **Connect** — two option cards. *Chat here in NextBlock* takes an OpenRouter key (link to
    openrouter.ai/keys, note that free models need no credit); the moment the key verifies a
@@ -182,11 +182,19 @@ The wizard is three screens, one decision each, every one skippable:
    launched without a key.
 2. **Photos** (optional) — a Pexels and/or Unsplash key so the builder can fill image slots
    itself; "Skip for now" is a first-class button.
-3. **Build** — on the chat path, the screen *is* the "Start building my site" button (a full
-   navigation to `/cms/dashboard?cortex=site-builder`, because the model-key bit is a layout
-   prop). On the MCP path it shows the token once, the client config for the chosen client,
-   and the exact kickoff prompt to paste (`SITE_BUILDER_KICKOFF_PROMPT` in
-   `lib/cortex-ai/site-builder-prompt.ts`, the same constant the chat sends). With no path
+3. **Brief** (optional) — `SiteBriefForm.tsx`, a one-page questionnaire (business, visitors,
+   site shape and pages, languages, look and feel, contact details, existing content, notes)
+   whose values `siteBriefFormToBrief` (`lib/cortex-ai/site-brief-form.ts`) turns into the
+   same `CortexSiteBrief` the chat interview saves; `saveSiteBriefFromFormAction`
+   (`brief-actions.ts`) stores it through `executeSaveSiteBrief` in `replace` mode. A saved
+   brief (this session or `existingBrief` from the loader) shows as a summary card with
+   "Edit brief"; "Skip, let Cortex interview me in chat" leaves the questions to phase 1.
+4. **Build** — on the chat path, the screen *is* the "Start building my site" button (a full
+   navigation to `/cms/dashboard?cortex=site-builder`, because the model-key and brief bits
+   are layout props). On the MCP path it shows the token once, the client config for the
+   chosen client, and the exact kickoff prompt to paste (`SITE_BUILDER_KICKOFF_PROMPT`, or
+   `SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF` once a brief is saved, both in
+   `lib/cortex-ai/site-builder-prompt.ts`, the same constants the chat sends). With no path
    chosen it offers both again and a "Finish" button.
 
 Every key is verified against its provider before it is stored (`verifyOpenRouterApiKey`
@@ -204,10 +212,28 @@ Routing rules (`deriveCortexSetupState`, `lib/cortex-ai/setup-state.ts`):
   a "Setup guide" button that re-opens the wizard on demand.
 - `?intent=site-builder` is what every "Build my site" entry links to
   (`CORTEX_SETUP_SITE_BUILDER_HREF`): the wizard redirects straight to
-  `/cms/dashboard?cortex=site-builder` when a model key already exists, so a self-host with
-  `OPENROUTER_API_KEY` never sees it.
-- The CMS layout computes `hasCortexModelKey` for admins and passes it to
-  `CortexGlobalAgentChat` as `hasModelKey`. Without it the drawer replaces its composer with
+  `/cms/dashboard?cortex=site-builder` when `readyForSiteBuilder` holds — an env key, or a
+  stored key with the wizard completed or skipped — so a self-host with `OPENROUTER_API_KEY`
+  never sees it. It deliberately does not key on `hasModelKey`: the key is stored on step 1
+  and the route re-renders whenever the client router re-fetches it, so that would throw the
+  operator into the chat mid-wizard. For the same reason NO wizard action revalidates
+  anything (`connectOpenRouterKeyAction`, `selectModelForSetupAction`, the photo-key action,
+  `enableMcpForSetupAction` — which calls the MCP actions with `{ revalidate: false }` so the
+  one-time token is not lost to a `/cms/welcome` re-render — `saveSiteBriefFromFormAction`,
+  and `completeCortexSetupAction`): any revalidation inside a server action re-renders the
+  current route in the action response, and on completion that raced the page's redirect
+  against the wizard's own `window.location.assign` (which may be the plain dashboard for
+  "Not now"). Every reader of these settings is dynamic, and the wizard always leaves with a
+  full navigation, so nothing needs revalidating.
+- The CMS layout computes `hasCortexModelKey` and `hasCortexSiteBrief` for admins in one
+  query (`getCortexChatStatus`, `lib/cortex-ai/site-brief-status.ts`) and passes them to
+  `CortexGlobalAgentChat` as `hasModelKey` / `hasSiteBrief`; with a brief the chat's
+  `startSiteBuilder()` sends `SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF`. "Has a brief" means
+  `isCortexSiteBriefComplete` (`libs/cortex/src/lib/site-brief.ts`: name AND description),
+  the same predicate the chat route uses to skip the interview phase and the wizard uses to
+  show "Brief saved", so the kickoff prompt never contradicts the system prompt (a name-only
+  brief from an interrupted chat interview prefills the form instead). Without a model key the
+  drawer replaces its composer with
   a "Finish setup" panel, `startSiteBuilder()` (the checklist "Start" button, the
   `?cortex=site-builder` deep link, the empty-chat button) navigates to the wizard instead of
   sending, and a stream error that mentions the key gets a "Finish Cortex setup" link. The
@@ -228,12 +254,15 @@ be a step inside that wizard; this is the next page.
   buy-now, monthly, "already have a key" and the nextblock.dev link are tertiary. Every
   checkout outcome (overlay cancelled, activation failed, key by email) stays on the page.
   On activation, "Continue to Cortex setup" does a full reload of `/cms/welcome`.
-- **Steps 2–4** — the page renders `CortexSetupWizard` with `precedingSteps={['Cortex AI']}`
-  and `intent="site-builder"` once the package is active and `needsSetup` holds, so the
-  chips read Cortex AI ✓ → Connect → Photos → Build. Its skip link goes to the dashboard.
+- **Steps 2–5** — the page renders `CortexSetupWizard` with `precedingSteps={['Cortex AI']}`
+  and `intent="site-builder"` once the package is active and the wizard is still owed, so
+  the chips read Cortex AI ✓ → Connect → Photos → Brief → Build. Its skip link goes to the
+  dashboard.
 - **Redirects, so nobody is trapped:** sandbox and non-admins → dashboard; package active
-  with a model key → `/cms/dashboard?cortex=site-builder`; package active but MCP-only or
-  wizard already finished → dashboard. Nothing in the proxy or layout forces the route; it
+  and `readyForSiteBuilder` (env key, or stored key with the wizard finished) →
+  `/cms/dashboard?cortex=site-builder`; a stored key with the wizard unfinished → the wizard
+  (key already connected); package active but MCP-only or wizard already finished →
+  dashboard. Nothing in the proxy or layout forces the route; it
   is reached only from the post-setup redirect, the dashboard checklist's "Start free
   trial" link (`lib/onboarding/status.ts`, `href: '/cms/welcome'`), and the legacy
   `/cms/dashboard?cortex=site-builder` deep link when Cortex is inactive (the dashboard
@@ -535,10 +564,25 @@ This constant is retained for compatibility, but Cortex AI's preferred generatio
 Configured all-purpose free fallbacks:
 
 ```txt
-qwen/qwen3-next-80b-a3b-instruct:free
 nvidia/nemotron-3-super-120b-a12b:free
-nvidia/nemotron-nano-9b-v2:free
+nvidia/nemotron-3-ultra-550b-a55b:free
+thinkingmachines/inkling:free
+nex-agi/nex-n2.5-pro:free
+poolside/laguna-s-2.1:free
+thinkingmachines/inkling-small:free
+inclusionai/ling-3.0-flash-vl:free
 ```
+
+(`CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY`, checked against the live OpenRouter catalog on
+2026-09-15: every entry advertises `tools` and has no expiration date; entry 0 is the
+highest-ranked one that also advertises `structured_outputs`, which
+`defaultStructuredOutputModel` needs, so it stays first even though nemotron-3-ultra is
+the stronger model.)
+When a chain entry fails, `isOpenRouterRecoverableRoutingError` decides whether the global
+agent falls through to the next model (429, any 404, "No endpoints found", "no longer
+available", "unavailable for free", "paid version is available", "not a valid model ID", …)
+and `getOpenRouterErrorStatus` extracts the HTTP status from the transport error or the
+OpenRouter JSON body (`error.code`) for the fallback log line.
 
 Registries:
 

@@ -89,10 +89,7 @@ async function loadBotProtection(supabase: {
   return { provider: 'none', siteKey: '' };
 }
 
+// The route is force-dynamic (above), so headers() never throws here.
 async function loadNonce(): Promise<string> {
-  try {
-    return (await headers()).get('x-nonce') || '';
-  } catch {
-    return '';
-  }
+  return (await headers()).get('x-nonce') || '';
 }

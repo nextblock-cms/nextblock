@@ -21,6 +21,7 @@ import {
   executeDeleteCmsItem,
   executeDeleteCustomBlock,
   executeFinishSiteBuild,
+  executeGetSiteOverview,
   executeInsertContentBlock,
   executeResetSiteContent,
   executeRewritePageDraft,
@@ -35,8 +36,12 @@ import {
   executeUpdateSectionColumnBlock,
   executeUpdateSiteIdentity,
   formatCortexSiteBriefForPrompt,
+  formatCortexSiteOverviewForPrompt,
+  getOpenRouterErrorStatus,
   isOpenRouterRateLimitError,
+  isOpenRouterRecoverableRoutingError,
   omitUnsupportedCortexAiModelOptions,
+  isCortexSiteBriefComplete,
   readCortexSiteBrief,
   resolveCortexAiAgentSettings,
   resolveCortexAiStockPhotoProvider,
@@ -46,6 +51,7 @@ import {
   type CortexAiPageContext,
   type CortexBuildSession,
   type CortexSiteBrief,
+  type CortexSiteOverview,
   z,
 } from '@nextblock-cms/cortex';
 import { validateBlockContent } from '../../../../lib/blocks/blockRegistry';
@@ -234,12 +240,33 @@ const GLOBAL_AGENT_SYSTEM_PROMPT = [
  * The guided flow behind "Build your site with Cortex": interview, plan, build.
  * Appended to the system prompt when the client opens the chat in site-builder mode.
  */
-const SITE_BUILDER_MODE_PROMPT = [
-  'SITE BUILDER MODE. The operator opened this chat to set up their website from scratch with you, the way an AI website builder works. Run it in three phases and keep every message short and friendly.',
-  'PHASE 1 — INTERVIEW. Call get_site_overview first to learn what exists, which languages are active, and whether the NextBlock demo content is still present. Then ask the discovery questions in ONE message as a short numbered list, and say that short answers or "you decide" are fine: (1) the business or project name and what it does, in one or two sentences; (2) who the visitors are and the one thing they should do (call, book, buy, read, sign up); (3) the site shape: a single landing page, or several pages — and which ones (home, about, services, menu, pricing, contact, blog, shop…); (4) the languages the public site must offer (name the ones currently active); (5) brand: colours (or "pick for me"), light or dark, tone of voice, and whether they have a logo to upload later; (6) contact details and social links to show (email, phone, address, hours); (7) whether anything already on the site should be kept, or everything replaced; (8) a reference or competitor site to draw inspiration from (a URL, fetch it with fetch_url_content), and whether they sell products online. Save every answer with save_site_brief as soon as you have it (mode "merge"). Ask at most one short follow-up round for what is still missing, then choose sensible defaults for the rest and say which defaults you chose.',
+const SITE_BUILDER_INTERVIEW_QUESTIONS =
+  'Ask the discovery questions in ONE message as a short numbered list, and say that short answers or "you decide" are fine: (1) the business or project name and what it does, in one or two sentences; (2) who the visitors are and the one thing they should do (call, book, buy, read, sign up); (3) the site shape: a single landing page, or several pages — and which ones (home, about, services, menu, pricing, contact, blog, shop…); (4) the languages the public site must offer (name the ones currently active); (5) brand: colours (or "pick for me"), light or dark, tone of voice, and whether they have a logo to upload later; (6) contact details and social links to show (email, phone, address, hours); (7) whether anything already on the site should be kept, or everything replaced; (8) a reference or competitor site to draw inspiration from (a URL, fetch it with fetch_url_content), and whether they sell products online. Save every answer with save_site_brief as soon as you have it (mode "merge"). Ask at most one short follow-up round for what is still missing, then choose sensible defaults for the rest and say which defaults you chose.';
+
+/**
+ * PHASE 1 depends on what the CMS already did for the model: when the operator
+ * filled in the site-brief form, the interview is over before the chat starts; when
+ * the route fetched the site overview itself, the model must not fetch it again.
+ */
+function buildSiteBuilderModePrompt(params: { briefComplete: boolean; overviewInjected: boolean }) {
+  const phaseOne = params.briefComplete
+    ? 'PHASE 1 — BRIEF ALREADY COLLECTED. The operator filled in the site brief in a form (see SITE BRIEF below). Do NOT ask the discovery questions. Fill any gaps with sensible defaults and say which defaults you chose in one line. Go straight to PHASE 2 and present the plan in your first message.'
+    : `PHASE 1 — INTERVIEW. ${
+        params.overviewInjected
+          ? 'Use the CURRENT SITE STATE below to learn what exists, which languages are active, and whether the NextBlock demo content is still present; do not call get_site_overview for that.'
+          : 'Call get_site_overview first to learn what exists, which languages are active, and whether the NextBlock demo content is still present.'
+      } Then ${SITE_BUILDER_INTERVIEW_QUESTIONS}`;
+
+  return [SITE_BUILDER_MODE_INTRO, phaseOne, ...SITE_BUILDER_MODE_LATER_PHASES].join(' ');
+}
+
+const SITE_BUILDER_MODE_INTRO =
+  'SITE BUILDER MODE. The operator opened this chat to set up their website from scratch with you, the way an AI website builder works. Run it in three phases and keep every message short and friendly.';
+
+const SITE_BUILDER_MODE_LATER_PHASES = [
   'PHASE 2 — PLAN. Present the plan in plain language: what will be removed (the demo pages, posts, menus, images, logo and NextBlock title — unless they keep content), then each page with its sections top to bottom, the header and footer menus, the copyright line, the theme colours, and the languages. End with "Shall I build it?". When they agree, call start_site_build with `summary` = that plan, `brief` = the complete brief, and `reset` = { keepLanguages: [the languages they want] } unless they keep existing content (then omit reset). Do not call reset_site_content separately in this mode; start_site_build runs the reset and opens the build session with a single confirmation.',
   'PHASE 3 — BUILD, as soon as start_site_build succeeds or whenever a build session is active. Work through the plan without pausing and without asking "shall I continue": (a) update_site_identity with site_title, site_description, site_keywords, footer_copyright for every language ("© {year} <name>"), and footer_show_attribution false if they want no NextBlock mention; (b) manage_language for any language that must exist; (c) manage_site_theme with the brand colours as HSL channel triplets, plus update_global_css only if a custom effect is needed; (d) if stock photos are available, search_stock_photos once per page theme and reuse the results; (e) the home page: rewrite_page_draft on contentType "page", slug "home" (it exists and is empty after the reset) with a hero and the agreed sections, then publish_content_draft; (f) every other page: create_cms_page with status "published" and full section blocks, a contact page with a form block; (g) update_navigation_bar with mode "replace" and update_footer for EVERY active language, linking the pages you created (home is "/"); (h) for each extra language, translate_content_bulk with complete translations of every visible string on every page; (i) finish_site_build with a one-paragraph summary, then tell the operator what was built with a link to each page and to /cms/pages, and remind them to upload their logo at /cms/settings/logos. Write real, specific copy from the brief — never lorem ipsum, never placeholders such as "[Your text here]".',
-].join(' ');
+];
 
 /**
  * Tools that keep their confirmation step even inside an approved build session:
@@ -399,15 +426,27 @@ function buildGlobalAgentSystemPrompt(
     brief: CortexSiteBrief | null;
     buildSession: CortexBuildSession | null;
     mode: 'default' | 'site-builder';
+    /** Fetched by the route itself (site-builder mode, no build session yet). */
+    overview?: CortexSiteOverview | null;
   }
 ) {
+  const overview = site.overview ?? null;
+
   return [
     GLOBAL_AGENT_SYSTEM_PROMPT,
-    site.mode === 'site-builder' ? SITE_BUILDER_MODE_PROMPT : null,
+    site.mode === 'site-builder'
+      ? buildSiteBuilderModePrompt({
+          briefComplete: isCortexSiteBriefComplete(site.brief),
+          overviewInjected: Boolean(overview),
+        })
+      : null,
     site.buildSession ? buildBuildSessionPrompt(site.buildSession) : null,
     site.brief
       ? `SITE BRIEF (what the client wants their website to be; the source of truth for names, copy, languages and style):\n${formatCortexSiteBriefForPrompt(site.brief)}`
       : 'No site brief is saved yet. If the user describes their business or what the site is for, record it with save_site_brief.',
+    overview
+      ? `CURRENT SITE STATE (fetched by the CMS just now — do not call get_site_overview again this turn unless you have changed something):\n${formatCortexSiteOverviewForPrompt(overview)}`
+      : null,
     formatPageContextForPrompt(pageContext),
     stockPhotoProvider
       ? `Stock photos ARE available (provider: ${stockPhotoProvider.provider}). Use search_stock_photos for real hero and section imagery.`
@@ -1200,15 +1239,30 @@ export async function POST(request: Request) {
       },
       Boolean(buildSession)
     );
-    const [stockPhotoProvider, agentSettings, siteBrief] = await Promise.all([
+    // In site-builder mode the "what does the site have now" check is done here, in
+    // code, so the model's first turn can be the plan rather than a tool round-trip.
+    // Skipped once a build session is active: the model is then mid-build and the
+    // snapshot would be stale by its next tool call anyway.
+    const shouldInjectOverview = mode === 'site-builder' && !buildSession;
+    const [stockPhotoProvider, agentSettings, siteBrief, siteOverview] = await Promise.all([
       resolveCortexAiStockPhotoProvider(serviceClient),
       resolveCortexAiAgentSettings(serviceClient),
       readCortexSiteBrief(serviceClient),
+      shouldInjectOverview
+        ? executeGetSiteOverview(
+            { includeMedia: false, includeNavigation: false, limit: 60 },
+            { supabase: serviceClient }
+          ).catch((error: unknown) => {
+            console.warn('[Cortex AI] Could not fetch the site overview for the site builder:', error);
+            return null;
+          })
+        : Promise.resolve(null),
     ]);
     const systemPrompt = buildGlobalAgentSystemPrompt(pageContext, stockPhotoProvider, {
       brief: siteBrief,
       buildSession,
       mode,
+      overview: siteOverview,
     });
     const maxSteps = buildSession
       ? Math.max(agentSettings.maxSteps, BUILD_MODE_MIN_STEPS)
@@ -1421,6 +1475,22 @@ export async function POST(request: Request) {
               isOpenRouterRateLimitError(lastError) &&
               index < modelIds.length - 1
             ) {
+              continue;
+            }
+
+            // A model that OpenRouter can no longer route ("No endpoints found",
+            // "no longer available", withdrawn free tier, 404) is an outage, not an
+            // answer: log it for the operator and try the next model in the chain.
+            if (
+              !hasToolCall &&
+              isOpenRouterRecoverableRoutingError(lastError) &&
+              index < modelIds.length - 1
+            ) {
+              console.warn('[Cortex AI] model unavailable, falling back', {
+                message: serializeStreamError(lastError),
+                status: getOpenRouterErrorStatus(lastError),
+                modelId,
+              });
               continue;
             }
 

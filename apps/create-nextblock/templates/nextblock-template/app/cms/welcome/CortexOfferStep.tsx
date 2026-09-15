@@ -19,9 +19,11 @@ import { formatPackagePrice, type PackageDef } from '@nextblock-cms/utils';
 
 import { CMS_WELCOME_PATH } from '../../../lib/cortex-ai/site-builder-prompt';
 import { SetupStepIndicator } from '../components/SetupStepIndicator';
+import { CORTEX_SETUP_STEP_LABELS } from '../settings/cortex-ai/setup/CortexSetupWizard';
 import { formatPackageDate, usePackageCheckout } from '../settings/packages/usePackageCheckout';
 
-const WELCOME_STEPS = ['Cortex AI', 'Connect', 'Photos', 'Build'] as const;
+/** Step 1 here, then the wizard's own steps: one sequence, so the chips never drift. */
+const WELCOME_STEPS: ReadonlyArray<string> = ['Cortex AI', ...CORTEX_SETUP_STEP_LABELS];
 const DASHBOARD_HREF = '/cms/dashboard';
 
 /**
@@ -30,12 +32,25 @@ const DASHBOARD_HREF = '/cms/dashboard';
  * Design rules: the decline is a real button next to the trial button, never a
  * text link; the price after the trial is stated up front; and every checkout
  * outcome (cancelled overlay, activation failed, key by email) keeps the operator on
- * this page with a way forward. On activation the flow continues with a full
- * navigation so the CMS layout picks up the now-active package.
+ * this page with a way forward.
+ *
+ * On activation the flow continues with a FULL navigation to this same route, right
+ * away. The activation actions revalidate the `/cms` layout, and any revalidation
+ * inside a server action makes the client router re-render the current route in the
+ * action response: the server page then sees Cortex active and swaps this component
+ * out for the wizard underneath the operator (under the still-open checkout overlay
+ * on the trial path). Nothing on this page can prevent that, so the hand-off is made
+ * deterministic instead: reload, and the wizard's own heading ("Your trial is
+ * active") is the confirmation. The "activated" stage below only shows for as long
+ * as the reload takes, with a manual "Continue" in case it is slow.
  */
 export function CortexOfferStep({ pkg }: { pkg: PackageDef }) {
   const { activateManualKey, busy, manualKey, monthlyPrice, offer, openCheckout, resendEmail, setManualKey, setStage, stage, trialEndsAt } =
-    usePackageCheckout({ pkg });
+    usePackageCheckout({
+      onActivated: () => window.location.assign(CMS_WELCOME_PATH),
+      pkg,
+      refreshOnActivate: false,
+    });
 
   const trialDays = pkg.trial?.days ?? 0;
 
@@ -75,9 +90,9 @@ export function CortexOfferStep({ pkg }: { pkg: PackageDef }) {
             <li className="flex gap-2">
               <MessageSquareText className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
               <span>
-                <span className="font-medium">Interviews you</span>
+                <span className="font-medium">Asks about your business</span>
                 <br />
-                <span className="text-muted-foreground">A few questions about your business, in chat.</span>
+                <span className="text-muted-foreground">A two-minute form (or a chat, if you prefer).</span>
               </span>
             </li>
             <li className="flex gap-2">

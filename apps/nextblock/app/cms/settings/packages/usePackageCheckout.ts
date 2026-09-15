@@ -50,9 +50,19 @@ export type BillingCycle = 'annual' | 'monthly';
 export function usePackageCheckout({
   onActivated,
   pkg,
+  refreshOnActivate = true,
 }: {
   onActivated?: (activated: PackageCheckoutActivated) => void;
   pkg: PackageDef;
+  /**
+   * Call `router.refresh()` once the package is active. Mostly belt and braces: the
+   * activation actions already revalidate the `/cms` layout, which makes the action
+   * response re-render the current route on its own, so a page that shows package
+   * state (the packages page, the dashboard checklist) picks it up either way. Pass
+   * `false` when the caller navigates away with a full load in `onActivated`; the
+   * refresh would only race that navigation.
+   */
+  refreshOnActivate?: boolean;
 }) {
   const router = useRouter();
   const offer = describePackageOffer(pkg);
@@ -76,9 +86,11 @@ export function usePackageCheckout({
       setStage({ kind: 'activated', result });
       toast.success(`${result.package} is active${result.isTrial ? ' — your free trial has started' : ''}.`);
       onActivated?.({ isTrial: result.isTrial, packageId: result.packageId, packageName: result.package });
-      router.refresh();
+      if (refreshOnActivate) {
+        router.refresh();
+      }
     },
-    [onActivated, router]
+    [onActivated, refreshOnActivate, router]
   );
 
   const handleCheckoutResponse = useCallback(

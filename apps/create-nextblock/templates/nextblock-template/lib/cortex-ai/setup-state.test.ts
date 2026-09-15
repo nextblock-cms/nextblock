@@ -56,4 +56,45 @@ describe('deriveCortexSetupState', () => {
       needsSetup: true,
     });
   });
+
+  describe('readyForSiteBuilder', () => {
+    const finished = { completed: true, path: 'chat' } as const;
+
+    it('is false without any model key, whatever the wizard state', () => {
+      expect(deriveCortexSetupState(base).readyForSiteBuilder).toBe(false);
+      expect(deriveCortexSetupState({ ...base, setup: finished }).readyForSiteBuilder).toBe(false);
+      expect(deriveCortexSetupState({ ...base, mcpEnabled: true, setup: finished }).readyForSiteBuilder).toBe(false);
+    });
+
+    it('is true for an env key even when the wizard was never run (self-host)', () => {
+      const state = deriveCortexSetupState({ ...base, hasEnvOpenRouterKey: true });
+      expect(state).toMatchObject({ hasModelKey: true, needsSetup: false, readyForSiteBuilder: true });
+    });
+
+    it('is false for a stored key while the wizard is unfinished (mid-wizard, step 1 saved the key)', () => {
+      expect(deriveCortexSetupState({ ...base, hasStoredOpenRouterKey: true })).toMatchObject({
+        hasModelKey: true,
+        needsSetup: false,
+        readyForSiteBuilder: false,
+      });
+      expect(
+        deriveCortexSetupState({ ...base, hasStoredOpenRouterKey: true, setup: { completed: false } })
+      ).toMatchObject({ hasModelKey: true, needsSetup: false, readyForSiteBuilder: false });
+    });
+
+    it('is true for a stored key once the wizard was finished or skipped', () => {
+      expect(
+        deriveCortexSetupState({ ...base, hasStoredOpenRouterKey: true, setup: finished })
+      ).toMatchObject({ hasModelKey: true, needsSetup: false, readyForSiteBuilder: true });
+      expect(
+        deriveCortexSetupState({ ...base, hasStoredOpenRouterKey: true, setup: { completed: true, path: 'later' } })
+      ).toMatchObject({ readyForSiteBuilder: true });
+    });
+
+    it('keeps the wizard when a key was stored mid-wizard even if an env key also exists', () => {
+      expect(
+        deriveCortexSetupState({ ...base, hasEnvOpenRouterKey: true, hasStoredOpenRouterKey: true })
+      ).toMatchObject({ readyForSiteBuilder: false });
+    });
+  });
 });

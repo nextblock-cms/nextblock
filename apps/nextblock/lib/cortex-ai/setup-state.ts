@@ -35,6 +35,18 @@ export type CortexSetupState = CortexSetupInputs & {
    * page redirects to the wizard, and the chat sends a key-less admin there.
    */
   needsSetup: boolean;
+  /**
+   * The site builder may open straight away, without showing the wizard first.
+   *
+   * Stricter than `hasModelKey` on purpose. An ENV key means a self-host that never
+   * needed the wizard. A STORED key is only "ready" once the wizard was finished or
+   * skipped: the key is saved on step 1, before the operator has picked a model, added
+   * photo keys, or clicked "Start building", so a stored key with the wizard unfinished
+   * must render the wizard (step 1 shows the connected key and the model picker), never
+   * the chat. `/cms/welcome` and the setup page redirect on this flag, not on
+   * `hasModelKey`.
+   */
+  readyForSiteBuilder: boolean;
 };
 
 /** The `onboarding_state.cortex_setup` sub-record, tolerant of anything on disk. */
@@ -67,5 +79,6 @@ export function deriveCortexSetupState(inputs: CortexSetupInputs): CortexSetupSt
     ...inputs,
     hasModelKey,
     needsSetup: !completed && !hasModelKey && !inputs.mcpEnabled,
+    readyForSiteBuilder: hasModelKey && !(inputs.hasStoredOpenRouterKey && !completed),
   };
 }

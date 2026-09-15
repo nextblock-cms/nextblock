@@ -7,7 +7,9 @@ import {
   executeSaveSiteBrief,
   executeStartSiteBuild,
   executeUpdateSiteIdentity,
+  formatCortexSiteOverviewForPrompt,
   resolveCortexBuildSession,
+  type CortexSiteOverview,
 } from './ai-global-agent-site-tools';
 import { CORTEX_AI_BUILD_SESSION_SETTING_KEY, CORTEX_AI_SITE_BRIEF_SETTING_KEY } from './site-brief';
 
@@ -436,5 +438,127 @@ describe('start_site_build / finish_site_build', () => {
         { actorFromOrphanedToken: true, actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/no longer exists/);
+  });
+});
+
+describe('formatCortexSiteOverviewForPrompt', () => {
+  function buildOverview(overrides: Partial<CortexSiteOverview> = {}): CortexSiteOverview {
+    const page = (id: number, slug: string, title: string, languageCode = 'en', isSeeded = true) => ({
+      blockCount: 3,
+      id,
+      isHome: slug === 'home' && languageCode === 'en',
+      isSeeded,
+      languageCode,
+      slug,
+      status: 'published',
+      title,
+      translationGroupId: null,
+    });
+
+    return {
+      brief: null,
+      buildSession: null,
+      counts: { customBlocks: 1, drafts: 2, media: 12, pages: 4, posts: 3, products: 0 },
+      customBlocks: [],
+      drafts: [],
+      homePage: page(1, 'home', 'Home'),
+      identity: {
+        activeLogo: { id: 'logo-1', isSeeded: true, name: 'NextBlock', objectKey: 'seed/logo.png' },
+        footerCopyright: null,
+        footerShowAttribution: true,
+        siteDescription: '',
+        siteKeywords: '',
+        siteTitle: 'NextBlock™ CMS',
+      },
+      languages: [
+        { code: 'en', id: 1, isActive: true, isDefault: true, name: 'English' },
+        { code: 'fr', id: 2, isActive: true, isDefault: false, name: 'Français' },
+        { code: 'de', id: 3, isActive: false, isDefault: false, name: 'Deutsch' },
+      ],
+      media: { count: 12, sample: undefined, seededCount: 5 },
+      navigation: null,
+      nextSteps: [],
+      pages: [page(1, 'home', 'Home'), page(2, 'about-us', 'About us', 'en', false), page(3, 'accueil', 'Accueil', 'fr')],
+      posts: [],
+      products: [],
+      seeded: { anyPresent: true, copyright: true, logo: true, media: 5, pages: 2, posts: 3, siteTitle: true },
+      success: true,
+      themes: [{ colorScheme: 'light', isActive: true, isDefault: true, name: 'Default', slug: 'default' }],
+      ...overrides,
+    };
+  }
+
+  it('renders a compact summary of what the site has now', () => {
+    const summary = formatCortexSiteOverviewForPrompt(buildOverview());
+
+    expect(summary).toContain('Counts: 4 pages, 3 posts, 0 products, 12 media, 1 custom blocks, 2 drafts.');
+    expect(summary).toContain('Languages: en (default), fr.');
+    expect(summary).not.toMatch(/\bde\b/);
+    expect(summary).toContain(
+      'NextBlock demo content: present (2 demo pages, 3 demo posts, 5 bundled images, the NextBlock logo, the default site title, the default copyright).'
+    );
+    expect(summary).toContain('Home page: "Home" (/home) published, 3 blocks, seeded demo content.');
+    expect(summary).toContain('Site title: "NextBlock™ CMS"; logo "NextBlock" (NextBlock demo logo).');
+    expect(summary).toContain('Themes: Default (light, default).');
+    expect(summary).toContain('Site brief: none saved.');
+    expect(summary).toContain('Build session: none.');
+    // `counts.pages` is the site total (exact count) while the list is capped by the
+    // query limit, so the "+N more" tail is measured against the total: 4 pages, 3 listed.
+    expect(summary).toContain('Pages: Home (/home) [en], About us (/about-us) [en], Accueil (/accueil) [fr], +1 more.');
+    expect(summary.length).toBeLessThan(1200);
+
+    const uncapped = formatCortexSiteOverviewForPrompt(
+      buildOverview({ counts: { customBlocks: 1, drafts: 2, media: 12, pages: 3, posts: 3, products: 0 } })
+    );
+    expect(uncapped).toContain('Pages: Home (/home) [en], About us (/about-us) [en], Accueil (/accueil) [fr].');
+  });
+
+  it('reports a missing home page, a saved brief, an active session, and caps the page list', () => {
+    const manyPages = Array.from({ length: 45 }, (_, index) => ({
+      blockCount: 0,
+      id: index + 10,
+      isHome: false,
+      isSeeded: false,
+      languageCode: 'en',
+      slug: `page-${index}`,
+      status: 'draft',
+      title: `Page ${index}`,
+      translationGroupId: null,
+    }));
+    const summary = formatCortexSiteOverviewForPrompt(
+      buildOverview({
+        brief: {
+          business_name: 'Maple Dental',
+          keep_existing_content: false,
+          languages: ['en'],
+          pages: [],
+          primary_language: 'en',
+          site_type: 'multi-page',
+          status: 'confirmed',
+        },
+        buildSession: { expiresAt: '2026-09-15T12:00:00.000Z', id: 'session-1', summary: 'Plan' },
+        homePage: null,
+        identity: {
+          activeLogo: null,
+          footerCopyright: null,
+          footerShowAttribution: true,
+          siteDescription: '',
+          siteKeywords: '',
+          siteTitle: '',
+        },
+        pages: manyPages,
+        seeded: { anyPresent: false, copyright: false, logo: false, media: 0, pages: 0, posts: 0, siteTitle: false },
+        themes: [],
+      })
+    );
+
+    expect(summary).toContain('NextBlock demo content: none detected.');
+    expect(summary).toContain('Home page: missing in the default language');
+    expect(summary).toContain('Site title: not set; no logo.');
+    expect(summary).not.toContain('Themes:');
+    expect(summary).toContain('Site brief: saved (status confirmed).');
+    expect(summary).toContain('Build session: active until 2026-09-15T12:00:00.000Z.');
+    expect(summary).toContain('Page 29 (/page-29) [en], +15 more.');
+    expect(summary).not.toContain('Page 30 (/page-30)');
   });
 });

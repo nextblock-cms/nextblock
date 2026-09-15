@@ -3,10 +3,38 @@ import { APICallError } from 'ai';
 export const CORTEX_AI_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 export const CORTEX_AI_OPENROUTER_FREE_ROUTER_MODEL = 'openrouter/free';
 
+/**
+ * Free OpenRouter models Cortex AI falls through, best first.
+ *
+ * Last checked against the live catalog (`GET /api/v1/models`): 2026-09-15.
+ *
+ * Membership rule: the id ends with `:free`, is present in the catalog with
+ * `tools` in `supported_parameters` (tool calling is mandatory), has no
+ * `expiration_date`, is a general-purpose text model of roughly 100B+ total
+ * parameters (no content-safety, finance, health or vision-only builds), and
+ * ranks by total parameters, weekly usage, context length, release date and
+ * `structured_outputs` support. The first entry doubles as
+ * `defaultStructuredOutputModel`, so it must support `structured_outputs`.
+ *
+ * `ai-model-registry.test.ts` asserts the shape of this list (`:free` suffix,
+ * unique ids) without touching the network; re-verify membership against the
+ * live catalog whenever OpenRouter answers "unavailable for free" for an entry.
+ */
 export const CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY = [
-  'qwen/qwen3-next-80b-a3b-instruct:free',
+  // 120B/12B hybrid MoE; tools + structured_outputs; NVIDIA-hosted; 262K ctx.
   'nvidia/nemotron-3-super-120b-a12b:free',
-  'nvidia/nemotron-nano-9b-v2:free',
+  // 550B/55B; most-used free model (3.77T tokens/week); 1M ctx; tools only.
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  // 975B/41B; 1M ctx; 99.98% uptime; SWE-bench Verified 77.6; tools only.
+  'thinkingmachines/inkling:free',
+  // Newest (2026-09-08); tools + structured_outputs; 469B tokens/week; size undisclosed.
+  'nex-agi/nex-n2.5-pro:free',
+  // 118B/8B coding-agent model; 1.26T tokens/week; 99.99% uptime; tools only.
+  'poolside/laguna-s-2.1:free',
+  // 276B/12B; 1M ctx; 99.99% uptime; tools only.
+  'thinkingmachines/inkling-small:free',
+  // 124B/5.5B general + vision model (2026-09-10); 329B tokens/week; tools only.
+  'inclusionai/ling-3.0-flash-vl:free',
 ] as const;
 
 export const CORTEX_AI_REQUIRED_MODEL_PARAMETERS = ['tools', 'structured_outputs'] as const;
@@ -386,39 +414,124 @@ export function getHttpStatusCode(error: unknown): number | null {
   return null;
 }
 
-export function isOpenRouterRateLimitError(error: unknown) {
-  return getHttpStatusCode(error) === 429;
+function isHttpStatusCode(value: number | null): value is number {
+  return value !== null && Number.isInteger(value) && value >= 100 && value <= 599;
 }
 
-function getDeepErrorMessage(error: unknown): string {
-  if (!error) {
+function parseJsonRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'string' || !value.trim().startsWith('{')) {
+    return null;
+  }
+
+  try {
+    return readRecord(JSON.parse(value));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * OpenRouter's failure body is `{ "error": { "code": <http status>, "message" } }`.
+ * The AI SDK keeps that body on `APICallError.responseBody` (raw string) and
+ * `APICallError.data` (parsed), neither of which `getHttpStatusCode` inspects.
+ */
+function getOpenRouterErrorBodyStatus(error: unknown, depth = 0): number | null {
+  const record = readRecord(error);
+
+  if (!record || depth > 8) {
+    return null;
+  }
+
+  const bodies = [
+    record,
+    readRecord(record.data),
+    parseJsonRecord(record.responseBody),
+    parseJsonRecord(record.text),
+  ];
+
+  for (const body of bodies) {
+    const errorRecord = readRecord(body?.error);
+    const code = readNumericProperty(errorRecord, 'code') ?? readNumericProperty(errorRecord, 'status');
+
+    if (isHttpStatusCode(code)) {
+      return code;
+    }
+  }
+
+  return getOpenRouterErrorBodyStatus(record.cause, depth + 1);
+}
+
+/**
+ * HTTP status of an OpenRouter failure, reading the transport status first
+ * (`APICallError.statusCode`, `response.status`, `cause.status`) and the JSON
+ * body's `error.code` second. `null` when nothing numeric is present.
+ */
+export function getOpenRouterErrorStatus(error: unknown): number | null {
+  const transportStatus = getHttpStatusCode(error);
+
+  if (isHttpStatusCode(transportStatus)) {
+    return transportStatus;
+  }
+
+  return getOpenRouterErrorBodyStatus(error);
+}
+
+export function isOpenRouterRateLimitError(error: unknown) {
+  return getOpenRouterErrorStatus(error) === 429;
+}
+
+const DEEP_ERROR_MESSAGE_KEYS = ['message', 'error', 'text', 'responseBody', 'data', 'cause'] as const;
+
+function getDeepErrorMessage(error: unknown, depth = 0): string {
+  if (!error || depth > 8) {
     return '';
   }
 
-  if (error instanceof Error) {
-    const causeMessage = 'cause' in error ? getDeepErrorMessage(error.cause) : '';
-    return [error.message, causeMessage].filter(Boolean).join('\n');
+  if (typeof error !== 'object') {
+    return String(error);
   }
 
-  if (typeof error === 'object') {
-    const record = error as Record<string, unknown>;
-    return ['message', 'error', 'text', 'cause']
-      .map((key) => getDeepErrorMessage(record[key]))
-      .filter(Boolean)
-      .join('\n');
+  const record = error as Record<string, unknown>;
+  const parts = error instanceof Error ? [error.message] : [];
+
+  for (const key of DEEP_ERROR_MESSAGE_KEYS) {
+    if (key === 'message' && error instanceof Error) {
+      continue;
+    }
+
+    parts.push(getDeepErrorMessage(record[key], depth + 1));
   }
 
-  return String(error);
+  return Array.from(new Set(parts.filter(Boolean))).join('\n');
 }
 
+/**
+ * Wordings OpenRouter uses when the model itself, not the request, is the
+ * problem, so trying the next model in the chain can succeed:
+ * - "No endpoints found that can handle the requested parameters"
+ * - "Model is no longer available as a free model" / "transitioned to a paid model"
+ * - "This model is unavailable for free. The paid version is available now"
+ * - "<id> is not a valid model ID"
+ */
+const OPENROUTER_RECOVERABLE_MESSAGE_PATTERN =
+  /No endpoints found|no longer available|not available as a free model|transitioned to a paid model|unavailable for free|paid version is available|is not a valid model ID/i;
+
+const OPENROUTER_NOT_FOUND_MESSAGE_PATTERN = /not found|does not exist|unknown model|no such model/i;
+
 export function isOpenRouterRecoverableRoutingError(error: unknown) {
-  if (isOpenRouterRateLimitError(error)) {
+  const status = getOpenRouterErrorStatus(error);
+
+  if (status === 429 || status === 404) {
     return true;
   }
 
-  return /No endpoints found|no longer available|not available as a free model|transitioned to a paid model/i.test(
-    getDeepErrorMessage(error)
-  );
+  const message = getDeepErrorMessage(error);
+
+  if (OPENROUTER_RECOVERABLE_MESSAGE_PATTERN.test(message)) {
+    return true;
+  }
+
+  return status === 400 && OPENROUTER_NOT_FOUND_MESSAGE_PATTERN.test(message);
 }
 
 function truncateErrorMessage(message: string, maxLength = 900) {

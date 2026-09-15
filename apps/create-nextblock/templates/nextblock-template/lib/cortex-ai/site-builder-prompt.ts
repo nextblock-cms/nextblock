@@ -9,6 +9,13 @@
 export const SITE_BUILDER_KICKOFF_PROMPT =
   'I want to set up my website with you. Look at what the site has now, then interview me about my business so you can plan and build it.';
 
+/**
+ * The kickoff once the operator filled in the site-brief form: the interview has
+ * already happened, so the first reply should be the plan.
+ */
+export const SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF =
+  "I've filled in my site brief. Look at what the site has now, then propose the plan to build it. Only ask me about anything that's genuinely missing.";
+
 /** Where every key-less path into the site builder lands. */
 export const CORTEX_SETUP_PATH = '/cms/settings/cortex-ai/setup';
 

@@ -11,8 +11,6 @@ import 'server-only';
 // supabase_migrations.schema_migrations inside one transaction, so a failure rolls back
 // cleanly and a retry re-runs from a clean state (critical: some migrations aren't
 // idempotent). Applied versions are tracked exactly like the Supabase CLI.
-import { existsSync } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import postgres from 'postgres';
 import { isLocalWritableEnv } from './env-status';
@@ -29,15 +27,28 @@ export interface SchemaApplyResult {
  * <workspaceRoot>/libs/db/src/supabase/migrations; a standalone create-nextblock
  * project materializes them at <projectRoot>/supabase/migrations.
  */
-function resolveMigrationsDir(): string | null {
+async function resolveMigrationsDir(): Promise<string | null> {
+  const { existsSync } = await loadFs();
+
   // Monorepo first: find the nearest nx.json ancestor (the workspace root) and use its
   // libs/db migrations. Checking nx.json before any supabase/ dir avoids accidentally
   // picking up a stray app-level supabase/migrations folder.
   let dir = process.cwd();
   for (let i = 0; i < 8; i++) {
-    if (existsSync(path.join(dir, 'nx.json'))) {
-      const monorepo = path.join(dir, 'libs', 'db', 'src', 'supabase', 'migrations');
-      if (existsSync(monorepo)) return monorepo;
+    if (
+      existsSync(
+        /* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ dir, 'nx.json')
+      )
+    ) {
+      const monorepo = path.join(
+        /* turbopackIgnore: true */ dir,
+        'libs',
+        'db',
+        'src',
+        'supabase',
+        'migrations'
+      );
+      if (existsSync(/* turbopackIgnore: true */ monorepo)) return monorepo;
       break;
     }
     const parent = path.dirname(dir);
@@ -48,8 +59,8 @@ function resolveMigrationsDir(): string | null {
   // Standalone create-nextblock project: nearest supabase/migrations from cwd upward.
   dir = process.cwd();
   for (let i = 0; i < 8; i++) {
-    const standalone = path.join(dir, 'supabase', 'migrations');
-    if (existsSync(standalone)) return standalone;
+    const standalone = path.join(/* turbopackIgnore: true */ dir, 'supabase', 'migrations');
+    if (existsSync(/* turbopackIgnore: true */ standalone)) return standalone;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -237,18 +248,44 @@ export async function resetDatabase(): Promise<{ ok: boolean; error?: string }> 
   };
 }
 
+/**
+ * Load node:fs through a dynamic import the bundler is told to leave alone.
+ *
+ * Next's output file tracing (Turbopack / nft) follows every fs call it can see
+ * (`existsSync`, `readdir`, `readFile`) and, because the paths here derive from
+ * `process.cwd()` and a runtime directory listing, gives up and traces the WHOLE project
+ * into every serverless function that transitively imports this module ("Encountered
+ * unexpected file in NFT list" / "Dynamic filesystem access causes tracing of the whole
+ * project"). The .sql files are never meant to be bundled: on Vercel the directory does
+ * not exist at runtime and applyMigrations() falls back to the embedded MIGRATIONS_BUNDLE;
+ * only local dev / Docker read the real files. This module therefore has NO static fs
+ * import: every fs call goes through this ignored dynamic import, and every fs /
+ * `path.join(process.cwd()…)` argument carries the `turbopackIgnore` hint the warning asks
+ * for (Next's own dist code hints both the fs call and the path.join inside it).
+ * `webpackIgnore` is honoured by both webpack and Turbopack (Next.js "Magic Comments").
+ * Runtime behaviour is exactly as before.
+ */
+function loadFs(): Promise<typeof import('node:fs')> {
+  return import(/* webpackIgnore: true */ /* turbopackIgnore: true */ 'node:fs');
+}
+
 export async function applyMigrations(): Promise<SchemaApplyResult> {
-  const migrationsDir = resolveMigrationsDir();
+  const migrationsDir = await resolveMigrationsDir();
 
   let files: string[];
   let readSql: (file: string) => Promise<string>;
 
   if (migrationsDir) {
     // Local dev / Docker: read the canonical .sql files from disk (always current).
-    files = (await readdir(migrationsDir))
+    const { readdir, readFile } = (await loadFs()).promises;
+    files = (await readdir(/* turbopackIgnore: true */ migrationsDir))
       .filter((name) => /^\d+_.*\.sql$/.test(name))
       .sort();
-    readSql = (file: string) => readFile(path.join(migrationsDir, file), 'utf8');
+    readSql = (file: string) =>
+      readFile(
+        /* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ migrationsDir, file),
+        'utf8'
+      );
   } else if (MIGRATIONS_BUNDLE.length > 0) {
     // Serverless (Vercel): libs/db isn't on the function filesystem, so fall back to the
     // build-time embedded bundle (npm run generate:migrations-bundle).

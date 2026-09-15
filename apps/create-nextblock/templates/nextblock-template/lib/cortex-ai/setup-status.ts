@@ -68,22 +68,3 @@ export async function getCortexSetupStatus(): Promise<CortexSetupStatus> {
     maskedStoredOpenRouterKey: storedKey.maskedKey,
   };
 }
-
-/**
- * The single bit the CMS layout needs for the chat drawer: can the dashboard chat
- * reach a model at all? Cheap enough to run on every CMS render for admins.
- */
-export async function hasCortexModelKey(): Promise<boolean> {
-  if (getCortexAiEnvConfig().hasOpenRouterEnvKey) {
-    return true;
-  }
-
-  const supabase = createClient();
-  const { data } = await supabase
-    .from('site_settings')
-    .select('value')
-    .eq('key', CORTEX_AI_OPENROUTER_SETTING_KEY)
-    .maybeSingle();
-
-  return getStoredOpenRouterKeyStatus(data?.value).hasStoredKey;
-}

@@ -146,6 +146,18 @@ export function safeParseCortexSiteBrief(value: unknown): CortexSiteBrief | null
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * A brief counts as collected once it names the business AND says what it does.
+ *
+ * The schema only requires the name (a chat interview saves after every answer, so a
+ * name-only brief is a normal intermediate state). Everything that decides whether the
+ * site builder may skip the interview — the chat kickoff, the wizard's "Brief saved"
+ * card and the route's system prompt — must agree, so they all call this one predicate.
+ */
+export function isCortexSiteBriefComplete(brief: CortexSiteBrief | null | undefined): brief is CortexSiteBrief {
+  return Boolean(brief && brief.business_name.trim() && brief.description?.trim());
+}
+
 /** A build session is only usable by the admin who opened it, and only until it expires. */
 export function isCortexBuildSessionUsable(
   session: CortexBuildSession | null | undefined,

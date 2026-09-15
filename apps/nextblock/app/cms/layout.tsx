@@ -10,7 +10,7 @@ import { getPaymentsReminder } from '../../lib/cms/payments-reminder';
 import { getUnreadMessageCount } from '../../lib/cms/unread-messages';
 import { getContactReminder } from '../../lib/cms/contact-reminder';
 import { maybeSyncCurrencyRates } from '../../lib/commerce/currency-rates-refresh';
-import { hasCortexModelKey as resolveCortexModelKey } from '../../lib/cortex-ai/setup-status';
+import { getCortexChatStatus } from '../../lib/cortex-ai/site-brief-status';
 import type { SystemAlertItem } from './components/SystemAlertsBanner';
 
 /**
@@ -83,9 +83,14 @@ export default async function CmsLayout({
       isAdmin ? getContactReminder() : Promise.resolve(null),
     ]);
 
-  // Whether the chat drawer can reach a model at all. Without a key it sends the
-  // admin to the first-run wizard instead of firing a request that is certain to fail.
-  const hasCortexModelKey = isAdmin && isCortexAiActive ? await resolveCortexModelKey() : false;
+  // Whether the chat drawer can reach a model at all (without a key it sends the
+  // admin to the first-run wizard instead of firing a request that is certain to
+  // fail), and whether a site brief is saved (the site builder then opens with the
+  // plan instead of the interview). One query for both.
+  const { hasModelKey: hasCortexModelKey, hasSiteBrief: hasCortexSiteBrief } =
+    isAdmin && isCortexAiActive
+      ? await getCortexChatStatus()
+      : { hasModelKey: false, hasSiteBrief: false };
 
   // After the response, refresh upstream update/conflict status in the background
   // (throttled to ~6h, see maybeRefreshUpstreamStatus). This keeps the banner current
@@ -102,6 +107,7 @@ export default async function CmsLayout({
     <CmsClientLayout
       isCortexAiActive={isCortexAiActive}
       hasCortexModelKey={hasCortexModelKey}
+      hasCortexSiteBrief={hasCortexSiteBrief}
       isEcommerceActive={isEcommerceActive}
       showTwoFactorReminder={showTwoFactorReminder}
       systemAlerts={systemAlerts}

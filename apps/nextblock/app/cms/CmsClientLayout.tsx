@@ -131,6 +131,7 @@ export default function CmsClientLayout({
   children,
   isCortexAiActive = false,
   hasCortexModelKey = true,
+  hasCortexSiteBrief = false,
   isEcommerceActive = false,
   showTwoFactorReminder = false,
   systemAlerts = [],
@@ -142,6 +143,8 @@ export default function CmsClientLayout({
   isCortexAiActive?: boolean,
   /** The dashboard chat has an OpenRouter key (stored or env) to talk to. */
   hasCortexModelKey?: boolean,
+  /** A site brief is saved, so the site builder opens with the plan, not the interview. */
+  hasCortexSiteBrief?: boolean,
   isEcommerceActive?: boolean,
   showTwoFactorReminder?: boolean,
   systemAlerts?: SystemAlertItem[],
@@ -553,7 +556,9 @@ export default function CmsClientLayout({
             onClick={() => setCmsSidebarOpen(false)}
         />
       )}
-      {isAdmin && isCortexAiActive && <CortexGlobalAgentChat hasModelKey={hasCortexModelKey} />}
+      {isAdmin && isCortexAiActive && (
+        <CortexGlobalAgentChat hasModelKey={hasCortexModelKey} hasSiteBrief={hasCortexSiteBrief} />
+      )}
     </div>
       </EcommerceActiveProvider>
       </CortexAiActiveProvider>

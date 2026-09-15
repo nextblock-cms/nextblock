@@ -26,6 +26,7 @@ import {
   CORTEX_SETUP_PATH,
   CORTEX_SETUP_SITE_BUILDER_HREF,
   SITE_BUILDER_KICKOFF_PROMPT,
+  SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF,
 } from "../../../lib/cortex-ai/site-builder-prompt";
 
 type ChatRole = "assistant" | "user";
@@ -936,6 +937,7 @@ function ToolActivityRow({
 
 export function CortexGlobalAgentChat({
   hasModelKey = true,
+  hasSiteBrief = false,
 }: {
   /**
    * The server found an OpenRouter key (stored BYOK or env). Without one every
@@ -943,6 +945,11 @@ export function CortexGlobalAgentChat({
    * composer for a pointer to the setup wizard and the site builder goes there too.
    */
   hasModelKey?: boolean;
+  /**
+   * A site brief is already saved (the wizard's form, or an earlier interview), so
+   * the site builder kicks off asking for the plan instead of the interview.
+   */
+  hasSiteBrief?: boolean;
 }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -1072,7 +1079,7 @@ export function CortexGlobalAgentChat({
     setOpen(true);
     window.setTimeout(() => {
       void sendMessageRef.current?.({
-        prompt: SITE_BUILDER_KICKOFF_PROMPT,
+        prompt: hasSiteBrief ? SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF : SITE_BUILDER_KICKOFF_PROMPT,
         threadOverride: thread,
       });
     }, 0);

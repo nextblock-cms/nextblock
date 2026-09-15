@@ -515,7 +515,7 @@ const PROMPT_BODIES: Record<string, (args: Record<string, string>) => string> = 
       '',
       args['brief']?.trim()
         ? `Brief:\n${args['brief']}`
-        : 'No brief was given: first ask, in one short numbered list, about the business and what it does, the audience and the one action visitors should take, the site shape (one landing page or which pages), the languages, brand colours and tone, contact details, and whether existing content is kept.',
+        : 'A site brief may already be saved (get_site_overview returns it under `brief`): if it is, use it and skip the questions; otherwise ask, in one short numbered list, about the business and what it does, the audience and the one action visitors should take, the site shape (one landing page or which pages), the languages, brand colours and tone, contact details, and whether existing content is kept.',
       '',
       'Process:',
       '1. Call get_site_overview to see what exists, the active languages, and whether the NextBlock demo content is still present. Record what you know with save_site_brief.',

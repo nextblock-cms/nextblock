@@ -102,10 +102,21 @@ export async function getMcpSettingsStatus(): Promise<McpSettingsStatus> {
   };
 }
 
-export async function saveMcpSettingsAction(input: {
-  allowLocalhostWithoutToken: boolean;
-  enabled: boolean;
-}): Promise<{ error?: string; success: boolean }> {
+/**
+ * `options.revalidate: false` skips the settings-page revalidation. Any revalidation
+ * inside a server action makes the client router re-render the CURRENT route in the
+ * action response, so the first-run wizard (mounted on `/cms/welcome`, whose server
+ * page redirects away as soon as MCP is on) must call these without it.
+ */
+type McpActionOptions = { revalidate?: boolean };
+
+export async function saveMcpSettingsAction(
+  input: {
+    allowLocalhostWithoutToken: boolean;
+    enabled: boolean;
+  },
+  options: McpActionOptions = {}
+): Promise<{ error?: string; success: boolean }> {
   const rejected = sandboxRejection('change MCP server settings');
   if (rejected) return rejected;
 
@@ -127,15 +138,20 @@ export async function saveMcpSettingsAction(input: {
     };
   }
 
-  revalidatePath(CORTEX_AI_SETTINGS_PATH);
+  if (options.revalidate !== false) {
+    revalidatePath(CORTEX_AI_SETTINGS_PATH);
+  }
   return { success: true };
 }
 
-export async function createMcpAccessTokenAction(input: {
-  expiresInDays?: number | null;
-  name: string;
-  scopes: CortexAiMcpScope[];
-}): Promise<{ error?: string; success: boolean; token?: string; tokenPrefix?: string }> {
+export async function createMcpAccessTokenAction(
+  input: {
+    expiresInDays?: number | null;
+    name: string;
+    scopes: CortexAiMcpScope[];
+  },
+  options: McpActionOptions = {}
+): Promise<{ error?: string; success: boolean; token?: string; tokenPrefix?: string }> {
   const rejected = sandboxRejection('mint MCP access tokens');
   if (rejected) return rejected;
 
@@ -185,7 +201,9 @@ export async function createMcpAccessTokenAction(input: {
       throw new Error(error.message);
     }
 
-    revalidatePath(CORTEX_AI_SETTINGS_PATH);
+    if (options.revalidate !== false) {
+      revalidatePath(CORTEX_AI_SETTINGS_PATH);
+    }
 
     return { success: true, token: minted.token, tokenPrefix: minted.tokenPrefix };
   } catch (error) {

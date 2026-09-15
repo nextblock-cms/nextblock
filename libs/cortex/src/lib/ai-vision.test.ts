@@ -128,10 +128,10 @@ describe('isKnownVisionCapableCortexAiModelId', () => {
   });
 
   it('rejects the text-only models used by the general fallback registry', () => {
-    expect(isKnownVisionCapableCortexAiModelId('qwen/qwen3-next-80b-a3b-instruct:free')).toBe(
+    expect(isKnownVisionCapableCortexAiModelId('nvidia/nemotron-3-super-120b-a12b:free')).toBe(
       false
     );
-    expect(isKnownVisionCapableCortexAiModelId('nvidia/nemotron-nano-9b-v2:free')).toBe(false);
+    expect(isKnownVisionCapableCortexAiModelId('nvidia/nemotron-3-ultra-550b-a55b:free')).toBe(false);
     expect(isKnownVisionCapableCortexAiModelId('openrouter/free')).toBe(false);
     expect(isKnownVisionCapableCortexAiModelId('')).toBe(false);
     expect(isKnownVisionCapableCortexAiModelId(null)).toBe(false);
@@ -183,7 +183,7 @@ describe('buildCortexAiVisionRoutingPolicy', () => {
     expect(
       buildCortexAiVisionRoutingPolicy({
         credentialSource: 'stored',
-        selectedModel: { modelId: 'qwen/qwen3-next-80b-a3b-instruct:free' },
+        selectedModel: { modelId: 'nvidia/nemotron-3-super-120b-a12b:free' },
       }).modelIds
     ).toEqual([...CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY]);
   });

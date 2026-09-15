@@ -1,7 +1,5 @@
 'use server';
 
-import { revalidatePath } from 'next/cache';
-
 import {
   CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY,
   CORTEX_AI_OPENROUTER_SETTING_KEY,
@@ -32,9 +30,27 @@ import { requireAdminSupabaseClient } from '../require-admin';
  * verified against its provider BEFORE it is stored, so nothing that fails here can
  * be saved by accident — except when the provider is unreachable and the operator
  * explicitly chooses "save anyway".
+ *
+ * Invariant: NO action in this file may revalidate anything: not the wizard's route,
+ * not a parent layout, not even an unrelated path.
+ *
+ * A server action that calls `revalidatePath` makes the Next client router re-fetch
+ * the CURRENT route as part of the action response, whatever path was revalidated.
+ * The wizard is mounted on `/cms/settings/cortex-ai/setup` and on `/cms/welcome`, and
+ * both server pages redirect onward as soon as the stored state says the wizard is no
+ * longer needed: a mid-wizard revalidation re-ran the page that was showing the
+ * wizard, which saw the freshly stored key (or the freshly enabled MCP server) and
+ * threw the operator into the chat or the dashboard before a model, photo keys or the
+ * one-time MCP token were shown. A revalidation on completion is no better: it raced
+ * the page's own redirect (to the site builder) against the wizard's explicit
+ * `window.location.assign` (which may be the plain dashboard, for "Not now").
+ *
+ * None of it is needed: every page that reads these settings is dynamic (it reads
+ * cookies through `createClient()`), so nothing is cached, and the wizard always ends
+ * with a full `window.location.assign`, which re-renders the CMS layout (and its
+ * model-key bit for the chat drawer) from scratch.
  */
 
-const CORTEX_AI_SETTINGS_PATH = '/cms/settings/cortex-ai';
 const ONBOARDING_STATE_KEY = 'onboarding_state';
 
 type VerificationFailure = { reason: 'invalid' | 'unreachable' | 'error'; message: string };
@@ -52,14 +68,6 @@ function sandboxRejection(): VerificationFailure | null {
 
 function toFailure(verification: Extract<CortexAiKeyVerification, { ok: false }>): VerificationFailure {
   return { message: verification.message, reason: verification.reason };
-}
-
-function revalidateCortexSurfaces() {
-  revalidatePath(CORTEX_AI_SETTINGS_PATH);
-  revalidatePath(`${CORTEX_AI_SETTINGS_PATH}/setup`);
-  revalidatePath('/cms/dashboard');
-  // The CMS layout passes the model-key bit to the chat drawer.
-  revalidatePath('/cms', 'layout');
 }
 
 export type ConnectOpenRouterKeyResult =
@@ -98,8 +106,6 @@ export async function connectOpenRouterKeyAction(input: {
     if (error) {
       throw new Error(error.message);
     }
-
-    revalidateCortexSurfaces();
 
     return {
       detail: verification.ok ? verification.detail : null,
@@ -147,7 +153,6 @@ export async function selectModelForSetupAction(input: {
         throw new Error(error.message);
       }
 
-      revalidateCortexSurfaces();
       return { model: null, success: true };
     }
 
@@ -181,7 +186,6 @@ export async function selectModelForSetupAction(input: {
       throw new Error(error.message);
     }
 
-    revalidateCortexSurfaces();
     return { model: selection, success: true };
   } catch (error) {
     return {
@@ -248,8 +252,6 @@ export async function saveStockPhotoKeysForSetupAction(input: {
       if (error) {
         throw new Error(error.message);
       }
-
-      revalidateCortexSurfaces();
     }
 
     return { errors, saved, success: Object.keys(errors).length === 0 };
@@ -271,6 +273,11 @@ export type EnableMcpForSetupResult =
  * Switch the MCP server on and mint one read+write token for the operator's own
  * machine. Localhost trust is left exactly as it was: the wizard never widens access
  * beyond what the operator asked for.
+ *
+ * Both delegated actions are told NOT to revalidate: the token is returned to the
+ * wizard's client state and shown on the last step exactly once, and a revalidation
+ * here re-rendered `/cms/welcome`, which redirects to the dashboard as soon as MCP is
+ * on. The operator never saw the token, and only its hash is stored.
  */
 export async function enableMcpForSetupAction(input: {
   allowLocalhostWithoutToken: boolean;
@@ -279,26 +286,30 @@ export async function enableMcpForSetupAction(input: {
   const rejected = sandboxRejection();
   if (rejected) return { message: rejected.message, success: false };
 
-  const settings = await saveMcpSettingsAction({
-    allowLocalhostWithoutToken: input.allowLocalhostWithoutToken,
-    enabled: true,
-  });
+  const settings = await saveMcpSettingsAction(
+    {
+      allowLocalhostWithoutToken: input.allowLocalhostWithoutToken,
+      enabled: true,
+    },
+    { revalidate: false }
+  );
 
   if (!settings.success) {
     return { message: settings.error ?? 'Failed to enable the MCP server.', success: false };
   }
 
-  const minted = await createMcpAccessTokenAction({
-    expiresInDays: null,
-    name: input.tokenName.trim() || 'My computer',
-    scopes: ['read', 'write'],
-  });
+  const minted = await createMcpAccessTokenAction(
+    {
+      expiresInDays: null,
+      name: input.tokenName.trim() || 'My computer',
+      scopes: ['read', 'write'],
+    },
+    { revalidate: false }
+  );
 
   if (!minted.success || !minted.token || !minted.tokenPrefix) {
     return { message: minted.error ?? 'Failed to create the access token.', success: false };
   }
-
-  revalidateCortexSurfaces();
 
   return { success: true, token: minted.token, tokenPrefix: minted.tokenPrefix };
 }
@@ -306,7 +317,8 @@ export async function enableMcpForSetupAction(input: {
 /**
  * Record that the wizard was finished (or deliberately skipped) so the settings
  * page stops redirecting here. Read-merge into the `onboarding_state` bag the
- * dashboard checklist already uses.
+ * dashboard checklist already uses. No revalidation (see the file header): the
+ * wizard follows this with a full navigation, which re-renders every reader.
  */
 export async function completeCortexSetupAction(input: {
   path: CortexSetupPath;
@@ -340,8 +352,6 @@ export async function completeCortexSetupAction(input: {
     if (error) {
       throw new Error(error.message);
     }
-
-    revalidateCortexSurfaces();
 
     return { success: true };
   } catch (error) {

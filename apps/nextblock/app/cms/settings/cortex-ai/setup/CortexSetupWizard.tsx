@@ -13,9 +13,11 @@ import {
   SearchableSelect,
 } from '@nextblock-cms/ui';
 import { cn } from '@nextblock-cms/utils';
-import type {
-  CortexAiCompatibleOpenRouterModel,
-  CortexAiStoredModelSelection,
+import {
+  isCortexSiteBriefComplete,
+  type CortexAiCompatibleOpenRouterModel,
+  type CortexAiStoredModelSelection,
+  type CortexSiteBrief,
 } from '@nextblock-cms/cortex';
 import {
   AlertTriangle,
@@ -24,18 +26,27 @@ import {
   Brain,
   Check,
   CheckCircle2,
+  ClipboardList,
   Cpu,
   ExternalLink,
   ImageIcon,
   KeyRound,
   Loader2,
   MessageSquareText,
+  Pencil,
   Plug,
   Sparkles,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
-import { SITE_BUILDER_KICKOFF_PROMPT } from '../../../../../lib/cortex-ai/site-builder-prompt';
+import {
+  briefToSiteBriefFormValues,
+  type SiteBriefFormValues,
+} from '../../../../../lib/cortex-ai/site-brief-form';
+import {
+  SITE_BUILDER_KICKOFF_PROMPT,
+  SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF,
+} from '../../../../../lib/cortex-ai/site-builder-prompt';
 import type { CortexSetupPath } from '../../../../../lib/cortex-ai/setup-state';
 import { SetupStepIndicator } from '../../../components/SetupStepIndicator';
 import { CopyButton, Snippet } from '../CopySnippet';
@@ -48,6 +59,7 @@ import {
   selectModelForSetupAction,
   type StockProviderId,
 } from './actions';
+import { SiteBriefForm } from './SiteBriefForm';
 
 /**
  * The Cortex AI first-run wizard.
@@ -59,9 +71,11 @@ import {
  *      operator submits it, so a typo is caught here, not in the chat an hour later.
  *   3. End on the action, not on a summary. The last screen IS the "Start building"
  *      button (chat path) or the exact prompt to paste (MCP path).
+ *   4. Ask once, in writing. The brief step is the interview Cortex used to run in
+ *      chat, as one form; a saved brief lets the build start at the plan.
  */
 
-type Step = 1 | 2 | 3;
+type Step = 1 | 2 | 3 | 4;
 type Path = 'chat' | 'mcp' | null;
 
 type KeyState =
@@ -98,10 +112,16 @@ type StockState =
       errors: Partial<Record<StockProviderId, { message: string; reason: 'invalid' | 'unreachable' | 'error' }>>;
     };
 
+type BriefState = { status: 'idle' } | { status: 'saved'; brief: CortexSiteBrief };
+
 type CortexSetupWizardProps = {
+  /** The public site's active languages; the brief form offers exactly these. */
+  activeLanguages: Array<{ code: string; name: string; isDefault: boolean }>;
   allowLocalhostWithoutToken: boolean;
   /** OpenRouter models that support tools + structured output (empty when the catalog failed). */
   compatibleModels: CortexAiCompatibleOpenRouterModel[];
+  /** A brief saved earlier (an interrupted run, or one Cortex wrote in chat); prefills the brief step. */
+  existingBrief: CortexSiteBrief | null;
   hasEncryptionKey: boolean;
   hasEnvOpenRouterKey: boolean;
   hasPexelsKey: boolean;
@@ -142,7 +162,9 @@ function formatModelPricing(pricing: Record<string, string>) {
   return 'Pricing varies';
 }
 
-const STEP_LABELS: ReadonlyArray<string> = ['Connect', 'Photos', 'Build'];
+/** The wizard's step chips; a flow that precedes the wizard prepends its own steps. */
+export const CORTEX_SETUP_STEP_LABELS: ReadonlyArray<string> = ['Connect', 'Photos', 'Brief', 'Build'];
+const STEP_LABELS = CORTEX_SETUP_STEP_LABELS;
 
 const SETTINGS_HREF = '/cms/settings/cortex-ai';
 const DASHBOARD_HREF = '/cms/dashboard';
@@ -150,9 +172,28 @@ const SITE_BUILDER_HREF = '/cms/dashboard?cortex=site-builder';
 
 const DEFAULT_HEADING = {
   description:
-    'Three quick steps and Cortex can build your site. Everything here can be changed later in settings.',
+    'Four quick steps and Cortex can build your site. Everything here can be changed later in settings.',
   title: 'Set up Cortex AI',
 };
+
+const SITE_TYPE_LABELS: Record<CortexSiteBrief['site_type'], string> = {
+  blog: 'blog',
+  'landing-page': 'one landing page',
+  'multi-page': 'several pages',
+  other: 'custom',
+  portfolio: 'portfolio',
+  store: 'online store',
+};
+
+/** One line that says what was saved, so the operator can tell it is the right brief. */
+function summariseBrief(brief: CortexSiteBrief) {
+  const pageCount = Math.max(brief.pages.length, 1);
+  return [
+    SITE_TYPE_LABELS[brief.site_type],
+    `${pageCount} ${pageCount === 1 ? 'page' : 'pages'}`,
+    brief.languages.map((code) => code.toUpperCase()).join(', '),
+  ].join(' · ');
+}
 
 function ExternalHint({ href, children }: { href: string; children: React.ReactNode }) {
   return (
@@ -228,8 +269,10 @@ function OptionCard({
 }
 
 export function CortexSetupWizard({
+  activeLanguages,
   allowLocalhostWithoutToken,
   compatibleModels,
+  existingBrief,
   hasEncryptionKey,
   hasEnvOpenRouterKey,
   hasPexelsKey,
@@ -290,11 +333,28 @@ export function CortexSetupWizard({
       : { status: 'idle' }
   );
 
-  // Step 3
+  // Step 3 — the site brief. A COMPLETE brief (name + description, the same test the
+  // chat route applies before skipping the interview) that Cortex or an earlier run
+  // already saved counts as done; "Edit brief" reopens the form prefilled from it. A
+  // name-only brief from an interrupted chat interview prefills the form instead, so
+  // the wizard never promises "no questionnaire" for a brief the route will still
+  // interview about.
+  const [briefState, setBriefState] = useState<BriefState>(
+    isCortexSiteBriefComplete(existingBrief) ? { brief: existingBrief, status: 'saved' } : { status: 'idle' }
+  );
+  const [editingBrief, setEditingBrief] = useState(false);
+  // The form's unsaved answers, held here because step 3 unmounts on Back: without
+  // this, going back to add a photo key wiped a half-filled questionnaire.
+  const [briefDraft, setBriefDraft] = useState<SiteBriefFormValues | null>(null);
+
+  // Step 4
   const [finishing, setFinishing] = useState<string | null>(null);
 
   const keyConnected = keyState.status === 'connected';
   const mcpReady = mcpState.status === 'enabled';
+  const briefSaved = briefState.status === 'saved';
+  const savedBrief = briefState.status === 'saved' ? briefState.brief : null;
+  const kickoffPrompt = briefSaved ? SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF : SITE_BUILDER_KICKOFF_PROMPT;
 
   function connectKey(allowUnverified = false) {
     const candidate = apiKey.trim();
@@ -621,7 +681,7 @@ export function CortexSetupWizard({
                       ) : (
                         <KeyRound className="mr-1.5 h-4 w-4" />
                       )}
-                      {keyState.status === 'checking' ? 'Checking with OpenRouter…' : 'Connect & continue'}
+                      {keyState.status === 'checking' ? 'Checking with OpenRouter…' : 'Connect key'}
                     </Button>
                     {replacingKey && (
                       <Button onClick={() => setReplacingKey(false)} type="button" variant="ghost">
@@ -864,19 +924,96 @@ export function CortexSetupWizard({
         </section>
       )}
 
-      {/* ───────────── Step 3: build ───────────── */}
+      {/* ───────────── Step 3: site brief ───────────── */}
       {step === 3 && (
         <section className="space-y-4" aria-labelledby="setup-step-3">
+          <div className="space-y-1">
+            <h2 id="setup-step-3" className="flex flex-wrap items-center gap-2 text-lg font-semibold">
+              <ClipboardList className="h-5 w-5 text-primary" />
+              Tell Cortex about your business
+              <Badge variant="outline" className="font-normal">
+                Skippable
+              </Badge>
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              This is the interview Cortex would otherwise run in chat, written down so you can answer in
+              two minutes and in any order. Only the name and description are required; skip it and
+              Cortex asks the same questions one at a time.
+            </p>
+          </div>
+
+          {savedBrief && !editingBrief ? (
+            <div className="space-y-3 rounded-xl border bg-card p-4">
+              <div className="flex items-start gap-2 text-sm">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                <div className="min-w-0">
+                  <p className="font-medium">Brief saved: {savedBrief.business_name}</p>
+                  <p className="text-xs text-muted-foreground">{summariseBrief(savedBrief)}</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button onClick={() => setStep(4)} type="button">
+                  Continue
+                  <ArrowRight className="ml-1.5 h-4 w-4" />
+                </Button>
+                <Button onClick={() => setEditingBrief(true)} type="button" variant="ghost">
+                  <Pencil className="mr-1.5 h-4 w-4" />
+                  Edit brief
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <SiteBriefForm
+              activeLanguages={activeLanguages}
+              initialValues={briefDraft ?? briefToSiteBriefFormValues(savedBrief ?? existingBrief, activeLanguages)}
+              isEditing={savedBrief !== null}
+              onChange={setBriefDraft}
+              onSaved={(brief) => {
+                setBriefState({ brief, status: 'saved' });
+                setBriefDraft(null);
+                setEditingBrief(false);
+                setStep(4);
+              }}
+              onSkip={() => {
+                setBriefDraft(null);
+                setEditingBrief(false);
+                // Editing a saved brief: "Cancel" returns to the saved card and the
+                // brief stands. No brief yet: skip the form, Cortex interviews in chat.
+                if (!savedBrief) setStep(4);
+              }}
+            />
+          )}
+
+          <div>
+            <Button
+              onClick={() => {
+                setEditingBrief(false);
+                setStep(2);
+              }}
+              type="button"
+              variant="ghost"
+            >
+              <ArrowLeft className="mr-1.5 h-4 w-4" />
+              Back
+            </Button>
+          </div>
+        </section>
+      )}
+
+      {/* ───────────── Step 4: build ───────────── */}
+      {step === 4 && (
+        <section className="space-y-4" aria-labelledby="setup-step-4">
           {path === 'chat' && keyConnected && (
             <div className="space-y-5 rounded-xl border border-primary/30 bg-primary/[0.04] p-6">
               <div className="space-y-1">
-                <h2 id="setup-step-3" className="flex items-center gap-2 text-lg font-semibold">
+                <h2 id="setup-step-4" className="flex items-center gap-2 text-lg font-semibold">
                   <Sparkles className="h-5 w-5 text-primary" />
                   You&rsquo;re ready to build
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Cortex will look at what your site has now, ask you a few questions about your business,
-                  then propose a plan. You approve it once and it builds the pages, menus and branding.
+                  {briefSaved
+                    ? 'Cortex has your brief. It will look at what the site has now, propose a plan, and build it after you approve — no questionnaire.'
+                    : 'Cortex will look at what your site has now, ask you a few questions about your business, then propose a plan. You approve it once and it builds the pages, menus and branding.'}
                 </p>
               </div>
 
@@ -897,6 +1034,14 @@ export function CortexSetupWizard({
                     <span className="h-4 w-4 shrink-0 rounded-full border border-muted-foreground/40" aria-hidden />
                   )}
                   {stockSummary ? `Stock photos: ${stockSummary}` : 'Stock photos: skipped'}
+                </li>
+                <li className="flex items-center gap-2">
+                  {briefSaved ? (
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                  ) : (
+                    <span className="h-4 w-4 shrink-0 rounded-full border border-muted-foreground/40" aria-hidden />
+                  )}
+                  {briefSaved ? 'Brief: saved' : 'Brief: Cortex will ask in chat'}
                 </li>
               </ul>
 
@@ -931,13 +1076,14 @@ export function CortexSetupWizard({
           {path === 'mcp' && (
             <div className="space-y-5">
               <div className="space-y-1">
-                <h2 id="setup-step-3" className="flex items-center gap-2 text-lg font-semibold">
+                <h2 id="setup-step-4" className="flex items-center gap-2 text-lg font-semibold">
                   <Plug className="h-5 w-5 text-primary" />
                   Connect your AI app
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  Add NextBlock to your client with the config below, then paste the prompt to start the
-                  interview.
+                  {briefSaved
+                    ? 'Add NextBlock to your client with the config below, then paste the prompt. Your brief is saved, so it goes straight to the plan.'
+                    : 'Add NextBlock to your client with the config below, then paste the prompt to start the interview.'}
                 </p>
               </div>
 
@@ -1023,10 +1169,10 @@ export function CortexSetupWizard({
                     <Sparkles className="h-4 w-4 text-primary" />
                     Then paste this to start
                   </p>
-                  <CopyButton label="Copy prompt" value={SITE_BUILDER_KICKOFF_PROMPT} />
+                  <CopyButton label="Copy prompt" value={kickoffPrompt} />
                 </div>
                 <blockquote className="rounded-md border bg-background px-3 py-2 text-sm leading-relaxed">
-                  {SITE_BUILDER_KICKOFF_PROMPT}
+                  {kickoffPrompt}
                 </blockquote>
                 <p className="text-xs text-muted-foreground">
                   Your client will ask you to approve each change. Clients that support MCP prompts also
@@ -1049,7 +1195,7 @@ export function CortexSetupWizard({
           {(path === null || (path === 'chat' && !keyConnected)) && (
             <div className="space-y-5">
               <div className="space-y-1">
-                <h2 id="setup-step-3" className="text-lg font-semibold">
+                <h2 id="setup-step-4" className="text-lg font-semibold">
                   Cortex is installed, not connected yet
                 </h2>
                 <p className="text-sm text-muted-foreground">
@@ -1096,7 +1242,7 @@ export function CortexSetupWizard({
           )}
 
           <div>
-            <Button disabled={finishing !== null} onClick={() => setStep(2)} type="button" variant="ghost">
+            <Button disabled={finishing !== null} onClick={() => setStep(3)} type="button" variant="ghost">
               <ArrowLeft className="mr-1.5 h-4 w-4" />
               Back
             </Button>
