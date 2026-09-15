@@ -22,6 +22,11 @@ import {
   useCortexAiPageContext,
   type CortexAiPageContext,
 } from "./CortexAiPageContext";
+import {
+  CORTEX_SETUP_PATH,
+  CORTEX_SETUP_SITE_BUILDER_HREF,
+  SITE_BUILDER_KICKOFF_PROMPT,
+} from "../../../lib/cortex-ai/site-builder-prompt";
 
 type ChatRole = "assistant" | "user";
 
@@ -181,8 +186,6 @@ export function openCortexSiteBuilder() {
   window.dispatchEvent(new CustomEvent(CORTEX_OPEN_EVENT, { detail: { mode: "site-builder" } }));
 }
 
-const SITE_BUILDER_KICKOFF_PROMPT =
-  "I want to set up my website with you. Look at what the site has now, then interview me about my business so you can plan and build it.";
 const BUILD_CONTINUE_DISPLAY = "Continuing the build…";
 const BUILD_SESSION_STOPPED_MESSAGE =
   "The build session is stopped. Cortex will ask for confirmation again before changing anything.";
@@ -931,11 +934,23 @@ function ToolActivityRow({
   );
 }
 
-export function CortexGlobalAgentChat() {
+export function CortexGlobalAgentChat({
+  hasModelKey = true,
+}: {
+  /**
+   * The server found an OpenRouter key (stored BYOK or env). Without one every
+   * request would fail with "requires OPENROUTER_API_KEY", so the drawer swaps its
+   * composer for a pointer to the setup wizard and the site builder goes there too.
+   */
+  hasModelKey?: boolean;
+}) {
   const pathname = usePathname();
   const router = useRouter();
   const cortexAiPageContext = useCortexAiPageContext();
   const [isMounted, setIsMounted] = useState(false);
+  // The sandbox keeps each visitor's key in localStorage, invisible to the server.
+  const [hasSandboxKey, setHasSandboxKey] = useState(false);
+  const canReachModel = hasModelKey || hasSandboxKey;
   const [threads, setThreads] = useState<ChatThread[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
   const [input, setInput] = useState("");
@@ -993,12 +1008,27 @@ export function CortexGlobalAgentChat() {
   }, []);
 
   useEffect(() => {
-    const resetProviderMetadata = () => setMetadata(null);
+    const readSandboxKey = () => {
+      if (process.env.NEXT_PUBLIC_IS_SANDBOX !== "true") {
+        return;
+      }
 
-    window.addEventListener(CORTEX_AI_SETTINGS_CHANGED_EVENT, resetProviderMetadata);
+      try {
+        setHasSandboxKey(Boolean(window.localStorage.getItem("cortex_ai_sandbox_openrouter_api_key")));
+      } catch {
+        setHasSandboxKey(false);
+      }
+    };
+    const onSettingsChanged = () => {
+      setMetadata(null);
+      readSandboxKey();
+    };
+
+    readSandboxKey();
+    window.addEventListener(CORTEX_AI_SETTINGS_CHANGED_EVENT, onSettingsChanged);
 
     return () => {
-      window.removeEventListener(CORTEX_AI_SETTINGS_CHANGED_EVENT, resetProviderMetadata);
+      window.removeEventListener(CORTEX_AI_SETTINGS_CHANGED_EVENT, onSettingsChanged);
     };
   }, []);
 
@@ -1020,6 +1050,13 @@ export function CortexGlobalAgentChat() {
     }
 
     if (isStreaming) {
+      return;
+    }
+
+    if (!canReachModel) {
+      // No key yet: the wizard collects one (or sets up MCP) and, with this intent,
+      // hands straight back to the site builder once a key exists.
+      router.push(CORTEX_SETUP_SITE_BUILDER_HREF);
       return;
     }
 
@@ -1840,10 +1877,40 @@ export function CortexGlobalAgentChat() {
         {streamError && (
           <div className="border-t border-destructive/20 bg-destructive/10 px-4 py-2 text-sm text-destructive">
             {streamError}
+            {/OPENROUTER_API_KEY|OpenRouter BYOK/i.test(streamError) && (
+              <>
+                {" "}
+                <button
+                  className="font-medium underline underline-offset-2"
+                  onClick={() => router.push(CORTEX_SETUP_PATH)}
+                  type="button"
+                >
+                  Finish Cortex setup
+                </button>
+              </>
+            )}
           </div>
         )}
 
         <div className="border-t border-slate-200 p-4 dark:border-slate-800">
+          {!canReachModel ? (
+            <div className="space-y-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-3 text-sm">
+              <p className="font-medium text-foreground">Cortex is installed but not connected yet.</p>
+              <p className="text-xs text-slate-600 dark:text-slate-300">
+                Add an OpenRouter key so Cortex can chat here, or connect your own AI app over MCP.
+                Two minutes either way.
+              </p>
+              <Button
+                className="h-8 rounded-md text-xs"
+                onClick={() => router.push(CORTEX_SETUP_PATH)}
+                size="sm"
+                type="button"
+              >
+                <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                Finish setup
+              </Button>
+            </div>
+          ) : (
           <div className="flex items-end gap-2">
             <Textarea
               className="max-h-36 min-h-12 resize-none rounded-lg text-sm"
@@ -1870,6 +1937,7 @@ export function CortexGlobalAgentChat() {
               </Button>
             )}
           </div>
+          )}
         </div>
       </aside>
     </>

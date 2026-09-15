@@ -1,0 +1,117 @@
+/**
+ * The copy-paste configuration for every MCP client NextBlock documents.
+ *
+ * Shared by the MCP settings card and the first-run setup wizard so the two can
+ * never disagree about a field name (Claude Code silently skips a server entry
+ * without `type`; VS Code wants `servers`, not `mcpServers`).
+ */
+
+export const MCP_TOKEN_PLACEHOLDER = 'YOUR_TOKEN';
+
+export type McpClientId = 'claude-code' | 'claude-desktop' | 'cursor' | 'vscode';
+
+export const MCP_CLIENTS: ReadonlyArray<readonly [McpClientId, string]> = [
+  ['claude-code', 'Claude Code'],
+  ['claude-desktop', 'Claude Desktop'],
+  ['cursor', 'Cursor'],
+  ['vscode', 'VS Code'],
+];
+
+export type McpClientSnippets = {
+  claudeCode: string;
+  claudeCodeCli: string;
+  claudeDesktop: string;
+  cursor: string;
+  vscode: string;
+};
+
+export function buildMcpClientSnippets(params: {
+  /** The bearer token to bake in; the placeholder when none has been minted yet. */
+  token: string | null;
+  url: string;
+  /**
+   * Loopback connection covered by localhost trust: the snippets must carry NO
+   * Authorization header, because the route rejects an invalid bearer outright
+   * rather than falling back to localhost trust.
+   */
+  usesLocalhostTrust: boolean;
+}): McpClientSnippets {
+  const { url, usesLocalhostTrust } = params;
+  const token = params.token ?? MCP_TOKEN_PLACEHOLDER;
+  const authHeader = usesLocalhostTrust ? undefined : { Authorization: `Bearer ${token}` };
+
+  const claudeCode = JSON.stringify(
+    {
+      mcpServers: {
+        nextblock: {
+          ...(authHeader ? { headers: authHeader } : {}),
+          type: 'http',
+          url,
+        },
+      },
+    },
+    null,
+    2
+  );
+
+  const cursor = JSON.stringify(
+    {
+      mcpServers: {
+        nextblock: {
+          ...(authHeader ? { headers: authHeader } : {}),
+          url,
+        },
+      },
+    },
+    null,
+    2
+  );
+
+  const vscode = JSON.stringify(
+    usesLocalhostTrust
+      ? { servers: { nextblock: { type: 'http', url } } }
+      : {
+          inputs: [
+            {
+              description: 'NextBlock MCP access token',
+              id: 'nextblockToken',
+              password: true,
+              type: 'promptString',
+            },
+          ],
+          servers: {
+            nextblock: {
+              headers: { Authorization: 'Bearer ${input:nextblockToken}' },
+              type: 'http',
+              url,
+            },
+          },
+        },
+    null,
+    2
+  );
+
+  const claudeDesktop = JSON.stringify(
+    {
+      mcpServers: {
+        nextblock: {
+          args: [
+            '-y',
+            'mcp-remote',
+            url,
+            ...(usesLocalhostTrust ? [] : ['--header', `Authorization: Bearer ${token}`]),
+          ],
+          command: 'npx',
+        },
+      },
+    },
+    null,
+    2
+  );
+
+  const claudeCodeCli = usesLocalhostTrust
+    ? `claude mcp add --transport http nextblock ${url}`
+    : `claude mcp add --transport http nextblock ${url} --header "Authorization: Bearer ${token}"`;
+
+  return { claudeCode, claudeCodeCli, claudeDesktop, cursor, vscode };
+}

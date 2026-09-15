@@ -7,6 +7,7 @@ export * from './lib/ai-global-agent-db-tools';
 export * from './lib/ai-global-agent-site-tools';
 export * from './lib/ai-global-agent-tools';
 export * from './lib/ai-key-crypto';
+export * from './lib/ai-key-verification';
 export * from './lib/ai-model-catalog';
 export * from './lib/ai-model-registry';
 export * from './lib/ai-seo-metadata';

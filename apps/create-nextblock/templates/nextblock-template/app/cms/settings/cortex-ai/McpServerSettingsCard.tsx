@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState, useTransition } from 'react';
+import React, { useState, useTransition } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Alert,
@@ -19,8 +19,6 @@ import {
 } from '@nextblock-cms/ui';
 import {
   AlertTriangle,
-  Check,
-  Copy,
   Info,
   KeyRound,
   Lock,
@@ -29,6 +27,13 @@ import {
   Trash2,
 } from 'lucide-react';
 
+import { CopyButton, Snippet } from './CopySnippet';
+import {
+  MCP_CLIENTS,
+  MCP_TOKEN_PLACEHOLDER,
+  buildMcpClientSnippets,
+  type McpClientId,
+} from './mcp-client-snippets';
 import {
   createMcpAccessTokenAction,
   revokeMcpAccessTokenAction,
@@ -60,44 +65,6 @@ type McpServerSettingsCardProps = {
   tokens: McpAccessTokenSummary[];
 };
 
-const TOKEN_PLACEHOLDER = 'YOUR_TOKEN';
-
-function CopyButton({ label = 'Copy', value }: { label?: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="sm"
-      className="h-7 shrink-0"
-      onClick={() => {
-        void navigator.clipboard.writeText(value).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1800);
-        });
-      }}
-    >
-      {copied ? <Check className="mr-1.5 h-3.5 w-3.5" /> : <Copy className="mr-1.5 h-3.5 w-3.5" />}
-      {copied ? 'Copied' : label}
-    </Button>
-  );
-}
-
-function Snippet({ code, title }: { code: string; title: string }) {
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <p className="text-xs font-medium">{title}</p>
-        <CopyButton value={code} />
-      </div>
-      <pre className="overflow-x-auto rounded-md border bg-muted/40 p-3 text-[11px] leading-relaxed">
-        <code>{code}</code>
-      </pre>
-    </div>
-  );
-}
-
 function formatDate(value: string | null) {
   if (!value) return null;
   return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(
@@ -124,16 +91,14 @@ export function McpServerSettingsCard({
   const [expiresInDays, setExpiresInDays] = useState('');
   const [mintedToken, setMintedToken] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeClient, setActiveClient] = useState<'claude-code' | 'claude-desktop' | 'cursor' | 'vscode'>(
-    'claude-code'
-  );
+  const [activeClient, setActiveClient] = useState<McpClientId>('claude-code');
   const [useLocalUrl, setUseLocalUrl] = useState(false);
 
   const url = useLocalUrl ? localMcpUrl : mcpUrl;
 
   // Once a token has been minted in this session, bake it into the snippets so the
   // admin can copy a config that actually works instead of hand-substituting.
-  const tokenForSnippet = mintedToken ?? TOKEN_PLACEHOLDER;
+  const tokenForSnippet = mintedToken ?? MCP_TOKEN_PLACEHOLDER;
 
   /**
    * Whether the generated snippets should carry an Authorization header at all.
@@ -146,88 +111,9 @@ export function McpServerSettingsCard({
    */
   const usesLocalhostTrust = useLocalUrl && allowLocalhost && !mintedToken;
 
-  const snippets = useMemo(() => {
-    const authHeader = usesLocalhostTrust
-      ? undefined
-      : { Authorization: `Bearer ${tokenForSnippet}` };
-
-    const claudeCode = JSON.stringify(
-      {
-        mcpServers: {
-          nextblock: {
-            ...(authHeader ? { headers: authHeader } : {}),
-            type: 'http',
-            url,
-          },
-        },
-      },
-      null,
-      2
-    );
-
-    const cursor = JSON.stringify(
-      {
-        mcpServers: {
-          nextblock: {
-            ...(authHeader ? { headers: authHeader } : {}),
-            url,
-          },
-        },
-      },
-      null,
-      2
-    );
-
-    const vscode = JSON.stringify(
-      usesLocalhostTrust
-        ? { servers: { nextblock: { type: 'http', url } } }
-        : {
-            inputs: [
-              {
-                description: 'NextBlock MCP access token',
-                id: 'nextblockToken',
-                password: true,
-                type: 'promptString',
-              },
-            ],
-            servers: {
-              nextblock: {
-                headers: { Authorization: 'Bearer ${input:nextblockToken}' },
-                type: 'http',
-                url,
-              },
-            },
-          },
-      null,
-      2
-    );
-
-    const claudeDesktop = JSON.stringify(
-      {
-        mcpServers: {
-          nextblock: {
-            args: [
-              '-y',
-              'mcp-remote',
-              url,
-              ...(usesLocalhostTrust
-                ? []
-                : ['--header', `Authorization: Bearer ${tokenForSnippet}`]),
-            ],
-            command: 'npx',
-          },
-        },
-      },
-      null,
-      2
-    );
-
-    return { claudeCode, claudeDesktop, cursor, vscode };
-  }, [tokenForSnippet, url, usesLocalhostTrust]);
-
-  const claudeCodeCli = usesLocalhostTrust
-    ? `claude mcp add --transport http nextblock ${url}`
-    : `claude mcp add --transport http nextblock ${url} --header "Authorization: Bearer ${tokenForSnippet}"`;
+  // Shared with the setup wizard so the two can never disagree about a field name.
+  const snippets = buildMcpClientSnippets({ token: tokenForSnippet, url, usesLocalhostTrust });
+  const claudeCodeCli = snippets.claudeCodeCli;
 
   // Belt-and-braces: the controls below are disabled in read-only mode, and the
   // server actions refuse sandbox writes on their own. These early returns just
@@ -547,20 +433,13 @@ export function McpServerSettingsCard({
                 : mintedToken
                   ? 'These snippets include the token you just created.'
                   : readOnly
-                    ? `This is the exact configuration you would paste on your own install, with ${TOKEN_PLACEHOLDER} standing in for the token you mint there.`
-                    : `Create a token above and these snippets will fill it in; otherwise replace ${TOKEN_PLACEHOLDER}.`}
+                    ? `This is the exact configuration you would paste on your own install, with ${MCP_TOKEN_PLACEHOLDER} standing in for the token you mint there.`
+                    : `Create a token above and these snippets will fill it in; otherwise replace ${MCP_TOKEN_PLACEHOLDER}.`}
             </p>
           </div>
 
           <div className="flex flex-wrap gap-1.5">
-            {(
-              [
-                ['claude-code', 'Claude Code'],
-                ['claude-desktop', 'Claude Desktop'],
-                ['cursor', 'Cursor'],
-                ['vscode', 'VS Code'],
-              ] as const
-            ).map(([key, label]) => (
+            {MCP_CLIENTS.map(([key, label]) => (
               <Button
                 key={key}
                 type="button"

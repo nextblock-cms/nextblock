@@ -10,6 +10,7 @@ import { getPaymentsReminder } from '../../lib/cms/payments-reminder';
 import { getUnreadMessageCount } from '../../lib/cms/unread-messages';
 import { getContactReminder } from '../../lib/cms/contact-reminder';
 import { maybeSyncCurrencyRates } from '../../lib/commerce/currency-rates-refresh';
+import { hasCortexModelKey as resolveCortexModelKey } from '../../lib/cortex-ai/setup-status';
 import type { SystemAlertItem } from './components/SystemAlertsBanner';
 
 /**
@@ -82,6 +83,10 @@ export default async function CmsLayout({
       isAdmin ? getContactReminder() : Promise.resolve(null),
     ]);
 
+  // Whether the chat drawer can reach a model at all. Without a key it sends the
+  // admin to the first-run wizard instead of firing a request that is certain to fail.
+  const hasCortexModelKey = isAdmin && isCortexAiActive ? await resolveCortexModelKey() : false;
+
   // After the response, refresh upstream update/conflict status in the background
   // (throttled to ~6h, see maybeRefreshUpstreamStatus). This keeps the banner current
   // without a cron — so it works on Vercel Hobby (limited crons) and self-hosted alike.
@@ -96,6 +101,7 @@ export default async function CmsLayout({
   return (
     <CmsClientLayout
       isCortexAiActive={isCortexAiActive}
+      hasCortexModelKey={hasCortexModelKey}
       isEcommerceActive={isEcommerceActive}
       showTwoFactorReminder={showTwoFactorReminder}
       systemAlerts={systemAlerts}

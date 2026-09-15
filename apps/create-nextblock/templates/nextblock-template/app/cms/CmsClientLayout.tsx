@@ -130,6 +130,7 @@ const CollapsibleNavItem = ({ icon: Icon, title, children, isActive, adminOnly, 
 export default function CmsClientLayout({
   children,
   isCortexAiActive = false,
+  hasCortexModelKey = true,
   isEcommerceActive = false,
   showTwoFactorReminder = false,
   systemAlerts = [],
@@ -139,6 +140,8 @@ export default function CmsClientLayout({
 }: {
   children: ReactNode,
   isCortexAiActive?: boolean,
+  /** The dashboard chat has an OpenRouter key (stored or env) to talk to. */
+  hasCortexModelKey?: boolean,
   isEcommerceActive?: boolean,
   showTwoFactorReminder?: boolean,
   systemAlerts?: SystemAlertItem[],
@@ -225,6 +228,7 @@ export default function CmsClientLayout({
   // pageTitle logic should now work reliably with usePathname
   let pageTitle = "CMS"; // Default title
   if (pathname === "/cms/dashboard") pageTitle = "Dashboard";
+  else if (pathname.startsWith("/cms/welcome")) pageTitle = "Welcome";
   else if (pathname.startsWith("/cms/custom-blocks/new")) pageTitle = "Create Custom Block";
   else if (pathname.startsWith("/cms/custom-blocks/") && pathname.endsWith("/edit")) pageTitle = "Edit Custom Block";
   else if (pathname.startsWith("/cms/custom-blocks")) pageTitle = "Block Management";
@@ -549,7 +553,7 @@ export default function CmsClientLayout({
             onClick={() => setCmsSidebarOpen(false)}
         />
       )}
-      {isAdmin && isCortexAiActive && <CortexGlobalAgentChat />}
+      {isAdmin && isCortexAiActive && <CortexGlobalAgentChat hasModelKey={hasCortexModelKey} />}
     </div>
       </EcommerceActiveProvider>
       </CortexAiActiveProvider>

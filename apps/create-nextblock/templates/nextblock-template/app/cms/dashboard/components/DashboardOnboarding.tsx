@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useEffect, useState, useTransition } from 'react';
+import { useEffect, useTransition } from 'react';
 import {
   Button,
   Card,
@@ -12,11 +12,10 @@ import {
   CardTitle,
 } from '@nextblock-cms/ui';
 import { ArrowRight, CheckCircle2, Circle, Sparkles, X } from 'lucide-react';
-import { NEXTBLOCK_PACKAGES, type PackageId } from '@nextblock-cms/utils';
 import type { OnboardingStatus } from '../../../../lib/onboarding/status';
+import { CMS_WELCOME_PATH } from '../../../../lib/cortex-ai/site-builder-prompt';
 import ConnectGitHubButton from '../../components/ConnectGitHubButton';
 import { CORTEX_SITE_BUILDER_QUERY_VALUE, openCortexSiteBuilder } from '../../components/CortexGlobalAgentChat';
-import { PackageCheckoutDialog } from '../../settings/packages/PackageCheckoutDialog';
 
 export default function DashboardOnboarding({
   status,
@@ -27,12 +26,11 @@ export default function DashboardOnboarding({
 }) {
   const [isPending, startTransition] = useTransition();
   const router = useRouter();
-  const [checkoutPackageId, setCheckoutPackageId] = useState<PackageId | null>(null);
   const trialOfferPackageId = status.trialOfferPackageId;
 
-  // The setup wizard and the sign-in redirect land on ?cortex=site-builder. When Cortex
-  // is not active yet nothing else consumes that query (the chat is not mounted), so
-  // open the trial dialog here — whatever the checklist state — and clean the URL.
+  // Older links (and bookmarks) land on ?cortex=site-builder. When Cortex is not active
+  // yet nothing else consumes that query (the chat is not mounted), so send the admin
+  // to the welcome flow, where the trial offer is a proper page rather than a popup.
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
@@ -49,24 +47,10 @@ export default function DashboardOnboarding({
       return;
     }
 
-    router.replace('/cms/dashboard');
-    setCheckoutPackageId(trialOfferPackageId);
+    router.replace(CMS_WELCOME_PATH);
   }, [router, trialOfferPackageId]);
 
-  const checkoutPackage = checkoutPackageId ? NEXTBLOCK_PACKAGES[checkoutPackageId] : null;
-  const checkoutDialog = checkoutPackage ? (
-    <PackageCheckoutDialog
-      intent={checkoutPackage.id === 'cortex-ai' ? 'site-builder' : 'default'}
-      onOpenChange={(open) => {
-        if (!open) setCheckoutPackageId(null);
-      }}
-      open
-      pkg={checkoutPackage}
-    />
-  ) : null;
-
-  // A dismissed checklist still honours the deep link: the dialog renders on its own.
-  if (status.dismissed) return checkoutDialog;
+  if (status.dismissed) return null;
 
   const pct = status.total > 0 ? Math.round((status.completed / status.total) * 100) : 0;
   const allDone = status.completed >= status.total;
@@ -79,7 +63,6 @@ export default function DashboardOnboarding({
 
   return (
     <Card className="border-primary/30 bg-primary/[0.03]">
-      {checkoutDialog}
       <CardHeader className="pb-3">
         <div className="flex items-start justify-between gap-4">
           <div className="space-y-1">
@@ -160,16 +143,12 @@ export default function DashboardOnboarding({
                     <Sparkles className="mr-1 h-3.5 w-3.5" />
                     {step.ctaLabel ?? 'Start'}
                   </Button>
-                ) : step.purchasePackageId ? (
-                  <Button
-                    variant="default"
-                    size="sm"
-                    className="shrink-0"
-                    onClick={() => setCheckoutPackageId(step.purchasePackageId as PackageId)}
-                    type="button"
-                  >
-                    <Sparkles className="mr-1 h-3.5 w-3.5" />
-                    {step.ctaLabel ?? 'Start free trial'}
+                ) : step.key === 'cortex-site-builder' ? (
+                  <Button asChild variant="default" size="sm" className="shrink-0">
+                    <Link href={step.href}>
+                      <Sparkles className="mr-1 h-3.5 w-3.5" />
+                      {step.ctaLabel ?? 'Start free trial'}
+                    </Link>
                   </Button>
                 ) : (
                   <Button asChild variant="outline" size="sm" className="shrink-0">

@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
 import {
   Alert,
   AlertDescription,
@@ -29,6 +30,7 @@ import {
   Lock,
   RotateCcw,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 
@@ -99,6 +101,8 @@ type CortexAiSettingsClientProps = {
   agentSettings: CortexAiAgentSettings;
   /** Slot for server-rendered cards (currently the MCP server access card). */
   children?: React.ReactNode;
+  /** Link to the first-run wizard; null where it is not offered (the sandbox). */
+  setupGuideHref?: string | null;
   successMessage?: string;
   errorMessage?: string;
 };
@@ -220,6 +224,7 @@ export function CortexAiSettingsClient({
   unsplashAppName,
   agentSettings,
   children,
+  setupGuideHref = null,
   successMessage,
   errorMessage,
 }: CortexAiSettingsClientProps) {
@@ -426,23 +431,33 @@ export function CortexAiSettingsClient({
 
   return (
     <div className="mx-auto w-full max-w-5xl space-y-4 px-4 py-6">
-      <div className="flex items-center gap-2.5">
-        <Brain className="h-6 w-6 text-primary" />
-        <div>
-          <h1 className="text-xl font-semibold leading-tight">
-            NextBlock Cortex AI
-            {isSandbox && (
-              <Badge variant="secondary" className="ml-2 align-middle font-normal">
-                Sandbox
-              </Badge>
-            )}
-          </h1>
-          <p className="text-xs text-muted-foreground">
-            {isSandbox
-              ? 'Set the OpenRouter key and model for your own browser session. Everything else is shown as configured by the sandbox host.'
-              : 'Manage activation, the OpenRouter model key, stock-photo providers, and MCP access.'}
-          </p>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <Brain className="h-6 w-6 text-primary" />
+          <div>
+            <h1 className="text-xl font-semibold leading-tight">
+              NextBlock Cortex AI
+              {isSandbox && (
+                <Badge variant="secondary" className="ml-2 align-middle font-normal">
+                  Sandbox
+                </Badge>
+              )}
+            </h1>
+            <p className="text-xs text-muted-foreground">
+              {isSandbox
+                ? 'Set the OpenRouter key and model for your own browser session. Everything else is shown as configured by the sandbox host.'
+                : 'Manage activation, the OpenRouter model key, stock-photo providers, and MCP access.'}
+            </p>
+          </div>
         </div>
+        {setupGuideHref && (
+          <Button asChild variant="outline" size="sm">
+            <Link href={setupGuideHref}>
+              <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+              Setup guide
+            </Link>
+          </Button>
+        )}
       </div>
 
       {banner && (

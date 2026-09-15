@@ -1,9 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useEffect } from 'react';
 import { CheckCircle2, ExternalLink, FlaskConical, Loader2, ShieldCheck, Sparkles } from 'lucide-react';
-import { toast } from 'sonner';
 
 import {
   Button,
@@ -15,49 +13,28 @@ import {
   DialogTitle,
   Input,
 } from '@nextblock-cms/ui';
-import { describePackageOffer, formatPackagePrice, type PackageDef, type PackagePricing } from '@nextblock-cms/utils';
+import { formatPackagePrice, type PackageDef } from '@nextblock-cms/utils';
 
+import { CORTEX_SETUP_SITE_BUILDER_HREF } from '../../../../lib/cortex-ai/site-builder-prompt';
 import {
-  activatePackage,
-  activatePurchasedPackage,
-  resendPurchasedLicenseEmail,
-  type ActivatePurchasedPackageResult,
-} from '../../../actions/package-actions';
+  formatPackageDate,
+  isPackageCheckoutSandbox as isSandbox,
+  usePackageCheckout,
+  type PackageCheckoutActivated,
+} from './usePackageCheckout';
 
-const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+export type { PackageCheckoutActivated };
 
 /**
  * Buy or start a trial of a NextBlock package without leaving the dashboard.
  *
- * Opens the Freemius checkout overlay (the same `@freemius/checkout` the storefront
- * uses; the host is already allowed by the CSP `frame-src`). When the buyer completes
- * the checkout, the overlay reports the new license id and `activatePurchasedPackage`
- * fetches the key from the vendor and activates it here. If that hand-off is not
- * possible the buyer still has the key by email, so the dialog falls back to a
- * paste-your-key field with a resend button.
+ * The stages live in `usePackageCheckout`; this is the dialog chrome around them.
  *
  * While the overlay is up the Radix dialog is NOT rendered: a modal Radix layer sets
  * `pointer-events: none` on `<body>` and traps focus, and the overlay's iframe lives
  * outside the Radix portal, so keeping the dialog open would make the checkout
  * unclickable. The dialog comes back on `purchaseCompleted` / `success` / `cancel`.
  */
-
-export type PackageCheckoutActivated = {
-  isTrial: boolean;
-  packageId: string;
-  packageName: string;
-};
-
-type Stage =
-  | { kind: 'offer' }
-  | { kind: 'checkout' }
-  | { kind: 'activating' }
-  | { kind: 'activated'; result: Extract<ActivatePurchasedPackageResult, { activated: true }> }
-  | { kind: 'needs_key'; email: string | null; message: string; resendEmailEndpoint: string | null }
-  | { kind: 'key_only' };
-
-type BillingCycle = 'annual' | 'monthly';
-
 export function PackageCheckoutDialog({
   intent = 'default',
   onActivated,
@@ -72,167 +49,23 @@ export function PackageCheckoutDialog({
   open: boolean;
   pkg: PackageDef;
 }) {
-  const router = useRouter();
-  const offer = describePackageOffer(pkg);
-  // The registry is a literal union; only some packages carry a monthly price.
-  const monthlyPrice = (pkg.pricing as PackagePricing).monthly;
-  const [stage, setStage] = useState<Stage>({ kind: 'offer' });
-  const [manualKey, setManualKey] = useState('');
-  const [busy, setBusy] = useState(false);
-  // The overlay fires purchaseCompleted and then success (after "Got it"); activate once.
-  const activationStartedRef = useRef(false);
+  const checkout = usePackageCheckout({ onActivated, pkg });
+  const { activateManualKey, busy, manualKey, monthlyPrice, offer, openCheckout, resendEmail, reset, setManualKey, setStage, stage, trialEndsAt } =
+    checkout;
 
   useEffect(() => {
     if (!open) {
-      setStage({ kind: 'offer' });
-      setManualKey('');
-      setBusy(false);
-      activationStartedRef.current = false;
+      reset();
     }
-  }, [open]);
-
-  const finishActivated = useCallback(
-    (result: Extract<ActivatePurchasedPackageResult, { activated: true }>) => {
-      setStage({ kind: 'activated', result });
-      toast.success(`${result.package} is active${result.isTrial ? ' — your free trial has started' : ''}.`);
-      onActivated?.({ isTrial: result.isTrial, packageId: result.packageId, packageName: result.package });
-      router.refresh();
-    },
-    [onActivated, router]
-  );
-
-  const handleCheckoutResponse = useCallback(
-    async (checkoutResponse: unknown) => {
-      if (activationStartedRef.current) {
-        return;
-      }
-
-      activationStartedRef.current = true;
-      setStage({ kind: 'activating' });
-
-      try {
-        const result = await activatePurchasedPackage({ checkoutResponse, packageId: pkg.id });
-
-        if (result.activated) {
-          finishActivated(result);
-          return;
-        }
-
-        setStage({
-          email: result.email,
-          kind: 'needs_key',
-          message: result.message,
-          resendEmailEndpoint: result.resendEmailEndpoint,
-        });
-      } catch (error) {
-        setStage({
-          email: null,
-          kind: 'needs_key',
-          message:
-            error instanceof Error
-              ? `The purchase went through, but activation failed: ${error.message}. Paste the key from your email below.`
-              : 'The purchase went through, but activation failed. Paste the key from your email below.',
-          resendEmailEndpoint: null,
-        });
-      }
-    },
-    [finishActivated, pkg.id]
-  );
-
-  const openCheckout = async (mode: 'buy' | 'trial', billingCycle: BillingCycle = 'annual') => {
-    if (isSandbox) {
-      return;
-    }
-
-    // Hides the Radix dialog (see the note above) for as long as the overlay is up.
-    setStage({ kind: 'checkout' });
-    activationStartedRef.current = false;
-
-    try {
-      const { Checkout } = await import('@freemius/checkout');
-      const handler = new Checkout({ product_id: pkg.fm_product_id });
-
-      await handler.open({
-        billing_cycle: billingCycle,
-        cancel: () => {
-          setStage((current) => (current.kind === 'checkout' ? { kind: 'offer' } : current));
-        },
-        name: 'NextBlock',
-        plan_id: pkg.fm_plan_id,
-        purchaseCompleted: (response: unknown) => {
-          void handleCheckoutResponse(response);
-        },
-        success: (response: unknown) => {
-          void handleCheckoutResponse(response);
-        },
-        title: pkg.name,
-        ...(mode === 'trial' && pkg.trial
-          ? { trial: pkg.trial.requiresPaymentMethod ? ('paid' as const) : ('free' as const) }
-          : {}),
-      });
-    } catch (error) {
-      setStage({ kind: 'offer' });
-      toast.error(
-        `The checkout could not be opened${error instanceof Error ? `: ${error.message}` : ''}. You can purchase on nextblock.dev instead.`
-      );
-    }
-  };
-
-  const activateManualKey = async () => {
-    const key = manualKey.trim();
-
-    if (!key) {
-      return;
-    }
-
-    setBusy(true);
-
-    try {
-      const result = await activatePackage(key, { packageId: pkg.id });
-
-      if ('error' in result) {
-        toast.error(result.error);
-        return;
-      }
-
-      finishActivated({
-        activated: true,
-        expiration: null,
-        isTrial: false,
-        package: result.package,
-        packageId: result.packageId,
-        trialEndsAt: null,
-      });
-    } catch {
-      toast.error('Activation failed. Please try again.');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const resendEmail = async (endpoint: string) => {
-    setBusy(true);
-
-    try {
-      const result = await resendPurchasedLicenseEmail(endpoint);
-
-      if (result.ok) {
-        toast.success('License email sent again.');
-      } else {
-        toast.error(result.error ?? 'Could not resend the email.');
-      }
-    } finally {
-      setBusy(false);
-    }
-  };
+  }, [open, reset]);
 
   const startSiteBuilder = () => {
     // Full navigation: the Cortex chat only mounts once the CMS layout re-renders with
-    // the package active, and its site-builder query handler runs on mount.
-    window.location.assign('/cms/dashboard?cortex=site-builder');
+    // the package active. A fresh activation has no model key yet, so this goes through
+    // the first-run wizard; when a key already exists (env or stored) the wizard hands
+    // straight off to /cms/dashboard?cortex=site-builder.
+    window.location.assign(CORTEX_SETUP_SITE_BUILDER_HREF);
   };
-
-  const trialEndsAt = stage.kind === 'activated' ? stage.result.trialEndsAt ?? stage.result.expiration : null;
 
   return (
     <Dialog open={open && stage.kind !== 'checkout'} onOpenChange={onOpenChange}>
@@ -348,7 +181,7 @@ export function PackageCheckoutDialog({
               </DialogTitle>
               <DialogDescription>
                 {stage.result.isTrial
-                  ? `Your free trial has started${trialEndsAt ? ` and runs until ${formatDate(trialEndsAt)}` : ''}. Your license key was also emailed to you.`
+                  ? `Your free trial has started${trialEndsAt ? ` and runs until ${formatPackageDate(trialEndsAt)}` : ''}. Your license key was also emailed to you.`
                   : 'Your license is activated on this site. The key was also emailed to you for safekeeping.'}
               </DialogDescription>
             </DialogHeader>
@@ -417,14 +250,4 @@ export function PackageCheckoutDialog({
       </DialogContent>
     </Dialog>
   );
-}
-
-function formatDate(value: string) {
-  const parsed = Date.parse(value.includes('T') || /z$/i.test(value) ? value : `${value.replace(' ', 'T')}Z`);
-
-  if (!Number.isFinite(parsed)) {
-    return value;
-  }
-
-  return new Date(parsed).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
 }

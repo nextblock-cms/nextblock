@@ -24,8 +24,6 @@ export type OnboardingStep = {
   connectGithub?: boolean;
   /** When true, render the "Build with Cortex" control that opens the site-builder chat. */
   openSiteBuilder?: boolean;
-  /** When set, the CTA opens the in-dashboard purchase/trial dialog for this package. */
-  purchasePackageId?: 'cortex-ai' | 'ecommerce';
   /** Label for the CTA button; defaults to "Set up". */
   ctaLabel?: string;
   /** When true, the step is informational for this user: no CTA is rendered. */
@@ -179,10 +177,11 @@ export async function getOnboardingStatus(opts: {
           description: `${describePackageOffer(NEXTBLOCK_PACKAGES['cortex-ai']).summary} Cortex interviews you about your business and replaces the sample content with your own pages, menus, and branding. A single landing page is fine too.${
             viewerIsAdmin ? '' : ' Ask an administrator to start the trial from Settings → Packages.'
           }`,
-          href: '/cms/settings/packages',
+          // The welcome flow: trial offer as a page, then the Cortex setup wizard.
+          href: '/cms/welcome',
           done: siteBuildDone,
           optional: true,
-          ...(viewerIsAdmin ? { purchasePackageId: 'cortex-ai' as const, ctaLabel: 'Start free trial' } : { ctaHidden: true }),
+          ...(viewerIsAdmin ? { ctaLabel: 'Start free trial' } : { ctaHidden: true }),
         },
     {
       key: 'branding',

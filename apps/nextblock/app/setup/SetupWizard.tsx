@@ -211,10 +211,11 @@ export default function SetupWizard({
       const signInData = new FormData();
       signInData.append('email', admin.email.trim());
       signInData.append('password', admin.password);
-      // Land the new administrator in the Cortex site builder so the first thing they
-      // do is replace the sample content with their own site. When the Cortex AI package
-      // is not active yet, the dashboard opens the free-trial dialog for that query instead.
-      signInData.append('redirect', '/cms/dashboard?cortex=site-builder');
+      // Continue the stepper on the first signed-in page: /cms/welcome shows the Cortex
+      // AI trial offer as a full step (with an equal "Not now"), then the Cortex setup
+      // wizard, before the dashboard is ever shown. Package activation needs an admin
+      // session, which is why that step cannot live in this pre-session wizard.
+      signInData.append('redirect', '/cms/welcome');
       await signInAction(signInData);
 
       // signInAction redirects on success (and on failure, to /sign-in with a message),
@@ -549,8 +550,8 @@ function SetupDone() {
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-wrap gap-2">
-        <Button onClick={() => (window.location.href = '/cms/dashboard?cortex=site-builder')}>
-          Build my site with Cortex AI
+        <Button onClick={() => (window.location.href = '/cms/welcome')}>
+          Continue
         </Button>
         <Button variant="outline" onClick={() => (window.location.href = '/cms/dashboard')}>
           Enter your CMS

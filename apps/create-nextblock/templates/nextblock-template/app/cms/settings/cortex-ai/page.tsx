@@ -1,11 +1,13 @@
-import { headers } from 'next/headers';
+import { redirect } from 'next/navigation';
 
 import { listCortexAiCompatibleOpenRouterModels } from '@nextblock-cms/cortex';
+import { getCortexSetupStatus } from '../../../../lib/cortex-ai/setup-status';
+import { CORTEX_SETUP_PATH } from '../../../../lib/cortex-ai/site-builder-prompt';
 import { getCortexAiSettingsStatus } from './actions';
 import { CortexAiSettingsClient } from './CortexAiSettingsClient';
 import { getMcpSettingsStatus, type McpSettingsStatus } from './mcp-actions';
 import { McpServerSettingsCard } from './McpServerSettingsCard';
-import { redirect } from 'next/navigation';
+import { resolveLocalOrigin, resolveSiteOrigin } from './origins';
 
 type CortexAiSettingsPageProps = {
   searchParams?: Promise<{
@@ -21,51 +23,6 @@ const SANDBOX_MCP_NOTICE =
   'NextBlock install, where you flip the switch, mint a token, and paste the config into Claude ' +
   'Code, Claude Desktop, Cursor, or VS Code.';
 
-/**
- * The origin an external MCP client should dial.
- *
- * Prefers NEXT_PUBLIC_URL (the deployed canonical origin) and falls back to the
- * request's own host, so the snippet is correct on a preview deployment or a custom
- * domain that was never written into the env.
- */
-async function resolveSiteOrigin(): Promise<string> {
-  const configured = process.env.NEXT_PUBLIC_URL?.trim();
-
-  if (configured) {
-    return configured.replace(/\/+$/, '');
-  }
-
-  const headerList = await headers();
-  const host = headerList.get('host');
-
-  if (!host) {
-    return 'https://your-site.com';
-  }
-
-  const protocol = headerList.get('x-forwarded-proto') || (host.startsWith('localhost') ? 'http' : 'https');
-
-  return `${protocol}://${host}`;
-}
-
-/**
- * The loopback origin to show in the "Localhost" client snippets.
- *
- * Ports differ per setup — `nx serve nextblock` uses Nx's default 4200, not Next's
- * plain 3000 — and a snippet pointing at the wrong port fails with a bare connection
- * error that gives the reader nothing to go on. When this page is itself being viewed
- * over loopback, that request's own host is the authoritative answer.
- */
-async function resolveLocalOrigin(): Promise<string> {
-  const headerList = await headers();
-  const host = headerList.get('host')?.trim();
-
-  if (host && /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host)) {
-    return `http://${host}`;
-  }
-
-  return 'http://localhost:4200';
-}
-
 export default async function CortexAiSettingsPage({
   searchParams,
 }: CortexAiSettingsPageProps) {
@@ -76,6 +33,17 @@ export default async function CortexAiSettingsPage({
   }
 
   const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+
+  // A freshly activated package with nothing configured gets the three-step wizard
+  // instead of this page, until a key or the MCP server exists or the admin has
+  // finished/skipped the wizard (which records itself in onboarding_state).
+  if (!isSandbox) {
+    const setup = await getCortexSetupStatus();
+
+    if (setup.needsSetup) {
+      redirect(CORTEX_SETUP_PATH);
+    }
+  }
   const params: { error?: string; success?: string } = searchParams
     ? await searchParams
     : {};
@@ -127,6 +95,7 @@ export default async function CortexAiSettingsPage({
       hasEnvUnsplashKey={status.hasEnvUnsplashKey}
       unsplashAppName={status.unsplashAppName}
       agentSettings={status.agentSettings}
+      setupGuideHref={isSandbox ? null : CORTEX_SETUP_PATH}
       successMessage={params.success}
       errorMessage={params.error}
     >
