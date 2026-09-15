@@ -138,6 +138,37 @@ Optional, per feature:
 - Stripe keys for physical-product checkout
 - Freemius keys for digital-product checkout and product sync
 
+## Dependency install scripts (`allowScripts`)
+
+Recent npm (11.13+, what Vercel's build image runs) blocks dependency install scripts
+(`preinstall` / `install` / `postinstall`) by default. Any package with such a script that
+is not listed under `allowScripts` in the **workspace root** `package.json` has its script
+silently skipped, and every install ends with:
+
+```txt
+npm warn allow-scripts N packages have install scripts not yet covered by allowScripts
+```
+
+The root `package.json` therefore carries an explicit policy. Entries are keyed by package
+name (`"esbuild": true` — any version) or exact version (`"esbuild@0.28.1": true`); semver
+ranges are rejected, `false` denies, and only the root's field is read in a workspace.
+
+| Package | Policy | Why |
+| --- | --- | --- |
+| `esbuild`, `@swc/core`, `unrs-resolver` | allow | postinstall verifies/installs the platform binary the build tooling uses |
+| `sharp` | allow | checks the prebuilt image binary and builds it only when no prebuilt exists (`node install/check.js \|\| npm run build`) |
+| `supabase` | allow | the Supabase CLI downloads its binary in postinstall; `npm run db:*` needs it |
+| `nx` | allow | its own post-install bookkeeping (no-op in CI) |
+| `@parcel/watcher` | deny | only compiles from source when `npm_config_build_from_source=true`; prebuilt binaries arrive as optional deps |
+| `less` | deny | its postinstall tries `pnpm exec playwright install` on any non-CI machine; irrelevant and fails here |
+
+Name-only entries were chosen on purpose: a pinned `pkg@1.2.3` re-triggers the warning
+(and re-skips the script) on every routine version bump. When you add a dependency with a
+native or binary postinstall, add it here **and** in `apps/nextblock/package.json`, which
+becomes the root of a standalone `create-nextblock` project. `npm install-scripts ls` (or
+`npm approve-scripts --allow-scripts-pending`) lists anything still unreviewed. The
+`.npmrc` also sets `fund=false` so the funding notice stays out of build logs.
+
 ## Running the Main App
 
 The canonical application is `apps/nextblock`.

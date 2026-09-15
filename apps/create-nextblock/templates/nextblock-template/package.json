@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/template",
-  "version": "0.18.4",
+  "version": "0.18.5",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -100,5 +100,13 @@
     "tailwindcss": "^4.2.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.59.1"
+  },
+  "allowScripts": {
+    "@swc/core": true,
+    "esbuild": true,
+    "sharp": true,
+    "unrs-resolver": true,
+    "@parcel/watcher": false,
+    "less": false
   }
 }

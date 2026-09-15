@@ -102,6 +102,12 @@ the one-click deploy needs **no manual dashboard configuration**:
 - **`framework: nextjs`** keeps Vercel's first-class Next.js runtime (SSR/ISR
   functions, image optimization, the `proxy.ts` middleware).
 
+A clean build log has no `npm warn allow-scripts` block and no funding notice: the root
+`package.json#allowScripts` decides which dependency install scripts may run (see
+[05-DEVELOPER-GUIDE.md](./05-DEVELOPER-GUIDE.md#dependency-install-scripts-allowscripts))
+and `.npmrc` sets `fund=false`. If the warning comes back after a dependency change, a new
+package with an install script needs an entry there.
+
 Leave the Vercel project's **Root Directory unset** (the repo root) — the build command
 already targets the app. Do **not** set Root Directory to `apps/nextblock`: the app
 imports the workspace libraries one level up, which a custom Root Directory would hide

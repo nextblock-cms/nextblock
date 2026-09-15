@@ -1,6 +1,6 @@
 {
   "name": "nextblock",
-  "version": "0.18.4",
+  "version": "0.18.5",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -300,6 +300,16 @@
     "includedScripts": []
   },
   "packageManager": "npm@10.9.8",
+  "allowScripts": {
+    "@swc/core": true,
+    "esbuild": true,
+    "nx": true,
+    "sharp": true,
+    "supabase": true,
+    "unrs-resolver": true,
+    "@parcel/watcher": false,
+    "less": false
+  },
   "overrides": {
     "postcss": "^8.5.26",
     "qs": "^6.15.2",

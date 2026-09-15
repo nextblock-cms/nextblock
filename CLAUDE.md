@@ -86,6 +86,12 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 
 ## Gotchas
 
+- npm ≥ 11.13 blocks dependency install scripts unless the ROOT `package.json` lists the
+  package under `allowScripts` (`"name": true`, or `"name@1.2.3": true`; semver ranges are
+  rejected, and only the root's field counts in the workspace). Adding a dependency with a
+  native/binary postinstall means adding it there, or every install logs "N packages have
+  install scripts not yet covered by allowScripts" and silently skips them. Mirror the entry
+  in `apps/nextblock/package.json` (it becomes the standalone template's root).
 - `@nextblock-cms/ecommerce` is the alias; the package is `@nextblock-cms/ecom`. Intentional.
 - Cortex's package id is `cortex-ai`, never `ai`. Cortex calls OpenRouter via the Vercel AI SDK
   and the operator picks the model; never assume a provider.
