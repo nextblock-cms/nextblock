@@ -185,11 +185,14 @@ The two jobs that used to be crons are handled like this:
   external schedule (a Pro cron they add themselves, or any HTTP scheduler).
 - **Sandbox reset** — only the public sandbox (`cms.nextblock.dev`) needs the
   15-minute `/api/cron/reset-sandbox` schedule, so it is a **pg_cron job inside the
-  sandbox's own Supabase database**, the one place only the sandbox has. `npm run
-  sandbox:schedule` (`tools/scripts/schedule-sandbox-reset.js`) enables `pg_cron` +
-  `pg_net`, stores `CRON_SECRET` in Supabase Vault and schedules an HTTP call to the
-  route every 15 minutes; `--status` shows the last runs and responses, `--remove`
-  unschedules. The job survives the reset itself (which drops only `public`). A branch
+  sandbox's own Supabase database**, the one place only the sandbox has. Run once, from
+  any checkout whose `.env.local` points at the sandbox database:
+  `npm run sandbox:schedule -- https://cms.nextblock.dev`
+  (`tools/scripts/schedule-sandbox-reset.js`). It enables `pg_cron` + `pg_net`, stores
+  `CRON_SECRET` in Supabase Vault and schedules an HTTP call to the route every 15
+  minutes; add `--print-sql` to get the same statements for the Supabase SQL editor
+  instead, `--status` shows the last runs and responses, `--remove` unschedules.
+  Nothing runs on Vercel. The job survives the reset itself (which drops only `public`). A branch
   carrying the cron was tried first and rejected: every Vercel project on the repo builds
   every branch, so each release produced a second, useless build in the other project.
   On a normal install the route returns 404 anyway.

@@ -12,17 +12,19 @@
  * from Supabase Vault. It survives the reset itself, which drops only the `public`
  * schema (`cron`, `net` and `vault` are untouched).
  *
- * Reads `.env.local` at the repo root (the same file `npm run sandbox:reset` uses):
+ * Run it ONCE from any machine whose `.env.local` points at the sandbox database (or
+ * paste the `--print-sql` output into the Supabase SQL editor). The job then lives in
+ * the database; nothing runs on Vercel. Reads from `.env.local` at the repo root:
  *   NEXT_PUBLIC_IS_SANDBOX=true    refuses to run otherwise
  *   CRON_SECRET                    the bearer token the route expects
  *   POSTGRES_URL_NON_POOLING       (or POSTGRES_URL / DATABASE_URL) the sandbox database
- *   NEXT_PUBLIC_URL                the public sandbox origin, unless --url is given
+ *   SANDBOX_URL / NEXT_PUBLIC_URL  the public sandbox origin, unless given on the command line
  *
- *   npm run sandbox:schedule                          # install / update the job
- *   npm run sandbox:schedule -- --url https://cms.nextblock.dev
- *   npm run sandbox:schedule -- --schedule "*\/30 * * * *"
- *   npm run sandbox:schedule -- --status              # job + last runs + last responses
- *   npm run sandbox:schedule -- --remove              # unschedule and drop the secret
+ *   npm run sandbox:schedule -- https://cms.nextblock.dev               # install / update
+ *   npm run sandbox:schedule -- https://cms.nextblock.dev --print-sql   # SQL for the dashboard
+ *   npm run sandbox:schedule -- --schedule="*\/30 * * * *" https://cms.nextblock.dev
+ *   npm run sandbox:schedule -- --status     # job + last runs + last HTTP responses
+ *   npm run sandbox:schedule -- --remove     # unschedule and drop the Vault secret
  */
 const fs = require('fs');
 const path = require('path');
@@ -40,12 +42,30 @@ if (fs.existsSync(envPath)) {
   dotenv.config({ path: envPath });
 }
 
+// npm on some shells swallows "--url value" even after "--", so accept every spelling:
+// --url value, --url=value, a bare https URL, or SANDBOX_URL in the environment.
 const args = process.argv.slice(2);
-const flag = (name) => args.includes(name);
-const option = (name) => {
-  const index = args.indexOf(name);
-  return index >= 0 ? args[index + 1] : undefined;
-};
+const flags = new Set();
+const options = {};
+let positionalUrl;
+for (let i = 0; i < args.length; i += 1) {
+  const arg = args[i];
+  if (arg.startsWith('--')) {
+    const eq = arg.indexOf('=');
+    if (eq > 0) {
+      options[arg.slice(2, eq)] = arg.slice(eq + 1);
+    } else if (i + 1 < args.length && !args[i + 1].startsWith('--') && !/^https?:\/\//.test(args[i + 1])) {
+      options[arg.slice(2)] = args[i + 1];
+      i += 1;
+    } else {
+      flags.add(arg.slice(2));
+    }
+  } else if (/^https?:\/\//.test(arg)) {
+    positionalUrl = arg;
+  }
+}
+const flag = (name) => flags.has(name);
+const option = (name) => options[name];
 
 function fail(message) {
   console.error('\x1b[31m%s\x1b[0m', message);
@@ -56,17 +76,61 @@ function sqlLiteral(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+function scheduleInputs() {
+  const cronSecret = (process.env.CRON_SECRET || '').trim();
+  if (!cronSecret) fail('CRON_SECRET is not set in .env.local.');
+
+  const siteUrl = option('url') || positionalUrl || process.env.SANDBOX_URL || process.env.NEXT_PUBLIC_URL;
+  if (!siteUrl || !/^https:\/\//.test(siteUrl)) {
+    fail('The sandbox origin must be an https URL, e.g.: npm run sandbox:schedule -- https://cms.nextblock.dev');
+  }
+  const resetUrl = new URL('/api/cron/reset-sandbox', siteUrl).href;
+  const schedule = option('schedule') || DEFAULT_SCHEDULE;
+  const command = `
+      select net.http_get(
+        url := ${sqlLiteral(resetUrl)},
+        headers := jsonb_build_object(
+          'Authorization',
+          'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = ${sqlLiteral(SECRET_NAME)})
+        ),
+        timeout_milliseconds := ${REQUEST_TIMEOUT_MS}
+      )`;
+
+  return { cronSecret, resetUrl, schedule, command };
+}
+
+/** The same statements the connected path runs, for pasting into the Supabase SQL editor. */
+function printSql() {
+  const { cronSecret, schedule, command } = scheduleInputs();
+  process.stdout.write(
+    [
+      "-- Paste into the sandbox project's SQL editor (Supabase dashboard -> SQL). Safe to re-run.",
+      'create extension if not exists pg_cron;',
+      'create extension if not exists pg_net;',
+      `delete from vault.secrets where name = ${sqlLiteral(SECRET_NAME)};`,
+      `select vault.create_secret(${sqlLiteral(cronSecret)}, ${sqlLiteral(SECRET_NAME)}, 'Bearer token for /api/cron/reset-sandbox');`,
+      `select cron.schedule(${sqlLiteral(JOB_NAME)}, ${sqlLiteral(schedule)}, $cmd$${command}\n$cmd$);`,
+      '',
+    ].join('\n')
+  );
+}
+
 async function main() {
   if (process.env.NEXT_PUBLIC_IS_SANDBOX !== 'true') {
     fail('Refusing to touch the schedule because NEXT_PUBLIC_IS_SANDBOX is not true in .env.local.');
   }
 
+  if (flag('print-sql')) {
+    printSql();
+    return;
+  }
+
   const dbUrl =
-    option('--db') ||
+    option('db') ||
     process.env.POSTGRES_URL_NON_POOLING ||
     process.env.POSTGRES_URL ||
     process.env.DATABASE_URL;
-  if (!dbUrl) fail('No database URL: set POSTGRES_URL_NON_POOLING (or POSTGRES_URL) or pass --db.');
+  if (!dbUrl) fail('No database URL: set POSTGRES_URL_NON_POOLING (or POSTGRES_URL) or pass --db=...');
 
   const sql = postgres(dbUrl, {
     max: 1,
@@ -77,12 +141,12 @@ async function main() {
   });
 
   try {
-    if (flag('--status')) {
+    if (flag('status')) {
       await printStatus(sql);
       return;
     }
 
-    if (flag('--remove')) {
+    if (flag('remove')) {
       await sql.unsafe(`
         do $$
         begin
@@ -96,15 +160,7 @@ async function main() {
       return;
     }
 
-    const cronSecret = (process.env.CRON_SECRET || '').trim();
-    if (!cronSecret) fail('CRON_SECRET is not set in .env.local.');
-
-    const siteUrl = option('--url') || process.env.NEXT_PUBLIC_URL;
-    if (!siteUrl || !/^https:\/\//.test(siteUrl)) {
-      fail('The sandbox origin must be an https URL: pass --url https://... or set NEXT_PUBLIC_URL.');
-    }
-    const resetUrl = new URL('/api/cron/reset-sandbox', siteUrl).href;
-    const schedule = option('--schedule') || DEFAULT_SCHEDULE;
+    const { cronSecret, resetUrl, schedule, command } = scheduleInputs();
 
     await sql.unsafe('create extension if not exists pg_cron');
     await sql.unsafe('create extension if not exists pg_net');
@@ -114,16 +170,6 @@ async function main() {
     await sql.unsafe(
       `select vault.create_secret(${sqlLiteral(cronSecret)}, ${sqlLiteral(SECRET_NAME)}, 'Bearer token for /api/cron/reset-sandbox')`
     );
-
-    const command = `
-      select net.http_get(
-        url := ${sqlLiteral(resetUrl)},
-        headers := jsonb_build_object(
-          'Authorization',
-          'Bearer ' || (select decrypted_secret from vault.decrypted_secrets where name = ${sqlLiteral(SECRET_NAME)})
-        ),
-        timeout_milliseconds := ${REQUEST_TIMEOUT_MS}
-      )`;
 
     // cron.schedule replaces an existing job of the same name, so re-running is safe.
     const [{ schedule: jobId }] = await sql.unsafe(
