@@ -190,8 +190,10 @@ The two jobs that used to be crons are handled like this:
   `npm run sandbox:schedule -- https://cms.nextblock.dev`
   (`tools/scripts/schedule-sandbox-reset.js`). It enables `pg_cron` + `pg_net`, stores
   `CRON_SECRET` in Supabase Vault and schedules an HTTP call to the route every 15
-  minutes; add `--print-sql` to get the same statements for the Supabase SQL editor
-  instead, `--status` shows the last runs and responses, `--remove` unschedules.
+  minutes; `npm run sandbox:schedule -- status` shows the last runs and responses,
+  `-- remove` unschedules, and `-- https://cms.nextblock.dev print-sql` prints the same
+  statements for the Supabase SQL editor instead (bare words, because npm on PowerShell
+  drops `--flags` even after `--`).
   Nothing runs on Vercel. The job survives the reset itself (which drops only `public`). A branch
   carrying the cron was tried first and rejected: every Vercel project on the repo builds
   every branch, so each release produced a second, useless build in the other project.

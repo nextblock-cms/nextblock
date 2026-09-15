@@ -20,11 +20,12 @@
  *   POSTGRES_URL_NON_POOLING       (or POSTGRES_URL / DATABASE_URL) the sandbox database
  *   SANDBOX_URL / NEXT_PUBLIC_URL  the public sandbox origin, unless given on the command line
  *
- *   npm run sandbox:schedule -- https://cms.nextblock.dev               # install / update
- *   npm run sandbox:schedule -- https://cms.nextblock.dev --print-sql   # SQL for the dashboard
+ *   npm run sandbox:schedule -- https://cms.nextblock.dev              # install / update
+ *   npm run sandbox:schedule -- https://cms.nextblock.dev print-sql    # SQL for the dashboard
  *   npm run sandbox:schedule -- --schedule="*\/30 * * * *" https://cms.nextblock.dev
- *   npm run sandbox:schedule -- --status     # job + last runs + last HTTP responses
- *   npm run sandbox:schedule -- --remove     # unschedule and drop the Vault secret
+ *   npm run sandbox:schedule -- status       # job + last runs + last HTTP responses
+ *   npm run sandbox:schedule -- remove       # unschedule and drop the Vault secret
+ *   (the --status / --remove / --print-sql spellings work where npm passes them through)
  */
 const fs = require('fs');
 const path = require('path');
@@ -42,8 +43,9 @@ if (fs.existsSync(envPath)) {
   dotenv.config({ path: envPath });
 }
 
-// npm on some shells swallows "--url value" even after "--", so accept every spelling:
-// --url value, --url=value, a bare https URL, or SANDBOX_URL in the environment.
+// npm on some shells (PowerShell in particular) swallows "--flag" even after "--", so
+// accept every spelling: bare words (status, remove, print-sql), a bare https URL,
+// --url=value / --schedule=value, or SANDBOX_URL in the environment.
 const args = process.argv.slice(2);
 const flags = new Set();
 const options = {};
@@ -62,6 +64,9 @@ for (let i = 0; i < args.length; i += 1) {
     }
   } else if (/^https?:\/\//.test(arg)) {
     positionalUrl = arg;
+  } else if (['status', 'remove', 'print-sql'].includes(arg)) {
+    // npm on PowerShell drops "--status" even after "--", so bare words work too.
+    flags.add(arg);
   }
 }
 const flag = (name) => flags.has(name);
