@@ -13,12 +13,14 @@ import {
   SearchableSelect,
 } from '@nextblock-cms/ui';
 import { cn } from '@nextblock-cms/utils';
-import {
-  isCortexSiteBriefComplete,
-  type CortexAiCompatibleOpenRouterModel,
-  type CortexAiStoredModelSelection,
-  type CortexSiteBrief,
+// Types only from the main barrel (erased at build time); runtime values MUST come
+// from the client entry, or the server-only Supabase client ends up in the browser bundle.
+import type {
+  CortexAiCompatibleOpenRouterModel,
+  CortexAiStoredModelSelection,
+  CortexSiteBrief,
 } from '@nextblock-cms/cortex';
+import { isCortexSiteBriefComplete } from '@nextblock-cms/cortex/client';
 import {
   AlertTriangle,
   ArrowLeft,
