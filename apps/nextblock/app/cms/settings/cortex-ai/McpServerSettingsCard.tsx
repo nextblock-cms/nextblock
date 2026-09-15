@@ -27,13 +27,9 @@ import {
   Trash2,
 } from 'lucide-react';
 
-import { CopyButton, Snippet } from './CopySnippet';
-import {
-  MCP_CLIENTS,
-  MCP_TOKEN_PLACEHOLDER,
-  buildMcpClientSnippets,
-  type McpClientId,
-} from './mcp-client-snippets';
+import { CopyButton } from './CopySnippet';
+import { McpClientConfigPanel } from './McpClientConfigPanel';
+import { MCP_TOKEN_PLACEHOLDER, buildMcpClientSnippets, type McpClientId } from './mcp-client-snippets';
 import {
   createMcpAccessTokenAction,
   revokeMcpAccessTokenAction,
@@ -113,7 +109,6 @@ export function McpServerSettingsCard({
 
   // Shared with the setup wizard so the two can never disagree about a field name.
   const snippets = buildMcpClientSnippets({ token: tokenForSnippet, url, usesLocalhostTrust });
-  const claudeCodeCli = snippets.claudeCodeCli;
 
   // Belt-and-braces: the controls below are disabled in read-only mode, and the
   // server actions refuse sandbox writes on their own. These early returns just
@@ -438,68 +433,12 @@ export function McpServerSettingsCard({
             </p>
           </div>
 
-          <div className="flex flex-wrap gap-1.5">
-            {MCP_CLIENTS.map(([key, label]) => (
-              <Button
-                key={key}
-                type="button"
-                size="sm"
-                variant={activeClient === key ? 'secondary' : 'ghost'}
-                className="h-7 text-xs"
-                onClick={() => setActiveClient(key)}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-
-          {activeClient === 'claude-code' && (
-            <div className="space-y-3">
-              <Snippet code={claudeCodeCli} title="One-line CLI setup" />
-              <Snippet
-                code={snippets.claudeCode}
-                title="…or add to .mcp.json in your project root"
-              />
-              <p className="text-[11px] text-muted-foreground">
-                The <span className="font-mono">type</span> field is required — Claude Code skips a
-                server entry that has a <span className="font-mono">url</span> but no{' '}
-                <span className="font-mono">type</span>.
-              </p>
-            </div>
-          )}
-
-          {activeClient === 'claude-desktop' && (
-            <div className="space-y-3">
-              <Alert>
-                <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>Two options, and the easy one has a catch</AlertTitle>
-                <AlertDescription className="text-xs">
-                  Settings &rarr; Connectors &rarr; Add custom connector accepts{' '}
-                  <span className="font-mono">{url}</span> directly (type{' '}
-                  <span className="font-mono">Bearer YOUR_TOKEN</span>, including the space, in the
-                  auth field) — but custom connectors dial out from Anthropic&rsquo;s cloud, so a
-                  localhost or firewalled site will not connect that way. Use the config below
-                  instead in that case; it bridges over stdio from your own machine.
-                </AlertDescription>
-              </Alert>
-              <Snippet code={snippets.claudeDesktop} title="claude_desktop_config.json" />
-            </div>
-          )}
-
-          {activeClient === 'cursor' && (
-            <Snippet code={snippets.cursor} title=".cursor/mcp.json" />
-          )}
-
-          {activeClient === 'vscode' && (
-            <div className="space-y-3">
-              <Snippet code={snippets.vscode} title=".vscode/mcp.json" />
-              <p className="text-[11px] text-muted-foreground">
-                VS Code uses <span className="font-mono">servers</span> at the top level, not{' '}
-                <span className="font-mono">mcpServers</span>, and prompts for the token rather than
-                storing it in the file.
-              </p>
-            </div>
-          )}
+          <McpClientConfigPanel
+            activeClient={activeClient}
+            onActiveClientChange={setActiveClient}
+            snippets={snippets}
+            url={url}
+          />
         </div>
       </CardContent>
     </Card>

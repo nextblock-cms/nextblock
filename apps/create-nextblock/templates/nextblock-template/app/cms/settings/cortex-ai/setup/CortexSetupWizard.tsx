@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useTransition } from 'react';
+import React, { useCallback, useMemo, useRef, useState, useTransition } from 'react';
 import Link from 'next/link';
 import {
   Alert,
@@ -20,7 +20,7 @@ import type {
   CortexAiStoredModelSelection,
   CortexSiteBrief,
 } from '@nextblock-cms/cortex';
-import { isCortexSiteBriefComplete } from '@nextblock-cms/cortex/client';
+import { formatCortexSiteBriefForPrompt, isCortexSiteBriefComplete } from '@nextblock-cms/cortex/client';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -51,8 +51,9 @@ import {
 } from '../../../../../lib/cortex-ai/site-builder-prompt';
 import type { CortexSetupPath } from '../../../../../lib/cortex-ai/setup-state';
 import { SetupStepIndicator } from '../../../components/SetupStepIndicator';
-import { CopyButton, Snippet } from '../CopySnippet';
-import { MCP_CLIENTS, buildMcpClientSnippets, type McpClientId } from '../mcp-client-snippets';
+import { CopyButton } from '../CopySnippet';
+import { McpClientConfigPanel } from '../McpClientConfigPanel';
+import { buildMcpClientSnippets, type McpClientId } from '../mcp-client-snippets';
 import {
   completeCortexSetupAction,
   connectOpenRouterKeyAction,
@@ -346,8 +347,14 @@ export function CortexSetupWizard({
   );
   const [editingBrief, setEditingBrief] = useState(false);
   // The form's unsaved answers, held here because step 3 unmounts on Back: without
-  // this, going back to add a photo key wiped a half-filled questionnaire.
-  const [briefDraft, setBriefDraft] = useState<SiteBriefFormValues | null>(null);
+  // this, going back to add a photo key wiped a half-filled questionnaire. A ref, not
+  // state: the form reports every keystroke, and re-rendering this whole wizard (the
+  // model catalog, the snippets) on each one is exactly the kind of long input
+  // handler INP flags. The value is only read when the form mounts.
+  const briefDraftRef = useRef<SiteBriefFormValues | null>(null);
+  const rememberBriefDraft = useCallback((values: SiteBriefFormValues) => {
+    briefDraftRef.current = values;
+  }, []);
 
   // Step 4
   const [finishing, setFinishing] = useState<string | null>(null);
@@ -356,7 +363,16 @@ export function CortexSetupWizard({
   const mcpReady = mcpState.status === 'enabled';
   const briefSaved = briefState.status === 'saved';
   const savedBrief = briefState.status === 'saved' ? briefState.brief : null;
-  const kickoffPrompt = briefSaved ? SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF : SITE_BUILDER_KICKOFF_PROMPT;
+  // The dashboard chat gets the brief from the server (the route injects it into the
+  // system prompt), but an external MCP client only sees what the operator pastes, so
+  // the MCP kickoff carries the brief itself. Same rendering the model reads in chat.
+  const kickoffPrompt = useMemo(
+    () =>
+      savedBrief
+        ? `${SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF}\n\nHere is my site brief:\n${formatCortexSiteBriefForPrompt(savedBrief)}`
+        : SITE_BUILDER_KICKOFF_PROMPT,
+    [savedBrief]
+  );
 
   function connectKey(allowUnverified = false) {
     const candidate = apiKey.trim();
@@ -472,7 +488,10 @@ export function CortexSetupWizard({
   const mcpSnippetUrl = useLocalUrl ? localMcpUrl : mcpUrl;
   const mcpToken = mcpState.status === 'enabled' ? mcpState.token : null;
   const usesLocalhostTrust = useLocalUrl && allowLocalhostWithoutToken && !mcpToken;
-  const snippets = buildMcpClientSnippets({ token: mcpToken, url: mcpSnippetUrl, usesLocalhostTrust });
+  const snippets = useMemo(
+    () => buildMcpClientSnippets({ token: mcpToken, url: mcpSnippetUrl, usesLocalhostTrust }),
+    [mcpSnippetUrl, mcpToken, usesLocalhostTrust]
+  );
 
   const stockSummary =
     stockState.status === 'saved' && stockState.providers.length > 0
@@ -481,27 +500,32 @@ export function CortexSetupWizard({
 
   // A saved model that has since left the catalog still has to be selectable, or the
   // picker would silently show "free models" for a site that is not using them.
-  const modelOptions = [
-    {
-      description: "Rotates through OpenRouter's free models. Fine to try; slower and less reliable for a full site build.",
-      label: 'Free models (automatic)',
-      value: FREE_MODELS_OPTION_VALUE,
-    },
-    ...(savedModel && !compatibleModels.some((model) => model.id === savedModel.modelId)
-      ? [
-          {
-            description: `${savedModel.modelId} · saved earlier`,
-            label: savedModel.name,
-            value: savedModel.modelId,
-          },
-        ]
-      : []),
-    ...compatibleModels.map((model) => ({
-      description: `${model.id} · ${formatModelPricing(model.pricing)}`,
-      label: model.name,
-      value: model.id,
-    })),
-  ];
+  // Memoised: the catalog can hold a few hundred models, and this list must not be
+  // rebuilt on every unrelated state change in the wizard.
+  const modelOptions = useMemo(
+    () => [
+      {
+        description: "Rotates through OpenRouter's free models. Fine to try; slower and less reliable for a full site build.",
+        label: 'Free models (automatic)',
+        value: FREE_MODELS_OPTION_VALUE,
+      },
+      ...(savedModel && !compatibleModels.some((model) => model.id === savedModel.modelId)
+        ? [
+            {
+              description: `${savedModel.modelId} · saved earlier`,
+              label: savedModel.name,
+              value: savedModel.modelId,
+            },
+          ]
+        : []),
+      ...compatibleModels.map((model) => ({
+        description: `${model.id} · ${formatModelPricing(model.pricing)}`,
+        label: model.name,
+        value: model.id,
+      })),
+    ],
+    [compatibleModels, savedModel]
+  );
   const modelSummary =
     keyState.status === 'connected' && keyState.source === 'env'
       ? 'Free models (environment key)'
@@ -967,17 +991,19 @@ export function CortexSetupWizard({
           ) : (
             <SiteBriefForm
               activeLanguages={activeLanguages}
-              initialValues={briefDraft ?? briefToSiteBriefFormValues(savedBrief ?? existingBrief, activeLanguages)}
+              initialValues={
+                briefDraftRef.current ?? briefToSiteBriefFormValues(savedBrief ?? existingBrief, activeLanguages)
+              }
               isEditing={savedBrief !== null}
-              onChange={setBriefDraft}
+              onChange={rememberBriefDraft}
               onSaved={(brief) => {
                 setBriefState({ brief, status: 'saved' });
-                setBriefDraft(null);
+                briefDraftRef.current = null;
                 setEditingBrief(false);
                 setStep(4);
               }}
               onSkip={() => {
-                setBriefDraft(null);
+                briefDraftRef.current = null;
                 setEditingBrief(false);
                 // Editing a saved brief: "Cancel" returns to the saved card and the
                 // brief stands. No brief yet: skip the form, Cortex interviews in chat.
@@ -1116,20 +1142,7 @@ export function CortexSetupWizard({
 
               <div className="space-y-3 rounded-xl border bg-card p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap gap-1.5">
-                    {MCP_CLIENTS.map(([key, label]) => (
-                      <Button
-                        key={key}
-                        className="h-7 text-xs"
-                        onClick={() => setActiveClient(key)}
-                        size="sm"
-                        type="button"
-                        variant={activeClient === key ? 'secondary' : 'ghost'}
-                      >
-                        {label}
-                      </Button>
-                    ))}
-                  </div>
+                  <p className="text-xs font-medium">Connect a client</p>
                   <div className="flex gap-1.5">
                     <Button
                       className="h-6 text-[11px]"
@@ -1152,17 +1165,12 @@ export function CortexSetupWizard({
                   </div>
                 </div>
 
-                {activeClient === 'claude-code' && (
-                  <div className="space-y-3">
-                    <Snippet code={snippets.claudeCodeCli} title="One-line CLI setup" />
-                    <Snippet code={snippets.claudeCode} title="…or add to .mcp.json in your project root" />
-                  </div>
-                )}
-                {activeClient === 'claude-desktop' && (
-                  <Snippet code={snippets.claudeDesktop} title="claude_desktop_config.json" />
-                )}
-                {activeClient === 'cursor' && <Snippet code={snippets.cursor} title=".cursor/mcp.json" />}
-                {activeClient === 'vscode' && <Snippet code={snippets.vscode} title=".vscode/mcp.json" />}
+                <McpClientConfigPanel
+                  activeClient={activeClient}
+                  onActiveClientChange={setActiveClient}
+                  snippets={snippets}
+                  url={mcpSnippetUrl}
+                />
               </div>
 
               <div className="space-y-2 rounded-xl border border-primary/30 bg-primary/[0.04] p-4">
@@ -1173,7 +1181,7 @@ export function CortexSetupWizard({
                   </p>
                   <CopyButton label="Copy prompt" value={kickoffPrompt} />
                 </div>
-                <blockquote className="rounded-md border bg-background px-3 py-2 text-sm leading-relaxed">
+                <blockquote className="max-h-72 overflow-y-auto whitespace-pre-wrap rounded-md border bg-background px-3 py-2 text-sm leading-relaxed">
                   {kickoffPrompt}
                 </blockquote>
                 <p className="text-xs text-muted-foreground">

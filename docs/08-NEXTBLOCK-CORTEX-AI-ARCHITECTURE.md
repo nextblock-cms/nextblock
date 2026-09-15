@@ -240,6 +240,15 @@ Routing rules (`deriveCortexSetupState`, `lib/cortex-ai/setup-state.ts`):
   sandbox is exempt: the wizard redirects to the settings page there, and the chat also
   honours the per-browser localStorage key.
 
+Two performance rules the wizard follows: the brief form reports every keystroke to the
+wizard so a half-filled questionnaire survives Back, but into a **ref**, never state (a
+state update there re-rendered the whole wizard, model catalog and snippets included, on
+each keystroke: a long-input-handler INP regression); and the model option list and the
+MCP snippets are `useMemo`d. On the MCP path the pasted kickoff prompt carries the brief
+itself (`formatCortexSiteBriefForPrompt`, exported through `@nextblock-cms/cortex/client`),
+because an external client only sees what the operator pastes; the dashboard chat gets the
+brief from the route's system prompt instead.
+
 ### Post-install welcome flow
 
 `/cms/welcome` (`app/cms/welcome/page.tsx`) is where /setup's sign-in redirect lands, so
@@ -1428,7 +1437,14 @@ an explicit opt-in.
 
 Client config differs in ways that silently no-op if copied wrong, which is why the UI
 generates each one rather than documenting a single snippet (one builder,
-`mcp-client-snippets.ts`, shared by the card and the first-run wizard):
+`mcp-client-snippets.ts`, and one renderer, `McpClientConfigPanel.tsx`, shared by the card
+and the first-run wizard):
+
+- **Claude Code in VS Code** — the extension has no config file; its "Add MCP server"
+  dialog asks for Name / Transport / URL / Headers / Scope, so the panel shows those as
+  separate copyable values (`claudeCodeExtension`: name `nextblock`, transport
+  `HTTP (remote)`, the endpoint URL, and `Authorization: Bearer <token>` for the headers
+  box — empty under localhost trust).
 
 - **Claude Code** — `mcpServers`, and `"type": "http"` is *required* (a `url` with no
   `type` is a hard error that skips the server).

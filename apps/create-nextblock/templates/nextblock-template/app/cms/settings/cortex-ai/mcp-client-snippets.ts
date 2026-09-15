@@ -8,18 +8,33 @@
 
 export const MCP_TOKEN_PLACEHOLDER = 'YOUR_TOKEN';
 
-export type McpClientId = 'claude-code' | 'claude-desktop' | 'cursor' | 'vscode';
+export type McpClientId = 'claude-code' | 'claude-code-vscode' | 'claude-desktop' | 'cursor' | 'vscode';
 
 export const MCP_CLIENTS: ReadonlyArray<readonly [McpClientId, string]> = [
-  ['claude-code', 'Claude Code'],
+  ['claude-code', 'Claude Code (terminal)'],
+  ['claude-code-vscode', 'Claude Code in VS Code'],
   ['claude-desktop', 'Claude Desktop'],
   ['cursor', 'Cursor'],
-  ['vscode', 'VS Code'],
+  ['vscode', 'VS Code (Copilot)'],
 ];
+
+/**
+ * The Claude Code VS Code extension has no config file to paste: its "Add MCP server"
+ * dialog asks for these fields one by one, so they are offered as separate values.
+ */
+export type McpClaudeCodeExtensionFields = {
+  /** Value for the "Headers (Header-Name: value, one per line)" box; empty under localhost trust. */
+  headers: string;
+  name: string;
+  /** The transport option to pick in the dialog. */
+  transport: 'HTTP (remote)';
+  url: string;
+};
 
 export type McpClientSnippets = {
   claudeCode: string;
   claudeCodeCli: string;
+  claudeCodeExtension: McpClaudeCodeExtensionFields;
   claudeDesktop: string;
   cursor: string;
   vscode: string;
@@ -113,5 +128,12 @@ export function buildMcpClientSnippets(params: {
     ? `claude mcp add --transport http nextblock ${url}`
     : `claude mcp add --transport http nextblock ${url} --header "Authorization: Bearer ${token}"`;
 
-  return { claudeCode, claudeCodeCli, claudeDesktop, cursor, vscode };
+  const claudeCodeExtension: McpClaudeCodeExtensionFields = {
+    headers: usesLocalhostTrust ? '' : `Authorization: Bearer ${token}`,
+    name: 'nextblock',
+    transport: 'HTTP (remote)',
+    url,
+  };
+
+  return { claudeCode, claudeCodeCli, claudeCodeExtension, claudeDesktop, cursor, vscode };
 }

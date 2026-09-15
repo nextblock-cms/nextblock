@@ -30,6 +30,21 @@ describe('buildMcpClientSnippets', () => {
     expect(vscode.inputs[0].password).toBe(true);
   });
 
+  it('offers the Claude Code VS Code extension its dialog fields', () => {
+    const withToken = buildMcpClientSnippets({ token: 'nb_abc', url, usesLocalhostTrust: false });
+
+    expect(withToken.claudeCodeExtension).toEqual({
+      headers: 'Authorization: Bearer nb_abc',
+      name: 'nextblock',
+      transport: 'HTTP (remote)',
+      url,
+    });
+
+    const trusted = buildMcpClientSnippets({ token: null, url, usesLocalhostTrust: true });
+
+    expect(trusted.claudeCodeExtension.headers).toBe('');
+  });
+
   it('falls back to the placeholder when no token exists', () => {
     const snippets = buildMcpClientSnippets({ token: null, url, usesLocalhostTrust: false });
 

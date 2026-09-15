@@ -12,4 +12,8 @@ export {
   createCortexAiStoredModelSelection,
   type CortexAiStoredModelSelection,
 } from './lib/ai-model-registry';
-export { isCortexSiteBriefComplete, type CortexSiteBrief } from './lib/site-brief';
+export {
+  formatCortexSiteBriefForPrompt,
+  isCortexSiteBriefComplete,
+  type CortexSiteBrief,
+} from './lib/site-brief';
