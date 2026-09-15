@@ -152,7 +152,11 @@ The app exposes both through:
 
 - CMS currency settings actions in
   `apps/nextblock/app/cms/settings/currencies/actions.ts`
-- `GET /api/cron/sync-currencies`, guarded by `CRON_SECRET`
+- a daily background refresh from the CMS layout
+  (`apps/nextblock/lib/commerce/currency-rates-refresh.ts`, `after()`-based so it needs
+  no cron), active only while the ecommerce package is on
+- `GET /api/cron/sync-currencies`, guarded by `CRON_SECRET`, for operators who prefer an
+  explicit external schedule (it is no longer declared in `vercel.json`)
 
 ## Tax Calculation
 

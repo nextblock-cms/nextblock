@@ -241,7 +241,10 @@ The repo currently assumes:
 
 - the app is deployed as a Next.js application
 - Supabase remains the database/auth backend
-- cron routes are protected with `Authorization: Bearer ${CRON_SECRET}`
+- cron routes are protected with `Authorization: Bearer ${CRON_SECRET}`; `vercel.json`
+  on `master` declares none of them (Hobby 1-click installs fail on sub-daily
+  schedules), the sandbox's 15-minute reset lives on the generated `sandbox` branch
+  (see docs/12), and FX rates refresh from the CMS layout without a cron
 - package activation and several system workflows require working server-side
   environment variables, not only public client keys
 

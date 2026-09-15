@@ -1,15 +1,5 @@
 {
   "buildCommand": "npx nx build nextblock --prod",
   "outputDirectory": "apps/nextblock/.next",
-  "framework": "nextjs",
-  "crons": [
-    {
-      "path": "/api/cron/reset-sandbox",
-      "schedule": "*/15 * * * *"
-    },
-    {
-      "path": "/api/cron/sync-currencies",
-      "schedule": "0 18 * * *"
-    }
-  ]
+  "framework": "nextjs"
 }

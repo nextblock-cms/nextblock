@@ -9,6 +9,7 @@ import { maybeRevalidatePackageActivations } from '../../lib/packages/revalidate
 import { getPaymentsReminder } from '../../lib/cms/payments-reminder';
 import { getUnreadMessageCount } from '../../lib/cms/unread-messages';
 import { getContactReminder } from '../../lib/cms/contact-reminder';
+import { maybeSyncCurrencyRates } from '../../lib/commerce/currency-rates-refresh';
 import type { SystemAlertItem } from './components/SystemAlertsBanner';
 
 /**
@@ -88,6 +89,9 @@ export default async function CmsLayout({
   // Same pattern for package licenses: once a day, ask Freemius whether each activated
   // license (a free trial in particular) is still valid, and switch it off when not.
   after(() => maybeRevalidatePackageActivations());
+  // And for store FX rates: once a day, when commerce is active and a currency asks for
+  // automatic rates. This replaced the daily /api/cron/sync-currencies Vercel cron.
+  after(() => maybeSyncCurrencyRates(isEcommerceActive));
 
   return (
     <CmsClientLayout

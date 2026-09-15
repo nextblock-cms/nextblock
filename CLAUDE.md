@@ -100,6 +100,10 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   silently disables every `unstable_cache` under it, the layout's included; `dynamic =
   'force-dynamic'` is enough. Hero content must not use `backdrop-blur-*`, and sections only
   get GPU-layer classes when they have a background image (first-frame compositing cost).
+- `vercel.json` on `master` must never declare `crons`: it ships to every Vercel 1-click
+  install and Hobby fails the deployment on any sub-daily schedule. The sandbox's 15-min
+  reset lives on the generated `sandbox` branch (`.github/workflows/sandbox-branch.yml`);
+  FX rates refresh from the CMS layout via `after()` (`lib/commerce/currency-rates-refresh.ts`).
 - `/robots.txt` is a route handler (`app/robots.txt/route.ts`) serving `buildRobotsTxt`, not an
   `app/robots.ts` metadata route: Next's serialiser drops the per-rule `other` directives the
   SEO screen lets operators add. The two cannot coexist.

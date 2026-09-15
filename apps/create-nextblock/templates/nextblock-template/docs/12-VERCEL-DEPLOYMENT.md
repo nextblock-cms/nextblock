@@ -167,18 +167,30 @@ the question entirely by resolving everything in-app, so the button prompts for 
 
 ## Cron jobs and the Hobby plan
 
-`vercel.json` declares two crons: `/api/cron/reset-sandbox` **every 15 minutes**
-(`*/15 * * * *`) and `/api/cron/sync-currencies` daily at 18:00 UTC. The 15-minute
-schedule is what keeps the public sandbox at `cms.nextblock.dev` fresh; that project
-runs on **Vercel Pro**, which allows cron schedules down to once per minute with
-per-minute precision.
+**`vercel.json` on `master` declares no crons, on purpose.** That file ships verbatim to
+every 1-click install (and the daily upstream sync keeps merging `master` into those
+repos), and Vercel's **Hobby (free) tier only allows cron jobs that run at most once per
+day** — a sub-daily schedule does not merely warn, it **fails the deployment outright**
+("Hobby accounts are limited to daily cron jobs… Upgrade to the Pro plan"). A cron-free
+`vercel.json` is the only shape that deploys everywhere.
 
-Vercel’s **Hobby (free) tier only allows cron jobs that run at most once per day**
-(timing is approximate, ±59 min), and **a sub-daily schedule fails the deployment**
-outright. So on a Hobby project you must **delete the `reset-sandbox` entry from
-`vercel.json`** before deploying. Nothing is lost: `reset-sandbox` only does work in
-sandbox mode — it returns 404 otherwise — so on a normal deploy it is a harmless
-no-op anyway. `sync-currencies` is daily and deploys fine on Hobby.
+The two jobs that used to be crons are handled like this:
+
+- **FX-rate sync** — no cron at all. The CMS layout refreshes exchange rates in the
+  background after a CMS page loads (`after()`), at most once a day, and only when the
+  ecommerce package is active and a non-default currency has *auto-update* on
+  (`apps/nextblock/lib/commerce/currency-rates-refresh.ts`, same pattern as the
+  upstream-update check). Installs without commerce never touch the FX provider.
+  `GET /api/cron/sync-currencies` still exists for operators who want a precise
+  external schedule (a Pro cron they add themselves, or any HTTP scheduler).
+- **Sandbox reset** — only the public sandbox (`cms.nextblock.dev`, Vercel Pro) needs
+  the 15-minute `/api/cron/reset-sandbox` schedule, so it lives on a generated
+  **`sandbox` branch**, not on `master`. The `sandbox-branch.yml` workflow runs on every
+  push to `master` in the upstream repo only, rewrites `vercel.json` with the cron
+  (`tools/scripts/write-sandbox-vercel-config.js`) and force-pushes `master` + that one
+  commit as `sandbox`. The sandbox Vercel project's **Production Branch** is set to
+  `sandbox`; never commit to that branch by hand. In a 1-click copy the workflow is
+  skipped, and the route returns 404 outside sandbox mode anyway.
 
 ### Debugging sandbox reset failures
 
