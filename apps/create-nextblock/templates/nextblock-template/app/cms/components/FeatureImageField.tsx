@@ -1,6 +1,6 @@
 "use client";
 
-import { type KeyboardEvent, useCallback, useEffect, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useState } from "react";
 import Image from "next/image";
 import {
   Button,
@@ -26,6 +26,16 @@ import MediaUploadForm from "../media/components/MediaUploadForm";
 type Media = Database["public"]["Tables"]["media"]["Row"];
 
 interface FeatureImageFieldProps {
+  /**
+   * What this image will actually do, shown under the label.
+   *
+   * It differs by content type — on a page the feature image is a full-width title
+   * banner above the blocks, on a post the article's hero — and editors could not
+   * tell from the field alone, which is how home pages ended up with a banner
+   * stacked over their hero. The caller supplies the copy because only it knows
+   * which one it is.
+   */
+  description?: ReactNode;
   initialImageId?: string | null;
   initialImageUrl?: string | null;
   /**
@@ -42,6 +52,7 @@ interface FeatureImageFieldProps {
 }
 
 export default function FeatureImageField({
+  description,
   initialImageId,
   initialImageUrl,
   onImageIdChange,
@@ -133,6 +144,7 @@ export default function FeatureImageField({
   return (
     <div>
       <Label htmlFor="feature_image_id">Feature Image</Label>
+      {description ? <div className="mt-1 text-xs text-muted-foreground">{description}</div> : null}
       <Input type="hidden" id="feature_image_id" name="feature_image_id" value={selectedFeatureImage.id || ""} />
       <div className="mt-2">
         {selectedFeatureImage.url && (

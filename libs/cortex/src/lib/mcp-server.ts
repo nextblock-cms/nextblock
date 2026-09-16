@@ -170,6 +170,7 @@ function buildInitializeResult(deps: CortexMcpHandlerDeps, requestedVersion: unk
       [
         'NextBlock Cortex AI exposes this CMS through typed tools.',
         'Call get_database_schema first when you are unsure what exists.',
+        'Conventions: a page or post feature_image_id renders as a full-width title banner above the content and is its share preview — give posts one, never the home page or a page with its own hero section (use update_site_identity social_image for the site-wide preview); mark hero sections is_hero:true; slider:true plus slides makes a carousel.',
         canWrite
           ? 'Page builds should go through generate_jsonb_layout, which stages a reviewable Live Draft rather than publishing directly.'
           : 'This connection is READ-ONLY. Mutating tools are not available on this token.',

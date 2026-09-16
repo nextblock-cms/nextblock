@@ -1,4 +1,5 @@
 import { getProductBySlug, getProducts, getProviderReadiness } from '@nextblock-cms/ecommerce/server';
+import { pickOriginalUploadObjectKey } from '../../../lib/media/original-upload';
 import {
   ProductProvider,
   mapRawVariantRelations,
@@ -143,16 +144,21 @@ export async function generateMetadata({ params }: ProductPageProps): Promise<Me
     return { title: 'Product Not Found' };
   }
   
-  // Resolve image URL for OG Image
+  // Resolve image URL for OG Image. Social crawlers do not decode AVIF, and the upload
+  // pipeline makes the AVIF derivative the row's primary key, so the preview uses the
+  // untouched upload when the row kept one. See lib/media/original-upload.ts. The
+  // storefront gallery further down is unaffected and still renders the AVIF.
   let imageUrl = undefined;
   const mediaItem = productRecord.product_media?.[0]?.media;
-  if (mediaItem?.file_path) {
-     if (mediaItem.file_path.startsWith('http')) {
-        imageUrl = mediaItem.file_path;
+  const socialKey: string | undefined =
+    pickOriginalUploadObjectKey(mediaItem) ?? mediaItem?.file_path ?? undefined;
+  if (socialKey) {
+     if (socialKey.startsWith('http')) {
+        imageUrl = socialKey;
      } else if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-        imageUrl = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${mediaItem.file_path}`;
+        imageUrl = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${socialKey}`;
      } else {
-        imageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${mediaItem.file_path}`;
+        imageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${socialKey}`;
      }
   }
 
@@ -186,7 +192,7 @@ export async function generateMetadata({ params }: ProductPageProps): Promise<Me
     productRecord.meta_description,
     productRecord.short_description
   );
-  const { siteTitle } = await getSiteSettings();
+  const { siteTitle, socialImage } = await getSiteSettings();
   // Self-referencing `<siteUrl>/product/<slug>` unless the product sets a manual custom_canonical override.
   const canonicalUrl = buildCanonicalUrl(productRecord.custom_canonical, siteUrl, `/product/${slug}`);
 
@@ -199,6 +205,7 @@ export async function generateMetadata({ params }: ProductPageProps): Promise<Me
       url: canonicalUrl,
       siteTitle,
       imageUrl,
+      fallbackImage: socialImage,
       type: 'website',
       locale: toOpenGraphLocale(productRecord.language_code),
     }),

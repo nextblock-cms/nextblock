@@ -10,6 +10,7 @@ import {
   PUBLIC_PAGES_CACHE_TAG,
 } from "../../lib/public-content-cache";
 import { resolveMediaUrl } from "../../lib/media/resolveMediaUrl";
+import { pickOriginalUploadObjectKey } from "../../lib/media/original-upload";
 import { getContentDraft } from "../../lib/visual-editing/draft-content";
 import type { ContentDraftRow, DraftBlockSnapshot } from "../../lib/visual-editing/types";
 
@@ -21,6 +22,15 @@ type PublicPageData = PageType & {
   language_id: number;
   translation_group_id: string | null;
   feature_image_url?: string | null;
+  /**
+   * The same feature image for LINK PREVIEWS, resolved to the untouched upload.
+   *
+   * `feature_image_url` above is the AVIF derivative the browser renders. Social
+   * crawlers do not decode AVIF, so `generateMetadata` uses this one instead; it
+   * falls back to the same key when the row kept no original. See
+   * `lib/media/original-upload.ts`.
+   */
+  feature_image_social_url?: string | null;
   feature_image_blur_data_url?: string | null;
   feature_image_width?: number | null;
   feature_image_height?: number | null;
@@ -325,7 +335,7 @@ async function loadPageData(
   const baseSelect = `
       id, slug, title, meta_title, meta_description, custom_canonical, feature_image_id, status, language_id, translation_group_id, author_id, created_at, updated_at,
       language_details:languages!inner(id, code),
-      feature_media_object:media!pages_feature_image_id_fkey(object_key, file_path, blur_data_url, width, height),
+      feature_media_object:media!pages_feature_image_id_fkey(object_key, file_path, blur_data_url, width, height, variants),
       blocks (id, page_id, block_type, content, order)
     `;
 
@@ -489,7 +499,7 @@ async function loadPageData(
   if (selectedPage.feature_image_id && (!featureMedia || contentDraft)) {
     const { data: mediaItem, error: mediaError } = await supabase
       .from("media")
-      .select("object_key, file_path, blur_data_url, width, height")
+      .select("object_key, file_path, blur_data_url, width, height, variants")
       .eq("id", selectedPage.feature_image_id)
       .maybeSingle();
 
@@ -511,6 +521,7 @@ async function loadPageData(
     language_id: languageId,
     translation_group_id: selectedPage.translation_group_id,
     feature_image_url: resolveMediaUrl(featureMedia?.object_key || featureMedia?.file_path || null),
+    feature_image_social_url: resolveMediaUrl(pickOriginalUploadObjectKey(featureMedia)),
     feature_image_blur_data_url: featureMedia?.blur_data_url ?? null,
     feature_image_width: featureMedia?.width ?? null,
     feature_image_height: featureMedia?.height ?? null,

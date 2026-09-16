@@ -1,3 +1,9 @@
+import {
+  ORIGINAL_UPLOAD_VARIANT_LABEL,
+  pickOriginalUploadObjectKey,
+  type MediaWithVariants,
+} from '../media/original-upload';
+
 // Pure, dependency-free rendering of the transactional-email brand header. Kept separate
 // from branding.ts (which is `server-only` and hits the DB) so this string logic — the
 // part worth unit-testing — imports nothing server-side and runs anywhere.
@@ -80,22 +86,8 @@ export function applyEmailBranding(html: string, branding: EmailBranding): strin
   return out;
 }
 
-// The `variants` JSONB the upload pipeline writes for a media row (camelCase keys).
-interface MediaVariant {
-  objectKey?: string | null;
-  variantLabel?: string | null;
-  fileType?: string | null;
-}
-
 // The subset of a media row the email logo resolver needs.
-export interface LogoMediaLike {
-  object_key?: string | null;
-  file_path?: string | null;
-  variants?: unknown;
-}
-
-/** Label the upload pipeline gives the untouched original file among a media row's variants. */
-export const ORIGINAL_UPLOAD_VARIANT_LABEL = 'original_uploaded';
+export type LogoMediaLike = MediaWithVariants;
 
 /**
  * Pick the storage key to use for a logo IN EMAIL.
@@ -106,18 +98,13 @@ export const ORIGINAL_UPLOAD_VARIANT_LABEL = 'original_uploaded';
  * render AVIF (or WebP), so for email we prefer that untouched original. Fall back to
  * `object_key`/`file_path` only when no original variant was kept (e.g. the seeded default
  * logo, which has no variants). This keeps the site on AVIF while email uses the original.
+ *
+ * The selection itself now lives in `lib/media/original-upload.ts`, because social
+ * link-preview crawlers need exactly the same thing; this stays as the email-facing name.
  */
 export function pickEmailLogoObjectKey(media: LogoMediaLike | null | undefined): string | null {
-  if (!media) return null;
-  const variants = Array.isArray(media.variants) ? (media.variants as MediaVariant[]) : [];
-  const original = variants.find(
-    (v) =>
-      v &&
-      typeof v === 'object' &&
-      v.variantLabel === ORIGINAL_UPLOAD_VARIANT_LABEL &&
-      typeof v.objectKey === 'string' &&
-      v.objectKey.length > 0,
-  );
-  if (original?.objectKey) return original.objectKey;
-  return media.object_key ?? media.file_path ?? null;
+  return pickOriginalUploadObjectKey(media);
 }
+
+/** Re-exported so existing email/media callers keep one import site. */
+export { ORIGINAL_UPLOAD_VARIANT_LABEL };

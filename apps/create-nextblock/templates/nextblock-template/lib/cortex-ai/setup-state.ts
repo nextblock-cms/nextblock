@@ -82,3 +82,42 @@ export function deriveCortexSetupState(inputs: CortexSetupInputs): CortexSetupSt
     readyForSiteBuilder: hasModelKey && !(inputs.hasStoredOpenRouterKey && !completed),
   };
 }
+
+export type CortexWelcomeDestination = 'site-builder' | 'dashboard' | 'wizard';
+
+/**
+ * Where `/cms/welcome` sends an administrator whose Cortex package is active.
+ *
+ * Pure so the rule is unit-testable, and — the property that matters — STABLE
+ * ACROSS THE WIZARD'S OWN SAVES. That page re-runs on the server whenever the
+ * client router re-fetches the current route while the wizard is mounted on it,
+ * which happens not only after a server action that revalidates (none of the
+ * wizard's do) but also after ANY server action that writes a cookie, such as the
+ * Supabase session refresh that any action can trigger once the access token has
+ * aged. So every state the wizard can put the install into mid-flow must map to
+ * `'wizard'`:
+ *
+ *   key       wizard finished/skipped   MCP on   ->  destination
+ *   env       any                       any          site-builder  (self-host; the wizard is never needed)
+ *   stored    yes                       any          site-builder
+ *   stored    no                        any          wizard        (step 1 stored the key; model, photos, brief still to come)
+ *   none      no                        yes          wizard        (step 1 switched MCP on; the client config is still to come)
+ *   none      no                        no           wizard        (nothing configured yet)
+ *   none      yes                       any          dashboard     (finished or skipped: nothing left to ask)
+ *
+ * The "MCP on, wizard unfinished" row is the one an earlier version sent to the
+ * dashboard — exactly the state after step 1 on the MCP path, so a session-cookie
+ * refresh during the brief form threw the operator out of the wizard before the
+ * build step.
+ */
+export function resolveCortexWelcomeDestination(state: CortexSetupState): CortexWelcomeDestination {
+  if (state.readyForSiteBuilder) {
+    return 'site-builder';
+  }
+
+  if (state.setup?.completed === true) {
+    return 'dashboard';
+  }
+
+  return 'wizard';
+}

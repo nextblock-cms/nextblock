@@ -177,7 +177,13 @@ The wizard is four screens, one decision each, every one skippable:
    default, with a hint driven by the key's `is_free_tier` flag) and Continue saves the
    choice through `selectModelForSetupAction`. *Use my own AI app (MCP)* switches the MCP
    server on and mints one read+write token for the operator's machine (localhost trust is
-   left as it was). "I'll decide later" moves on with neither — and then step 3 offers no
+   left as it was) — or, when active tokens already exist (a re-run of the guide, or a token
+   minted on the settings page before it), lists them first (`existingMcpTokens`, loaded by
+   `loadCortexSetupWizardProps` through `getMcpSettingsStatus`, newest preselected) next to
+   "Create a new connection": picking one calls `useExistingMcpTokenForSetupAction`, which
+   only switches the server on, and the Build step then names the connection and asks for
+   the token value saved at creation (a secret is shown once; only its hash is stored).
+   "I'll decide later" moves on with neither — and then step 3 offers no
    "Start building" button, only the two cards back to this step, so the chat can never be
    launched without a key.
 2. **Photos** (optional) — a Pexels and/or Unsplash key so the builder can fill image slots
@@ -191,8 +197,12 @@ The wizard is four screens, one decision each, every one skippable:
    "Edit brief"; "Skip, let Cortex interview me in chat" leaves the questions to phase 1.
 4. **Build** — on the chat path, the screen *is* the "Start building my site" button (a full
    navigation to `/cms/dashboard?cortex=site-builder`, because the model-key and brief bits
-   are layout props). On the MCP path it shows the token once, the client config for the
-   chosen client, and the exact kickoff prompt to paste (`SITE_BUILDER_KICKOFF_PROMPT`, or
+   are layout props). On the MCP path it shows the token once (or, for a reused connection,
+   its name and prefix with `YOUR_TOKEN` kept in the snippets), the client config for the
+   chosen client — the client tabs and the Live site / Localhost toggle mark the active choice
+   with the `default` (primary) button variant, because `secondary` is Slate 100 in the CMS
+   theme and invisible on the white card — and the exact kickoff prompt to paste
+   (`SITE_BUILDER_KICKOFF_PROMPT`, or
    `SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF` once a brief is saved, both in
    `lib/cortex-ai/site-builder-prompt.ts`, the same constants the chat sends). With no path
    chosen it offers both again and a "Finish" button.
@@ -225,6 +235,16 @@ Routing rules (`deriveCortexSetupState`, `lib/cortex-ai/setup-state.ts`):
   against the wizard's own `window.location.assign` (which may be the plain dashboard for
   "Not now"). Every reader of these settings is dynamic, and the wizard always leaves with a
   full navigation, so nothing needs revalidating.
+- The re-render hazard is wider than revalidation: any server action that writes a cookie
+  (the Supabase session refresh does, from whichever action happens to run once the access
+  token has aged) also makes the router re-fetch the current route. So the pages hosting the
+  wizard must map every mid-wizard state to the wizard. `/cms/welcome` decides through
+  `resolveCortexWelcomeDestination` (`setup-state.ts`): site builder when
+  `readyForSiteBuilder`, dashboard only once `cortex_setup.completed` is true, the wizard
+  otherwise; the setup route only redirects on `?intent=site-builder` + ready. The earlier
+  rule sent "MCP on, wizard unfinished" — the state right after step 1 on the MCP path — to
+  the dashboard, which is how saving the brief could land an operator on the dashboard
+  instead of the Build step on a first run.
 - The CMS layout computes `hasCortexModelKey` and `hasCortexSiteBrief` for admins in one
   query (`getCortexChatStatus`, `lib/cortex-ai/site-brief-status.ts`) and passes them to
   `CortexGlobalAgentChat` as `hasModelKey` / `hasSiteBrief`; with a brief the chat's
@@ -267,11 +287,12 @@ be a step inside that wizard; this is the next page.
   and `intent="site-builder"` once the package is active and the wizard is still owed, so
   the chips read Cortex AI ✓ → Connect → Photos → Brief → Build. Its skip link goes to the
   dashboard.
-- **Redirects, so nobody is trapped:** sandbox and non-admins → dashboard; package active
-  and `readyForSiteBuilder` (env key, or stored key with the wizard finished) →
-  `/cms/dashboard?cortex=site-builder`; a stored key with the wizard unfinished → the wizard
-  (key already connected); package active but MCP-only or wizard already finished →
-  dashboard. Nothing in the proxy or layout forces the route; it
+- **Redirects, so nobody is trapped** (`resolveCortexWelcomeDestination`): sandbox and
+  non-admins → dashboard; package active and `readyForSiteBuilder` (env key, or stored key
+  with the wizard finished) → `/cms/dashboard?cortex=site-builder`; wizard finished or
+  skipped without a model key → dashboard; everything else (nothing configured, or a stored
+  key or an enabled MCP server with the wizard unfinished) → the wizard, with the key or the
+  connection already marked done. Nothing in the proxy or layout forces the route; it
   is reached only from the post-setup redirect, the dashboard checklist's "Start free
   trial" link (`lib/onboarding/status.ts`, `href: '/cms/welcome'`), and the legacy
   `/cms/dashboard?cortex=site-builder` deep link when Cortex is inactive (the dashboard
@@ -1245,10 +1266,13 @@ Section blocks are the layout primitive for multi-section pages (heroes, landing
    - Completes background intent: a bare `{type:'gradient'}` gets real color stops; a `theme` background without a theme defaults to `muted`; an `image` background without a real `media_id` is downgraded to `none` (the AI cannot invent media).
    - Deep-normalizes and validates each nested column block (also fixes a prior bug where nested blocks were only shallow-validated on CREATE).
    - Tolerates a model that flattens columns into a single list (`[blockA, blockB]`) by treating them as one column.
+   - Normalizes carousel slides the same way: with `slider: true`, each `slides[]` entry (`{ background, column_blocks }`) gets the background defaults and the nested-block normalization and validation, and `slider` is switched off when no slide exists. The Cortex-side mirror schema (`sectionBlockFallbackSchema` in `block-content-schemas.ts`) carries `is_hero`, `slider`, `slides`, `autoplay` and `timeframe` like the app's `SectionBlockSchema`.
 
    Net effect: a model can emit a section with just `column_blocks` plus intent (`is_hero`, an optional `background`) and the server produces a valid, well-styled section.
 
-2. **Design recipe in the global-agent system prompt** (`route.ts`, the `PAGE DESIGN` bullets). Tells the model to compose pages from `section` blocks, supply one column per desired grid track, make the first section a hero, alternate `none`/`theme:'muted'`/`theme:'primary'` backgrounds for rhythm, use discrete heading blocks (not `<h2>` inside text HTML), and prefer gradient/theme backgrounds unless a real `media_id` exists. A single `text` block's `html_content` still accepts fully custom HTML/CSS for bespoke sections.
+2. **Design recipe in the global-agent system prompt** (`route.ts`, the `PAGE DESIGN`, `SLIDERS` and `FEATURE IMAGES` bullets). Tells the model to compose pages from `section` blocks, supply one column per desired grid track, make the first section a hero — `is_hero: true`, the editor's "Hero Section (Prioritized image loading)" checkbox: the background image (and a hero slider's first slide) loads with priority and the content is vertically centred — alternate `none`/`theme:'muted'`/`theme:'primary'` backgrounds for rhythm, use discrete heading blocks (not `<h2>` inside text HTML), and prefer gradient/theme backgrounds unless a real `media_id` exists. `SLIDERS` explains the "Enable Slider (Carousel layout)" checkbox: `slider: true` plus a `slides` array renders a carousel of full sections (each slide its own background and block content), `autoplay: true` and `timeframe` in seconds (default 5) rotate it. It also carries the non-obvious part: only the slides are DRAWN, but the grid track count still comes from the top-level `column_blocks`, because the renderer computes one `gridClass` from `responsive_columns.desktop` and reuses it inside every slide. A model that puts its columns only in `slides` would otherwise get `desktop = 1` from the normalizer and see every slide collapse to a single column, so the prompt tells it to send one top-level column per column it wants per slide (empty ones are fine). Verified by execution during review; the collapse predates this change, but the instruction to build sliders is what made it reachable. The same two sentences sit in `createCmsBlockInputSchema`'s `content` description and in the MCP `build-site` / `build-page` prompts, so an external client learns them too. A single `text` block's `html_content` still accepts fully custom HTML/CSS for bespoke sections.
+
+3. **Feature-image rule** (`FEATURE_IMAGE_DESCRIPTION` in `ai-global-agent-tools.ts` for the three `feature_image_id` fields and `set_content_images`, the `FEATURE IMAGES` bullet in `route.ts`, the MCP prompts and the server's initialize `instructions`). `feature_image_id` is not a thumbnail: on a page it renders as a full-width title banner above the blocks (`app/[slug]/PageClientContent.tsx`: dimmed cover image, page title centred in white), on a post the article hero, and it is the Open Graph image. The model is told to give posts one (very wide, landscape), never the home page or a page that opens with its own hero section, and to set the site-wide share preview with `update_site_identity` `social_image` instead (`site_settings.site_social_image`; the Branding screen edits the same setting, see docs/03 "Feature images and the social preview image"). The site builder's phase 3 says so explicitly for the home page, and `get_site_overview` reports whether a social preview image is set. Before this text existed the builder put a feature image on a client's home page, which stacked a title banner above the hero.
 
 ## External URL Ingestion and Live-Draft Page Rewrites
 
@@ -1958,7 +1982,7 @@ through the dashboard. Rough order for a from-scratch build:
 | Ground yourself | `get_site_overview` (one call: languages, identity, every page/post/product, menus, themes, custom blocks, drafts, the saved brief, seeded-content detection); `get_database_schema` only for raw table work |
 | Remember the client | `save_site_brief` |
 | Approve the plan | `start_site_build` with `summary`, `brief`, and `reset` (one confirmation opens an unattended build session and removes the demo content) |
-| Identity | `update_site_identity` (title, description, keywords, per-language copyright, logo pin, NextBlock footer credit) |
+| Identity | `update_site_identity` (title, description, keywords, per-language copyright, logo pin, NextBlock footer credit, `social_image` share preview) |
 | Brand it | `manage_site_theme`, `update_global_css` |
 | Assets | `search_stock_media`, `upload_media` |
 | Catalogue | `manage_product_category`, `create_cms_product`, `manage_product_variants` |

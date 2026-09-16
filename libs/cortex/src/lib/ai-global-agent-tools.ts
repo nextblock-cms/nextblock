@@ -274,6 +274,19 @@ export const readCurrentCmsItemInputSchema = z.strictObject({
   includeBlocks: z.boolean().default(true),
 });
 
+/**
+ * What `feature_image_id` does, spelled out for the model, because the field name
+ * suggests a harmless thumbnail. On a page it renders as a full-width title banner
+ * ABOVE the page's blocks (PageClientContent: the image as a dimmed cover background,
+ * about 200-300px tall, with the page title centred over it in white); on a post it is
+ * the article's hero image above the header; and it is the social/OG preview image
+ * and the listing-card thumbnail. So a page that opens with its own hero section must
+ * NOT get one, or the banner stacks above the hero and repeats the title — which is
+ * what the site builder did to a client's home page before this text existed.
+ */
+const FEATURE_IMAGE_DESCRIPTION =
+  'The feature image: an existing media library id OR an external https:// image URL, which is downloaded into the media library automatically (pass `mainImage` from fetch_url_content or a `url` from search_stock_photos straight in). WHAT IT DOES: on a page it renders as a full-width title banner ABOVE the page\'s blocks (the image as a dimmed cover background, about 200-300px tall, with the page title centred over it in white); on a post it is the article\'s hero image above the header. It is also the social/OG preview image and the card thumbnail in post listings. RULES: give every post one. Give a page one only when a title banner above its content is wanted; NEVER set one on the home page or on any page that opens with its own hero section (the banner would stack above the hero and repeat the title) — set the site-wide social preview with update_site_identity `social_image` instead. Pick a very wide landscape image (about 3:1, at least 1600px wide): the banner crops it to a short full-width band.';
+
 export const updateCurrentCmsFieldsInputSchema = z.strictObject({
   cmsTarget: cmsTargetOverrideSchema,
   fields: z
@@ -289,9 +302,7 @@ export const updateCurrentCmsFieldsInputSchema = z.strictObject({
     .max(2048)
     .nullable()
     .optional()
-    .describe(
-      'The feature image. Accepts EITHER an existing media library id OR an external https:// image URL, which is downloaded into the media library automatically — so pass `mainImage` from fetch_url_content or a `url` from search_stock_photos straight in. Despite the name, you do not need to import the image yourself. Every page and post should get one: it is the social/OG preview image and the card thumbnail in post listings.'
-    ),
+    .describe(FEATURE_IMAGE_DESCRIPTION),
       label: z.string().max(120).nullable().optional(),
       meta_description: z.string().max(500).nullable().optional(),
       meta_title: z.string().max(160).nullable().optional(),
@@ -341,7 +352,7 @@ const createCmsBlockInputSchema = z.strictObject({
   content: z
     .record(z.string(), z.unknown())
     .describe(
-      'The block content, matching that block type\'s schema. For a `text` block, `html_content` is rendered as real HTML and may include an inline <style> and an inline <script> — so you can add scroll reveals, counters, hover effects, and other motion directly in a block. Inline scripts are stamped with the site CSP nonce automatically. Three rules. (1) THE PAGE IS REACT-HYDRATED. Do not change the text, classes, or attributes of surrounding server-rendered markup: React reconciles afterwards and reverts your change (a counter animates then snaps back) or logs a hydration mismatch. Waiting for `load` is NOT sufficient — hydration can still be in flight. Safe patterns instead: animate with the Web Animations API (el.animate() touches no attribute); append your own new elements and style those; use CSS for anything CSS can do; and if you must set text, render the FINAL value server-side and only animate toward it once the element scrolls into view. (2) `on*` attributes (onclick, onload, …) are stripped, so bind with addEventListener. (3) The script runs once per full page load, not on client-side navigation — for site-wide behaviour use manage_site_script.'
+      'The block content, matching that block type\'s schema. For a `text` block, `html_content` is rendered as real HTML and may include an inline <style> and an inline <script> — so you can add scroll reveals, counters, hover effects, and other motion directly in a block. Inline scripts are stamped with the site CSP nonce automatically. Three rules. (1) THE PAGE IS REACT-HYDRATED. Do not change the text, classes, or attributes of surrounding server-rendered markup: React reconciles afterwards and reverts your change (a counter animates then snaps back) or logs a hydration mismatch. Waiting for `load` is NOT sufficient — hydration can still be in flight. Safe patterns instead: animate with the Web Animations API (el.animate() touches no attribute); append your own new elements and style those; use CSS for anything CSS can do; and if you must set text, render the FINAL value server-side and only animate toward it once the element scrolls into view. (2) `on*` attributes (onclick, onload, …) are stripped, so bind with addEventListener. (3) The script runs once per full page load, not on client-side navigation — for site-wide behaviour use manage_site_script. For a `section` block: `is_hero: true` marks the page hero (the editor checkbox "Hero Section (Prioritized image loading)": its background image loads with priority and its content is vertically centred); `slider: true` with a `slides` array ([{ background, column_blocks }, …], the editor checkbox "Enable Slider (Carousel layout)") renders a carousel of full sections: only the slides are drawn, but the grid track count still comes from the top-level `column_blocks`, so send one top-level column per column you want inside each slide (empty columns are fine) and give every slide that same number of columns. Add `autoplay: true` and `timeframe` in seconds (default 5) to rotate it.'
     ),
   order: z.number().int().min(0).optional(),
 });
@@ -376,9 +387,7 @@ export const createCmsPageInputSchema = z.strictObject({
     .max(2048)
     .nullable()
     .optional()
-    .describe(
-      'The feature image. Accepts EITHER an existing media library id OR an external https:// image URL, which is downloaded into the media library automatically — so pass `mainImage` from fetch_url_content or a `url` from search_stock_photos straight in. Despite the name, you do not need to import the image yourself. Every page and post should get one: it is the social/OG preview image and the card thumbnail in post listings.'
-    ),
+    .describe(FEATURE_IMAGE_DESCRIPTION),
   languageCode: z.string().trim().min(2).max(80).optional(),
   meta_description: z.string().max(500).nullable().optional(),
   meta_title: z.string().max(160).nullable().optional(),
@@ -398,9 +407,7 @@ export const createCmsPostInputSchema = z.strictObject({
     .max(2048)
     .nullable()
     .optional()
-    .describe(
-      'The feature image. Accepts EITHER an existing media library id OR an external https:// image URL, which is downloaded into the media library automatically — so pass `mainImage` from fetch_url_content or a `url` from search_stock_photos straight in. Despite the name, you do not need to import the image yourself. Every page and post should get one: it is the social/OG preview image and the card thumbnail in post listings.'
-    ),
+    .describe(FEATURE_IMAGE_DESCRIPTION),
   label: z.string().max(120).nullable().optional(),
   languageCode: z.string().trim().min(2).max(80).optional(),
   meta_description: z.string().max(500).nullable().optional(),
@@ -2776,6 +2783,36 @@ function normalizeSectionContent(
       isHero ? 'center' : 'start'
     ),
   };
+
+  // A carousel's slides are section bodies of their own: normalize each one the same
+  // way (background defaults, nested block normalization and validation), or a slider
+  // would carry the only unvalidated nested blocks on the page.
+  if (Array.isArray(rawContent.slides)) {
+    normalized.slides = rawContent.slides
+      .filter((slide): slide is Record<string, unknown> => isPlainJsonRecord(slide))
+      .map((slide, slideIndex) => {
+        let slideColumns = Array.isArray(slide.column_blocks) ? slide.column_blocks : [];
+
+        if (slideColumns.length > 0 && slideColumns.every((column) => isPlainJsonRecord(column) && !Array.isArray(column))) {
+          slideColumns = [slideColumns];
+        }
+
+        return {
+          background: normalizeSectionBackground(slide.background),
+          column_blocks: slideColumns.map((column, columnIndex) => {
+            const blocks = Array.isArray(column) ? column : [];
+
+            return blocks.map((nested, blockIndex) =>
+              normalizeNestedColumnBlock(
+                nested,
+                `${label} slide ${slideIndex} column ${columnIndex} block ${blockIndex}`,
+                context
+              )
+            );
+          }),
+        };
+      });
+  }
 
   // Avoid an empty carousel render: only keep slider mode if real slides exist.
   if (normalized.slider === true && !(Array.isArray(normalized.slides) && normalized.slides.length > 0)) {
@@ -8079,7 +8116,7 @@ export function createCortexGlobalAgentTools(context?: ToolExecutionContext) {
     }),
     set_content_images: tool({
       description:
-        "Set the feature image for a page or post, or the image gallery for a product. Pass `images`: a list of image URLs (e.g. `mainImage` from fetch_url_content or `url` values from search_stock_photos) and/or existing media library IDs. External URLs are imported into the media library automatically — NEVER put an image URL directly into feature_image_id. The FIRST image becomes the feature image (pages/posts) or the main product image (products); for a product the remaining images become its gallery in order (this REPLACES the product's current images). Targets the currently open page/post/product by default; to target any other item (for example a product you just created from the dashboard) pass contentType plus slug, entityId, or title — no open editor needed. Mutating: first returns a confirmation phrase; only applies after exact confirmation.",
+        "Set the feature image for a page or post, or the image gallery for a product. Pass `images`: a list of image URLs (e.g. `mainImage` from fetch_url_content or `url` values from search_stock_photos) and/or existing media library IDs. External URLs are imported into the media library automatically — NEVER put an image URL directly into feature_image_id. The FIRST image becomes the feature image (pages/posts) or the main product image (products); for a product the remaining images become its gallery in order (this REPLACES the product's current images). On a PAGE the feature image renders as a full-width title banner above the blocks, so never set one on the home page or on a page that opens with its own hero section — use update_site_identity `social_image` for that page's share preview instead; posts should always have one. Targets the currently open page/post/product by default; to target any other item (for example a product you just created from the dashboard) pass contentType plus slug, entityId, or title — no open editor needed. Mutating: first returns a confirmation phrase; only applies after exact confirmation.",
       execute: (input) => executeSetContentImages(input, context),
       inputSchema: setContentImagesInputSchema,
       strict: true,

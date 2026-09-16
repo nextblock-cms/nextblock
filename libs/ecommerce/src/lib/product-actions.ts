@@ -457,7 +457,8 @@ export async function getProductBySlug(
           file_name,
           blur_data_url,
           width,
-          height
+          height,
+          variants
         )
       ),
       product_variants (

@@ -484,8 +484,16 @@ async function loadLayoutData() {
 }
 
 export async function generateMetadata(): Promise<Metadata> {
-  const { siteTitle, siteDescription, siteKeywords } = await getSiteSettings();
+  const { siteTitle, siteDescription, siteKeywords, socialImage } = await getSiteSettings();
   const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+  // The site-wide preview image from the Branding screen, else NextBlock's own banner.
+  const defaultSocialImage = socialImage
+    ? {
+        url: socialImage.url,
+        ...(socialImage.width && socialImage.height ? { width: socialImage.width, height: socialImage.height } : {}),
+        alt: socialImage.alt?.trim() || siteTitle,
+      }
+    : { url: DEFAULT_OG_IMAGE, width: DEFAULT_OG_IMAGE_WIDTH, height: DEFAULT_OG_IMAGE_HEIGHT, alt: siteTitle };
 
   return {
     metadataBase: new URL(defaultUrl),
@@ -501,14 +509,7 @@ export async function generateMetadata(): Promise<Metadata> {
       description: siteDescription,
       url: defaultUrl,
       siteName: siteTitle,
-      images: [
-        {
-          url: DEFAULT_OG_IMAGE,
-          width: DEFAULT_OG_IMAGE_WIDTH,
-          height: DEFAULT_OG_IMAGE_HEIGHT,
-          alt: siteTitle,
-        },
-      ],
+      images: [defaultSocialImage],
       locale: 'en_US',
       type: 'website',
     },
@@ -516,7 +517,7 @@ export async function generateMetadata(): Promise<Metadata> {
       card: 'summary_large_image',
       title: siteTitle,
       description: siteDescription,
-      images: [DEFAULT_OG_IMAGE],
+      images: [defaultSocialImage.url],
     },
     icons: {
       icon: [

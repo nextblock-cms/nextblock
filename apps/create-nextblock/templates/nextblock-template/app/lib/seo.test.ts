@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCanonicalUrl,
+  buildSocialMetadata,
+  DEFAULT_OG_IMAGE,
+  DEFAULT_OG_IMAGE_HEIGHT,
+  DEFAULT_OG_IMAGE_WIDTH,
   extractIntroExcerptFromBlocks,
   resolveMetaTitle,
   resolvePageMetaDescription,
@@ -84,5 +88,47 @@ describe("buildCanonicalUrl", () => {
   it("returns a relative fallback when the site URL is unset (resolved by metadataBase)", () => {
     expect(buildCanonicalUrl(null, "", "/about")).toBe("/about");
     expect(buildCanonicalUrl("/override", "", "/about")).toBe("/override");
+  });
+});
+
+describe("buildSocialMetadata", () => {
+  const base = { title: "Home", description: "Desc", url: "https://acme.test/", siteTitle: "Acme" };
+  const imagesOf = (meta: ReturnType<typeof buildSocialMetadata>) => ({
+    og: (meta.openGraph as { images?: unknown } | undefined)?.images,
+    twitter: (meta.twitter as { images?: unknown } | undefined)?.images,
+  });
+
+  it("uses the page's own feature image first", () => {
+    const meta = buildSocialMetadata({
+      ...base,
+      fallbackImage: { url: "https://cdn.test/share.jpg" },
+      imageUrl: "https://cdn.test/feature.jpg",
+    });
+
+    expect(imagesOf(meta)).toEqual({
+      og: [{ url: "https://cdn.test/feature.jpg", alt: "Home | Acme" }],
+      twitter: ["https://cdn.test/feature.jpg"],
+    });
+  });
+
+  it("falls back to the site-wide social image, with its dimensions and alt text", () => {
+    const meta = buildSocialMetadata({
+      ...base,
+      fallbackImage: { alt: "Acme storefront", height: 630, url: "https://cdn.test/share.jpg", width: 1200 },
+      imageUrl: null,
+    });
+
+    expect(imagesOf(meta)).toEqual({
+      og: [{ url: "https://cdn.test/share.jpg", width: 1200, height: 630, alt: "Acme storefront" }],
+      twitter: ["https://cdn.test/share.jpg"],
+    });
+  });
+
+  it("uses the bundled banner, declared at its real size, when nothing is configured", () => {
+    const meta = buildSocialMetadata({ ...base, fallbackImage: null, imageUrl: null });
+
+    expect(imagesOf(meta).og).toEqual([
+      { url: DEFAULT_OG_IMAGE, width: DEFAULT_OG_IMAGE_WIDTH, height: DEFAULT_OG_IMAGE_HEIGHT, alt: "Home | Acme" },
+    ]);
   });
 });

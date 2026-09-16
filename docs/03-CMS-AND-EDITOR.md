@@ -50,6 +50,40 @@ supports multi-column compositions instead of only flat block lists. Legacy
 migration `libs/db/src/supabase/migrations/02004_baseline_seed.sql` (originally `00000000000021_migrate_hero_blocks_to_sections`, folded in by the generation-2 squash), so `hero` is no
 longer a standalone registered block type.
 
+#### Section layout flags
+
+Two checkboxes in the section editor's layout panel
+(`app/cms/blocks/components/SectionConfigPanel.tsx`) change how a section renders,
+and both are plain booleans on its `content`:
+
+- **Hero Section (Prioritized image loading)** — `is_hero: true`. The section's
+  background image (and the first slide of a hero carousel) renders with
+  `priority`, so it is not lazy-loaded below the fold, and Cortex's section
+  normalizer defaults a hero's `vertical_alignment` to `center`. Set it on the
+  section that opens a page; it is a loading hint, not a style switch.
+- **Enable Slider (Carousel layout)** — `slider: true`, with a `slides` array of
+  `{ background, column_blocks }` entries. `SectionBlockRenderer` then renders
+  `SectionSlider` over those slides and IGNORES the section's own top-level
+  `column_blocks` and `background`; `autoplay` plus `timeframe` (seconds,
+  default 5) rotate it. A `slider: true` with no slides falls back to the normal
+  single layout (the normalizer clears the flag rather than rendering an empty
+  carousel).
+
+  One trap worth knowing, because it bites anything that writes a slider
+  programmatically: the grid track count stays a SECTION-level setting. The
+  renderer computes one `gridClass` from `content.responsive_columns.desktop` and
+  applies it inside every slide, and the editor resizes each slide's
+  `column_blocks` to that same number (`SectionBlockEditor`). Cortex's normalizer
+  derives `desktop` from the top-level `column_blocks`, which a slider usually
+  leaves empty — so a section whose columns live only in `slides` renders every
+  slide as a single column. The agent prompts therefore tell the model to send one
+  top-level column per column it wants inside each slide, even though only the
+  slides are drawn.
+
+Both flags are in `SectionBlockSchema` (`lib/blocks/blockRegistry.ts`) and
+mirrored in Cortex's `sectionBlockFallbackSchema`, so the agent can set them
+too — see docs/08 "Section Design Intelligence".
+
 ### How the CMS uses the registry
 
 The CMS block editor components under `app/cms/blocks` use the registry to:
@@ -159,6 +193,73 @@ The editor integrates with a pluggable image picker bridge:
 
 This keeps the editor package reusable while still supporting CMS media
 selection.
+
+## Feature images and the social preview image
+
+Two different images decide what a page shows at the top and what a shared link
+shows, and confusing them produces a duplicated title banner on a home page.
+
+**`pages.feature_image_id` / `posts.feature_image_id`** is a media row, picked
+with `FeatureImageField` in the page/post form. It is not a hidden thumbnail:
+
+- On a **page**, `app/[slug]/PageClientContent.tsx` renders it as a full-width
+  banner ABOVE the page's blocks — the image dimmed as a cover background, about
+  200–300px tall, with the page title centred over it in white. Pick a very wide
+  landscape image, because the banner crops it to a short band. A page that
+  already opens with its own hero section should have NO feature image, or the
+  banner stacks above the hero and repeats the title. The home page in
+  particular should not have one.
+- On a **post**, `PostClientContent.tsx` renders it as the article's hero image
+  above the header, and the post listing uses it as the card thumbnail. Posts
+  should have one.
+- Either way it is also that page's Open Graph / Twitter preview image, served as
+  the original upload rather than the AVIF the page renders. See below.
+
+**`site_settings.site_social_image`** is the site-wide share preview, edited on
+`/cms/settings/logos` (Branding → Site identity & SEO → "Social preview image",
+a media picker with a 1200×630 preview frame) and by Cortex's
+`update_site_identity` `social_image` argument. It is used for any page, post or
+product that has NO feature image of its own, and for the root layout's default
+metadata. Without it, link previews fall back to NextBlock's bundled banner
+(`DEFAULT_OG_IMAGE`), which is never what a client site wants.
+
+The value is JSONB in the shape `parseSiteSocialImageSetting`
+(`libs/utils/src/lib/seo/social-image.ts`) validates: a media pick stores
+`media_id` + `object_key` + size (resolved to a URL at read time, so the media
+host can change; the key is the ORIGINAL upload, see below), while Cortex may
+store a hotlinked `url` instead. It is read
+by `getSiteSettings` (`app/lib/site-settings.ts`, cached, tag
+`public-site-settings`) and handed to `buildSocialMetadata` as `fallbackImage`.
+So the resolution order for every public page is: the page's own feature image →
+the site social preview image → the bundled NextBlock banner.
+
+### Link previews use the original upload, not the AVIF
+
+`app/api/process-image/route.ts` converts every upload to AVIF
+(`TARGET_FORMAT = 'avif'`) and `app/api/media/record/route.ts` makes that derivative
+the row's `object_key`. That is what the site renders, and it should be: AVIF is far
+smaller and every browser NextBlock targets decodes it. The untouched file is kept
+alongside it in `media.variants` under the label `original_uploaded`.
+
+Social link-preview crawlers are not browsers. Facebook, LinkedIn, X and most chat
+apps fetch `og:image` without AVIF support, so an AVIF preview shows nothing at all.
+So every image that exists to be crawled resolves through
+`pickOriginalUploadObjectKey` (`@nextblock-cms/utils/media-variants`, re-exported
+app-side as `lib/media/original-upload.ts`) instead of `object_key`:
+
+- pages and posts expose `feature_image_social_url` beside `feature_image_url`, and
+  only `generateMetadata` reads it; the rendered banner and hero keep the AVIF,
+- the product page resolves its `og:image` the same way, while the storefront
+  gallery keeps the AVIF,
+- the Branding picker and Cortex's `social_image` both STORE the original's key and
+  its own width and height, since that value has no other consumer.
+
+Post listing cards are deliberately left alone: they render in a browser, where AVIF
+is the right choice. Rows that kept no original variant, such as the seeded demo
+media, fall back to `object_key`, so a caller never ends up with no image. The same
+selection has always backed transactional email, where Outlook cannot decode AVIF
+either; `lib/email/branding-format.ts` now delegates to the shared helper rather
+than keeping its own copy.
 
 ## Commerce-Aware Blocks
 

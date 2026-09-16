@@ -4,6 +4,7 @@ import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
 import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
 
+import { resolveCortexWelcomeDestination } from '../../../lib/cortex-ai/setup-state';
 import { getCortexSetupStatus } from '../../../lib/cortex-ai/setup-status';
 import { requireAdminSupabaseClient } from '../settings/cortex-ai/require-admin';
 import { CortexSetupWizard } from '../settings/cortex-ai/setup/CortexSetupWizard';
@@ -47,35 +48,27 @@ export default async function CmsWelcomePage() {
 
   const status = await getCortexSetupStatus();
 
-  // Where an active Cortex lands. This page re-runs on the server every time a server
-  // action revalidates a path while it is the current route (the Next client router
-  // re-fetches the current route after such an action), so the decision must be
-  // stable across the wizard's own saves: storing the OpenRouter key on step 1 flips
-  // `hasModelKey` but must NOT change where this page sends the operator.
-  //
-  //   key source            wizard finished/skipped   MCP on   ->  destination
-  //   (a) none              yes                       yes          dashboard          (!needsSetup, !ready)
-  //   (b) stored            no                        any          wizard             (!ready, wizard shows the key + model picker)
-  //   (c) env               any                       any          site builder       (ready: self-host, no wizard needed)
-  //   (d) stored            yes                       any          site builder       (ready)
-  //   (e) none              no                        no           wizard             (needsSetup)
-  //   (f) none              yes                       no           dashboard          (skipped with "later": nothing left to ask)
-  //   (g) none              no                        yes          dashboard          (!needsSetup: MCP-only install, chat has no key)
-  //
-  // Only (c) and (d) open the chat; (b) is the mid-wizard state the old `hasModelKey`
-  // check got wrong. `readyForSiteBuilder` encodes (b)–(d); `needsSetup` separates (e)
-  // from (a)/(f)/(g).
-  if (status.readyForSiteBuilder) {
+  // Where an active Cortex lands. This page re-runs on the server every time the
+  // client router re-fetches the current route while the wizard is mounted on it:
+  // after a server action that revalidates a path (none of the wizard's do), but ALSO
+  // after any server action that writes a cookie, which the Supabase session refresh
+  // does from inside whichever action happens to run once the access token has aged.
+  // So the decision must be stable across the wizard's own saves: storing the
+  // OpenRouter key on step 1, or switching the MCP server on, must NOT change where
+  // this page sends the operator. `resolveCortexWelcomeDestination` holds the table;
+  // in short, only a finished or skipped wizard leaves this route.
+  const destination = resolveCortexWelcomeDestination(status);
+
+  if (destination === 'site-builder') {
     redirect('/cms/dashboard?cortex=site-builder');
   }
 
-  if (!status.needsSetup && !status.hasStoredOpenRouterKey) {
-    // (a), (f), (g): MCP configured or the wizard already finished/skipped, and no key
-    // waiting for the rest of the wizard: nothing left to ask.
+  if (destination === 'dashboard') {
+    // Finished or skipped without a model key (an MCP-only install): nothing left to ask.
     redirect('/cms/dashboard');
   }
 
-  // (b) and (e): render the wizard.
+  // Every other state is the wizard, at whatever step the operator is on.
 
   const props = await loadCortexSetupWizardProps(status);
 

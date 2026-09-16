@@ -260,6 +260,18 @@ export function toOpenGraphLocale(languageCode?: string | null): string {
   return map[code] ?? 'en_US';
 }
 
+/**
+ * The site-wide social preview image an operator picked on the Branding screen (or
+ * Cortex set through `update_site_identity`), already resolved to a URL by
+ * `getSiteSettings`. Null when none is configured.
+ */
+export interface SocialFallbackImage {
+  url: string;
+  width?: number | null;
+  height?: number | null;
+  alt?: string | null;
+}
+
 export interface SocialMetadataInput {
   /** Bare page title (without the site-title suffix). */
   title: string;
@@ -267,8 +279,10 @@ export interface SocialMetadataInput {
   /** Canonical URL of the page (absolute, or path resolved via metadataBase). */
   url: string;
   siteTitle: string;
-  /** Resolved feature-image URL; falls back to the default OG image when empty. */
+  /** Resolved feature-image URL; falls back to `fallbackImage`, then the bundled default. */
   imageUrl?: string | null;
+  /** The site-wide social preview image, used when the page has no feature image. */
+  fallbackImage?: SocialFallbackImage | null;
   type?: 'website' | 'article';
   publishedTime?: string | null;
   locale?: string | null;
@@ -276,18 +290,26 @@ export interface SocialMetadataInput {
 
 /**
  * Builds the `openGraph` + `twitter` metadata for a public page so that every
- * page emits a complete, suffixed social title and always has an OG image
- * (the feature image when present, otherwise the bundled default).
+ * page emits a complete, suffixed social title and always has an OG image: the
+ * feature image when present, else the site-wide social preview image from the
+ * Branding screen, else the bundled NextBlock banner.
  */
 export function buildSocialMetadata(
   input: SocialMetadataInput
 ): Pick<Metadata, 'openGraph' | 'twitter'> {
-  const usingDefaultImage = !input.imageUrl;
-  const imageUrl = input.imageUrl || DEFAULT_OG_IMAGE;
   const socialTitle = composeTitleWithSite(input.title, input.siteTitle);
-  const image = usingDefaultImage
-    ? { url: imageUrl, width: 1200, height: 630, alt: socialTitle }
-    : { url: imageUrl, alt: socialTitle };
+  const fallback = input.fallbackImage?.url ? input.fallbackImage : null;
+  const imageUrl = input.imageUrl || fallback?.url || DEFAULT_OG_IMAGE;
+  const image = input.imageUrl
+    ? { url: imageUrl, alt: socialTitle }
+    : fallback
+      ? {
+          url: imageUrl,
+          ...(fallback.width && fallback.height ? { width: fallback.width, height: fallback.height } : {}),
+          alt: fallback.alt?.trim() || socialTitle,
+        }
+      : // The bundled banner is declared at its real size (see DEFAULT_OG_IMAGE_WIDTH).
+        { url: imageUrl, width: DEFAULT_OG_IMAGE_WIDTH, height: DEFAULT_OG_IMAGE_HEIGHT, alt: socialTitle };
 
   const openGraphBase = {
     title: socialTitle,

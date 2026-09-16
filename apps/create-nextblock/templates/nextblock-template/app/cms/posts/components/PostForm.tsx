@@ -599,6 +599,12 @@ export default function PostForm({
       )}
 
       <FeatureImageField
+        description={
+          <>
+            The article&rsquo;s hero image, the thumbnail in post listings, and the link preview image.
+            Every post should have one; a wide landscape image works best.
+          </>
+        }
         initialImageId={initialFeatureImageId || post?.feature_image_id || null}
         initialImageUrl={initialFeatureImageUrl || null}
         onImageIdChange={handleFeatureImageChange}

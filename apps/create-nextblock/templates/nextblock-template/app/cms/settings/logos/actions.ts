@@ -2,6 +2,7 @@
 
 import { createClient } from '@nextblock-cms/db/server'
 import { INVOICE_SETTINGS_KEY, serializeInvoiceSettings, type InvoiceSettings } from '@nextblock-cms/ecommerce'
+import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo'
 import { revalidatePath, updateTag } from 'next/cache'
 import { redirect } from 'next/navigation'
 import type { Logo } from './types'
@@ -152,10 +153,25 @@ export async function saveInvoiceSettings(payload: InvoiceSettings) {
   return { success: true }
 }
 
+/**
+ * The site-wide social preview image as the Branding form handles it: a media
+ * library pick (`mediaId` + `objectKey`) or, when Cortex stored a hotlinked photo,
+ * a bare `url`. Null means "use NextBlock's bundled banner".
+ */
+export interface SiteSocialImageSelection {
+  mediaId: string | null
+  objectKey: string | null
+  url: string | null
+  width: number | null
+  height: number | null
+  alt: string | null
+}
+
 export interface SiteSeoSettings {
   siteTitle: string
   siteDescription: string
   siteKeywords: string
+  socialImage: SiteSocialImageSelection | null
 }
 
 export async function getSiteSeoSettings(): Promise<SiteSeoSettings> {
@@ -163,31 +179,63 @@ export async function getSiteSeoSettings(): Promise<SiteSeoSettings> {
   const { data, error } = await supabase
     .from('site_settings')
     .select('key, value')
-    .in('key', ['site_title', 'site_description', 'site_keywords'])
+    .in('key', ['site_title', 'site_description', 'site_keywords', SITE_SOCIAL_IMAGE_SETTING_KEY])
 
   const settings: Record<string, string> = {}
+  let socialImageValue: unknown = null
   if (!error && data) {
     data.forEach((item) => {
-      if (typeof item.value === 'string') {
+      if (item.key === SITE_SOCIAL_IMAGE_SETTING_KEY) {
+        socialImageValue = item.value
+      } else if (typeof item.value === 'string') {
         settings[item.key] = item.value
       }
     })
   }
 
+  const socialImage = parseSiteSocialImageSetting(socialImageValue)
+
   return {
     siteTitle: settings.site_title ?? '',
     siteDescription: settings.site_description ?? '',
     siteKeywords: settings.site_keywords ?? '',
+    socialImage: socialImage
+      ? {
+          alt: socialImage.alt,
+          height: socialImage.height,
+          mediaId: socialImage.media_id,
+          objectKey: socialImage.object_key,
+          url: socialImage.url,
+          width: socialImage.width,
+        }
+      : null,
   }
 }
 
 export async function saveSiteSeoSettings(payload: SiteSeoSettings) {
   const supabase = createClient()
+  const socialImage = payload.socialImage
 
   const { error } = await supabase.from('site_settings').upsert([
     { key: 'site_title', value: payload.siteTitle.trim() },
     { key: 'site_description', value: payload.siteDescription.trim() },
     { key: 'site_keywords', value: payload.siteKeywords.trim() },
+    // Same shape Cortex's update_site_identity writes and getSiteSettings reads
+    // (parseSiteSocialImageSetting); null clears the image.
+    {
+      key: SITE_SOCIAL_IMAGE_SETTING_KEY,
+      value:
+        socialImage && (socialImage.objectKey || socialImage.url)
+          ? {
+              alt: socialImage.alt,
+              height: socialImage.height,
+              media_id: socialImage.mediaId,
+              object_key: socialImage.objectKey,
+              url: socialImage.url,
+              width: socialImage.width,
+            }
+          : null,
+    },
   ])
 
   if (error) {

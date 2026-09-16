@@ -15,3 +15,4 @@ export * from './lib/nextblock-packages';
 export * from './lib/color';
 export * from './lib/publishing';
 export * from './lib/seo';
+export * from './lib/media-variants';

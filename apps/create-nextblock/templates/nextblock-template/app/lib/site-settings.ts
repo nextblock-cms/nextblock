@@ -8,10 +8,13 @@ import {
   resolveSupabaseServiceKey,
   resolveSupabaseUrl,
 } from '../../lib/setup/env-status';
+import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo';
+import { resolveMediaUrl } from '../../lib/media/resolveMediaUrl';
 import {
   DEFAULT_SITE_TITLE,
   DEFAULT_SITE_DESCRIPTION,
   DEFAULT_SITE_KEYWORDS,
+  type SocialFallbackImage,
 } from './seo';
 
 export const SITE_SETTINGS_CACHE_TAG = 'public-site-settings';
@@ -21,6 +24,12 @@ export interface SiteSettings {
   siteTitle: string;
   siteDescription: string;
   siteKeywords: string;
+  /**
+   * The site-wide Open Graph / Twitter preview image from the Branding screen
+   * (`site_settings.site_social_image`), resolved to a URL. Null means "none set":
+   * `buildSocialMetadata` then falls back to the bundled NextBlock banner.
+   */
+  socialImage: SocialFallbackImage | null;
 }
 
 /**
@@ -61,6 +70,7 @@ export const getSiteSettings = cache(unstable_cache(
       siteTitle: DEFAULT_SITE_TITLE,
       siteDescription: DEFAULT_SITE_DESCRIPTION,
       siteKeywords: DEFAULT_SITE_KEYWORDS,
+      socialImage: null,
     };
 
     // Unconfigured instance (pre-/setup): the static client would point at the dummy
@@ -75,7 +85,7 @@ export const getSiteSettings = cache(unstable_cache(
       const { data, error } = await supabase
         .from('site_settings')
         .select('key, value')
-        .in('key', ['site_title', 'site_description', 'site_keywords']);
+        .in('key', ['site_title', 'site_description', 'site_keywords', SITE_SOCIAL_IMAGE_SETTING_KEY]);
 
       if (error || !data) {
         // PGRST205 = table not found: the schema isn't migrated yet (e.g. mid-setup,
@@ -88,16 +98,29 @@ export const getSiteSettings = cache(unstable_cache(
       }
 
       const settings: Record<string, string> = {};
+      let socialImageValue: unknown = null;
       data.forEach((item) => {
-        if (typeof item.value === 'string') {
+        if (item.key === SITE_SOCIAL_IMAGE_SETTING_KEY) {
+          socialImageValue = item.value;
+        } else if (typeof item.value === 'string') {
           settings[item.key] = item.value;
         }
       });
+
+      // A media-library pick is stored as its object key (resolved here, so the
+      // media host can change without rewriting the setting); a Cortex-set URL is
+      // used verbatim.
+      const socialImage = parseSiteSocialImageSetting(socialImageValue);
+      const socialImageUrl = socialImage ? socialImage.url ?? resolveMediaUrl(socialImage.object_key) : null;
 
       return {
         siteTitle: settings.site_title?.trim() || fallback.siteTitle,
         siteDescription: settings.site_description?.trim() || fallback.siteDescription,
         siteKeywords: settings.site_keywords?.trim() || fallback.siteKeywords,
+        socialImage:
+          socialImage && socialImageUrl
+            ? { alt: socialImage.alt, height: socialImage.height, url: socialImageUrl, width: socialImage.width }
+            : null,
       };
     } catch (caught) {
       console.error('Unexpected error fetching site settings:', caught);

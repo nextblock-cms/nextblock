@@ -1,4 +1,6 @@
 import { tool } from 'ai';
+import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo';
+import { findOriginalUploadVariant, pickOriginalUploadObjectKey } from '@nextblock-cms/utils/media-variants';
 
 import { requireActorRole } from './ai-global-agent-theming-tools';
 import {
@@ -95,6 +97,7 @@ const IDENTITY_SETTING_KEYS = [
   'site_description',
   'site_keywords',
   'site_title',
+  SITE_SOCIAL_IMAGE_SETTING_KEY,
 ] as const;
 
 /* -------------------------------------------------------------------------- */
@@ -506,6 +509,12 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
   const activeLogoMedia = activeLogo ? media.find((row) => row.id === activeLogo.media_id) ?? null : null;
   const activeLogoObjectKey = activeLogoMedia ? String(activeLogoMedia.object_key) : null;
 
+  // The site-wide share preview (Branding screen, or update_site_identity social_image).
+  const storedSocialImage = parseSiteSocialImageSetting(settings.get(SITE_SOCIAL_IMAGE_SETTING_KEY));
+  const socialImage = storedSocialImage
+    ? { mediaId: storedSocialImage.media_id, objectKey: storedSocialImage.object_key, url: storedSocialImage.url }
+    : null;
+
   const pages = ((pagesResult.data ?? []) as any[]).map((row) => ({
     blockCount: blockCounts.get(`page:${row.id}`) ?? 0,
     id: Number(row.id),
@@ -604,6 +613,7 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
       siteDescription: typeof settings.get('site_description') === 'string' ? settings.get('site_description') : '',
       siteKeywords: typeof settings.get('site_keywords') === 'string' ? settings.get('site_keywords') : '',
       siteTitle,
+      socialImage,
     },
     languages: languages.map((row) => ({
       code: String(row.code),
@@ -697,6 +707,11 @@ export function formatCortexSiteOverviewForPrompt(overview: CortexSiteOverview):
     ? `logo "${identity.activeLogo.name || identity.activeLogo.id}"${identity.activeLogo.isSeeded ? ' (NextBlock demo logo)' : ''}`
     : 'no logo';
   lines.push(`Site title: ${identity.siteTitle ? `"${identity.siteTitle}"` : 'not set'}; ${logo}.`);
+  lines.push(
+    identity.socialImage
+      ? 'Social preview image: set.'
+      : 'Social preview image: not set (link previews show the NextBlock banner; set one with update_site_identity social_image).'
+  );
 
   if (overview.themes.length > 0) {
     lines.push(
@@ -757,6 +772,16 @@ export const updateSiteIdentityInputSchema = z
     site_description: z.string().trim().max(500).optional().describe('Default meta description and header tagline.'),
     site_keywords: z.string().trim().max(500).optional().describe('Comma-separated SEO keywords.'),
     site_title: z.string().trim().min(1).max(160).optional().describe('The brand name shown in the header and <title>.'),
+    social_image: z
+      .string()
+      .trim()
+      .min(1)
+      .max(2048)
+      .nullable()
+      .optional()
+      .describe(
+        'The site-wide social preview image (Open Graph / Twitter card) for every page, post or product without a feature image of its own — the home page above all, which must NOT get a feature image (on a page that renders a full-width title banner above the hero). A media library id (from list_media or upload_media) or an https image URL, hotlinked as-is (a search_stock_photos `url` works). Use a wide landscape image, ideally 1200×630. Null clears it and the NextBlock banner is used.'
+      ),
   })
   .refine((value) => Object.values(value).some((entry) => entry !== undefined), {
     message: 'Provide at least one identity field to update.',
@@ -785,7 +810,20 @@ export async function executeUpdateSiteIdentity(input: UpdateSiteIdentityInput, 
     return confirmation;
   }
 
+  // Resolve every value BEFORE the first write. `social_image` is the only argument
+  // that can still be rejected at execution time (an id no media row has), and the
+  // writes below are separate upserts with no transaction around them — resolving
+  // inside the loop would leave the earlier settings committed when it throws.
+  const resolved: Array<[string, unknown]> = [];
   for (const [key, value] of updates) {
+    resolved.push(
+      key === 'social_image'
+        ? [SITE_SOCIAL_IMAGE_SETTING_KEY, await resolveSocialImageSetting(supabase, value as string | null)]
+        : [key, value]
+    );
+  }
+
+  for (const [key, value] of resolved) {
     await upsertSetting(supabase, key, value);
   }
 
@@ -794,7 +832,65 @@ export async function executeUpdateSiteIdentity(input: UpdateSiteIdentityInput, 
   return {
     mutationExecuted: true,
     success: true,
-    updatedKeys: updates.map(([key]) => key),
+    updatedKeys: resolved.map(([key]) => key),
+  };
+}
+
+const MEDIA_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Turn the `social_image` argument into the stored `site_social_image` value (the
+ * shape `parseSiteSocialImageSetting` reads): a media library row, whose object key
+ * and size are copied so the public site never joins `media` for metadata, or a
+ * hotlinked https URL. Nothing is imported — stock photos stay hotlinked here exactly
+ * as they do in image blocks.
+ */
+async function resolveSocialImageSetting(supabase: SupabaseLike, value: string | null) {
+  if (value === null) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return { alt: null, height: null, media_id: null, object_key: null, url: trimmed, width: null };
+  }
+
+  if (!MEDIA_ID_RE.test(trimmed)) {
+    throw new Error(`"${trimmed}" is not a usable social image — provide an https:// image URL or a media library id.`);
+  }
+
+  const { data, error } = await supabase
+    .from('media')
+    .select('id, object_key, file_path, width, height, description, variants')
+    .eq('id', trimmed)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Could not read media ${trimmed}: ${serializeError(error)}`);
+  }
+
+  if (!data) {
+    throw new Error(`No media library item has the id ${trimmed}. Call list_media to find one, or upload_media to import an image first.`);
+  }
+
+  // The UNTOUCHED upload, not the row's AVIF derivative: this value is only ever
+  // fetched by social crawlers, which do not decode AVIF. Same choice the Branding
+  // screen makes, so both writers store the same shape.
+  const original = findOriginalUploadVariant(data);
+  const objectKey = pickOriginalUploadObjectKey(data);
+
+  if (!objectKey) {
+    throw new Error(`Media ${trimmed} has no usable file to serve as the social image.`);
+  }
+
+  return {
+    alt: typeof data.description === 'string' && data.description.trim() ? data.description.trim() : null,
+    height: original?.height ?? (typeof data.height === 'number' ? data.height : null),
+    media_id: String(data.id),
+    object_key: objectKey,
+    url: null,
+    width: original?.width ?? (typeof data.width === 'number' ? data.width : null),
   };
 }
 
@@ -808,7 +904,7 @@ const resetScopeSchema = z
     identity: z
       .boolean()
       .default(true)
-      .describe('Clear the NextBlock site title, description, keywords, copyright line, and the seeded logo.'),
+      .describe('Clear the NextBlock site title, description, keywords, copyright line, social preview image, and the seeded logo.'),
     navigation: z.boolean().default(true).describe('Delete every header and footer navigation item.'),
     pages: z.boolean().default(true).describe('Delete pages (all languages) except keepPageSlugs.'),
     posts: z.boolean().default(true).describe('Delete every blog post.'),
@@ -1027,7 +1123,9 @@ async function planSiteReset(
     blocksToClearPageIds: parsed.clearKeptPageBlocks ? keptPageIds : [],
     customBlockSlugs,
     draftsToDelete,
-    identityKeys: scope.identity ? ['site_title', 'site_description', 'site_keywords', 'footer_copyright'] : [],
+    identityKeys: scope.identity
+      ? ['site_title', 'site_description', 'site_keywords', 'footer_copyright', SITE_SOCIAL_IMAGE_SETTING_KEY]
+      : [],
     languagesToDeactivate,
     logosToDelete,
     mediaToDelete,
@@ -1093,6 +1191,7 @@ async function applySiteReset(plan: ResetPlan, supabase: SupabaseLike, keptLangu
     await upsertSetting(supabase, 'site_title', '');
     await upsertSetting(supabase, 'site_description', '');
     await upsertSetting(supabase, 'site_keywords', '');
+    await upsertSetting(supabase, SITE_SOCIAL_IMAGE_SETTING_KEY, null);
     await upsertSetting(
       supabase,
       'footer_copyright',
@@ -1375,7 +1474,7 @@ export function createCortexSiteTools(context?: SiteToolContext) {
     }),
     update_site_identity: tool({
       description:
-        'Set the site-wide identity: site_title (brand name in the header and <title>), site_description, site_keywords, footer_copyright per locale ("{year}" is substituted), footer_show_attribution (the "Published with NextBlock" credit), and the pinned active_logo_id. Use it right after a reset and whenever the client renames or re-describes their business. Mutating: first returns a confirmation phrase; only executes after exact confirmation.',
+        'Set the site-wide identity: site_title (brand name in the header and <title>), site_description, site_keywords, footer_copyright per locale ("{year}" is substituted), footer_show_attribution (the "Published with NextBlock" credit), the pinned active_logo_id, and social_image — the site-wide Open Graph / share preview image (a media id or an https URL) used by every page without a feature image, the home page above all, which must never get a feature image of its own. Use it right after a reset and whenever the client renames or re-describes their business. Mutating: first returns a confirmation phrase; only executes after exact confirmation.',
       execute: (input) => executeUpdateSiteIdentity(input, context),
       inputSchema: updateSiteIdentityInputSchema,
       strict: true,

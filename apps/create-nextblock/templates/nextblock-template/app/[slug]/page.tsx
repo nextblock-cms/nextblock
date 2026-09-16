@@ -108,7 +108,7 @@ export async function generateMetadata(
 
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
   const description = resolvePageMetaDescription(pageData.meta_description, pageData.blocks);
-  const { siteTitle } = await getSiteSettings();
+  const { siteTitle, socialImage } = await getSiteSettings();
   // Self-referencing `<siteUrl>/<slug>` unless the page sets a manual custom_canonical override.
   const canonicalUrl = buildCanonicalUrl(pageData.custom_canonical, siteUrl, `/${params.slug}`);
 
@@ -120,7 +120,8 @@ export async function generateMetadata(
       description,
       url: canonicalUrl,
       siteTitle,
-      imageUrl: pageData.feature_image_url,
+      imageUrl: pageData.feature_image_social_url ?? pageData.feature_image_url,
+      fallbackImage: socialImage,
       type: 'website',
       locale: toOpenGraphLocale(pageData.language_code),
     }),

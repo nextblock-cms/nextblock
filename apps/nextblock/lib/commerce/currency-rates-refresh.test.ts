@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type CurrencyRow = {
   auto_update_exchange_rate: boolean | null;
@@ -74,7 +74,14 @@ describe('isCurrencyRefreshDue', () => {
 });
 
 describe('maybeSyncCurrencyRates', () => {
+  // The fixtures below are timestamps relative to the fixed NOW, but this function
+  // calls isCurrencyRefreshDue WITHOUT a clock argument, so it reads Date.now().
+  // Without freezing the clock, "fresh" stops being fresh once real time moves a day
+  // past NOW and the suite starts failing on a date rather than on a code change.
+  // Only Date is faked; timers are left real so nothing here has to be advanced.
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
     mocks.verifyPackageOnline.mockReset();
     mocks.syncStoreCurrencyRates.mockReset();
     mocks.currencies = [usd, eur(null)];
@@ -82,6 +89,10 @@ describe('maybeSyncCurrencyRates', () => {
       provider: 'frankfurter',
       updatedCurrencies: ['EUR'],
     });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('does nothing without the ecommerce package', async () => {

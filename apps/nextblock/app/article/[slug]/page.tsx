@@ -93,7 +93,7 @@ export async function generateMetadata(
 
   const title = resolveMetaTitle(postData.meta_title, postData.title);
   const description = resolvePostMetaDescription(postData.meta_description, postData.subtitle);
-  const { siteTitle } = await getSiteSettings();
+  const { siteTitle, socialImage } = await getSiteSettings();
   // Self-referencing `<siteUrl>/article/<slug>` unless the post sets a manual custom_canonical override.
   const canonicalUrl = buildCanonicalUrl(postData.custom_canonical, siteUrl, `/article/${params.slug}`);
 
@@ -105,7 +105,8 @@ export async function generateMetadata(
       description,
       url: canonicalUrl,
       siteTitle,
-      imageUrl: postData.feature_image_url,
+      imageUrl: postData.feature_image_social_url ?? postData.feature_image_url,
+      fallbackImage: socialImage,
       type: 'article',
       publishedTime: postData.published_at || postData.created_at,
       locale: toOpenGraphLocale(postData.language_code),

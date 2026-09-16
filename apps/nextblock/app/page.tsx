@@ -135,7 +135,7 @@ export async function generateMetadata(): Promise<Metadata> {
 
   const title = resolveMetaTitle(pageData.meta_title, pageData.title);
   const description = resolvePageMetaDescription(pageData.meta_description, pageData.blocks);
-  const { siteTitle } = await getSiteSettings();
+  const { siteTitle, socialImage } = await getSiteSettings();
 
   return {
     title,
@@ -145,7 +145,8 @@ export async function generateMetadata(): Promise<Metadata> {
       description,
       url: `${siteUrl}`,
       siteTitle,
-      imageUrl: pageData.feature_image_url,
+      imageUrl: pageData.feature_image_social_url ?? pageData.feature_image_url,
+      fallbackImage: socialImage,
       type: 'website',
       locale: toOpenGraphLocale(pageData.language_code),
     }),

@@ -9,6 +9,7 @@ import {
   PUBLIC_POSTS_CACHE_TAG,
 } from "../../../lib/public-content-cache";
 import { resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
+import { pickOriginalUploadObjectKey } from "../../../lib/media/original-upload";
 import { getContentDraft } from "../../../lib/visual-editing/draft-content";
 import type { ContentDraftRow, DraftBlockSnapshot } from "../../../lib/visual-editing/types";
 
@@ -20,6 +21,12 @@ type PublicPostData = PostType & {
   language_id: number;
   translation_group_id: string;
   feature_image_url?: string | null;
+  /**
+   * The same image for LINK PREVIEWS, resolved to the untouched upload rather than
+   * the AVIF derivative the browser renders, because social crawlers do not decode
+   * AVIF. See `lib/media/original-upload.ts`.
+   */
+  feature_image_social_url?: string | null;
   /** The media row's description, used as the hero image alt text when present. */
   feature_image_alt?: string | null;
   feature_image_blur_data_url?: string | null;
@@ -308,7 +315,7 @@ async function loadPostData(
       *,
       languages!inner (id, code),
       blocks (*),
-      media ( object_key, blur_data_url, width, height, description )
+      media ( object_key, file_path, blur_data_url, width, height, description, variants )
     `)
     .eq("slug", slug) // Find the post by its unique slug for this language
     .order('order', { foreignTable: 'blocks', ascending: true });
@@ -379,6 +386,7 @@ async function loadPostData(
     language_id: langInfo.id,
     translation_group_id: postData.translation_group_id,
     feature_image_url: resolveMediaUrl(postData.media?.object_key),
+    feature_image_social_url: resolveMediaUrl(pickOriginalUploadObjectKey(postData.media)),
     feature_image_alt: postData.media?.description ?? null,
     feature_image_blur_data_url: postData.media?.blur_data_url,
     feature_image_width: postData.media?.width ?? null,

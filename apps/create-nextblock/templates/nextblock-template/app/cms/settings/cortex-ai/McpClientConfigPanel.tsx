@@ -30,6 +30,11 @@ export function McpClientConfigPanel({
 
   return (
     <div className="space-y-3">
+      {/*
+        The active tab is `default` (primary), not `secondary`: the CMS theme's
+        secondary is Slate 100, which is invisible against the white card, and a site
+        theme can set it to anything. Primary always contrasts with its foreground.
+      */}
       <div className="flex flex-wrap gap-1.5" role="tablist" aria-label="MCP client">
         {MCP_CLIENTS.map(([key, label]) => (
           <Button
@@ -40,7 +45,7 @@ export function McpClientConfigPanel({
             role="tab"
             size="sm"
             type="button"
-            variant={activeClient === key ? 'secondary' : 'ghost'}
+            variant={activeClient === key ? 'default' : 'ghost'}
           >
             {label}
           </Button>

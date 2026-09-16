@@ -2,6 +2,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@nextblock-cms/ui";
 import { Spinner, Alert, AlertDescription } from "@nextblock-cms/ui";
@@ -616,6 +617,25 @@ export default function PageForm({
       )}
 
       <FeatureImageField
+        description={
+          slug === 'home' ? (
+            <>
+              On a page this renders a <strong>full-width banner above your content</strong>, with the page
+              title centred over it. A home page that starts with its own hero section usually should not
+              have one. To set the image shown when someone shares a link, use{' '}
+              <Link className="underline" href="/cms/settings/logos">
+                Branding &rarr; Social preview image
+              </Link>{' '}
+              instead.
+            </>
+          ) : (
+            <>
+              Renders as a full-width banner above your content, with the page title centred over it, so
+              pick a very wide image. Leave it empty on a page that opens with its own hero section. It is
+              also this page&rsquo;s link preview image.
+            </>
+          )
+        }
         initialImageId={initialFeatureImageId || page?.feature_image_id || null}
         initialImageUrl={initialFeatureImageUrl || null}
         onImageIdChange={handleFeatureImageChange}

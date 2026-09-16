@@ -276,11 +276,12 @@ export function McpServerSettingsCard({
             <Input readOnly value={url} className="font-mono text-xs" />
             <CopyButton value={url} />
           </div>
+          {/* Active choice in `default` (primary): `secondary` is near-white in the CMS theme. */}
           <div className="flex gap-1.5 pt-0.5">
             <Button
               type="button"
               size="sm"
-              variant={useLocalUrl ? 'ghost' : 'secondary'}
+              variant={useLocalUrl ? 'ghost' : 'default'}
               className="h-6 text-[11px]"
               onClick={() => setUseLocalUrl(false)}
             >
@@ -289,7 +290,7 @@ export function McpServerSettingsCard({
             <Button
               type="button"
               size="sm"
-              variant={useLocalUrl ? 'secondary' : 'ghost'}
+              variant={useLocalUrl ? 'default' : 'ghost'}
               className="h-6 text-[11px]"
               onClick={() => setUseLocalUrl(true)}
             >

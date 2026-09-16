@@ -520,9 +520,10 @@ const PROMPT_BODIES: Record<string, (args: Record<string, string>) => string> = 
       'Process:',
       '1. Call get_site_overview to see what exists, the active languages, and whether the NextBlock demo content is still present. Record what you know with save_site_brief.',
       '2. Present the plan (what is removed, every page with its sections, menus, footer, theme, languages) and call start_site_build with `summary`, `brief`, and `reset` (keepLanguages = the languages wanted) unless existing content is kept. Over MCP the host approves the call; there is no chat confirmation.',
-      '3. Build: update_site_identity; manage_language as needed; manage_site_theme with the brand colours; search_stock_media for imagery when available; rewrite the empty "home" page with generate_jsonb_layout then publish_content_draft; create_cms_page (status "published") for every other page; update_site_navigation (mode "replace") and update_footer for every language; translate_content_bulk for each extra language.',
+      '3. Build: update_site_identity (title, description, keywords, copyright, and social_image for the share preview of pages without a feature image); manage_language as needed; manage_site_theme with the brand colours; search_stock_media for imagery when available; rewrite the empty "home" page with generate_jsonb_layout then publish_content_draft; create_cms_page (status "published") for every other page; update_site_navigation (mode "replace") and update_footer for every language; translate_content_bulk for each extra language.',
       '4. Call finish_site_build with a summary, then report every page with its URL.',
       'Write real copy from the brief, never placeholders. Every page must exist in every active language.',
+      'Conventions: mark each page\'s opening section is_hero:true (priority image loading, centred content); slider:true with a slides array makes a rotating banner; NEVER set feature_image_id on the home page or on a page that opens with a hero section — on a page it renders a full-width title banner above the blocks — but give every post one.',
     ].join('\n'),
   'build-page': (args) =>
     [
@@ -532,7 +533,7 @@ const PROMPT_BODIES: Record<string, (args: Record<string, string>) => string> = 
       '',
       'Process:',
       '1. Call get_database_schema and read_current_cms_item (or read_database_records on `pages`) to ground yourself in what exists.',
-      '2. Compose the page from `section` blocks: one column entry per grid track, the first section a hero, alternating none / theme:"muted" / theme:"primary" backgrounds for rhythm. Use discrete heading blocks rather than <h2> inside text HTML.',
+      '2. Compose the page from `section` blocks: one column entry per grid track, the first section a hero (is_hero:true), alternating none / theme:"muted" / theme:"primary" backgrounds for rhythm. Use discrete heading blocks rather than <h2> inside text HTML. Do not set feature_image_id on a page that opens with a hero: on a page it renders a full-width title banner above the blocks.',
       '3. Call search_stock_media for real photography; copy each photo\'s attribution fields onto the image block.',
       '4. Write the result with generate_jsonb_layout. It stages a Live Draft — tell the user to preview and publish it.',
     ].join('\n'),

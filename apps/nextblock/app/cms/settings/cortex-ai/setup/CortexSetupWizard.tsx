@@ -53,6 +53,7 @@ import type { CortexSetupPath } from '../../../../../lib/cortex-ai/setup-state';
 import { SetupStepIndicator } from '../../../components/SetupStepIndicator';
 import { CopyButton } from '../CopySnippet';
 import { McpClientConfigPanel } from '../McpClientConfigPanel';
+import type { McpAccessTokenSummary } from '../mcp-actions';
 import { buildMcpClientSnippets, type McpClientId } from '../mcp-client-snippets';
 import {
   completeCortexSetupAction,
@@ -60,6 +61,7 @@ import {
   enableMcpForSetupAction,
   saveStockPhotoKeysForSetupAction,
   selectModelForSetupAction,
+  useExistingMcpTokenForSetupAction,
   type StockProviderId,
 } from './actions';
 import { SiteBriefForm } from './SiteBriefForm';
@@ -103,6 +105,8 @@ type McpState =
   | { status: 'idle' }
   | { status: 'working' }
   | { status: 'enabled'; token: string | null; tokenPrefix: string | null }
+  /** An existing token was chosen: the server is on, nothing was minted, no secret to show. */
+  | { status: 'existing'; name: string; tokenPrefix: string }
   | { status: 'error'; message: string };
 
 type StockState =
@@ -125,6 +129,13 @@ type CortexSetupWizardProps = {
   compatibleModels: CortexAiCompatibleOpenRouterModel[];
   /** A brief saved earlier (an interrupted run, or one Cortex wrote in chat); prefills the brief step. */
   existingBrief: CortexSiteBrief | null;
+  /**
+   * Active MCP tokens minted earlier (on the settings page, or by a previous run of
+   * this wizard). Step 1 offers them so the guide can be re-run against a connection
+   * that already exists. A token's secret is shown only once, so picking one means
+   * "keep using the value you saved", never a re-display.
+   */
+  existingMcpTokens: McpAccessTokenSummary[];
   hasEncryptionKey: boolean;
   hasEnvOpenRouterKey: boolean;
   hasPexelsKey: boolean;
@@ -276,6 +287,7 @@ export function CortexSetupWizard({
   allowLocalhostWithoutToken,
   compatibleModels,
   existingBrief,
+  existingMcpTokens,
   hasEncryptionKey,
   hasEnvOpenRouterKey,
   hasPexelsKey,
@@ -317,6 +329,9 @@ export function CortexSetupWizard({
 
   // Step 1 — MCP
   const [tokenName, setTokenName] = useState('My computer');
+  // Which connection the MCP card is about: an existing token's id, or 'new'. The
+  // newest existing token is preselected, so re-running the guide takes one click.
+  const [mcpChoice, setMcpChoice] = useState<string>(existingMcpTokens[0]?.id ?? 'new');
   const [mcpState, setMcpState] = useState<McpState>({ status: 'idle' });
   const [activeClient, setActiveClient] = useState<McpClientId>('claude-code');
   const [useLocalUrl, setUseLocalUrl] = useState(false);
@@ -360,7 +375,8 @@ export function CortexSetupWizard({
   const [finishing, setFinishing] = useState<string | null>(null);
 
   const keyConnected = keyState.status === 'connected';
-  const mcpReady = mcpState.status === 'enabled';
+  const mcpReady = mcpState.status === 'enabled' || mcpState.status === 'existing';
+  const existingConnection = mcpState.status === 'existing' ? mcpState : null;
   const briefSaved = briefState.status === 'saved';
   const savedBrief = briefState.status === 'saved' ? briefState.brief : null;
   // The dashboard chat gets the brief from the server (the route injects it into the
@@ -431,8 +447,27 @@ export function CortexSetupWizard({
   }
 
   function enableMcp() {
+    const existing = mcpChoice === 'new' ? null : (existingMcpTokens.find((token) => token.id === mcpChoice) ?? null);
+
     setMcpState({ status: 'working' });
     startTransition(async () => {
+      if (existing) {
+        // Re-running the guide against a connection that already exists: switch the
+        // server on if needed and carry the token's name to the last step. Its secret
+        // was shown once, when it was created, so the snippets keep the placeholder.
+        const reused = await useExistingMcpTokenForSetupAction({ allowLocalhostWithoutToken, tokenId: existing.id });
+
+        if (!reused.success) {
+          setMcpState({ message: reused.message, status: 'error' });
+          return;
+        }
+
+        setMcpState({ name: reused.name, status: 'existing', tokenPrefix: reused.tokenPrefix });
+        toast.success(`Using your "${reused.name}" connection. The client config is on the last step.`);
+        setStep(2);
+        return;
+      }
+
       const result = await enableMcpForSetupAction({ allowLocalhostWithoutToken, tokenName });
 
       if (!result.success) {
@@ -731,13 +766,22 @@ export function CortexSetupWizard({
                   <div className="flex items-start gap-2 text-sm">
                     <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
                     <p className="font-medium">
-                      MCP server enabled. Your access token and the client config are on the last step.
+                      {existingConnection
+                        ? `MCP server on, using your "${existingConnection.name}" connection (token ${existingConnection.tokenPrefix}…). The client config is on the last step.`
+                        : 'MCP server enabled. Your access token and the client config are on the last step.'}
                     </p>
                   </div>
-                  <Button onClick={() => setStep(2)} type="button">
-                    Continue
-                    <ArrowRight className="ml-1.5 h-4 w-4" />
-                  </Button>
+                  <div className="flex flex-wrap gap-2">
+                    <Button onClick={() => setStep(2)} type="button">
+                      Continue
+                      <ArrowRight className="ml-1.5 h-4 w-4" />
+                    </Button>
+                    {existingConnection && (
+                      <Button onClick={() => setMcpState({ status: 'idle' })} type="button" variant="ghost">
+                        Choose a different connection
+                      </Button>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <form
@@ -747,25 +791,68 @@ export function CortexSetupWizard({
                     enableMcp();
                   }}
                 >
-                  <div className="space-y-1.5">
-                    <Label htmlFor="setup_mcp_token_name" className="text-xs">
-                      Name this connection
-                    </Label>
-                    <Input
-                      autoFocus
-                      disabled={mcpState.status === 'working'}
-                      id="setup_mcp_token_name"
-                      maxLength={80}
-                      onChange={(event) => setTokenName(event.target.value)}
-                      placeholder="My computer"
-                      value={tokenName}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      This switches the MCP server on and creates one access token for your machine.
-                      {mcpEnabled ? ' The server is already on; only the token is new.' : ''} You can
-                      add or revoke tokens later in settings.
-                    </p>
-                  </div>
+                  {existingMcpTokens.length > 0 && (
+                    <div className="space-y-1.5" role="radiogroup" aria-label="MCP connection">
+                      <p className="text-xs font-medium">Connection</p>
+                      {[...existingMcpTokens.map((token) => ({ id: token.id, token })), { id: 'new', token: null }].map(
+                        ({ id, token }) => (
+                          <label
+                            key={id}
+                            className={cn(
+                              'flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2 text-sm transition-colors',
+                              mcpChoice === id ? 'border-primary bg-primary/[0.04]' : 'hover:border-primary/50'
+                            )}
+                          >
+                            <input
+                              checked={mcpChoice === id}
+                              className="mt-1 accent-primary"
+                              disabled={mcpState.status === 'working'}
+                              name="setup_mcp_connection"
+                              onChange={() => setMcpChoice(id)}
+                              type="radio"
+                              value={id}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="font-medium">{token ? token.name : 'Create a new connection'}</span>
+                              {token && (
+                                <span className="block text-xs text-muted-foreground">
+                                  Token {token.tokenPrefix}… · {token.scopes.join(' + ')} · created{' '}
+                                  {token.createdAt.slice(0, 10)}
+                                  {token.lastUsedAt ? ` · last used ${token.lastUsedAt.slice(0, 10)}` : ' · never used'}
+                                </span>
+                              )}
+                            </span>
+                          </label>
+                        )
+                      )}
+                      <p className="text-xs text-muted-foreground">
+                        An existing connection keeps the token you saved when it was created (it is shown only
+                        once). Lost it? Create a new one.
+                      </p>
+                    </div>
+                  )}
+
+                  {mcpChoice === 'new' && (
+                    <div className="space-y-1.5">
+                      <Label htmlFor="setup_mcp_token_name" className="text-xs">
+                        Name this connection
+                      </Label>
+                      <Input
+                        autoFocus={existingMcpTokens.length === 0}
+                        disabled={mcpState.status === 'working'}
+                        id="setup_mcp_token_name"
+                        maxLength={80}
+                        onChange={(event) => setTokenName(event.target.value)}
+                        placeholder="My computer"
+                        value={tokenName}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        This switches the MCP server on and creates one access token for your machine.
+                        {mcpEnabled ? ' The server is already on; only the token is new.' : ''} You can
+                        add or revoke tokens later in settings.
+                      </p>
+                    </div>
+                  )}
 
                   {mcpState.status === 'error' && (
                     <Alert variant="destructive">
@@ -781,7 +868,11 @@ export function CortexSetupWizard({
                     ) : (
                       <Plug className="mr-1.5 h-4 w-4" />
                     )}
-                    {mcpState.status === 'working' ? 'Enabling…' : 'Enable MCP & continue'}
+                    {mcpState.status === 'working'
+                      ? 'Enabling…'
+                      : mcpChoice === 'new'
+                        ? 'Enable MCP & continue'
+                        : 'Use this connection & continue'}
                   </Button>
                 </form>
               )}
@@ -1115,7 +1206,31 @@ export function CortexSetupWizard({
                 </p>
               </div>
 
-              {mcpToken ? (
+              {existingConnection ? (
+                <Alert>
+                  <KeyRound className="h-4 w-4" />
+                  <AlertTitle>Using your &ldquo;{existingConnection.name}&rdquo; connection</AlertTitle>
+                  <AlertDescription className="text-xs">
+                    {usesLocalhostTrust ? (
+                      <>
+                        This machine connects over localhost, which needs no token at all, so the config below
+                        carries none. Its token (starting {existingConnection.tokenPrefix}…) is what the live-site
+                        config would use.
+                      </>
+                    ) : (
+                      <>
+                        Its token (starting {existingConnection.tokenPrefix}…) was shown once, when it was created:
+                        paste the value you saved in place of YOUR_TOKEN in the snippets below. Lost it? Go back and
+                        create a new connection, or mint one under{' '}
+                        <Link className="underline" href={SETTINGS_HREF}>
+                          Cortex AI settings
+                        </Link>
+                        .
+                      </>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              ) : mcpToken ? (
                 <Alert>
                   <KeyRound className="h-4 w-4" />
                   <AlertTitle>Copy this token now</AlertTitle>
@@ -1143,13 +1258,14 @@ export function CortexSetupWizard({
               <div className="space-y-3 rounded-xl border bg-card p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="text-xs font-medium">Connect a client</p>
+                  {/* Active choice in `default` (primary): `secondary` is near-white in the CMS theme. */}
                   <div className="flex gap-1.5">
                     <Button
                       className="h-6 text-[11px]"
                       onClick={() => setUseLocalUrl(false)}
                       size="sm"
                       type="button"
-                      variant={useLocalUrl ? 'ghost' : 'secondary'}
+                      variant={useLocalUrl ? 'ghost' : 'default'}
                     >
                       Live site
                     </Button>
@@ -1158,7 +1274,7 @@ export function CortexSetupWizard({
                       onClick={() => setUseLocalUrl(true)}
                       size="sm"
                       type="button"
-                      variant={useLocalUrl ? 'secondary' : 'ghost'}
+                      variant={useLocalUrl ? 'default' : 'ghost'}
                     >
                       Localhost
                     </Button>

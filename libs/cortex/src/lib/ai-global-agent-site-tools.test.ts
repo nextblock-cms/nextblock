@@ -469,6 +469,7 @@ describe('formatCortexSiteOverviewForPrompt', () => {
         siteDescription: '',
         siteKeywords: '',
         siteTitle: 'NextBlock™ CMS',
+        socialImage: null,
       },
       languages: [
         { code: 'en', id: 1, isActive: true, isDefault: true, name: 'English' },
@@ -545,6 +546,7 @@ describe('formatCortexSiteOverviewForPrompt', () => {
           siteDescription: '',
           siteKeywords: '',
           siteTitle: '',
+          socialImage: null,
         },
         pages: manyPages,
         seeded: { anyPresent: false, copyright: false, logo: false, media: 0, pages: 0, posts: 0, siteTitle: false },
@@ -560,5 +562,118 @@ describe('formatCortexSiteOverviewForPrompt', () => {
     expect(summary).toContain('Build session: active until 2026-09-15T12:00:00.000Z.');
     expect(summary).toContain('Page 29 (/page-29) [en], +15 more.');
     expect(summary).not.toContain('Page 30 (/page-30)');
+  });
+});
+
+describe('update_site_identity social_image', () => {
+  const USER_MEDIA = '3f9c2a10-7b4e-4c8d-9e21-5a6b7c8d9e01';
+
+  it('stores the untouched upload, not the AVIF derivative, with the original size', async () => {
+    // The pipeline makes object_key the AVIF and keeps the upload under variants.
+    // Social crawlers cannot decode AVIF, so the stored preview must be the JPEG.
+    const { database, supabase } = createMockSupabase({
+      media: [
+        {
+          id: USER_MEDIA,
+          object_key: 'uploads/share_original.avif',
+          file_name: 'share.jpg',
+          width: 1600,
+          height: 900,
+          description: 'Acme storefront',
+          created_at: '2024-03-01',
+          variants: [
+            { objectKey: 'uploads/share_original.avif', variantLabel: 'original_avif', width: 1600, height: 900 },
+            { objectKey: 'uploads/share.jpg', variantLabel: 'original_uploaded', width: 1200, height: 630 },
+          ],
+        },
+      ],
+    });
+    const input = { social_image: USER_MEDIA };
+    const preview = expectConfirmation(await executeUpdateSiteIdentity(input, { actorUserId: 'user_1', supabase }));
+
+    const result = await executeUpdateSiteIdentity(input, {
+      actorUserId: 'user_1',
+      latestUserMessage: preview.confirmationPhrase,
+      supabase,
+    });
+
+    expect(result).toMatchObject({ mutationExecuted: true, success: true, updatedKeys: ['site_social_image'] });
+    expect(database.site_settings.find((row) => row.key === 'site_social_image')?.value).toEqual({
+      alt: 'Acme storefront',
+      height: 630,
+      media_id: USER_MEDIA,
+      object_key: 'uploads/share.jpg',
+      url: null,
+      width: 1200,
+    });
+
+    const overview = await executeGetSiteOverview({}, { actorUserId: 'user_1', supabase });
+    expect(overview.identity.socialImage).toEqual({ mediaId: USER_MEDIA, objectKey: 'uploads/share.jpg', url: null });
+    expect(formatCortexSiteOverviewForPrompt(overview)).toContain('Social preview image: set.');
+  });
+
+  it('hotlinks an https URL, refuses anything else, and clears with null', async () => {
+    const { database, supabase } = createMockSupabase();
+    const confirm = async (input: Record<string, unknown>) => {
+      const preview = expectConfirmation(await executeUpdateSiteIdentity(input, { actorUserId: 'user_1', supabase }));
+      return executeUpdateSiteIdentity(input, { actorUserId: 'user_1', latestUserMessage: preview.confirmationPhrase, supabase });
+    };
+
+    await confirm({ social_image: 'https://images.example.com/share.jpg' });
+    expect(database.site_settings.find((row) => row.key === 'site_social_image')?.value).toMatchObject({
+      media_id: null,
+      url: 'https://images.example.com/share.jpg',
+    });
+
+    await expect(confirm({ social_image: 'not-a-media-id' })).rejects.toThrow(/not a usable social image/);
+    await expect(confirm({ social_image: '00000000-0000-4000-8000-000000000000' })).rejects.toThrow(/No media library item/);
+
+    await confirm({ social_image: null });
+    expect(database.site_settings.find((row) => row.key === 'site_social_image')?.value).toBeNull();
+    expect(formatCortexSiteOverviewForPrompt(await executeGetSiteOverview({}, { actorUserId: 'user_1', supabase }))).toContain(
+      'Social preview image: not set'
+    );
+  });
+});
+
+describe('update_site_identity partial writes', () => {
+  it('rejects an unusable social_image before committing any other identity setting', async () => {
+    const { database, supabase } = createMockSupabase();
+    const input = { site_title: 'Acme Bakery', social_image: 'storefront.jpg' };
+    const preview = expectConfirmation(await executeUpdateSiteIdentity(input, { actorUserId: 'user_1', supabase }));
+
+    await expect(
+      executeUpdateSiteIdentity(input, {
+        actorUserId: 'user_1',
+        latestUserMessage: preview.confirmationPhrase,
+        supabase,
+      })
+    ).rejects.toThrow(/not a usable social image/);
+
+    // The title must NOT have been written: every value is resolved before the first
+    // upsert, so a rejected social image leaves the whole update un-applied.
+    expect(database.site_settings.find((row) => row.key === 'site_title')?.value).toBe('NextBlock™ CMS');
+  });
+});
+
+describe('social image falls back when a row kept no original', () => {
+  const SEEDED = '7c1e9b02-4d5a-4f13-8a6c-2b9d0e1f3a45';
+
+  it('uses the row key for media with no variants', async () => {
+    const { database, supabase } = createMockSupabase({
+      media: [{ id: SEEDED, object_key: 'images/NBcover.webp', file_name: 'NBcover.webp', created_at: '2024-01-01' }],
+    });
+    const input = { social_image: SEEDED };
+    const preview = expectConfirmation(await executeUpdateSiteIdentity(input, { actorUserId: 'user_1', supabase }));
+
+    await executeUpdateSiteIdentity(input, {
+      actorUserId: 'user_1',
+      latestUserMessage: preview.confirmationPhrase,
+      supabase,
+    });
+
+    expect(database.site_settings.find((row) => row.key === 'site_social_image')?.value).toMatchObject({
+      object_key: 'images/NBcover.webp',
+    });
   });
 });

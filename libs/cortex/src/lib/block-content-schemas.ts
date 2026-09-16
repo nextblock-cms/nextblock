@@ -95,11 +95,23 @@ const blockInColumnSchema = z.object({
   content: z.record(z.string(), z.any()),
   temp_id: z.string().optional(),
 });
+// One carousel slide: a full section body of its own (background + columns).
+const sectionSlideSchema = z.object({
+  background: backgroundSchema,
+  column_blocks: z.array(z.array(blockInColumnSchema)),
+});
 export const sectionBlockFallbackSchema = z.object({
+  // Slider settings mirror the editor's "Enable Slider (Carousel layout)" panel:
+  // `autoplay` rotates the slides every `timeframe` SECONDS (5 when omitted).
+  autoplay: z.boolean().optional(),
   background: backgroundSchema,
   column_blocks: z.array(z.array(blockInColumnSchema)),
   column_gap: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
   container_type: z.enum(['full-width', 'container', 'container-sm', 'container-lg', 'container-xl']),
+  // The editor's "Hero Section (Prioritized image loading)" checkbox: the section's
+  // background image (and the first slide's images) load with priority, and the
+  // normalizer centres its content vertically.
+  is_hero: z.boolean().optional(),
   padding: z.object({
     bottom: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
     top: z.enum(['none', 'sm', 'md', 'lg', 'xl']),
@@ -109,6 +121,11 @@ export const sectionBlockFallbackSchema = z.object({
     mobile: z.union([z.literal(1), z.literal(2)]),
     tablet: z.union([z.literal(1), z.literal(2), z.literal(3)]),
   }),
+  // With `slider: true` and a non-empty `slides` list the renderer shows a carousel
+  // of those slides and ignores the top-level `column_blocks` and `background`.
+  slider: z.boolean().optional(),
+  slides: z.array(sectionSlideSchema).optional(),
+  timeframe: z.number().optional(),
   vertical_alignment: z.enum(['start', 'center', 'end', 'stretch']).optional(),
 });
 export const fallbackBlockSchemas: Record<BlockType, z.ZodTypeAny> = {

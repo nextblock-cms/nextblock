@@ -16,5 +16,6 @@ export * from './page-document';
 export * from './readability';
 export * from './redirects';
 export * from './robots';
+export * from './social-image';
 export * from './types';
 

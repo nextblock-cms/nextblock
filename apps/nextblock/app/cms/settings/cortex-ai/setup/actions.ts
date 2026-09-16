@@ -1,6 +1,7 @@
 'use server';
 
 import {
+  CORTEX_AI_MCP_TOKENS_TABLE,
   CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY,
   CORTEX_AI_OPENROUTER_SETTING_KEY,
   CORTEX_AI_PEXELS_SETTING_KEY,
@@ -312,6 +313,77 @@ export async function enableMcpForSetupAction(input: {
   }
 
   return { success: true, token: minted.token, tokenPrefix: minted.tokenPrefix };
+}
+
+export type UseExistingMcpTokenForSetupResult =
+  | { success: true; name: string; tokenPrefix: string }
+  | { success: false; message: string };
+
+/**
+ * Point the wizard at an MCP token that already exists (minted on the settings page,
+ * or by an earlier run of this wizard) instead of minting another one. The server is
+ * switched on if it is off; nothing else changes. A token's secret is shown exactly
+ * once, at creation, and only its hash is stored, so the last step tells the operator
+ * to paste the value they saved rather than pretending to show it again.
+ *
+ * No revalidation, like every action in this file (see the header).
+ */
+export async function useExistingMcpTokenForSetupAction(input: {
+  allowLocalhostWithoutToken: boolean;
+  tokenId: string;
+}): Promise<UseExistingMcpTokenForSetupResult> {
+  const rejected = sandboxRejection();
+  if (rejected) return { message: rejected.message, success: false };
+
+  let token: { name: string; tokenPrefix: string };
+
+  try {
+    const { supabase } = await requireAdminSupabaseClient();
+    const id = String(input.tokenId || '').trim();
+
+    if (!id) {
+      return { message: 'Pick a connection, or create a new one.', success: false };
+    }
+
+    const { data: row, error } = await supabase
+      .from(CORTEX_AI_MCP_TOKENS_TABLE)
+      .select('id, name, token_prefix, expires_at, revoked_at')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    if (!row || row.revoked_at) {
+      return { message: 'That connection no longer exists. Create a new one instead.', success: false };
+    }
+
+    if (row.expires_at && Date.parse(row.expires_at) <= Date.now()) {
+      return { message: 'That connection\'s token has expired. Create a new one instead.', success: false };
+    }
+
+    token = { name: String(row.name), tokenPrefix: String(row.token_prefix) };
+  } catch (error) {
+    return {
+      message: error instanceof Error ? error.message : 'Could not read the MCP connection.',
+      success: false,
+    };
+  }
+
+  const settings = await saveMcpSettingsAction(
+    {
+      allowLocalhostWithoutToken: input.allowLocalhostWithoutToken,
+      enabled: true,
+    },
+    { revalidate: false }
+  );
+
+  if (!settings.success) {
+    return { message: settings.error ?? 'Failed to enable the MCP server.', success: false };
+  }
+
+  return { name: token.name, success: true, tokenPrefix: token.tokenPrefix };
 }
 
 /**
