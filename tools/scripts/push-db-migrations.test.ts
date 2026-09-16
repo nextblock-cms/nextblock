@@ -92,12 +92,55 @@ describe('parseMigrationList', () => {
     expect(status.remoteOnly).toEqual([]);
   });
 
-  it('returns empty sets for output with no table at all', () => {
-    expect(parseMigrationList('Cannot connect to remote database')).toEqual({
-      applied: [],
-      pending: [],
-      remoteOnly: [],
-    });
+  it('returns null for output with no table at all', () => {
+    // NOT empty sets. An unrecognised output and a genuinely empty history lead to opposite
+    // actions — the callers apply the baseline to an empty history and refuse on an
+    // unreadable one — so the parser must not let the two look alike.
+    expect(parseMigrationList('Cannot connect to remote database')).toBeNull();
+  });
+
+  it('reads columns by header position, so an outer delimiter cannot invert local and remote', () => {
+    // A leading delimiter shifts every cell by one. Read by fixed index, each pending local
+    // migration would look like a retired remote version — and `--reconcile-squash` reverts
+    // retired versions.
+    const status = parseMigrationList(
+      [
+        '| Local          | Remote         | Time (UTC)     |',
+        '|----------------|----------------|----------------|',
+        '| 02005          |                |                |',
+        '|                | 00000000000042 | 00000000000042 |',
+      ].join('\n')
+    );
+
+    expect(status.pending).toEqual(['02005']);
+    expect(status.remoteOnly).toEqual(['00000000000042']);
+    expect(status.applied).toEqual([]);
+  });
+
+  it('tolerates a box-drawing table', () => {
+    const status = parseMigrationList(
+      [
+        '   Local          │ Remote         │ Time (UTC)     ',
+        '  ────────────────┼────────────────┼────────────────',
+        '   02005          │ 02005          │ 02005          ',
+      ].join('\n')
+    );
+
+    expect(status.applied).toEqual(['02005']);
+  });
+
+  it('ignores pipe-bearing chatter printed before the header row', () => {
+    const status = parseMigrationList(
+      [
+        'A new version of Supabase CLI is available: v2.117.0 | currently v2.107.0',
+        '   Local          | Remote         | Time (UTC)     ',
+        '  ----------------|----------------|----------------',
+        '   02005          |                |                ',
+      ].join('\n')
+    );
+
+    expect(status.pending).toEqual(['02005']);
+    expect(status.remoteOnly).toEqual([]);
   });
 });
 

@@ -5991,7 +5991,9 @@ The root `package.json` exposes the following migration-related scripts:
 | `db:migrate:check` | `node tools/scripts/push-db-migrations.js --check` | Dry-run pending remote migrations |
 | `db:migrate` / `db:push` | `node tools/scripts/push-db-migrations.js --confirm` | Apply pending migration files only; no reset, sandbox seed, function deploy, or config push |
 | `db:migrate:repair-history:check` | `node tools/scripts/repair-db-migration-history.js --check` | Preview baseline migration-history repair |
-| `db:migrate:repair-history` | `node tools/scripts/repair-db-migration-history.js --confirm` | Mark existing baseline migrations as applied without running their SQL; with `-- --reconcile-squash`, record a migration squash (revert retired versions, mark the new generation applied) |
+| `db:migrate:repair-history` | `node tools/scripts/repair-db-migration-history.js --confirm` | Mark existing baseline migrations as applied without running their SQL (never the catch-up). Detects a squashed history and offers to switch to `--reconcile-squash`, which records the squash: mark the new generation applied, then revert the retired versions |
+| `db:migrate:repair-history:revert:check` | `node tools/scripts/repair-db-migration-history.js --check --revert` | Preview un-recording a version from the remote history |
+| `db:migrate:repair-history:revert` | `node tools/scripts/repair-db-migration-history.js --confirm --revert` | Un-record a version so its file runs again — the undo for a repair that marked the wrong version applied. Takes the version as a bare argument. Refuses unrecorded versions, retired versions, and a catch-up that would replay its whole generation; `--force` overrides but must be passed via node, since npm consumes that flag |
 | `db:migrate:fresh` | `node tools/scripts/push-db-migrations.js --confirm --allow-baseline-replay` | Apply the full baseline only to a brand-new empty database |
 | `db:reset` | `supabase db reset --workdir libs/db/src` | Full local reset and replay |
 | `db:link` | `dotenv + supabase-link` via `tools/scripts/supabase-link.js` | Link local workspace to remote project |

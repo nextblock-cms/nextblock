@@ -184,38 +184,79 @@ function assertMigrationNaming(localFiles) {
 // GGNNN scheme is 5-digit, and the remote history can hold both at once during a squash.
 const VERSION_PATTERN = /^\d+$/;
 
+/** Column delimiters the CLI has shipped: ASCII pipe, and box-drawing verticals. */
+const COLUMN_SPLIT = /[|│┃]/;
+
+function splitRow(line) {
+  return line.split(COLUMN_SPLIT).map((cell) => cell.trim());
+}
+
 /**
  * Parse `supabase migration list` into local/remote sets.
  *
  * Output is a three-column table (Local | Remote | Time). A row with only a Local
  * value is a migration file that has never been applied; a row with only a Remote
  * value is a history entry with no file behind it.
+ *
+ * Column positions come from the header row rather than from fixed indices 0 and 1. A table
+ * rendered with an outer delimiter ("| 02005 | | |") shifts every cell by one, which would
+ * classify each pending local migration as a retired remote version — and a retired version
+ * is what `--reconcile-squash` reverts. Reading the header keeps the two columns identified
+ * however the table is drawn.
+ *
+ * Returns NULL when no header row is recognised. Callers must treat that as a failed read and
+ * never as an empty history: "nothing parsed" and "the database has no migrations" call for
+ * opposite actions, and conflating them makes this command affirmatively lie about the
+ * database when the CLI changes its output.
  */
 function parseMigrationList(output) {
+  const lines = output.split('\n');
+
+  let localIndex = -1;
+  let remoteIndex = -1;
+  let headerLine = -1;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!COLUMN_SPLIT.test(lines[i])) {
+      continue;
+    }
+    const cells = splitRow(lines[i]).map((cell) => cell.toLowerCase());
+    const local = cells.indexOf('local');
+    const remote = cells.indexOf('remote');
+    if (local !== -1 && remote !== -1) {
+      localIndex = local;
+      remoteIndex = remote;
+      headerLine = i;
+      break;
+    }
+  }
+
+  if (headerLine === -1) {
+    return null;
+  }
+
   const pending = [];
   const applied = [];
   const remoteOnly = [];
 
-  for (const line of output.split('\n')) {
-    if (!line.includes('|')) {
+  for (let i = headerLine + 1; i < lines.length; i += 1) {
+    if (!COLUMN_SPLIT.test(lines[i])) {
       continue;
     }
 
-    const cells = line.split('|').map((cell) => cell.trim());
+    const cells = splitRow(lines[i]);
+    const local = cells[localIndex] || '';
+    const remote = cells[remoteIndex] || '';
 
-    if (cells.length < 2) {
-      continue;
-    }
-
-    const hasLocal = VERSION_PATTERN.test(cells[0]);
-    const hasRemote = VERSION_PATTERN.test(cells[1]);
+    const hasLocal = VERSION_PATTERN.test(local);
+    const hasRemote = VERSION_PATTERN.test(remote);
 
     if (hasLocal && hasRemote) {
-      applied.push(cells[0]);
+      applied.push(local);
     } else if (hasLocal) {
-      pending.push(cells[0]);
+      pending.push(local);
     } else if (hasRemote) {
-      remoteOnly.push(cells[1]);
+      remoteOnly.push(remote);
     }
   }
 
@@ -243,7 +284,19 @@ function readMigrationStatus(dbPassword, { allowFailure = false } = {}) {
     return null;
   }
 
-  return parseMigrationList(output);
+  const status = parseMigrationList(output);
+
+  if (!status) {
+    if (allowFailure) {
+      return null;
+    }
+    log('Could not recognise the output of `supabase migration list`.', colors.red);
+    log('No "Local | Remote" header row was found, so the remote history was not read.', colors.yellow);
+    log('Refusing to continue: an unreadable history must not be mistaken for an empty one.', colors.yellow);
+    process.exit(1);
+  }
+
+  return status;
 }
 
 function describeVersion(version, localFiles) {
@@ -426,20 +479,27 @@ function main() {
     process.exit(1);
   }
 
+  // Refuse, do not merely warn. `supabase db push` hard-fails while retired versions remain,
+  // so running it anyway buries this advice under a CLI stack trace and reads as "the tool is
+  // broken". There is no legitimate push over a history the CLI rejects, so there is no
+  // escape hatch here either — record the squash first.
   if (status.remoteOnly.length > 0) {
     log('');
     log(
       'The remote history holds versions with no local file (a migration squash retired them).',
-      colors.yellow,
+      colors.red,
     );
     log(
-      '`supabase db push` refuses to run while that is the case. Record the squash first with',
+      '`supabase db push` refuses to run while that is the case, so this command stops here.',
       colors.yellow,
     );
+    log('Record the squash first — it reads the plan to you before changing anything:', colors.yellow);
+    log('  npm run db:migrate:repair-history', colors.yellow);
     log(
-      '`npm run db:migrate:repair-history -- --reconcile-squash` (read the plan it prints), then re-run this command.',
-      colors.yellow,
+      'It detects the retired versions and offers to switch to the squash reconcile. Then re-run this command.',
+      colors.dim,
     );
+    process.exit(1);
   }
 
   supabase(pushArgs);

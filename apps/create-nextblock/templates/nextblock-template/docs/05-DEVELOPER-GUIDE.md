@@ -80,9 +80,15 @@ the CMS at `/cms/dashboard`. Every later sign-up gets the `USER` role.
 - `npm run db:migrate:fresh`: apply the full migration baseline to a
   brand-new empty database
 - `npm run db:migrate:repair-history:check`: preview the migration-history
-  baseline repair for an existing database whose schema is already present
+  baseline repair for an existing database whose schema is already present. When the
+  remote history still lists retired versions it detects the squash and shows the
+  squash-reconcile plan instead
 - `npm run db:migrate:repair-history`: mark historical baseline migrations as
-  applied without running their SQL
+  applied without running their SQL; on a squashed history it asks `[Y/n]` and switches
+  to the reconcile (revert the retired versions, record the new generation)
+- `npm run db:migrate:repair-history:revert:check <version>` /
+  `npm run db:migrate:repair-history:revert <version>`: un-record a version so its file
+  runs again — the undo for a repair that marked the wrong thing applied
 - `npm run db:push`: alias for `npm run db:migrate`
 - `npm run db:push:sandbox`: legacy sandbox bootstrap path that pushes
   migrations with `--include-all`, pushes Supabase config, seeds sandbox
@@ -216,10 +222,17 @@ Production rule:
 - If `db:migrate:check` lists the generation baseline (`02001_baseline_schema.sql` …) as
   pending on an existing database whose history is empty, do not run `db:migrate` yet.
   Run `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`,
-  then check again. If instead it shows retired 14-digit versions "recorded remotely with
-  no local file" beside the pending baseline, the database has not crossed the squash:
-  run `npm run db:migrate:repair-history:check -- --reconcile-squash`, then the same without
-  `:check`. The expected result after either repair is that only new unapplied migrations remain.
+  then check again. The same two commands also handle the other shape — retired 14-digit
+  versions "recorded remotely with no local file" beside the pending baseline, meaning the
+  database has not crossed the squash: they detect it and offer to switch to the squash
+  reconcile. The expected result after either repair is that only new unapplied migrations
+  remain.
+
+  > **Windows:** PowerShell strips a bare `--`, so `npm run <script> -- --flag` silently runs
+  > the script's default mode (npm warns `Unknown cli config`). Invoke the script directly
+  > instead — `node tools/scripts/repair-db-migration-history.js --check --reconcile-squash`,
+  > `node apps/nextblock/tools/update.mjs --db-only`. A bare trailing argument is forwarded
+  > fine, so `npm run db:migrate:repair-history:revert 02000` works as written.
 - Do not use `npm run db:reset`, `npm run sandbox:reset`,
   `npm run db:migrate:fresh`, or `npm run db:push:sandbox` against production.
 

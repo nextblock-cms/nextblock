@@ -247,14 +247,27 @@ and it is safe because of three properties:
 What each kind of database needs:
 
 - **Production (was at the end of generation 1):** record the squash, run nothing —
-  `npm run db:migrate:repair-history:check -- --reconcile-squash` prints the plan, the same
-  command without `:check` reverts the retired versions and marks `02000`–`02004` applied.
-  `supabase db push` refuses to run while retired versions remain in the remote history, so
-  this comes first; `db:migrate:check` says so.
+  `npm run db:migrate:repair-history:check` prints the plan, the same command without `:check`
+  applies it. Both detect the retired versions themselves and switch to the squash reconcile,
+  asking `[Y/n]` first; you do not have to pass `--reconcile-squash`. The reconcile reverts the
+  retired versions and marks `02000`–`02004` applied. `supabase db push` refuses to run while
+  retired versions remain in the remote history, so this comes first; `db:migrate:check` says so.
 - **A database that sat behind generation 1:** cross with the lenient applier first —
-  `npm run update -- --db-only` — which tolerates retired history rows (the catch-up reads
-  them to decide what to replay) and records what it applies; then reconcile as above.
-  `--reconcile-squash` detects this case and refuses to revert too early.
+  `node apps/nextblock/tools/update.mjs --db-only` — which tolerates retired history rows (the
+  catch-up reads them to decide what to replay) and records what it applies; then reconcile as
+  above. The reconcile detects this case and refuses to revert too early: when the highest
+  recorded retired version is below the catch-up's `catchup-through`, it reads
+  `site_settings.migration_baseline_generation` to decide what to do. The history alone cannot
+  tell it — a version recorded by `migration repair` looks exactly like one an applier
+  recorded — but the catch-up writes that marker as its last statement, so it is the one
+  honest signal that the SQL ran:
+  - marker at this generation → the catch-up ran; the retired rows have done their job and the
+    reconcile proceeds. **This is the normal state after crossing**, and it stays true even
+    though the highest retired version never moves (the catch-up replays retired files without
+    recording a row for each).
+  - marker unset, catch-up still pending → cross the squash first; it refuses.
+  - marker unset, catch-up already recorded → an earlier auto-detect repair recorded it without
+    running it. It refuses and prints the `:revert` command to un-record it.
 - **The sandbox:** its reset payload wipes `public`, replays the folder from empty
   (seed runs, marker set, catch-up skipped) and re-records the generation's versions.
 - **Downstream installs (Vercel, `npm create nextblock`, Docker):** nothing to do. The
@@ -286,12 +299,49 @@ production or shared database change.
 - If an existing database whose history was wiped lists the baseline files
   (`02001_baseline_schema.sql` …) as pending, do not replay them blindly. Use
   `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`
-  (it auto-detects the applied high-water mark from the tables that exist; override with
-  `--through=<version>`), then rerun `npm run db:migrate:check`.
+  (it auto-detects the applied high-water mark from the tables that exist), then rerun
+  `npm run db:migrate:check`. It never marks the catch-up applied, whatever it detects.
+- `--through=<version>` overrides the detected level. It must name an exact version in the
+  current folder — versions are compared as strings, so `2014` would sort above every `02xxx`
+  and sweep the whole generation, and a retired 14-digit version is meaningless here; both are
+  rejected. It is only for a database whose history table is empty, and it does not silence
+  the retired-version warning.
+- That auto-detect mode is **only** for a wiped history. On a history that still lists retired
+  versions it would record the catch-up as applied without running it, and because every applier
+  matches by version and never by content, the catch-up would then be unreachable forever. The
+  command detects that shape and offers to switch, so this is enforced rather than remembered.
 - If the check shows retired 14-digit versions "recorded remotely with no local file" next to
   a pending `02000`–`02004`, the database has not crossed the squash yet — see "How a
   squash crosses live databases" above.
+
 - Use `npm run db:migrate:fresh` only for a brand-new empty database.
+
+#### Undoing a repair that marked the wrong versions applied
+
+A version recorded in the history is skipped by every applier, forever, until it is un-recorded
+— there is no "re-run this migration" because nothing matches on content. To take a version
+back out of the history:
+
+```bash
+npm run db:migrate:repair-history:revert:check 02000   # plan only
+npm run db:migrate:repair-history:revert 02000         # apply
+```
+
+The file becomes pending again and the next applier runs it. The common case is a catch-up that
+the auto-detect mode recorded without running: the reconcile detects exactly that and prints
+this command. Un-record the catch-up **before** reverting the retired rows — it reads them to
+decide what to replay, so an empty history makes it replay the whole retired generation.
+
+It refuses three things: a version recorded nowhere (usually a typo, and reverting it would
+print success while doing nothing), a retired version (that row is what tells the catch-up the
+migration already ran), and a catch-up when no retired rows remain in its
+`catchup-from`..`catchup-through` range and `site_settings.migration_baseline_generation` does
+not show it would self-skip. Override with `--force`, which npm consumes itself, so it has to
+go through node:
+
+```bash
+node tools/scripts/repair-db-migration-history.js --confirm --revert <version> --force
+```
 
 #### Why `db:migrate:check` is read-only by construction
 
@@ -355,7 +405,7 @@ and are what the next squash repeats with `G = 3`.
    apply every file in order with `psql -v ON_ERROR_STOP=1 -1 -f`, recording each version
    in `supabase_migrations.schema_migrations` exactly like the real appliers do — the
    catch-up reads that table, so the harness must fill it. **Apply LF-normalized copies**
-   (`tr -d ''`), never the working tree as-is: with `core.autocrlf=true` the tree mixes
+   (`sed $'s/\r$//'`, or `dos2unix`), never the working tree as-is: with `core.autocrlf=true` the tree mixes
    CRLF (git checkouts) and LF (tool-written files), and a multi-line `replace()` pattern
    only matches content seeded with the same line endings — building generation 2 from the
    raw tree silently lost migration 042's copy change. The git-canonical form is LF.

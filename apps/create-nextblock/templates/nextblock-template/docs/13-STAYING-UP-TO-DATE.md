@@ -19,6 +19,14 @@ npm run update -- --skip-db # code + dependencies only
 npm run update -- --db-only # apply pending migrations only
 ```
 
+> **Windows (PowerShell):** a bare `--` is stripped by the shell, so every flagged form above
+> silently runs a *full* update instead. Invoke the script directly:
+>
+> ```powershell
+> node apps/nextblock/tools/update.mjs --check
+> node apps/nextblock/tools/update.mjs --db-only
+> ```
+
 Implementation: [`apps/nextblock/tools/update.mjs`](../apps/nextblock/tools/update.mjs)
 (synced into the standalone template as `tools/update.mjs`), on top of the shared engine
 [`apps/nextblock/tools/lib/migrate-core.mjs`](../apps/nextblock/tools/lib/migrate-core.mjs).
@@ -334,7 +342,12 @@ Supabase CLI, the rules are the same:
 
 > **Edge case:** if your project's migration history is empty/inconsistent, the hook skips
 > rather than risk misapplying. Run `npm run db:migrate:repair-history` then
-> `npm run db:migrate` once to reconcile (see [docs/04](./04-DATABASE-AND-AUTH.md)).
+> `npm run db:migrate` once to reconcile (see [docs/04](./04-DATABASE-AND-AUTH.md)). If the
+> history still lists versions retired by a squash, `repair-history` detects that and offers
+> to reconcile the squash instead — take the offer; the plain repair is for a wiped history.
+>
+> **Windows:** PowerShell strips a bare `--`, so `npm run update -- --db-only` runs a full
+> update instead of the database-only one. Use `node apps/nextblock/tools/update.mjs --db-only`.
 
 ---
 

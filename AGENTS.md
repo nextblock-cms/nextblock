@@ -16,8 +16,8 @@ changes must be append-only, forward-only, and non-destructive by default.
 > retired 14-digit generation-1 files `00000000000000`–`00000000000042`; generation 1 was itself
 > the 2026-07 squash of the original 45 files. Every live database created before a squash still
 > carries the retired versions in its history; that is expected, and
-> `npm run db:migrate:repair-history -- --reconcile-squash` records the squash there without
-> running SQL. **Do not squash casually** — the runbook in `docs/04` ("Squashing migrations")
+> `npm run db:migrate:repair-history` records the squash there without running SQL — it detects
+> the retired versions itself and offers to switch to the squash reconcile, so no flag is needed. **Do not squash casually** — the runbook in `docs/04` ("Squashing migrations")
 > is the only supported way, and it always ships a catch-up because downstream installs exist.
 >
 > **Never trust a hardcoded "next migration is N" — list `libs/db/src/supabase/migrations`
@@ -45,13 +45,19 @@ changes must be append-only, forward-only, and non-destructive by default.
   replay on production or any database containing orders, users, payments, or
   customer data.
 - Use `npm run db:migrate:check` before `npm run db:migrate`.
-- If a live database reports old baseline migrations, including
-  `00000000000000_baseline_schema.sql`, as pending, use
-  `npm run db:migrate:repair-history:check`, then
-  `npm run db:migrate:repair-history` (pass `--through=00000000000003` — the
-  baseline's top file creates no tables, so auto-detection stops at `000`), then
-  rerun `npm run db:migrate:check`. This marks already-present baseline migrations
-  as applied; it does not run their SQL.
+- If a live database reports the generation baseline (`02001_baseline_schema.sql` …) as
+  pending, use `npm run db:migrate:repair-history:check`, then
+  `npm run db:migrate:repair-history`, then rerun `npm run db:migrate:check`. This marks
+  already-present baseline migrations as applied; it does not run their SQL. The auto-detect
+  path never marks the catch-up (`GG000`) applied — that file must RUN, and recording it
+  strands every retired migration it would have replayed. The squash reconcile records it
+  only when the database is provably at `catchup-through`, i.e. the end of the retired
+  generation, where it would have nothing to replay anyway.
+- `--through=<version>` overrides the auto-detected level. It must be an exact version in
+  the current folder (`02001`, not `2001` and not a retired 14-digit version), and it is
+  only for a database whose history table is empty.
+- To undo a repair that recorded the wrong version:
+  `npm run db:migrate:repair-history:revert <version>` (`:revert:check` prints the plan).
 - Only use `npm run db:migrate:fresh` for a brand-new empty database.
 
 For more detail, read `docs/04-DATABASE-AND-AUTH.md` and
