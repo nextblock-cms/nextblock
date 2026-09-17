@@ -1,13 +1,15 @@
 // components/blocks/PostsGridClient.tsx
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useLanguage } from '../../context/LanguageContext';
 import type { PostWithMediaDimensions } from './types';
 import Image from 'next/image';
 import { Button } from '@nextblock-cms/ui/button';
 import PostCardSkeleton from './PostCardSkeleton'; // Added import
+import { usePageParam } from '../../hooks/usePageParam';
+import { useLabel } from '../../lib/i18n/use-label';
 
 interface PostsGridClientProps {
   initialPosts: PostWithMediaDimensions[];
@@ -34,6 +36,8 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
   fetchAction,
 }) => {
   const { currentLocale } = useLanguage();
+  const label = useLabel();
+  const gridRef = useRef<HTMLDivElement>(null);
   const [currentPage, setCurrentPage] = useState(initialPage);
   const [posts, setPosts] = useState<PostWithMediaDimensions[]>(initialPosts);
   const [isLoading, setIsLoading] = useState(false);
@@ -51,9 +55,9 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
     setSkeletonCount(initialPosts.length > 0 ? initialPosts.length : postsPerPage);
   }, [initialPosts, initialPage, postsPerPage]);
 
-  const handlePageChange = async (newPage: number) => {
-    if (newPage < 1 || newPage > totalPages || isLoading) return;
-    
+  const handlePageChange = async (newPage: number, { recordInUrl = true } = {}) => {
+    if (newPage < 1 || newPage > totalPages || isLoading || newPage === currentPage) return;
+
     // For subsequent page loads, always show `postsPerPage` skeletons
     setSkeletonCount(postsPerPage);
     setIsLoading(true);
@@ -68,13 +72,22 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
       } else {
         setPosts(result.posts);
         setCurrentPage(newPage);
+        if (recordInUrl) pushPage(newPage);
+        // Keep the top of the grid in view rather than leaving the reader at the bottom of
+        // the previous page. An explicit `behavior` beats the reduced-motion stylesheet rule.
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        gridRef.current?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
       }
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to fetch posts.");
+    } catch {
+      // A thrown server action carries Next's generic English text in production.
+      setError(label('posts_grid.error', 'Failed to load posts.', 'Impossible de charger les articles.'));
       setPosts([]); // Clear posts on error
     }
     setIsLoading(false);
   };
+
+  // `?page=N` in the address bar, and Back/Forward, restore a page without a new history entry.
+  const pushPage = usePageParam((page) => void handlePageChange(page, { recordInUrl: false }));
 
   const columnClasses: { [key: number]: string } = {
     1: 'grid-cols-1',
@@ -101,12 +114,12 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
   const imageSizes = getImageSizes(columns);
 
   if (error && !isLoading) { // Only show full error if not also loading (e.g. initial load error after skeletons)
-    return <div className="text-red-500 py-10 text-center">Error: {error}</div>;
+    return <div role="alert" className="text-destructive py-10 text-center">{error}</div>;
   }
 
   return (
-    <div>
-      <div className={`grid ${gridColsClass} gap-6`}>
+    <div ref={gridRef} className="scroll-mt-24">
+      <div aria-busy={isLoading} className={`grid ${gridColsClass} gap-6`}>
         {isLoading ? (
           Array.from({ length: skeletonCount }).map((_, index) => (
             <PostCardSkeleton key={`skeleton-${index}`} />
@@ -120,7 +133,8 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
                   <div className="aspect-video overflow-hidden">
                     <Image
                       src={post.feature_image_url}
-                      alt={`Feature image for ${post.title}`}
+                      // Decorative: the card is one link and the title right below names it.
+                      alt=""
                       width={post.feature_image_width && post.feature_image_width > 0 ? post.feature_image_width : DEFAULT_FEATURE_IMAGE_WIDTH}
                       height={post.feature_image_height && post.feature_image_height > 0 ? post.feature_image_height : DEFAULT_FEATURE_IMAGE_HEIGHT}
                       sizes={imageSizes}
@@ -144,37 +158,49 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
                   <h3 className="text-lg font-semibold mb-2 group-hover:text-primary">{post.title}</h3>
                   {post.excerpt && <p className="text-sm text-muted-foreground mb-3 line-clamp-3">{post.excerpt}</p>}
                   <div className="mt-auto pt-2">
-                    <span className="text-xs text-primary group-hover:underline">Read more</span>
+                    <span className="text-xs text-primary group-hover:underline">
+                      {label('posts_grid.read_more', 'Read more', 'Lire la suite')}
+                    </span>
                   </div>
                 </div>
               </div>
             </Link>
           ))
         ) : (
-          !error && <div className="col-span-full text-center py-10">No posts found.</div> // Show if no posts and no error, and not loading
+          !error && (
+            <div className="col-span-full text-center py-10">
+              {label('posts_grid.empty', 'No posts found.', 'Aucun article trouvé.')}
+            </div>
+          ) // Show if no posts and no error, and not loading
         )}
       </div>
 
       {showPagination && totalPages > 1 && (
-        <div className="flex justify-center items-center mt-8 space-x-2">
+        <nav
+          aria-label={label('pagination.label', 'Pagination', 'Pagination')}
+          className="flex justify-center items-center mt-8 space-x-2"
+        >
           <Button
             onClick={() => handlePageChange(currentPage - 1)}
             disabled={currentPage === 1 || isLoading}
             variant="outline"
           >
-            Previous
+            {label('pagination.previous', 'Previous', 'Précédent')}
           </Button>
-          <span className="text-sm">
-            Page {currentPage} of {totalPages}
+          <span aria-live="polite" className="text-sm tabular-nums">
+            {label('pagination.page_of', 'Page {current} of {total}', 'Page {current} sur {total}', {
+              current: currentPage,
+              total: totalPages,
+            })}
           </span>
           <Button
             onClick={() => handlePageChange(currentPage + 1)}
             disabled={currentPage === totalPages || isLoading}
             variant="outline"
           >
-            Next
+            {label('pagination.next', 'Next', 'Suivant')}
           </Button>
-        </div>
+        </nav>
       )}
       {/* {isLoading && <p className="text-center mt-4 text-sm text-muted-foreground">Fetching posts...</p>} */}
     </div>

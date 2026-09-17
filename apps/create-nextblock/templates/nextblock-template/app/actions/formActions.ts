@@ -15,6 +15,7 @@ import {
   verifyBotProtection,
   type BotProtectionProvider,
   HONEYPOT_FIELD,
+  LEGACY_HONEYPOT_FIELD,
   TURNSTILE_TOKEN_FIELD,
   RECAPTCHA_TOKEN_FIELD,
 } from '../../lib/botProtection/verify';
@@ -36,6 +37,17 @@ import {
 interface FormSubmissionResult {
   success: boolean;
   message: string;
+  /**
+   * Stable reason for a failure the renderer can translate; `message` stays the English
+   * text for anything that reads the result without the renderer.
+   */
+  code?: 'empty' | 'throttled' | 'error';
+  /**
+   * What the visitor typed, echoed back on failure only. React 19 resets an uncontrolled
+   * form when its action settles, so without this a server error wiped the message the
+   * visitor had just written. Keys are the posted field names (`f_<temp_id>`).
+   */
+  values?: Record<string, string>;
 }
 
 type FormSubmissionConfig = {
@@ -100,13 +112,20 @@ export async function handleFormSubmission(
 ): Promise<FormSubmissionResult> {
   const { formKey, botProtectionProvider } = normalizeSubmissionConfig(config);
 
+  const values: Record<string, string> = {};
+  formData.forEach((value, key) => {
+    if (typeof value === 'string' && key.startsWith('f_')) {
+      values[key] = value.slice(0, MAX_FIELD_LENGTH);
+    }
+  });
+
   const verification = await verifyBotProtection(formData, { botProtectionProvider });
   if (!verification.ok) {
     if (verification.reason === 'honeypot') {
       // Fool the bot by returning a fake success so it learns nothing.
       return { success: true, message: "Submission successful!" };
     }
-    return { success: false, message: verification.message };
+    return { success: false, message: verification.message, values };
   }
 
   try {
@@ -125,6 +144,7 @@ export async function handleFormSubmission(
       if (
         key.startsWith('$') ||
         key === HONEYPOT_FIELD ||
+        key === LEGACY_HONEYPOT_FIELD ||
         key === RECAPTCHA_TOKEN_FIELD ||
         key === TURNSTILE_TOKEN_FIELD ||
         key === 'form_key' ||
@@ -141,7 +161,7 @@ export async function handleFormSubmission(
     });
 
     if (submitted.length === 0) {
-      return { success: false, message: 'Please fill in the form before submitting.' };
+      return { success: false, code: 'empty', message: 'Please fill in the form before submitting.', values };
     }
 
     const senderEmail =
@@ -171,7 +191,7 @@ export async function handleFormSubmission(
       .trim();
 
     if (!body) {
-      return { success: false, message: 'Please fill in the form before submitting.' };
+      return { success: false, code: 'empty', message: 'Please fill in the form before submitting.', values };
     }
 
     const requestHeaders = await headers();
@@ -191,7 +211,9 @@ export async function handleFormSubmission(
     if ((count ?? 0) >= THROTTLE_MAX_SUBMISSIONS) {
       return {
         success: false,
+        code: 'throttled',
         message: "You've sent several messages already. Please wait a few minutes before sending another.",
+        values,
       };
     }
 
@@ -215,7 +237,9 @@ export async function handleFormSubmission(
     if (!thread) {
       return {
         success: false,
+        code: 'error',
         message: 'Sorry, there was an error sending your message. Please try again later.',
+        values,
       };
     }
 
@@ -239,7 +263,9 @@ export async function handleFormSubmission(
     console.error('Form submission failed:', error);
     return {
       success: false,
+      code: 'error',
       message: 'Sorry, there was an error sending your message. Please try again later.',
+      values,
     };
   }
 }

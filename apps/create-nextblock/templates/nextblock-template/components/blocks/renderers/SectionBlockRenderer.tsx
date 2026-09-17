@@ -11,6 +11,7 @@ import { getPublicBlockRendererLoader } from "../publicRendererLoaders";
 import SectionSlider from "./SectionSlider";
 import { getCachedCustomBlockDefinitionBySlug } from "../../../lib/custom-block-definitions";
 import { CachedDynamicLayoutEngine } from "../../renderers/CachedDynamicLayoutEngine";
+import { getCachedLanguageCode } from "../../../lib/languages/cached-language-code";
 import { resolveBlockRelations } from "../../../lib/resolve-block-relations";
 
 // Static imports for core block renderers for LCP/performance optimization
@@ -356,6 +357,8 @@ async function renderNestedBlock({
             definition={definition}
             layoutSchema={definition.layout_schema}
             fields={definition.fields}
+            locale={await getCachedLanguageCode(languageId)}
+            showDiagnostics={Boolean(visualEditing?.enabled)}
             data={{
               ...(resolvedBlock.data || {}),
               resolved_relations: resolvedBlock.resolved_relations || {},
@@ -488,6 +491,14 @@ export default async function SectionBlockRenderer({
               minHeight: formatMinHeight(slideBackground.min_height) || '400px'
             }}
           >
+            {/* Photo credit: slides used to drop it, which breaks the Unsplash API terms. It
+                sits inside the slide so it goes inert with it. */}
+            {slideBackground.type === 'image' && slideBackground.image?.attribution && (
+              <StockPhotoCredit
+                attribution={slideBackground.image.attribution}
+                className="pointer-events-auto absolute bottom-1 right-2 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white/90 [&_a]:text-white"
+              />
+            )}
             {/* Background image Layer for slide */}
             {slideBackground.type === 'image' && slideBackground.image && (
               <div className={ABSOLUTE_BACKGROUND_CLASSES}>
@@ -597,7 +608,8 @@ export default async function SectionBlockRenderer({
       {content.background?.type === 'image' && content.background.image?.attribution && (
         <StockPhotoCredit
           attribution={content.background.image.attribution}
-          className="pointer-events-auto absolute bottom-1 right-2 z-10 rounded bg-black/40 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm [&_a]:text-white"
+          // No `backdrop-blur-*`: this section can be the hero (project rule).
+          className="pointer-events-auto absolute bottom-1 right-2 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white/90 [&_a]:text-white"
         />
       )}
       {content.background?.type === 'image' && content.background.image && (

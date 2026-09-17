@@ -80,10 +80,10 @@ describe('renderRobotsMetadata', () => {
       'User-Agent: Yandex\nClean-param: ref /articles/\nClean-param: utm_source /\nRequest-Rate: 10/1m\n\n' +
         'Host: example.com\n'
     );
-    // Next's own serialiser drops them. This is the divergence that makes /robots.txt a
-    // route handler running our renderer instead of a metadata route: were it the
-    // latter, every `other` line the preview shows would vanish from the served file.
-    expect(nextResolveRobots(metadata)).toBe('User-Agent: Yandex\n\nHost: example.com\n');
+    // Next's own serialiser dropped these until 16.3, which is why /robots.txt became a
+    // route handler running our renderer instead of a metadata route. Next 16.3 emits them
+    // too; this now pins that the two agree, so a future divergence fails here.
+    expect(nextResolveRobots(metadata)).toBe(renderRobotsMetadata(metadata));
   });
 
   it("emits Next's exact shape, blank trailing line and all", () => {
@@ -163,16 +163,17 @@ describe('buildRobotsTxt', () => {
   it('serves the non-standard directives it shows, via the per-rule `other` escape hatch', () => {
     // These are the lines that used to appear in the preview and vanish from the
     // file. `Clean-param`, `Request-rate` and a per-group `Host` have no typed field
-    // in `MetadataRoute.Robots`, so a metadata route drops them — proven right here,
-    // against Next's real serialiser. app/robots.txt/route.ts serves `buildRobotsTxt`
-    // itself, which is what keeps them in the file crawlers receive.
+    // in `MetadataRoute.Robots`, and before Next 16.3 a metadata route dropped them.
+    // app/robots.txt/route.ts serves `buildRobotsTxt` itself, which keeps them in the
+    // file crawlers receive whatever Next's serialiser does. Next 16.3 carries `other`
+    // through as well, checked here against its real serialiser.
     const custom = settings({
       customRules:
         'User-agent: Yandex\nClean-param: ref /articles/\nClean-param: utm_source /\nHost: example.com',
       sitemapEnabled: false,
     });
 
-    expect(served(custom, LIVE)).not.toContain('Clean-param');
+    expect(served(custom, LIVE)).toContain('Clean-param');
     expect(listUnservedCustomRuleLines(custom, LIVE)).toEqual([]);
     expect(buildRobotsTxt(custom, LIVE)).toBe(
       'User-Agent: *\nAllow: /\n\n' +

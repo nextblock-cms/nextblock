@@ -1,7 +1,7 @@
 import '@nextblock-cms/ui/styles/globals.css';
 // app/layout.tsx
 
-import type { Metadata } from 'next';
+import type { Metadata, Viewport } from 'next';
 import Script from 'next/script';
 import { Providers } from './providers';
 import { DeferredCartDrawer } from '../components/DeferredCartDrawer';
@@ -17,8 +17,10 @@ import {
   activeThemeSlugs,
   buildThemeCss,
   defaultThemeSlug,
+  themeColorFor,
   type SiteTheme,
 } from '../lib/themes/buildThemeCss';
+import { getCachedSiteThemes } from '../lib/themes/cached-site-themes';
 import { SITE_SCRIPT_COLUMNS, type SiteScript } from '../lib/site-scripts/types';
 import SiteScripts from '../components/SiteScripts';
 import { DeferredSpeedInsights } from '../components/DeferredSpeedInsights';
@@ -185,24 +187,7 @@ const getCachedGlobalCss = unstable_cache(
   { revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS }
 );
 
-const getCachedSiteThemes = unstable_cache(
-  async (): Promise<SiteTheme[]> => {
-    const supabase = createStaticSupabaseClient();
-    const { data, error } = await supabase
-      .from('site_themes')
-      .select('id, slug, name, description, icon, color_scheme, tokens, extra_css, is_system, is_default, is_active, sort_order')
-      .order('sort_order');
 
-    if (error || !data) {
-      // A missing table (pre-migration install) must not take the site down —
-      // libs/ui/src/styles/theme.css still ships a working fallback palette.
-      return [];
-    }
-    return data as unknown as SiteTheme[];
-  },
-  ['public-layout-site-themes'],
-  { revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS, tags: ['public-layout-site-themes'] }
-);
 
 const getCachedSiteScripts = unstable_cache(
   async (): Promise<SiteScript[]> => {
@@ -483,6 +468,21 @@ async function loadLayoutData() {
   };
 }
 
+// Next renders the viewport and theme-color tags from this export. The layout used to add its
+// own `<meta name="viewport">` as well, so every page shipped the tag twice. The colour is
+// the default theme's background; `ThemeColorSync` follows the visitor's own theme choice.
+export async function generateViewport(): Promise<Viewport> {
+  const themes = isSupabaseConfigured()
+    ? await getCachedSiteThemes().catch(() => [] as SiteTheme[])
+    : ([] as SiteTheme[]);
+
+  return {
+    initialScale: 1,
+    themeColor: themeColorFor(themes),
+    width: 'device-width',
+  };
+}
+
 export async function generateMetadata(): Promise<Metadata> {
   const { siteTitle, siteDescription, siteKeywords, socialImage } = await getSiteSettings();
   const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
@@ -527,7 +527,9 @@ export async function generateMetadata(): Promise<Metadata> {
       ],
       apple: [{ url: '/favicon/apple-touch-icon.png' }],
     },
-    manifest: '/favicon/site.webmanifest',
+    // Served by app/manifest.ts: the site's own name and theme colours instead of the static
+    // file, whose `name` was empty and whose icon paths pointed at files that do not exist.
+    manifest: '/manifest.webmanifest',
     // Sandbox is a copy of production, so keep it out of the index. Use
     // `noindex, follow` (not nofollow) so Googlebot still follows internal links,
     // recrawls every page, and drops them all — paired with an allow-crawl
@@ -606,7 +608,6 @@ export default async function RootLayout({
   return (
     <html lang={serverDeterminedLocale} suppressHydrationWarning>
       <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
         {themeCss && <style id="nb-theme-tokens" dangerouslySetInnerHTML={{ __html: themeCss }} />}
         {globalCss && <style dangerouslySetInnerHTML={{ __html: globalCss }} />}
         <SiteScripts nonce={nonce} placement="head" scripts={siteScripts} />

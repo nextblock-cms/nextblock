@@ -47,18 +47,31 @@ type ResolvedRelationEntry = {
 export type DynamicLayoutEngineProps = {
   cacheTags?: string[];
   className?: string;
+  /** ISO 4217 code for bare minor-unit prices and the preferred entry of a currency map. */
+  currency?: string;
   data?: DynamicLayoutData;
   definition?: Pick<CustomBlockDefinition, 'fields' | 'id' | 'layout_schema' | 'name' | 'slug'>;
   fields?: CustomBlockField[];
   layoutSchema?: CustomBlockLayoutNode;
+  /** BCP 47 locale of the page, for number and currency formatting. */
+  locale?: string;
   maxDepth?: number;
+  /**
+   * Show the red developer warnings (unknown field, missing image, broken layout). They
+   * are for whoever is building the block: pass true while visual editing is on. Public
+   * visitors get nothing in their place. Defaults to on outside production.
+   */
+  showDiagnostics?: boolean;
 };
 
 type RenderContext = {
+  currency?: string;
   data: DynamicLayoutData;
   fieldsByKey: Map<string, CustomBlockField>;
+  locale: string;
   maxDepth: number;
   path: string;
+  showDiagnostics: boolean;
   visited: WeakSet<object>;
 };
 
@@ -66,7 +79,9 @@ export function getDynamicLayoutDefinitionCacheTag(idOrSlug: string) {
   return `${DYNAMIC_LAYOUT_ENGINE_CACHE_TAG}:definition:${idOrSlug}`;
 }
 
-function WarningTag({ message }: { message: string }) {
+function WarningTag({ message, show }: { message: string; show: boolean }) {
+  if (!show) return null;
+
   return (
     <span
       className="inline-flex rounded border border-destructive/30 bg-destructive/10 px-2 py-1 text-xs text-destructive"
@@ -128,22 +143,40 @@ function isPriceColumn(column: string) {
   return column === 'price' || column === 'prices' || column === 'price_adjustment' || /_price$/.test(column) || /_prices$/.test(column);
 }
 
-function formatCentsAsCurrency(cents: number) {
-  return `$${(cents / 100).toFixed(2)}`;
+const DEFAULT_PRICE_CURRENCY = 'USD';
+
+type PriceFormat = { currency?: string; locale: string };
+
+/**
+ * Minor units -> localized currency. The divisor comes from the currency itself, so JPY
+ * (no decimals) is not divided by 100, and the separators and symbol position follow the
+ * page locale (`250,00 $` on a French page, not `$250.00`).
+ */
+function formatMinorUnits(amount: number, currency: string, locale: string) {
+  try {
+    const formatter = new Intl.NumberFormat(locale, { currency, style: 'currency' });
+    const digits = formatter.resolvedOptions().maximumFractionDigits ?? 2;
+    return formatter.format(amount / 10 ** digits);
+  } catch {
+    // Unknown currency code or locale: keep the number readable instead of throwing.
+    return `${(amount / 100).toFixed(2)} ${currency}`;
+  }
 }
 
-function formatRelationColumnValue(column: string, value: unknown): string {
+function formatRelationColumnValue(column: string, value: unknown, format: PriceFormat): string {
   if (isPriceColumn(column)) {
     if (typeof value === 'number' && Number.isFinite(value)) {
-      return formatCentsAsCurrency(value);
+      return formatMinorUnits(value, format.currency ?? DEFAULT_PRICE_CURRENCY, format.locale);
     }
-    // Multi-currency maps like { "USD": 25000 } store minor units too.
+    // Multi-currency maps like { "USD": 25000 } store minor units too. The key IS the
+    // currency: the first amount used to be printed with a hardcoded "$" whatever it was.
     if (isRecord(value)) {
-      const amounts = Object.values(value).filter(
-        (entry): entry is number => typeof entry === 'number' && Number.isFinite(entry)
+      const entries = Object.entries(value).filter(
+        (entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1])
       );
-      if (amounts.length > 0) {
-        return formatCentsAsCurrency(amounts[0]);
+      const preferred = entries.find(([code]) => code === format.currency) ?? entries[0];
+      if (preferred) {
+        return formatMinorUnits(preferred[1], preferred[0], format.locale);
       }
     }
   }
@@ -154,7 +187,8 @@ function formatRelationColumnValue(column: string, value: unknown): string {
 function getResolvedRelationLabel(
   field: CustomBlockField,
   data: DynamicLayoutData,
-  column?: string
+  column: string | undefined,
+  format: PriceFormat
 ) {
   if (field.type !== 'db_relation') {
     return '';
@@ -173,7 +207,7 @@ function getResolvedRelationLabel(
       if (relationEntry.record) {
         const preferred = relationEntry.record[targetColumn];
         if (preferred !== null && preferred !== undefined && preferred !== '') {
-          return formatRelationColumnValue(targetColumn, preferred);
+          return formatRelationColumnValue(targetColumn, preferred, format);
         }
 
         return stringifyDisplayValue(relationEntry.record);
@@ -230,6 +264,18 @@ function extractRelationImageRef(
   return null;
 }
 
+/** A human name for the related row, or nothing: never an id, a slug or a JSON dump. */
+function relationImageAlt(record: Record<string, unknown>): string | undefined {
+  for (const column of ['alt', 'title', 'name', 'full_name']) {
+    const candidate = record[column];
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return undefined;
+}
+
 function getImageValue(value: unknown) {
   if (typeof value === 'string') {
     const src = resolveMediaUrl(value);
@@ -264,21 +310,24 @@ function renderImageField({
   className,
   field,
   node,
+  showDiagnostics,
   value,
 }: {
   className?: string;
   field: CustomBlockField;
   node: Extract<CustomBlockLayoutNode, { type: 'field_render' }>;
+  showDiagnostics: boolean;
   value: unknown;
 }) {
   const image = getImageValue(value);
   if (!image) {
-    return <WarningTag message={`Missing image field "${field.key}"`} />;
+    return <WarningTag show={showDiagnostics} message={`Missing image field "${field.key}"`} />;
   }
 
   const img = React.createElement('img', {
     alt: image.alt || field.label,
     className: resolveElement(node.as, 'img', FIELD_ELEMENTS) === 'img' ? className : undefined,
+    decoding: 'async',
     height: image.height,
     loading: 'lazy',
     src: image.src,
@@ -337,12 +386,12 @@ function renderFieldNode(
   context: RenderContext
 ) {
   if (typeof node.field_key !== 'string') {
-    return <WarningTag message="Invalid custom block field reference" />;
+    return <WarningTag show={context.showDiagnostics} message="Invalid custom block field reference" />;
   }
 
   const field = context.fieldsByKey.get(node.field_key);
   if (!field) {
-    return <WarningTag message={`Unknown field "${node.field_key}"`} />;
+    return <WarningTag show={context.showDiagnostics} message={`Unknown field "${node.field_key}"`} />;
   }
 
   // A field_render node bound to a db_relation may pick a specific column of the
@@ -351,7 +400,10 @@ function renderFieldNode(
   const relationColumn = typeof node.column === 'string' && node.column ? node.column : undefined;
   const value =
     field.type === 'db_relation'
-      ? getResolvedRelationLabel(field, context.data, relationColumn) || context.data[field.key]
+      ? getResolvedRelationLabel(field, context.data, relationColumn, {
+          currency: context.currency,
+          locale: context.locale,
+        }) || context.data[field.key]
       : context.data[field.key];
   const className = typeof node.className === 'string' ? node.className : undefined;
 
@@ -360,9 +412,18 @@ function renderFieldNode(
     const relation = context.data.resolved_relations?.[field.key];
     const entry = Array.isArray(relation) ? relation[0] : relation;
     let imageRef: string | null = null;
+    // Carried over when the related row has them (media rows do): intrinsic dimensions stop
+    // the layout shifting while the image loads, and the row's own name beats the field
+    // label as alternative text.
+    let imageMeta: { alt?: string; height?: unknown; width?: unknown } = {};
 
     if (isRecord(entry) && isRecord(entry.record)) {
       imageRef = extractRelationImageRef(entry.record, relationColumn ?? field.display_column);
+      imageMeta = {
+        alt: relationImageAlt(entry.record),
+        height: entry.record.height,
+        width: entry.record.width,
+      };
     } else if (looksLikeImageRef(value)) {
       imageRef = value;
     }
@@ -371,12 +432,13 @@ function renderFieldNode(
       className,
       field,
       node,
-      value: imageRef ? { object_key: imageRef } : null,
+      showDiagnostics: context.showDiagnostics,
+      value: imageRef ? { ...imageMeta, object_key: imageRef } : null,
     });
   }
 
   if (field.type === 'image_r2') {
-    return renderImageField({ className, field, node, value });
+    return renderImageField({ className, field, node, showDiagnostics: context.showDiagnostics, value });
   }
 
   return renderTextField({ className, field, node, value });
@@ -412,16 +474,16 @@ export function renderDynamicLayoutNode(
 ): React.ReactNode {
   try {
     if (depth > context.maxDepth) {
-      return <WarningTag message="Custom block layout depth limit reached" />;
+      return <WarningTag show={context.showDiagnostics} message="Custom block layout depth limit reached" />;
     }
 
     if (!isLayoutNode(node)) {
-      return <WarningTag message="Invalid custom block layout node" />;
+      return <WarningTag show={context.showDiagnostics} message="Invalid custom block layout node" />;
     }
 
     if (isRecord(node)) {
       if (context.visited.has(node)) {
-        return <WarningTag message="Custom block layout cycle detected" />;
+        return <WarningTag show={context.showDiagnostics} message="Custom block layout cycle detected" />;
       }
       context.visited.add(node);
     }
@@ -433,31 +495,37 @@ export function renderDynamicLayoutNode(
     return renderFieldNode(node, context);
   } catch (error) {
     console.error('[DynamicLayoutEngine] Failed to render layout node:', error);
-    return <WarningTag message="Invalid custom block layout" />;
+    return <WarningTag show={context.showDiagnostics} message="Invalid custom block layout" />;
   }
 }
 
 export function DynamicLayoutEngine({
   className,
+  currency,
   data,
   definition,
   fields,
   layoutSchema,
+  locale = 'en',
   maxDepth = DYNAMIC_LAYOUT_ENGINE_MAX_DEPTH,
+  showDiagnostics = process.env.NODE_ENV !== 'production',
 }: DynamicLayoutEngineProps) {
   const resolvedLayoutSchema = layoutSchema ?? definition?.layout_schema;
   const resolvedFields = fields ?? definition?.fields ?? [];
 
   if (!resolvedLayoutSchema) {
-    return <WarningTag message="Missing custom block layout" />;
+    return <WarningTag show={showDiagnostics} message="Missing custom block layout" />;
   }
 
   const fieldsByKey = new Map(resolvedFields.map((field) => [field.key, field]));
   const rendered = renderDynamicLayoutNode(resolvedLayoutSchema, {
+    currency,
     data: data ?? {},
     fieldsByKey,
+    locale,
     maxDepth,
     path: 'root',
+    showDiagnostics,
     visited: new WeakSet<object>(),
   });
 

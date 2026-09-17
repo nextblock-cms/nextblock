@@ -271,6 +271,32 @@ partial release by running the **remaining** libs individually
 (`node tools/scripts/release-lib.js <lib> <version>` … then `release-cli.js <version>`),
 or bump to a fresh version and re-run the whole thing.
 
+### The pre-publish check
+
+`release-lib.js` builds with `NODE_ENV=production`, finalizes the premium libraries'
+manifests, and then runs `tools/scripts/verify-lib-dist.js <lib>` before `npm publish`. A
+failed check aborts the release and restores the version. The check must come AFTER the
+manifest step: `ecommerce` builds with the raw source `package.json`, which has no `exports`
+at all, so checking first rejected every subpath (that is what stopped the first 0.19.1
+attempt). The two `exports` maps live in `tools/scripts/lib-publish-exports.js`, shared by
+the release script and the check, so the check also works on a plain `nx build` output. Run
+it by hand after any `nx build <lib>`:
+
+```bash
+node tools/scripts/verify-lib-dist.js ecommerce
+```
+
+It exists because a broken package is invisible inside the monorepo, where
+`@nextblock-cms/*` resolves through tsconfig paths to TypeScript source. Only a scaffold,
+which installs from npm, runs the compiled output. Each check is a failure that shipped
+in 0.19.0 and broke `next build` in every generated project:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Development build | Without `NODE_ENV=production` the Nx Vite executor builds in development mode. plugin-react then emits `jsxDEV(..., this)` with the builder's absolute paths, and `this` is illegal in a file with inline server actions ("Server Actions cannot use `this`"). |
+| Consumed subpaths | With `preserveModules`, only modules reachable from a build entry are emitted. A module imported **only** through its subpath (`@nextblock-cms/utils/script-safety`) shipped a `.d.ts` and no JavaScript. Give it its own `build.lib.entry`. |
+| Lost exports | `libs/db` and `libs/utils` track stale compiled twins (`foo.js` beside `foo.ts`). Vite resolves `.js` before `.ts` by default, so the package was assembled from months-old code. Both configs now set `resolve.extensions` with TypeScript first. |
+
 ### Library build gotchas (dts / tsconfig)
 
 Each lib emits its `.d.ts` via `vite-plugin-dts` running tsc on `tsconfig.lib.json`. When a

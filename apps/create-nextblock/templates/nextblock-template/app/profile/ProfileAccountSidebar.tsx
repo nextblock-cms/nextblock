@@ -59,7 +59,7 @@ export function ProfileAccountSidebar({
           </div>
           <p className="text-lg font-semibold">{displayName}</p>
           {user.email ? (
-            <p className="text-sm text-muted-foreground">{user.email}</p>
+            <p className="break-all text-sm text-muted-foreground">{user.email}</p>
           ) : null}
         </div>
 

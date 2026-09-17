@@ -171,7 +171,7 @@ describe('submitProductInquiry', () => {
   it('rejects a malformed email address before touching the database', async () => {
     const result = await submitProductInquiry(null, buildFormData({ email: 'not-an-email' }));
 
-    expect(result).toEqual({ success: false, messageKey: 'ecommerce.contact_seller_invalid' });
+    expect(result).toMatchObject({ success: false, messageKey: 'ecommerce.contact_seller_invalid' });
     expect(mocks.insert).not.toHaveBeenCalled();
   });
 
@@ -180,7 +180,7 @@ describe('submitProductInquiry', () => {
 
     const result = await submitProductInquiry(null, buildFormData());
 
-    expect(result).toEqual({ success: false, messageKey: 'ecommerce.contact_seller_invalid' });
+    expect(result).toMatchObject({ success: false, messageKey: 'ecommerce.contact_seller_invalid' });
     expect(mocks.insert).not.toHaveBeenCalled();
   });
 
@@ -189,7 +189,7 @@ describe('submitProductInquiry', () => {
 
     const result = await submitProductInquiry(null, buildFormData());
 
-    expect(result).toEqual({ success: false, messageKey: 'ecommerce.contact_seller_throttled' });
+    expect(result).toMatchObject({ success: false, messageKey: 'ecommerce.contact_seller_throttled' });
     expect(mocks.insert).not.toHaveBeenCalled();
   });
 
@@ -224,7 +224,7 @@ describe('submitProductInquiry', () => {
 
     const result = await submitProductInquiry(null, buildFormData());
 
-    expect(result).toEqual({ success: false, messageKey: 'ecommerce.contact_seller_throttled' });
+    expect(result).toMatchObject({ success: false, messageKey: 'ecommerce.contact_seller_throttled' });
     expect(mocks.throttleKey).toHaveBeenCalledWith('unknown');
   });
 

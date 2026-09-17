@@ -7,7 +7,7 @@
 **The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.**
 
 <p align="center">
-  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fnextblock-cms%2Fnextblock&project-name=nextblock&repository-name=nextblock&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22supabase%22%2C%22productSlug%22%3A%22supabase%22%7D%5D"><img src="https://vercel.com/button" alt="Deploy with Vercel" height="40" /></a>
+  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fnextblock-cms%2Fnextblock&project-name=nextblock&repository-name=nextblock&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22supabase%22%2C%22productSlug%22%3A%22supabase%22%7D%5D&demo-title=NextBlock%20CMS&demo-description=Open-source%20Next.js%2016%20%2B%20Supabase%20CMS%20with%20a%20block%20editor%2C%20SEO%20engine%2C%20bilingual%20content%20and%20an%20MCP%20server%20for%20AI%20agents.&demo-url=https%3A%2F%2Fcms.nextblock.dev%2F&demo-image=https%3A%2F%2Fcms.nextblock.dev%2Fassets%2Fnextblock-banner.jpg"><img src="https://vercel.com/button" alt="Deploy with Vercel" height="40" /></a>
 </p>
 
 <p align="center">
@@ -75,7 +75,7 @@ We combined the **flexibility of a Block Editor** with the **raw power of Next.j
 
 ### ☁️ Option 1 — Deploy to the cloud in one click (recommended)
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fnextblock-cms%2Fnextblock&project-name=nextblock&repository-name=nextblock&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22supabase%22%2C%22productSlug%22%3A%22supabase%22%7D%5D)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fnextblock-cms%2Fnextblock&project-name=nextblock&repository-name=nextblock&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22supabase%22%2C%22productSlug%22%3A%22supabase%22%7D%5D&demo-title=NextBlock%20CMS&demo-description=Open-source%20Next.js%2016%20%2B%20Supabase%20CMS%20with%20a%20block%20editor%2C%20SEO%20engine%2C%20bilingual%20content%20and%20an%20MCP%20server%20for%20AI%20agents.&demo-url=https%3A%2F%2Fcms.nextblock.dev%2F&demo-image=https%3A%2F%2Fcms.nextblock.dev%2Fassets%2Fnextblock-banner.jpg)
 
 During import, Vercel's native **Supabase Marketplace integration** (the `stores`
 button parameter) prompts you to create a Supabase database (name + region), then

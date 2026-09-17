@@ -266,10 +266,13 @@ export default function PostClientContent({ initialPostData, currentSlug, childr
       return null;
     }
 
+    // A fixed zone: this client component also renders on the server (UTC), so without one a
+    // visitor west of UTC could hydrate to the previous day and mismatch the server HTML.
     return new Date(currentPostData.published_at).toLocaleDateString(currentPostData.language_code, {
       year: 'numeric',
       month: 'long',
       day: 'numeric',
+      timeZone: 'UTC',
     });
   }, [currentPostData?.language_code, currentPostData?.published_at]);
 
@@ -355,7 +358,7 @@ export default function PostClientContent({ initialPostData, currentSlug, childr
     return (
       <div className="container mx-auto px-4 py-8 text-center">
         <h1 className="text-2xl font-bold mb-4">Article Not Found</h1>
-        <p className="text-muted-foreground">The article for slug &quot;{currentSlug}&quot; could not be loaded.</p>
+        <p className="text-muted-foreground">The article for slug &ldquo;{currentSlug}&rdquo; could not be loaded.</p>
         <p className="mt-4">
           <Link href={`/${currentPrefix}`} className="text-primary hover:underline">Back to Articles</Link>
           <span className="mx-2">|</span>
@@ -366,16 +369,16 @@ export default function PostClientContent({ initialPostData, currentSlug, childr
   }
   
   if (!currentPostData && (isLoadingLanguages || isLoadingTargetLang)) {
-     return <div className="container mx-auto px-4 py-20 text-center"><p>Loading article content...</p></div>;
+     return <div className="container mx-auto px-4 py-20 text-center"><p>Loading article content…</p></div>;
   }
 
   if (!currentPostData) {
-     return <div className="container mx-auto px-4 py-20 text-center"><p>Could not load article content for &quot;{currentSlug}&quot;.</p></div>;
+     return <div className="container mx-auto px-4 py-20 text-center"><p>Could not load article content for &ldquo;{currentSlug}&rdquo;.</p></div>;
   }
 
   return (
     <article className={`post-article w-full mx-auto pb-16 md:pb-24 ${postPresentation.articleClassName ?? ''}`}>
-      {isLoadingTargetLang && <div className="text-center py-2 text-sm text-muted-foreground">Switching language...</div>}
+      {isLoadingTargetLang && <div role="status" className="text-center py-2 text-sm text-muted-foreground">Switching language…</div>}
 
       <div className="mx-auto max-w-6xl px-4 pt-6 md:pt-10">
         <div className="mb-4 flex items-center justify-between gap-4 text-sm">
@@ -404,7 +407,7 @@ export default function PostClientContent({ initialPostData, currentSlug, childr
           />
         ) : null}
 
-        <header className={`mx-auto max-w-4xl rounded-[1.75rem] border border-slate-200/80 bg-background/95 px-6 py-8 shadow-[0_24px_70px_-36px_rgba(15,23,42,0.4)] backdrop-blur dark:border-white/10 dark:bg-slate-950/90 ${currentPostData?.feature_image_url ? '-mt-12 md:-mt-16' : 'mt-6'}`}>
+        <header className={`mx-auto max-w-4xl rounded-[1.75rem] border border-slate-200/80 bg-background px-6 py-8 shadow-[0_24px_70px_-36px_rgba(15,23,42,0.4)] dark:border-white/10 dark:bg-slate-950 ${currentPostData?.feature_image_url ? '-mt-12 md:-mt-16' : 'mt-6'}`}>
           <div className="mb-4 flex flex-wrap items-center justify-center gap-3 text-sm md:justify-start">
             <span className={`inline-flex items-center rounded-full border px-3 py-1 font-semibold ${postPresentation.badgeClassName}`}>
               {displayLabel}

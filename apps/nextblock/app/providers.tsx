@@ -18,6 +18,7 @@ import { LanguageProvider, useLanguage } from '../context/LanguageContext';
 import { CurrentContentProvider } from '../context/CurrentContentContext';
 import { ThemeCatalogProvider } from '../context/ThemeCatalogContext';
 import { DeferredCartTranslator } from '../components/DeferredCartTranslator';
+import { ThemeColorSync } from '../components/ThemeColorSync';
 import { CurrencyProvider } from '@nextblock-cms/ecommerce/CurrencyProvider';
 import { TranslationsProvider } from '@nextblock-cms/utils';
 import {
@@ -98,6 +99,7 @@ export function Providers({ children, ...props }: { children: React.ReactNode;[k
                 nonce={nonce}
                 themes={resolvedThemes}
               >
+                <ThemeColorSync />
                 <ThemeCatalogProvider themes={themeCatalog}>{children}</ThemeCatalogProvider>
               </ThemeProvider>
             </TranslationBridge>

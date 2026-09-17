@@ -104,29 +104,36 @@ export interface ContactSellerState {
     | '';
   /** Set only for captcha failures, which carry their own provider-specific text. */
   message?: string;
+  /**
+   * What the visitor typed, echoed back on failure only. React 19 resets an uncontrolled
+   * form when its action settles, so a captcha, throttle or send failure used to wipe the
+   * message they had just written.
+   */
+  values?: { name: string; email: string; message: string };
 }
 
 export async function submitProductInquiry(
   _prevState: unknown,
   formData: FormData
 ): Promise<ContactSellerState> {
+  const productId = readField(formData, 'product_id', 64);
+  const senderName = readField(formData, 'name', MAX_NAME_LENGTH);
+  const senderEmail = readField(formData, 'email', MAX_EMAIL_LENGTH);
+  const message = readField(formData, 'message', MAX_MESSAGE_LENGTH);
+  const locale = readField(formData, 'locale', 12) || null;
+  const values = { name: senderName, email: senderEmail, message };
+
   const verification = await verifyBotProtection(formData);
   if (!verification.ok) {
     // Fake a success for the honeypot so the bot learns nothing about the check.
     if (verification.reason === 'honeypot') {
       return { success: true, messageKey: 'ecommerce.contact_seller_sent' };
     }
-    return { success: false, messageKey: '', message: verification.message };
+    return { success: false, messageKey: '', message: verification.message, values };
   }
 
-  const productId = readField(formData, 'product_id', 64);
-  const senderName = readField(formData, 'name', MAX_NAME_LENGTH);
-  const senderEmail = readField(formData, 'email', MAX_EMAIL_LENGTH);
-  const message = readField(formData, 'message', MAX_MESSAGE_LENGTH);
-  const locale = readField(formData, 'locale', 12) || null;
-
   if (!productId || !senderName || !senderEmail || !message || !isPlausibleEmail(senderEmail)) {
-    return { success: false, messageKey: 'ecommerce.contact_seller_invalid' };
+    return { success: false, messageKey: 'ecommerce.contact_seller_invalid', values };
   }
 
   try {
@@ -145,7 +152,7 @@ export async function submitProductInquiry(
       .gte('created_at', since);
 
     if ((count ?? 0) >= THROTTLE_MAX_SUBMISSIONS) {
-      return { success: false, messageKey: 'ecommerce.contact_seller_throttled' };
+      return { success: false, messageKey: 'ecommerce.contact_seller_throttled', values };
     }
 
     // Look the product up server-side: a client-supplied title would let anyone send
@@ -157,7 +164,7 @@ export async function submitProductInquiry(
       .maybeSingle();
 
     if (!product) {
-      return { success: false, messageKey: 'ecommerce.contact_seller_invalid' };
+      return { success: false, messageKey: 'ecommerce.contact_seller_invalid', values };
     }
 
     const { data: inserted, error: insertError } = await supabase
@@ -178,7 +185,7 @@ export async function submitProductInquiry(
 
     if (insertError) {
       console.error('Failed to record product inquiry:', insertError.message);
-      return { success: false, messageKey: 'ecommerce.contact_seller_error' };
+      return { success: false, messageKey: 'ecommerce.contact_seller_error', values };
     }
 
     // Open the conversation this enquiry belongs to. The enquiry row above stays as
@@ -217,6 +224,6 @@ export async function submitProductInquiry(
     return { success: true, messageKey: 'ecommerce.contact_seller_sent' };
   } catch (error) {
     console.error('Product inquiry submission failed:', error);
-    return { success: false, messageKey: 'ecommerce.contact_seller_error' };
+    return { success: false, messageKey: 'ecommerce.contact_seller_error', values };
   }
 }

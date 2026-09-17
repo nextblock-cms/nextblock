@@ -38,14 +38,22 @@ export default function ForgotPassword() {
           <h1 className="text-2xl font-medium">{t('reset_password')}</h1>
           <p className="text-sm text-secondary-foreground">
             {t('already_have_account')}{" "}
-            <Link className="text-primary underline" href="/sign-in">
+            <Link className="text-primary underline transition-colors hover:text-primary/80" href="/sign-in">
               {t('sign_in')}
             </Link>
           </p>
         </div>
         <div className="flex flex-col gap-2 [&>input]:mb-3 mt-8">
           <Label htmlFor="email">{t('email')}</Label>
-          <Input name="email" placeholder={t('you_at_example_com')} required />
+          <Input
+            id="email"
+            type="email"
+            name="email"
+            autoComplete="email"
+            spellCheck={false}
+            placeholder={t('you_at_example_com')}
+            required
+          />
           <SubmitButton formAction={forgotPasswordAction}>
             {t('reset_password')}
           </SubmitButton>

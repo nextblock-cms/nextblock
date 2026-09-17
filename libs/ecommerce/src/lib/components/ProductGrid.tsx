@@ -2,7 +2,7 @@
 
 import { Product } from '../types';
 import { ProductCard } from './ProductCard';
-import { cn } from '@nextblock-cms/utils';
+import { cn, useTranslations } from '@nextblock-cms/utils';
 
 interface ProductGridProps {
   products: Product[];
@@ -11,8 +11,16 @@ interface ProductGridProps {
 }
 
 export const ProductGrid = ({ products, columns = 3, className }: ProductGridProps) => {
+  const { t } = useTranslations();
+
   if (!products.length) {
-    return <div className="py-12 text-center text-muted-foreground">No products found.</div>;
+    const emptyLabel = t('ecommerce.no_products_found');
+
+    return (
+      <div className="py-12 text-center text-muted-foreground">
+        {emptyLabel === 'ecommerce.no_products_found' ? 'No products found.' : emptyLabel}
+      </div>
+    );
   }
 
   return (
@@ -24,8 +32,9 @@ export const ProductGrid = ({ products, columns = 3, className }: ProductGridPro
         className
       )}
     >
-      {products.map((product) => (
-        <ProductCard key={product.id} product={product} />
+      {/* The first row is usually above the fold: loading it lazily delays the first paint. */}
+      {products.map((product, index) => (
+        <ProductCard key={product.id} product={product} priority={index < columns} />
       ))}
     </div>
   );

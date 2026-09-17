@@ -8,6 +8,14 @@ const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 export default defineConfig({
   root: __dirname,
+  // TypeScript first. src/ tracks stale compiled twins (`package-validation.js` beside
+  // `package-validation.ts`, and nine more), and Vite's default order resolves an
+  // extension-less import to the `.js`. Through 0.19.0 that assembled the published package
+  // from code dated 2026-05-13: `PACKAGE_ACTIVATION_CACHE_TAG`, the trial-expiry check and
+  // the Supabase env alias chain were all missing, which broke `next build` in scaffolds.
+  resolve: {
+    extensions: ['.mts', '.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+  },
   plugins: [
     dts({
       entryRoot: 'src',

@@ -32,9 +32,14 @@ const ColorPicker = React.forwardRef<HTMLDivElement, ColorPickerProps>(
       onChange(`rgba(${r}, ${g}, ${b}, ${a})`);
     };
 
+    const inputId = React.useId();
+
     return (
       <div className={cn("space-y-1.5", className)} ref={ref}>
-        <Label className="text-xs uppercase font-bold text-muted-foreground tracking-wider leading-none">
+        <Label
+          htmlFor={inputId}
+          className="text-xs uppercase font-bold text-muted-foreground tracking-wider leading-none"
+        >
           {label}
         </Label>
         <div className="flex items-center gap-2">
@@ -42,7 +47,8 @@ const ColorPicker = React.forwardRef<HTMLDivElement, ColorPickerProps>(
             <PopoverTrigger asChild>
               <button
                 type="button"
-                className="w-9 h-9 rounded-md border border-input cursor-pointer flex-shrink-0 shadow-sm transition-all hover:scale-105"
+                aria-label={`${label}: open the colour picker`}
+                className="w-9 h-9 rounded-md border border-input cursor-pointer flex-shrink-0 shadow-sm transition-transform hover:scale-105 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 style={{ backgroundColor: color }}
               />
             </PopoverTrigger>
@@ -53,6 +59,7 @@ const ColorPicker = React.forwardRef<HTMLDivElement, ColorPickerProps>(
             </PopoverContent>
           </Popover>
           <Input
+            id={inputId}
             value={color}
             onChange={(e) => onChange(e.target.value)}
             className="h-9 font-mono text-xs flex-1 min-w-[100px]"

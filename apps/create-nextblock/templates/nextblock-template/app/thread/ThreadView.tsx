@@ -121,14 +121,17 @@ export default function ThreadView({
                   {new Date(message.created_at).toLocaleString()}
                 </time>
               </div>
-              <p className="whitespace-pre-wrap text-sm text-foreground">{message.body}</p>
+              <p className="whitespace-pre-wrap break-words text-sm text-foreground">{message.body}</p>
             </li>
           );
         })}
       </ol>
 
       {state.success ? (
-        <div className="flex items-start gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900/50 dark:bg-emerald-950/30">
+        <div
+          role="status"
+          className="flex items-start gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900/50 dark:bg-emerald-950/30"
+        >
           <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
           <p className="text-sm text-emerald-900 dark:text-emerald-200">{label('thread.sent')}</p>
         </div>
@@ -152,7 +155,11 @@ export default function ThreadView({
             scriptNonce={scriptNonce}
           />
 
-          {errorText && <p className="text-sm font-semibold text-destructive">{errorText}</p>}
+          {errorText && (
+            <p role="alert" className="text-sm font-semibold text-destructive">
+              {errorText}
+            </p>
+          )}
 
           <div className="flex justify-end">
             <SendButton label={label('thread.send')} pendingLabel={label('thread.sending')} />

@@ -116,7 +116,7 @@ export function ViewLiveButton({
             </DialogDescription>
           </DialogHeader>
           {error ? (
-            <p className="text-sm text-destructive">Couldn&apos;t publish: {error}</p>
+            <p role="alert" className="text-sm text-destructive">Couldn&apos;t publish: {error}</p>
           ) : null}
           <DialogFooter className="mt-4 gap-2">
             <Button

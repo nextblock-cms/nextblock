@@ -2,7 +2,8 @@
 
 import { Product } from '../types';
 import { AddToCartButton } from './AddToCartButton';
-import { cn, formatPrice } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 import Link from 'next/link';
 
 import { useTranslations } from '@nextblock-cms/utils';
@@ -20,6 +21,8 @@ interface FeaturedProductProps {
 }
 
 export const FeaturedProduct = ({ product, className, imagePosition = 'left' }: FeaturedProductProps) => {
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const { t } = useTranslations();
   const { activeCurrencyCode, currencies } = useCurrency();
   const variantRange = resolvePriceRangeForCurrency({
@@ -55,7 +58,7 @@ export const FeaturedProduct = ({ product, className, imagePosition = 'left' }: 
             activeCurrencyCode
           )}`
       : formatPrice(resolvedPrice.sale_price ?? resolvedPrice.price, activeCurrencyCode);
-  const trialSummary = getTrialSummary(product);
+  const trialSummary = getTrialSummary(product, t);
   
   return (
     <div className={cn("overflow-hidden rounded-xl border bg-card shadow-sm", className)}>
@@ -67,6 +70,10 @@ export const FeaturedProduct = ({ product, className, imagePosition = 'left' }: 
                 <img
                     src={product.image_url}
                     alt={product.title}
+                    width={800}
+                    height={800}
+                    loading="lazy"
+                    decoding="async"
                     className="h-full w-full object-cover"
                 />
              ) : (

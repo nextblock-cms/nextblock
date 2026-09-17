@@ -31,6 +31,8 @@
     color: hsl(var(--foreground) / 0.88);
     font-size: 1.04rem;
     line-height: 1.85;
+    /* Long URLs and unbroken strings wrap instead of widening the page. */
+    overflow-wrap: break-word;
   }
 
   .prose h1,
@@ -76,6 +78,28 @@
     color: hsl(var(--primary));
     text-decoration-thickness: 0.08em;
     text-underline-offset: 0.2em;
+  }
+
+  /* base.css resets `a` to `text-decoration: inherit`, so a prose link without editor
+     classes (imported or MCP-authored HTML) was distinguished by colour alone and had no
+     hover feedback. Button-style anchors (inline CTA widgets, `Button asChild`) are
+     block-level and keep their own look; `:where()` keeps the specificity unchanged. */
+  .prose a:where(:not(.inline-block, .inline-flex, .block, .flex)) {
+    text-decoration-line: underline;
+    transition:
+      text-decoration-thickness 150ms ease,
+      color 150ms ease;
+  }
+
+  .prose a:where(:not(.inline-block, .inline-flex, .block, .flex)):hover {
+    text-decoration-thickness: 0.14em;
+    color: hsl(var(--primary) / 0.85);
+  }
+
+  .prose a:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: 0.2rem;
   }
 
   .prose strong {
@@ -358,8 +382,11 @@
   border-radius: 9999px;
 }
 
+/* Transparent rather than `none`: forced-colors mode repaints a transparent outline, while
+   the box-shadow ring below disappears there. */
 .nb-color-picker .react-colorful__interactive {
-  outline: none;
+  outline: 2px solid transparent;
+  outline-offset: 2px;
 }
 
 .nb-color-picker .react-colorful__interactive:focus-visible .react-colorful__pointer {

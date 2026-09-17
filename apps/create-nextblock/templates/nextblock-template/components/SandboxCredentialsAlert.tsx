@@ -20,8 +20,9 @@ export function SandboxCredentialsAlert() {
           {t('demo_access_desc')}
         </p>
         <ul className="space-y-1 font-mono text-xs bg-white/50 dark:bg-black/20 p-2 rounded border border-blue-100 dark:border-blue-900/50">
-          <li>{t('demo_user_label')} <span className="font-bold select-all">demo@nextblock.dev</span></li>
-          <li>{t('demo_password_label')} <span className="font-bold select-all">password</span></li>
+          {/* translate="no": browser auto-translate would rewrite the literal "password". */}
+          <li>{t('demo_user_label')} <span translate="no" className="font-bold select-all">demo@nextblock.dev</span></li>
+          <li>{t('demo_password_label')} <span translate="no" className="font-bold select-all">password</span></li>
         </ul>
       </div>
     </div>

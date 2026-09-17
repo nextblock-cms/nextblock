@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useTransition, useOptimistic } from "react";
+import React, { useState, useEffect, useRef, useTransition, useOptimistic } from "react";
 import { createClient } from "@nextblock-cms/db";
 import { Button } from "@nextblock-cms/ui/button";
 import { Textarea } from "@nextblock-cms/ui/textarea";
@@ -9,6 +9,7 @@ import { submitInteraction, toggleReaction } from "../app/actions/interactions";
 import { cn, useTranslations } from "@nextblock-cms/utils";
 import { MessageSquare, ThumbsUp, Star, Loader2, PenTool } from "lucide-react";
 import { StaffReplies, useStaffReplies } from "./StaffReplies";
+import { useLabel } from "../lib/i18n/use-label";
 
 interface ProductReviewsSectionProps {
   productId: string;
@@ -16,6 +17,12 @@ interface ProductReviewsSectionProps {
 
 export default function ProductReviewsSection({ productId }: ProductReviewsSectionProps) {
   const { t, lang } = useTranslations();
+  const label = useLabel();
+  const starRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const starsLabel = (count: number) =>
+    count === 1
+      ? label("reviews.star_one", "{count} star", "{count} étoile", { count })
+      : label("reviews.star_other", "{count} stars", "{count} étoiles", { count });
   const [reviews, setReviews] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(0);
@@ -217,8 +224,10 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
         {user ? (
           <Button
             onClick={() => setIsFormOpen(!isFormOpen)}
-            className="flex items-center gap-2 transition-all"
+            className="flex items-center gap-2 transition-colors"
             variant={isFormOpen ? "outline" : "default"}
+            aria-expanded={isFormOpen}
+            aria-controls="review-form"
           >
             <PenTool className="h-4 w-4" />
             {isFormOpen ? t("reviews.cancel_review") : t("reviews.write_review")}
@@ -233,6 +242,7 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
       {/* Submission Form */}
       {isFormOpen && (
         <form
+          id="review-form"
           onSubmit={handleSubmitReview}
           className="bg-card/50 border border-border/80 rounded-2xl p-6 shadow-sm space-y-4 animate-in fade-in slide-in-from-top-4 duration-300"
         >
@@ -240,22 +250,50 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
 
           {/* Stars Selection */}
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block">
+            {/* Not a <label>: there is no single control for it to point at. The five stars
+                are one radio group, with the usual roving tabindex and arrow keys. */}
+            <span
+              id="review-rating-label"
+              className="text-xs font-semibold text-muted-foreground uppercase tracking-wider block"
+            >
               {t("reviews.rating")}
-            </label>
-            <div className="flex items-center gap-1.5">
+            </span>
+            <div
+              role="radiogroup"
+              aria-labelledby="review-rating-label"
+              className="flex items-center gap-1.5"
+              onKeyDown={(event) => {
+                const step =
+                  event.key === "ArrowRight" || event.key === "ArrowUp"
+                    ? 1
+                    : event.key === "ArrowLeft" || event.key === "ArrowDown"
+                      ? -1
+                      : 0;
+                if (step === 0) return;
+                event.preventDefault();
+                const next = Math.min(5, Math.max(1, rating + step));
+                setRating(next);
+                starRefs.current[next - 1]?.focus();
+              }}
+            >
               {Array.from({ length: 5 }).map((_, i) => {
                 const starVal = i + 1;
                 const isActive = starVal <= (hoverRating || rating);
                 return (
                   <button
                     key={i}
+                    ref={(element) => {
+                      starRefs.current[i] = element;
+                    }}
                     type="button"
+                    role="radio"
+                    aria-checked={rating === starVal}
+                    tabIndex={rating === starVal ? 0 : -1}
                     onClick={() => setRating(starVal)}
                     onMouseEnter={() => setHoverRating(starVal)}
                     onMouseLeave={() => setHoverRating(0)}
-                    className="transition-transform active:scale-95 focus:outline-none"
-                    aria-label={`Rate ${starVal} stars`}
+                    className="rounded-sm transition-transform active:scale-95 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={starsLabel(starVal)}
                   >
                     <Star
                       className={cn(
@@ -281,17 +319,19 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
             </label>
             <Textarea
               id="review-content"
+              name="review"
+              autoComplete="off"
               placeholder={t("reviews.description_placeholder")}
               value={content}
               onChange={(e) => setContent(e.target.value)}
-              className="min-h-[120px] focus:ring-1 focus:ring-primary"
+              className="min-h-[120px] focus-visible:ring-1 focus-visible:ring-primary"
               disabled={submitting}
               required
             />
           </div>
 
-          {error && <div className="text-sm font-semibold text-destructive">{error}</div>}
-          {success && <div className="text-sm font-semibold text-emerald-600">{success}</div>}
+          {error && <div role="alert" className="text-sm font-semibold text-destructive">{error}</div>}
+          {success && <div role="status" className="text-sm font-semibold text-emerald-600">{success}</div>}
 
           <div className="flex justify-end gap-3 pt-2">
             <Button
@@ -322,7 +362,8 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
           optimisticReviews.map((review) => {
             const hasLiked = likedIds.includes(review.id) || review.tempHasReacted;
             const likeCount = (review.reactions as Record<string, number>)?.likes || 0;
-            const reviewerName = review.profiles?.full_name || "Anonymous";
+            const reviewerName =
+              review.profiles?.full_name || label("interactions.anonymous", "Anonymous", "Anonyme");
             const dateStr = new Date(review.created_at).toLocaleDateString(lang, {
               year: "numeric",
               month: "long",
@@ -332,7 +373,7 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
             return (
               <div
                 key={review.id}
-                className="bg-card border border-border/60 rounded-2xl p-5 shadow-sm space-y-4 hover:border-border/100 transition-all duration-300"
+                className="bg-card border border-border/60 rounded-2xl p-5 shadow-sm space-y-4 hover:border-border/100 transition-colors duration-300"
               >
                 {/* Reviewer Header */}
                 <div className="flex items-center justify-between gap-4">
@@ -344,17 +385,24 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
                       </AvatarFallback>
                     </Avatar>
                     <div>
-                      <h4 className="text-sm font-semibold text-foreground leading-none">
+                      {/* h3, not h4: the section title is an h2 and nothing sits between. */}
+                      <h3 className="text-sm font-semibold text-foreground leading-none">
                         {reviewerName}
-                      </h4>
+                      </h3>
                       <span className="text-[10px] text-muted-foreground mt-1.5 block" suppressHydrationWarning>
                         {dateStr}
                       </span>
                     </div>
                   </div>
 
-                  {/* Rating Stars */}
-                  <div className="flex items-center gap-0.5 text-amber-500">
+                  {/* Rating Stars: five decorative icons, so the score itself is the name. */}
+                  <div
+                    role="img"
+                    aria-label={label("reviews.rated", "Rated {rating} out of 5", "Note : {rating} sur 5", {
+                      rating: review.rating,
+                    })}
+                    className="flex items-center gap-0.5 text-amber-500"
+                  >
                     {Array.from({ length: 5 }).map((_, i) => (
                       <Star
                         key={i}
@@ -368,16 +416,18 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
                 </div>
 
                 {/* Review Content */}
-                <p className="text-sm text-slate-600 dark:text-slate-350 leading-relaxed whitespace-pre-line text-left">
+                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line break-words text-left">
                   {review.content}
                 </p>
 
                 {/* Reaction Actions */}
                 <div className="flex items-center pt-2">
                   <button
+                    type="button"
+                    aria-pressed={Boolean(hasLiked)}
                     onClick={() => handleLike(review.id)}
                     className={cn(
-                      "flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full border transition-all active:scale-95",
+                      "flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full border transition-[color,background-color,border-color,transform] active:scale-95",
                       hasLiked
                         ? "bg-primary/5 border-primary/20 text-primary"
                         : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-border/100"
@@ -407,8 +457,9 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
 
         {/* Loading Spinner */}
         {loading && (
-          <div className="flex justify-center py-6">
+          <div role="status" className="flex justify-center py-6">
             <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            <span className="sr-only">{label("loading", "Loading…", "Chargement…")}</span>
           </div>
         )}
 

@@ -9,6 +9,7 @@ import { submitInteraction, toggleReaction } from "../app/actions/interactions";
 import { cn, useTranslations } from "@nextblock-cms/utils";
 import { MessageSquare, ThumbsUp, Loader2, PenTool } from "lucide-react";
 import { StaffReplies, useStaffReplies } from "./StaffReplies";
+import { useLabel } from "../lib/i18n/use-label";
 
 interface PostCommentsSectionProps {
   postId: number;
@@ -16,6 +17,9 @@ interface PostCommentsSectionProps {
 
 export default function PostCommentsSection({ postId }: PostCommentsSectionProps) {
   const { t, lang } = useTranslations();
+  // `comments.cancel` and `comments.submitting` were seeded by no migration and `t()` answers
+  // a missing key with the key itself, so both buttons showed the raw key to visitors.
+  const label = useLabel();
   const [comments, setComments] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [page, setPage] = useState(0);
@@ -214,8 +218,10 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
 
         {user ? (
           <Button
+            aria-expanded={isFormOpen}
+            aria-controls="comment-form"
             onClick={() => setIsFormOpen(!isFormOpen)}
-            className="flex items-center gap-2 transition-all"
+            className="flex items-center gap-2 transition-colors"
             variant={isFormOpen ? "outline" : "default"}
           >
             <PenTool className="h-4 w-4" />
@@ -231,6 +237,7 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
       {/* Submission Form */}
       {isFormOpen && (
         <form
+          id="comment-form"
           onSubmit={handleSubmitComment}
           className="bg-card/50 border border-border/80 rounded-2xl p-6 shadow-sm space-y-4 animate-in fade-in slide-in-from-top-4 duration-300"
         >
@@ -246,17 +253,19 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
             </label>
             <Textarea
               id="comment-content"
+              name="comment"
+              autoComplete="off"
               placeholder={t("comments.message_placeholder")}
               value={content}
               onChange={(e) => setContent(e.target.value)}
-              className="min-h-[120px] focus:ring-1 focus:ring-primary"
+              className="min-h-[120px] focus-visible:ring-1 focus-visible:ring-primary"
               disabled={submitting}
               required
             />
           </div>
 
-          {error && <div className="text-sm font-semibold text-destructive">{error}</div>}
-          {success && <div className="text-sm font-semibold text-emerald-600">{success}</div>}
+          {error && <div role="alert" className="text-sm font-semibold text-destructive">{error}</div>}
+          {success && <div role="status" className="text-sm font-semibold text-emerald-600">{success}</div>}
 
           <div className="flex justify-end gap-3 pt-2">
             <Button
@@ -265,13 +274,13 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
               onClick={() => setIsFormOpen(false)}
               disabled={submitting}
             >
-              {t("comments.cancel")}
+              {label("comments.cancel", "Cancel", "Annuler")}
             </Button>
             <Button type="submit" disabled={submitting} className="min-w-[120px]">
               {submitting ? (
                 <>
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  {t("comments.submitting")}
+                  {label("comments.submitting", "Submitting…", "Envoi en cours…")}
                 </>
               ) : (
                 t("comments.post_comment")
@@ -287,7 +296,8 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
           optimisticComments.map((comment) => {
             const hasLiked = likedIds.includes(comment.id) || comment.tempHasReacted;
             const likeCount = (comment.reactions as Record<string, number>)?.likes || 0;
-            const commenterName = comment.profiles?.full_name || "Anonymous";
+            const commenterName =
+              comment.profiles?.full_name || label("interactions.anonymous", "Anonymous", "Anonyme");
             const dateStr = new Date(comment.created_at).toLocaleDateString(lang, {
               year: "numeric",
               month: "long",
@@ -297,7 +307,7 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
             return (
               <div
                 key={comment.id}
-                className="bg-card border border-border/60 rounded-2xl p-5 shadow-sm space-y-4 hover:border-border/100 transition-all duration-300"
+                className="bg-card border border-border/60 rounded-2xl p-5 shadow-sm space-y-4 hover:border-border/100 transition-colors duration-300"
               >
                 {/* Commenter Header */}
                 <div className="flex items-center justify-between gap-4">
@@ -309,9 +319,10 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
                       </AvatarFallback>
                     </Avatar>
                     <div>
-                      <h4 className="text-sm font-semibold text-foreground leading-none">
+                      {/* h3, not h4: the section title is an h2 and nothing sits between. */}
+                      <h3 className="text-sm font-semibold text-foreground leading-none">
                         {commenterName}
-                      </h4>
+                      </h3>
                       <span className="text-[10px] text-muted-foreground mt-1.5 block" suppressHydrationWarning>
                         {dateStr}
                       </span>
@@ -320,16 +331,18 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
                 </div>
 
                 {/* Comment Content */}
-                <p className="text-sm text-slate-600 dark:text-slate-350 leading-relaxed whitespace-pre-line text-left">
+                <p className="text-sm text-slate-600 dark:text-slate-300 leading-relaxed whitespace-pre-line break-words text-left">
                   {comment.content}
                 </p>
 
                 {/* Reaction Actions */}
                 <div className="flex items-center pt-2">
                   <button
+                    type="button"
+                    aria-pressed={Boolean(hasLiked)}
                     onClick={() => handleLike(comment.id)}
                     className={cn(
-                      "flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full border transition-all active:scale-95",
+                      "flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full border transition-[color,background-color,border-color,transform] active:scale-95",
                       hasLiked
                         ? "bg-primary/5 border-primary/20 text-primary"
                         : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-border/100"
@@ -359,8 +372,9 @@ export default function PostCommentsSection({ postId }: PostCommentsSectionProps
 
         {/* Loading Spinner */}
         {loading && (
-          <div className="flex justify-center py-6">
+          <div role="status" className="flex justify-center py-6">
             <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            <span className="sr-only">{label("loading", "Loading…", "Chargement…")}</span>
           </div>
         )}
 

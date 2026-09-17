@@ -133,8 +133,9 @@ export function InvoiceDocument({
       </div>
 
       <div className="px-6 py-6 print:px-0 print:py-3">
-        <div className="overflow-hidden rounded-2xl border">
-          <table className="w-full border-collapse text-sm print:table-fixed print:text-[9px]">
+        {/* overflow-x-auto: `overflow-hidden` cut the right-hand columns off on a phone. */}
+        <div className="overflow-x-auto rounded-2xl border print:overflow-visible">
+          <table className="w-full border-collapse text-sm tabular-nums print:table-fixed print:text-[9px]">
             <thead className="bg-slate-50">
               <tr>
                 <th className="px-4 py-3 text-left font-semibold print:w-[22%] print:px-2 print:py-1.5">{labels.item}</th>

@@ -5,9 +5,11 @@ type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 
 interface FooterNavigationProps {
   navItems: NavigationItem[];
+  /** Landmark name in the visitor's language; AppShell resolves it. */
+  ariaLabel?: string;
 }
 
-export default function FooterNavigation({ navItems }: FooterNavigationProps) {
+export default function FooterNavigation({ navItems, ariaLabel = 'Footer navigation' }: FooterNavigationProps) {
   if (navItems.length === 0) {
     return null;
   }
@@ -26,7 +28,7 @@ export default function FooterNavigation({ navItems }: FooterNavigationProps) {
       ));
 
   return (
-    <nav className="flex flex-wrap justify-center items-center gap-x-4 gap-y-2" aria-label="Footer navigation">
+    <nav className="flex flex-wrap justify-center items-center gap-x-4 gap-y-2" aria-label={ariaLabel}>
       {renderNavItems(navItems)}
     </nav>
   );

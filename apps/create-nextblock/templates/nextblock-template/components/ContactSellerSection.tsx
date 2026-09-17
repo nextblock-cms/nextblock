@@ -1,6 +1,6 @@
 'use client';
 
-import { useActionState } from 'react';
+import { useActionState, useEffect, useRef } from 'react';
 import { useFormStatus } from 'react-dom';
 import { Button } from '@nextblock-cms/ui';
 import { Input } from '@nextblock-cms/ui';
@@ -80,6 +80,13 @@ export default function ContactSellerSection({
 }: ContactSellerSectionProps) {
   const { t, lang } = useTranslations();
   const [state, formAction] = useActionState(submitProductInquiry, INITIAL_STATE);
+  const successRef = useRef<HTMLDivElement>(null);
+
+  // The confirmation replaces the form, so the focused submit button disappears. Without
+  // this, focus falls back to <body> and a screen-reader user loses their place.
+  useEffect(() => {
+    if (state.success) successRef.current?.focus();
+  }, [state.success]);
 
   // Resolve a key to its translation, falling back to the English literal.
   const label = (key: string): string => {
@@ -91,7 +98,10 @@ export default function ContactSellerSection({
     return (
       <div
         id="contact-seller"
-        className="rounded-2xl border border-emerald-200 bg-emerald-50 p-6 dark:border-emerald-900/50 dark:bg-emerald-950/30"
+        ref={successRef}
+        tabIndex={-1}
+        role="status"
+        className="rounded-2xl border border-emerald-200 bg-emerald-50 p-6 outline-hidden dark:border-emerald-900/50 dark:bg-emerald-950/30"
       >
         <div className="flex items-start gap-3">
           <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
@@ -112,9 +122,10 @@ export default function ContactSellerSection({
       id="contact-seller"
       className="scroll-mt-24 rounded-2xl border border-border/80 bg-card/50 p-6 shadow-sm"
     >
-      <h3 className="text-lg font-semibold text-foreground">
+      {/* h2: the only heading above it on a product page is the h1. */}
+      <h2 className="text-lg font-semibold text-foreground">
         {label('ecommerce.contact_seller_heading')}
-      </h3>
+      </h2>
       <p className="mt-1 text-sm text-muted-foreground">
         {label('ecommerce.contact_seller_intro')}
       </p>
@@ -131,7 +142,14 @@ export default function ContactSellerSection({
             >
               {label('ecommerce.contact_seller_name')}
             </label>
-            <Input id="contact-seller-name" name="name" required maxLength={120} autoComplete="name" />
+            <Input
+              id="contact-seller-name"
+              name="name"
+              required
+              maxLength={120}
+              autoComplete="name"
+              defaultValue={state.values?.name}
+            />
           </div>
 
           <div className="space-y-1.5">
@@ -148,6 +166,8 @@ export default function ContactSellerSection({
               required
               maxLength={254}
               autoComplete="email"
+              spellCheck={false}
+              defaultValue={state.values?.email}
             />
           </div>
         </div>
@@ -165,6 +185,7 @@ export default function ContactSellerSection({
             required
             maxLength={2000}
             className="min-h-[120px]"
+            defaultValue={state.values?.message}
           />
         </div>
 
@@ -174,7 +195,11 @@ export default function ContactSellerSection({
           scriptNonce={scriptNonce}
         />
 
-        {errorText && <p className="text-sm font-semibold text-destructive">{errorText}</p>}
+        {errorText && (
+          <p role="alert" className="text-sm font-semibold text-destructive">
+            {errorText}
+          </p>
+        )}
 
         <div className="flex justify-end pt-1">
           <SubmitButton

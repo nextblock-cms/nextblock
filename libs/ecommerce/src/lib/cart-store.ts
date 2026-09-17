@@ -8,7 +8,11 @@ import type { AppliedCouponState } from './coupons';
 
 export interface AddItemResult {
   success: boolean;
+  /** English text, kept for callers that only log it. */
   error?: string;
+  /** Translation key for the same failure, so the UI can answer in the visitor's language. */
+  errorKey?: string;
+  errorParams?: Record<string, string | number>;
 }
 
 interface CartState {
@@ -67,6 +71,7 @@ export const useCartStore = create<CartState>()(
             return {
               success: false,
               error: 'This software license is already in your cart.',
+              errorKey: 'ecommerce.cart_error_license_in_cart',
             };
           }
 
@@ -85,6 +90,7 @@ export const useCartStore = create<CartState>()(
           return {
             success: false,
             error: 'This item is out of stock.',
+            errorKey: 'ecommerce.cart_error_out_of_stock',
           };
         }
 
@@ -92,6 +98,8 @@ export const useCartStore = create<CartState>()(
           return {
             success: false,
             error: `Only ${availableStock} available for this SKU.`,
+            errorKey: 'ecommerce.cart_error_stock_limit',
+            errorParams: { count: availableStock },
           };
         }
 
@@ -184,6 +192,10 @@ export const useCartStore = create<CartState>()(
       name: 'cart-storage',
       storage: createJSONStorage(() => localStorage),
       skipHydration: true,
+      // Persist the cart, not the UI. `isOpen` used to be stored too, so a visitor who left
+      // with the drawer open got it thrown open again (stealing focus) on the next page load
+      // and in every new tab.
+      partialize: (state) => ({ items: state.items, appliedCoupon: state.appliedCoupon }),
     }
   )
 );

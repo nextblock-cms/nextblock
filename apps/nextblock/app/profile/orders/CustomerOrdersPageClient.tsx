@@ -47,7 +47,7 @@ export function CustomerOrdersPageClient({
 
         <Card className="md:col-span-8">
           <CardHeader>
-            <CardTitle>
+            <CardTitle role="heading" aria-level={1}>
               {translateOrFallback(t, 'profile_orders_title', 'My orders')}
             </CardTitle>
             <CardDescription>

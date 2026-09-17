@@ -62,6 +62,14 @@ export function TranslationsProvider({
   );
 }
 
+/**
+ * Like {@link useTranslations}, but answers `null` outside a provider instead of throwing.
+ * For design-system components that must also work for consumers who never mount one.
+ */
+export function useOptionalTranslations() {
+  return useContext(TranslationsContext) ?? null;
+}
+
 export function useTranslations() {
   const context = useContext(TranslationsContext);
   if (context === undefined) {

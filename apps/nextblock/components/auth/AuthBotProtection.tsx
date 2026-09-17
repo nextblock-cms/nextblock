@@ -3,10 +3,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Script from 'next/script';
 
-// Field names must match the server verifier in lib/botProtection/verify.ts.
-const HONEYPOT_FIELD = 'verification_secondary_email';
-const TURNSTILE_TOKEN_FIELD = 'cf-turnstile-response';
-const RECAPTCHA_TOKEN_FIELD = 'g-recaptcha-response';
+// Field names shared with the server verifier (lib/botProtection/verify.ts).
+import {
+  HONEYPOT_FIELD,
+  RECAPTCHA_TOKEN_FIELD,
+  TURNSTILE_TOKEN_FIELD,
+} from '../../lib/botProtection/fields';
 
 type BotProtectionProvider = 'none' | 'turnstile' | 'recaptcha';
 

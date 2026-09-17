@@ -79,17 +79,19 @@ export function SearchableSelect({
           <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
-        <div className="flex items-center border-b px-3">
+      <PopoverContent className="w-(--radix-popover-trigger-width) p-0" align="start">
+        {/* The input drops its own ring, so the row carries the focus indicator. */}
+        <div className="flex items-center rounded-t-md border-b px-3 focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring">
           <Search className="mr-2 h-4 w-4 shrink-0 opacity-50" />
           <Input
-            className="flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-none border-0 focus-visible:ring-0 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50"
+            aria-label={searchPlaceholder}
+            className="flex h-10 w-full rounded-md bg-transparent py-3 text-sm outline-hidden border-0 focus-visible:ring-0 focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50"
             placeholder={searchPlaceholder}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
         </div>
-        <div className="max-h-80 overflow-y-auto p-1">
+        <div className="max-h-80 overflow-y-auto overscroll-contain p-1">
           {filteredOptions.length === 0 ? (
             <p className="py-6 text-center text-sm text-muted-foreground">
               {emptyMessage}
@@ -101,9 +103,12 @@ export function SearchableSelect({
                   key={option.value}
                   type="button"
                   className={cn(
-                    'relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-2 pr-8 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground text-left',
+                    // The ring tells the focused option apart from the selected one, which
+                    // shares the accent background.
+                    'relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-2 pr-8 text-sm outline-hidden hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring text-left',
                     value === option.value && 'bg-accent text-accent-foreground'
                   )}
+                  aria-pressed={value === option.value}
                   onClick={() => handleSelect(option.value)}
                 >
                   <span className="flex flex-col gap-0.5 w-full">

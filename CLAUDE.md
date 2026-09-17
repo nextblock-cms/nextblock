@@ -88,6 +88,11 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - After schema or seed changes regenerate all three artifacts (`db:types`,
   `generate:migrations-bundle`, `generate:sandbox`); the generators fail silently by omission.
 - Server-only modules throw in a browser: Cortex on call, S3 and `server-only` imports on import.
+- UI copy: `t(key)` returns the KEY for an unseeded key, so `t('x') || 'Fallback'` never falls
+  back. Use `useLabel()` (app, EN + FR fallbacks), `translateOrFallback` (ecommerce) or
+  `useOptionalTranslations()` (ui), and seed every new key EN + FR in a forward migration
+  (`02015` is the model). Shop prices go through `usePriceFormatter()`, never bare `formatPrice`.
+  Accessibility traps and the audit: docs/05 → "Public UI Copy and Accessibility".
 
 ## Gotchas
 

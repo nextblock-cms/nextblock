@@ -153,14 +153,14 @@ export default function PageClientContent({ initialPageData, currentSlug, childr
     return (
       <div className="container mx-auto px-4 py-8 text-center">
         <h1 className="text-2xl font-bold mb-4">Page Not Found</h1>
-        <p className="text-muted-foreground">The page for slug &quot;{currentSlug}&quot; could not be loaded or is not available in any language.</p>
+        <p className="text-muted-foreground">The page for slug &ldquo;{currentSlug}&rdquo; could not be loaded or is not available in any language.</p>
         <p className="mt-4"><Link href="/" className="text-primary hover:underline">Go to Homepage</Link></p>
       </div>
     );
   }
   
   if (!currentPageData && (isLoadingLanguages || isLoadingTargetLang)) {
-     return <div className="container mx-auto px-4 py-20 text-center"><p>Loading page content...</p></div>;
+     return <div className="container mx-auto px-4 py-20 text-center"><p>Loading page content…</p></div>;
   }
   
   if (!currentPageData) { // Fallback if still no data after loading attempts
@@ -170,7 +170,7 @@ export default function PageClientContent({ initialPageData, currentSlug, childr
 
   return (
     <article className="w-full mx-auto">
-      {isLoadingTargetLang && <div className="text-center py-2 text-sm text-muted-foreground">Switching language...</div>}
+      {isLoadingTargetLang && <div role="status" className="text-center py-2 text-sm text-muted-foreground">Switching language…</div>}
 
       {currentPageData.feature_image_url ? (
         <div className="relative h-48 w-full overflow-hidden bg-slate-950 sm:h-56 md:h-64 lg:h-72">

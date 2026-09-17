@@ -11,8 +11,10 @@ import ThreadView, { type ThreadMessage } from './ThreadView';
 
 // A conversation changes whenever either side writes; a cached copy would show the
 // visitor a reply that is no longer the latest, or hide one that just arrived.
+// `dynamic` alone is enough. `fetchCache = 'force-no-store'` also switched off every
+// `unstable_cache` under this segment, the root layout's included, so each thread view
+// re-queried the navigation, themes and translations (project rule, see CLAUDE.md).
 export const dynamic = 'force-dynamic';
-export const fetchCache = 'force-no-store';
 
 const MAX_MESSAGES = 200;
 

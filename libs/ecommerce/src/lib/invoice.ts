@@ -176,7 +176,7 @@ export function formatInvoiceCurrency(
   }).format(amount / 100);
 }
 
-export function formatInvoiceDate(value?: string | null, locale = 'en-US') {
+export function formatInvoiceDate(value?: string | null, locale = 'en-US', timeZone = 'UTC') {
   if (!value) {
     return '';
   }
@@ -186,10 +186,15 @@ export function formatInvoiceDate(value?: string | null, locale = 'en-US') {
     return '';
   }
 
+  // A fixed zone. Every caller is a client component that also renders on the server (the
+  // orders list, the invoice, the license panel): with the ambient zone the server (UTC) and
+  // a visitor west of it could format different days, which is a hydration mismatch and a
+  // date that changes after load.
   return new Intl.DateTimeFormat(locale, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
+    timeZone,
   }).format(parsed);
 }
 

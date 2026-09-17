@@ -14,7 +14,8 @@ import { Button } from '@nextblock-cms/ui/button';
 import { Input } from '@nextblock-cms/ui/input';
 import { Label } from '@nextblock-cms/ui/label';
 import { Tag, X } from 'lucide-react';
-import { formatPrice, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 
 import type { CouponQuote } from '../coupons';
 import { normalizeCouponCode } from '../coupons';
@@ -37,6 +38,8 @@ export function CouponForm({
   const setAppliedCoupon = useCart((state) => state.setAppliedCoupon);
   const clearAppliedCoupon = useCart((state) => state.removeCoupon);
   const { t } = useTranslations();
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const [codeInput, setCodeInput] = useState('');
   const [quote, setQuote] = useState<CouponQuote | null>(null);
   const [error, setError] = useState('');
@@ -101,6 +104,10 @@ export function CouponForm({
       }
     } catch (validationError) {
       console.error('Failed to validate coupon:', validationError);
+      // Forget the key, or the effect below never retries: the coupon stayed applied in the
+      // store (checkout still sends it, so the server discounts) while this form showed an
+      // undiscounted total for the rest of the visit.
+      lastValidationKeyRef.current = null;
       setQuote(null);
       onQuoteChange?.(null);
       setError(
@@ -170,7 +177,12 @@ export function CouponForm({
         {quote ? (
           <Badge variant="secondary" className="gap-1">
             {quote.code}
-            <button type="button" onClick={removeCoupon} aria-label={`Remove coupon ${quote.code}`}>
+            <button
+              type="button"
+              onClick={removeCoupon}
+              aria-label={translateOrFallback('ecommerce.remove_coupon', 'Remove coupon {code}').replace('{code}', quote.code)}
+              className="-mr-1 inline-flex h-6 w-6 items-center justify-center rounded-full focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            >
               <X className="h-3 w-3" />
             </button>
           </Badge>
@@ -181,14 +193,23 @@ export function CouponForm({
         <div className="flex gap-2">
           <Input
             id={compact ? 'coupon-code-compact' : 'coupon-code'}
+            name="coupon"
+            autoComplete="off"
+            autoCapitalize="characters"
+            spellCheck={false}
+            aria-invalid={error ? true : undefined}
+            aria-describedby={error ? (compact ? 'coupon-error-compact' : 'coupon-error') : undefined}
             value={codeInput}
-            onChange={(event: ChangeEvent<HTMLInputElement>) =>
-              setCodeInput(event.target.value.toUpperCase())
-            }
-            placeholder={translateOrFallback('ecommerce.coupon_placeholder', 'Code')}
+            // No `.toUpperCase()` here: rewriting a controlled value moves the caret to the
+            // end on every mid-string edit. The `uppercase` class shows capitals and
+            // `normalizeCouponCode` uppercases what is actually sent.
+            onChange={(event: ChangeEvent<HTMLInputElement>) => setCodeInput(event.target.value)}
+            placeholder={translateOrFallback('ecommerce.coupon_placeholder', 'SAVE10…')}
             className="uppercase"
             onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-              if (event.key === 'Enter') {
+              // Enter used to skip the `isApplying` guard the button has, so two requests
+              // could race and the slower response won.
+              if (event.key === 'Enter' && !isApplying) {
                 event.preventDefault();
                 void applyCode(codeInput);
               }
@@ -201,23 +222,26 @@ export function CouponForm({
             onClick={() => void applyCode(codeInput)}
           >
             {isApplying
-              ? translateOrFallback('ecommerce.applying', 'Applying...')
+              ? translateOrFallback('ecommerce.applying', 'Applying…')
               : translateOrFallback('ecommerce.apply', 'Apply')}
           </Button>
         </div>
       ) : (
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-muted-foreground">
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="min-w-0 truncate text-muted-foreground">
             {quote.name}
           </span>
-          <span className="font-medium text-emerald-600">
-            -{formatPrice(quote.discountTotal, currencyCode)}
+          {/* A negative amount, so the locale decides where the minus sign goes. */}
+          <span className="shrink-0 font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
+            {formatPrice(-quote.discountTotal, currencyCode)}
           </span>
         </div>
       )}
 
       {error ? (
-        <p className="text-xs text-destructive">{error}</p>
+        <p id={compact ? 'coupon-error-compact' : 'coupon-error'} role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
       ) : null}
     </div>
   );

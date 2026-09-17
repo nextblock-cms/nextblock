@@ -19,6 +19,7 @@ import SectionBlockRenderer from "./blocks/renderers/SectionBlockRenderer"; // S
 import ClientTextBlockRenderer from "./blocks/renderers/ClientTextBlockRenderer"; // Static import for client component
 import { addNonceToInlineScripts } from "../lib/blocks/inlineScriptNonce";
 import { getCachedCustomBlockDefinitionBySlug } from "../lib/custom-block-definitions";
+import { getCachedLanguageCode } from "../lib/languages/cached-language-code";
 import { CachedDynamicLayoutEngine } from "./renderers/CachedDynamicLayoutEngine";
 import { resolveBlockRelations } from "../lib/resolve-block-relations";
 import { substitutePrivacyMergeTags } from "../lib/privacy/contact-emails";
@@ -138,6 +139,8 @@ async function renderLoadedBlock({
             definition={definition}
             layoutSchema={definition.layout_schema}
             fields={definition.fields}
+            locale={await getCachedLanguageCode(languageId)}
+            showDiagnostics={Boolean(visualEditing?.enabled)}
             data={{
               ...(resolvedBlock.data || {}),
               resolved_relations: resolvedBlock.resolved_relations || {},

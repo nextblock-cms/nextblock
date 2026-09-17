@@ -6,6 +6,8 @@ import {
   defaultThemeSlug,
   isValidThemeSlug,
   sanitizeExtraCss,
+  themeColorFor,
+  tripletToThemeColor,
   type SiteTheme,
 } from './buildThemeCss';
 import { isValidTokenValue } from './tokens';
@@ -159,5 +161,34 @@ describe('theme wiring helpers', () => {
     expect(defaultThemeSlug(themes)).toBe('light');
     expect(defaultThemeSlug([])).toBe('light');
     expect(defaultThemeSlug([theme({ slug: 'only', is_default: false })])).toBe('only');
+  });
+});
+
+describe('theme-color', () => {
+  it('uses the default theme background, in the comma form every meta parser accepts', () => {
+    const themes = [
+      theme({ id: 'id-2', slug: 'dark', color_scheme: 'dark', is_default: true, tokens: { background: '222 47% 4%' } }),
+      theme({ is_default: false }),
+    ];
+
+    expect(themeColorFor(themes)).toBe('hsl(222, 47%, 4%)');
+  });
+
+  it('falls back to the first active theme, then to white', () => {
+    expect(themeColorFor([theme({ is_default: false, tokens: { background: '10 20% 30%' } })])).toBe('hsl(10, 20%, 30%)');
+    expect(themeColorFor([theme({ is_active: false })])).toBe('#ffffff');
+    expect(themeColorFor([])).toBe('#ffffff');
+  });
+
+  it('never forwards a value that is not an HSL triplet', () => {
+    expect(tripletToThemeColor('red; } body { display:none')).toBeNull();
+    expect(tripletToThemeColor('')).toBeNull();
+    expect(tripletToThemeColor(undefined)).toBeNull();
+    expect(themeColorFor([theme({ tokens: { background: 'url(x)' } })])).toBe('#ffffff');
+  });
+
+  it('accepts the decimal and comma spellings the token validator allows', () => {
+    expect(tripletToThemeColor(' 222.2 47.4% 11.2% ')).toBe('hsl(222.2, 47.4%, 11.2%)');
+    expect(tripletToThemeColor('0, 0%, 100%')).toBe('hsl(0, 0%, 100%)');
   });
 });

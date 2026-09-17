@@ -158,7 +158,7 @@ export function ConsentBanner() {
         <button
           type="button"
           onClick={() => setManaging((prev) => !prev)}
-          className="mt-2 w-full text-center text-[11px] text-slate-800 underline underline-offset-2 transition hover:text-slate-600 dark:hover:text-slate-300"
+          className="mt-2 w-full text-center text-[11px] text-slate-800 underline underline-offset-2 transition-colors hover:text-slate-600 dark:text-slate-300 dark:hover:text-slate-100"
         >
           {managing
             ? translate('privacy.consent.hide_options', 'Hide options')

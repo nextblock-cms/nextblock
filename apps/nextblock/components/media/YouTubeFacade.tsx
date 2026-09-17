@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import Image from 'next/image';
+import { useLabel } from '../../lib/i18n/use-label';
 import {
   buildNoCookieEmbedUrl,
   youTubePosterUrl,
@@ -47,7 +48,8 @@ const YouTubeFacade: React.FC<YouTubeFacadeProps> = ({
 }) => {
   const [activated, setActivated] = useState(false);
   const [posterQuality, setPosterQuality] = useState<YouTubePosterQuality>('maxres');
-  const label = title || 'YouTube video';
+  const translate = useLabel();
+  const label = title || translate('video.untitled', 'YouTube video', 'Vidéo YouTube');
   const surface = className || FILL;
   const poster = youTubePosterUrl(videoId, posterQuality);
   const posterSize = YOUTUBE_POSTER_DIMENSIONS[posterQuality];
@@ -69,7 +71,7 @@ const YouTubeFacade: React.FC<YouTubeFacadeProps> = ({
     <button
       type="button"
       onClick={() => setActivated(true)}
-      aria-label={`Play video: ${label}`}
+      aria-label={translate('video.play', 'Play video: {title}', 'Lire la vidéo : {title}', { title: label })}
       className={`${surface} group flex items-center justify-center overflow-hidden border-0 bg-black p-0`}
     >
       {/* Routed through next/image on purpose: i.ytimg.com serves the poster as a

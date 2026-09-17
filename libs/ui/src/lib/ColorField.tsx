@@ -159,13 +159,17 @@ const ColorField = React.forwardRef<HTMLButtonElement, ColorFieldProps>(function
 
   const displayCssColor = activeToken?.cssColor ?? (isCustom ? value : undefined);
 
+  // Feature detection has to wait for the browser: reading `window` during render would
+  // differ between the server and the client.
   React.useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setSupportsEyeDropper(typeof window !== "undefined" && "EyeDropper" in window);
   }, []);
 
   // Resync local state whenever the popover opens or the value changes upstream.
   React.useEffect(() => {
     if (!open) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setRecent(readRecentColors());
     setMode(isCustom ? "custom" : "theme");
     const seed =
@@ -264,7 +268,7 @@ const ColorField = React.forwardRef<HTMLButtonElement, ColorFieldProps>(function
             aria-label={label ? `${label}: ${triggerText}` : `Colour: ${triggerText}`}
             className={cn(
               "flex h-9 w-full items-center gap-2 rounded-md border border-input bg-background px-2 text-sm shadow-sm transition-colors",
-              "hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+              "hover:bg-accent/40 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
               disabled && "cursor-not-allowed opacity-50",
             )}
           >
@@ -344,7 +348,7 @@ const ColorField = React.forwardRef<HTMLButtonElement, ColorFieldProps>(function
                         setOpen(false);
                       }}
                       className={cn(
-                        "relative flex h-8 w-8 shrink-0 items-center justify-center rounded-md border transition-all hover:scale-105",
+                        "relative flex h-8 w-8 shrink-0 items-center justify-center rounded-md border transition-transform hover:scale-105",
                         selected ? "border-ring ring-2 ring-ring/40" : "border-border/70",
                       )}
                       style={{ backgroundColor: token.cssColor }}

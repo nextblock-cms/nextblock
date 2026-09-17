@@ -1,6 +1,7 @@
 'use client';
 
 import Image from 'next/image';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
   ArrowRight,
@@ -31,6 +32,7 @@ import {
   useState,
   type ComponentType,
   type KeyboardEvent,
+  type MouseEvent,
 } from 'react';
 import { useGlobalSearch } from '../hooks/useGlobalSearch';
 import type {
@@ -46,7 +48,7 @@ const fallbackTranslations: Record<string, Record<string, string>> = {
     'global_search.trigger': 'Search',
     'global_search.title': 'Search',
     'global_search.description': 'Search published pages, posts, and products.',
-    'global_search.placeholder': 'Search...',
+    'global_search.placeholder': 'Search…',
     'global_search.filter_all': 'All',
     'global_search.filter_pages': 'Pages',
     'global_search.filter_posts': 'Posts',
@@ -59,12 +61,14 @@ const fallbackTranslations: Record<string, Record<string, string>> = {
     'global_search.error_description': 'Please try again in a moment.',
     'global_search.empty_title': 'No results found.',
     'global_search.empty_description': 'Try another search term.',
+    'global_search.loading': 'Searching…',
+    'global_search.results_count': 'Results: {count}',
   },
   fr: {
     'global_search.trigger': 'Rechercher',
     'global_search.title': 'Rechercher',
-    'global_search.description': 'Rechercher dans les pages, articles et produits publies.',
-    'global_search.placeholder': 'Rechercher...',
+    'global_search.description': 'Rechercher dans les pages, articles et produits publiés.',
+    'global_search.placeholder': 'Rechercher…',
     'global_search.filter_all': 'Tout',
     'global_search.filter_pages': 'Pages',
     'global_search.filter_posts': 'Articles',
@@ -72,11 +76,13 @@ const fallbackTranslations: Record<string, Record<string, string>> = {
     'global_search.result_page': 'Page',
     'global_search.result_post': 'Article',
     'global_search.result_product': 'Produit',
-    'global_search.recent': 'Recents',
+    'global_search.recent': 'Récents',
     'global_search.error_title': 'La recherche est indisponible.',
-    'global_search.error_description': 'Veuillez reessayer dans un instant.',
-    'global_search.empty_title': 'Aucun resultat trouve.',
+    'global_search.error_description': 'Veuillez réessayer dans un instant.',
+    'global_search.empty_title': 'Aucun résultat trouvé.',
     'global_search.empty_description': 'Essayez un autre terme de recherche.',
+    'global_search.loading': 'Recherche en cours…',
+    'global_search.results_count': 'Résultats : {count}',
   },
 };
 
@@ -198,7 +204,19 @@ function saveRecentResult(result: GlobalSearchResult) {
     ...loadRecentResults().filter((item) => item.href !== result.href),
   ].slice(0, 5);
 
-  window.localStorage.setItem(RECENT_SEARCH_RESULTS_KEY, JSON.stringify(nextResults));
+  // Storage can be blocked (private mode, site-data settings). This runs inside the click
+  // that opens a result, so a throw here used to cancel the navigation.
+  try {
+    window.localStorage.setItem(RECENT_SEARCH_RESULTS_KEY, JSON.stringify(nextResults));
+  } catch {
+    // Recents are a convenience; losing them is fine.
+  }
+}
+
+const RESULTS_LISTBOX_ID = 'global-search-results';
+
+function resultOptionId(result: GlobalSearchResult) {
+  return `global-search-option-${result.type}-${result.id}`;
 }
 
 function ResultThumbnail({ result }: { result: GlobalSearchResult }) {
@@ -241,22 +259,28 @@ function SearchResultRow({
   result: GlobalSearchResult;
   query: string;
   isActive: boolean;
-  onSelect: (result: GlobalSearchResult) => void;
+  onSelect: (result: GlobalSearchResult, event: MouseEvent<HTMLAnchorElement>) => void;
   resultTypeLabel: string;
 }) {
   const config = resultTypeConfig[result.type];
   const supportingMeta = result.meta.sku || result.meta.label || result.locale?.toUpperCase();
 
+  // A real link, so Ctrl/Cmd-click, middle-click and "copy link address" work. The input
+  // keeps focus and drives the list through aria-activedescendant, hence tabIndex -1.
   return (
-    <button
-      type="button"
+    <Link
+      href={result.href}
+      id={resultOptionId(result)}
+      role="option"
+      aria-selected={isActive}
+      tabIndex={-1}
       className={cn(
         'group flex w-full items-center gap-3 rounded-md border border-transparent p-3 text-left transition-colors',
         isActive
           ? 'border-border bg-accent text-accent-foreground'
           : 'hover:bg-accent/70 hover:text-accent-foreground'
       )}
-      onClick={() => onSelect(result)}
+      onClick={(event) => onSelect(result, event)}
     >
       <ResultThumbnail result={result} />
       <span className="min-w-0 flex-1">
@@ -290,7 +314,7 @@ function SearchResultRow({
         </span>
       </span>
       <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-    </button>
+    </Link>
   );
 }
 
@@ -329,6 +353,7 @@ export default function GlobalSearch({
   const [activeIndex, setActiveIndex] = useState(0);
   const [recentResults, setRecentResults] = useState<GlobalSearchResult[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const {
     query,
     setQuery,
@@ -355,6 +380,17 @@ export default function GlobalSearch({
 
     return fallbackTranslations[lang]?.[key] ?? fallbackTranslations.en[key] ?? key;
   };
+  // Results, the empty state and errors replace each other silently; this is what a screen
+  // reader hears instead. Empty while the visitor has not typed a searchable query.
+  const searchAnnouncement = !canSearch
+    ? ''
+    : isLoading
+      ? tx('global_search.loading')
+      : status === 'error'
+        ? `${tx('global_search.error_title')} ${tx('global_search.error_description')}`
+        : results.length === 0
+          ? `${tx('global_search.empty_title')} ${tx('global_search.empty_description')}`
+          : tx('global_search.results_count').replace('{count}', String(results.length));
 
   useEffect(() => {
     if (openOnMount) {
@@ -391,12 +427,32 @@ export default function GlobalSearch({
     setActiveIndex(0);
   }, [filter, query, results.length, open]);
 
-  const handleSelect = (result: GlobalSearchResult) => {
+  const rememberResult = (result: GlobalSearchResult) => {
     saveRecentResult(result);
     setRecentResults(loadRecentResults());
+  };
+
+  /** Keyboard path: Enter on the active option. */
+  const handleSelect = (result: GlobalSearchResult) => {
+    rememberResult(result);
     setOpen(false);
     router.push(result.href);
   };
+
+  /** Pointer path: the <Link> navigates by itself; a modified click opens a new tab. */
+  const handleResultClick = (result: GlobalSearchResult, event: MouseEvent<HTMLAnchorElement>) => {
+    rememberResult(result);
+    const opensElsewhere = event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0;
+    if (!opensElsewhere) setOpen(false);
+  };
+
+  const activeResult = displayedResults[activeIndex];
+  const activeOptionId = activeResult ? resultOptionId(activeResult) : undefined;
+
+  useEffect(() => {
+    if (!open || !activeOptionId) return;
+    document.getElementById(activeOptionId)?.scrollIntoView({ block: 'nearest' });
+  }, [activeOptionId, open]);
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (displayedResults.length === 0) {
@@ -424,6 +480,7 @@ export default function GlobalSearch({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <Button
+        ref={triggerRef}
         type="button"
         variant="outline"
         size={variant === 'mobile' ? 'icon' : 'default'}
@@ -440,22 +497,39 @@ export default function GlobalSearch({
         {variant === 'desktop' ? <span>{tx('global_search.trigger')}</span> : null}
       </Button>
 
-      <DialogContent className="flex h-[min(820px,calc(100dvh-2rem))] max-w-4xl flex-col overflow-hidden rounded-lg p-0">
+      <DialogContent
+        className="flex h-[min(820px,calc(100dvh-2rem))] max-w-4xl flex-col overflow-hidden rounded-lg p-0"
+        // Opened from the deferred placeholder (or Ctrl+K), Radix has no trigger to give
+        // focus back to and would drop it on <body>.
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          triggerRef.current?.focus();
+        }}
+      >
         <DialogTitle className="sr-only">{tx('global_search.title')}</DialogTitle>
         <DialogDescription className="sr-only">
           {tx('global_search.description')}
         </DialogDescription>
 
         <div className="border-b border-border px-4 py-3">
-          <div className="flex items-center gap-3">
+          {/* The input drops its own ring, so the row carries the focus indicator instead. */}
+          <div className="-mx-2 flex items-center gap-3 rounded-md px-2 focus-within:ring-2 focus-within:ring-ring/60">
             <Search className="h-5 w-5 shrink-0 text-muted-foreground" />
             <Input
               ref={inputRef}
+              type="search"
+              name="q"
+              aria-label={tx('global_search.title')}
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={displayedResults.length > 0}
+              aria-controls={RESULTS_LISTBOX_ID}
+              aria-activedescendant={activeOptionId}
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               onKeyDown={handleInputKeyDown}
               placeholder={tx('global_search.placeholder')}
-              className="h-12 border-0 bg-transparent px-0 text-base shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+              className="h-12 border-0 bg-transparent px-0 text-base shadow-none focus-visible:ring-0 focus-visible:ring-offset-0 [&::-webkit-search-cancel-button]:appearance-none"
               autoComplete="off"
               spellCheck={false}
             />
@@ -479,6 +553,7 @@ export default function GlobalSearch({
                       ? 'border-primary/40 bg-primary/10 text-foreground'
                       : 'border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground'
                   )}
+                  aria-pressed={filter === config.value}
                   onClick={() => setFilter(config.value)}
                 >
                   <Icon className="h-3.5 w-3.5" />
@@ -494,7 +569,11 @@ export default function GlobalSearch({
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <p className="sr-only" role="status" aria-live="polite">
+          {searchAnnouncement}
+        </p>
+
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3">
           {isLoading ? <LoadingRows /> : null}
 
           {!isLoading && status === 'error' ? (
@@ -516,16 +595,23 @@ export default function GlobalSearch({
                   {tx('global_search.recent')}
                 </div>
               ) : null}
-              {displayedResults.map((result, index) => (
-                <SearchResultRow
-                  key={`${result.type}-${result.id}`}
-                  result={result}
-                  query={query}
-                  isActive={index === activeIndex}
-                  onSelect={handleSelect}
-                  resultTypeLabel={tx(resultTypeConfig[result.type].labelKey)}
-                />
-              ))}
+              <div
+                id={RESULTS_LISTBOX_ID}
+                role="listbox"
+                aria-label={showRecent ? tx('global_search.recent') : tx('global_search.title')}
+                className="space-y-1"
+              >
+                {displayedResults.map((result, index) => (
+                  <SearchResultRow
+                    key={`${result.type}-${result.id}`}
+                    result={result}
+                    query={query}
+                    isActive={index === activeIndex}
+                    onSelect={handleResultClick}
+                    resultTypeLabel={tx(resultTypeConfig[result.type].labelKey)}
+                  />
+                ))}
+              </div>
             </div>
           ) : null}
 

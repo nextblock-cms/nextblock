@@ -11,6 +11,12 @@ const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 export default defineConfig({
   root: __dirname,
+  // TypeScript first: src/ tracks stale compiled twins (`server.js`, `lib/server-utils.js`)
+  // beside their `.ts` sources, and Vite's default order would resolve an extension-less
+  // import to the `.js` and publish the old code. Same trap as libs/db.
+  resolve: {
+    extensions: ['.mts', '.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+  },
   plugins: [
     dts({
       entryRoot: 'src',
@@ -98,7 +104,7 @@ export default defineConfig({
             if (fs.existsSync(srcFile)) {
               const head = fs
                 .readFileSync(srcFile, 'utf8')
-                .replace(/^﻿/, '')
+                .replace(/^\uFEFF/, '')
                 .trimStart();
               if (/^['"]use client['"]/.test(head)) return "'use client';";
               if (/^['"]use server['"]/.test(head)) return "'use server';";
@@ -123,7 +129,7 @@ export default defineConfig({
             const directive = directiveForModule(relNoExt);
             if (!directive) continue;
             const contents = fs.readFileSync(full, 'utf8');
-            const trimmed = contents.replace(/^﻿/, '').trimStart();
+            const trimmed = contents.replace(/^\uFEFF/, '').trimStart();
             if (
               trimmed.startsWith("'use client'") ||
               trimmed.startsWith('"use client"') ||
@@ -396,6 +402,12 @@ export declare function hasEnvVars(): Promise<boolean>;
         // install fails to resolve the import. Naming it here forces the chunk to be
         // emitted so the wildcard has something to point at.
         'lib/seo/index': './src/lib/seo/index.ts',
+        // Imported ONLY through its subpath (`@nextblock-cms/utils/script-safety`, by
+        // @nextblock-cms/cortex and the CMS site-scripts screen), never by the root barrel,
+        // so without an entry of its own preserveModules emits no JavaScript for it — only
+        // the `.d.ts`. Published cortex then failed to resolve it in every scaffold.
+        // `tools/scripts/verify-lib-dist.js` now catches the next module like this.
+        'lib/script-safety': './src/lib/script-safety.ts',
       },
       name: 'utils',
       fileName: (format, entryName) => `${entryName}.${format}.js`,

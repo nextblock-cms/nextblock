@@ -139,14 +139,18 @@ export function CurrencyProvider({
   );
 
   useEffect(() => {
-    if (!preferredCurrencyCode) {
+    // Not before the store has hydrated. `rehydrate()` above is synchronous, so on the first
+    // pass this effect still holds its pre-hydration closure (nothing stored yet, preferred =
+    // the cookie or locale guess) and used to write that guess over the visitor's saved
+    // choice whenever the two differed.
+    if (!hasHydrated || !preferredCurrencyCode) {
       return;
     }
 
     if (storedCurrencyCode !== preferredCurrencyCode) {
       setStoredCurrencyCode(preferredCurrencyCode);
     }
-  }, [preferredCurrencyCode, setStoredCurrencyCode, storedCurrencyCode]);
+  }, [hasHydrated, preferredCurrencyCode, setStoredCurrencyCode, storedCurrencyCode]);
 
   useEffect(() => {
     if (!preferredCurrencyCode || typeof document === 'undefined') {

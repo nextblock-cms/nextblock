@@ -48,6 +48,7 @@ export function CustomSelectWithInput({
   }
 
   const selectValue = isCustomValue ? "custom" : value
+  const triggerId = React.useId()
 
   React.useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -57,13 +58,20 @@ export function CustomSelectWithInput({
   return (
     <div className="space-y-1.5">
       <div className="flex items-center">
-        <Label className="text-xs uppercase font-bold text-muted-foreground tracking-wider leading-none">
+        <Label
+          htmlFor={triggerId}
+          className="text-xs uppercase font-bold text-muted-foreground tracking-wider leading-none"
+        >
           {label}
         </Label>
         <TooltipProvider>
           <Tooltip>
             <TooltipTrigger asChild>
-              <button type="button" className="ml-2">
+              <button
+                type="button"
+                aria-label={`About ${label}`}
+                className="ml-2 rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              >
                 <Info className="h-4 w-4 text-muted-foreground" />
               </button>
             </TooltipTrigger>
@@ -77,7 +85,7 @@ export function CustomSelectWithInput({
         <div className="flex gap-2">
           <div className="flex-1">
             <Select onValueChange={handleSelectChange} value={selectValue}>
-              <SelectTrigger className="h-9 text-sm">
+              <SelectTrigger id={triggerId} className="h-9 text-sm">
                 <SelectValue placeholder="Select a value" />
               </SelectTrigger>
               <SelectContent>
@@ -91,6 +99,7 @@ export function CustomSelectWithInput({
             </Select>
           </div>
           <Input
+            aria-label={`${label}: custom value`}
             className="flex-1 h-9 text-sm"
             value={isCustomValue ? value : ""}
             onChange={e => onChange(e.target.value)}
@@ -99,7 +108,7 @@ export function CustomSelectWithInput({
         </div>
       ) : (
         <Select onValueChange={handleSelectChange} value={selectValue}>
-          <SelectTrigger className="h-9 text-sm">
+          <SelectTrigger id={triggerId} className="h-9 text-sm">
             <SelectValue placeholder="Select a value" />
           </SelectTrigger>
           <SelectContent>

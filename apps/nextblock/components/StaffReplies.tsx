@@ -92,7 +92,7 @@ export function StaffReplies({ replies }: { replies: StaffReply[] | undefined })
               })}
             </time>
           </div>
-          <p className="whitespace-pre-line text-sm leading-relaxed text-slate-600 dark:text-slate-350">
+          <p className="whitespace-pre-line text-sm leading-relaxed break-words text-slate-600 dark:text-slate-300">
             {reply.content}
           </p>
         </li>

@@ -7,8 +7,7 @@ import PostClientContent from "./PostClientContent";
 import { getCachedPublishedPostTranslatedSlugs, getPostDataBySlug } from "./page.utils";
 import BlockRenderer from "../../../components/BlockRenderer";
 import { getSsgSupabaseClient } from "@nextblock-cms/db/server"; // Correct import
-import type { SectionBlockContent } from '../../../lib/blocks/blockRegistry';
-import { resolveMediaUrl } from '../../../lib/media/resolveMediaUrl';
+
 import {
   resolveMetaTitle,
   resolvePostMetaDescription,
@@ -132,22 +131,10 @@ export default async function DynamicPostPage({ params: paramsPromise }: PostPag
     ? await getCachedPublishedPostTranslatedSlugs(initialPostData.translation_group_id)
     : {};
 
-  let lcpImageUrl: string | null = null;
-
-  if (initialPostData && initialPostData.blocks) {
-    const heroBlock = initialPostData.blocks.find(block => block.block_type === 'section' && (block.content as any)?.is_hero);
-    if (heroBlock) {
-      const heroContent = heroBlock.content as unknown as SectionBlockContent;
-      if (
-        heroContent.background &&
-        heroContent.background.type === "image" &&
-        heroContent.background.image &&
-        heroContent.background.image.object_key
-      ) {
-        lcpImageUrl = resolveMediaUrl(heroContent.background.image.object_key);
-      }
-    }
-  }
+  // No manual `<link rel="preload" as="image">` for the hero background. The section
+  // renderer draws it with next/image + `priority`, which already emits a preload for the
+  // optimized `/_next/image` URL. A preload of the raw media URL never matched that request,
+  // so the browser downloaded the full-size original in competition with the LCP image.
 
   const requestOrigin = await getRequestOrigin();
   const draft = await draftMode();
@@ -192,9 +179,6 @@ export default async function DynamicPostPage({ params: paramsPromise }: PostPag
 
   return (
     <>
-      {lcpImageUrl && (
-        <link rel="preload" as="image" href={lcpImageUrl} />
-      )}
       <script
         type="application/ld+json"
         nonce={nonce}

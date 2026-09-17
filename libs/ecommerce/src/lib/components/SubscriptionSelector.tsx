@@ -9,10 +9,10 @@ import { toast } from 'sonner';
 import { getPublicFreemiusPricing } from '../pages/cms/products/actions';
 import { Product, BillingCycle, ResolvedPlanWithPricing } from '../types';
 import {
-  formatPrice,
   majorUnitAmountToMinor,
   useTranslations,
 } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 import { useCurrency } from '../CurrencyProvider';
 import { convertMinorUnitAmount } from '../currency';
 import { getTrialSummary } from '../trials';
@@ -22,6 +22,8 @@ interface SubscriptionSelectorProps {
 }
 
 export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => {
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const store = useCart((state) => state);
   const { t } = useTranslations();
   const { activeCurrencyCode, currencies, defaultCurrency } = useCurrency();
@@ -142,7 +144,7 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
       else if (hasLifetime) setSelectedCycle('lifetime');
   }
 
-  const trialSummary = getTrialSummary(product);
+  const trialSummary = getTrialSummary(product, t);
 
   let displayPriceMinor = product.price;
   if (selectedCycle === 'monthly' && pricing.monthly_price != null) {
@@ -176,11 +178,17 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
   return (
     <div className="flex flex-col gap-4">
       {/* Billing Cycle Toggle */}
-      <div className="flex bg-secondary/35 p-1 rounded-lg w-full max-w-sm mx-auto shadow-inner">
+      <div
+        role="group"
+        aria-label={t('ecommerce.billing_cycle') === 'ecommerce.billing_cycle' ? 'Billing cycle' : t('ecommerce.billing_cycle')}
+        className="flex bg-secondary/35 p-1 rounded-lg w-full max-w-sm mx-auto shadow-inner"
+      >
         {hasMonthly && (
             <button
+            type="button"
+            aria-pressed={selectedCycle === 'monthly'}
             onClick={() => setSelectedCycle('monthly')}
-            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
                 selectedCycle === 'monthly'
                 ? 'bg-background shadow-sm text-foreground'
                 : 'text-muted-foreground hover:text-foreground'
@@ -191,8 +199,10 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
         )}
         {hasAnnual && (
             <button
+            type="button"
+            aria-pressed={selectedCycle === 'annual'}
             onClick={() => setSelectedCycle('annual')}
-            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
                 selectedCycle === 'annual'
                 ? 'bg-background shadow-sm text-foreground'
                 : 'text-muted-foreground hover:text-foreground'
@@ -203,8 +213,10 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
         )}
          {hasLifetime && (
             <button
+            type="button"
+            aria-pressed={selectedCycle === 'lifetime'}
             onClick={() => setSelectedCycle('lifetime')}
-            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+            className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring ${
                 selectedCycle === 'lifetime'
                 ? 'bg-background shadow-sm text-foreground'
                 : 'text-muted-foreground hover:text-foreground'
@@ -216,7 +228,7 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
       </div>
 
       <div className="text-center">
-          <span className="text-3xl font-extrabold text-foreground">
+          <span className="text-3xl font-extrabold text-foreground tabular-nums">
             {formatPrice(displayPriceMinor, activeCurrencyCode)}
           </span>
           {selectedCycle !== 'lifetime' && (
@@ -233,9 +245,13 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
           )}
       </div>
 
-      <Button onClick={handleAddToCart} className="w-full h-12 text-md font-bold shadow-md transition-all hover:shadow-lg active:scale-[0.98]">
+      <Button onClick={handleAddToCart} className="w-full h-12 text-base font-bold shadow-md transition-shadow hover:shadow-lg active:scale-[0.98]">
         <ShoppingCart className="mr-2 h-4 w-4" />
-        {trialSummary?.label ? `Start ${trialSummary.label}` : t('ecommerce.get_license')}
+        {trialSummary?.label
+          ? t('ecommerce.start_trial', { trial: trialSummary.label }) === 'ecommerce.start_trial'
+            ? `Start ${trialSummary.label}`
+            : t('ecommerce.start_trial', { trial: trialSummary.label })
+          : t('ecommerce.get_license')}
       </Button>
     </div>
   );

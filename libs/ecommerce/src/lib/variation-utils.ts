@@ -291,6 +291,46 @@ export function chooseInitialVariantSelections(
   }, {});
 }
 
+/**
+ * The selections after the shopper picks `termId` for `attributeId`.
+ *
+ * The pick always wins. Every other attribute keeps its current term when some variant
+ * combines it with everything chosen so far, and otherwise moves to the first term that
+ * does. With a sparse matrix (only Red/S and Blue/M exist) choosing Blue therefore lands on
+ * Blue/M. The old flow re-normalized `{...current, [attributeId]: termId}` attribute by
+ * attribute, which reverted the pick itself whenever it clashed with another dropdown.
+ */
+export function applyVariantSelection(
+  attributes: ProductAttribute[],
+  variants: ProductVariant[],
+  current: Record<string, string | undefined>,
+  attributeId: string,
+  termId: string
+) {
+  const next: Record<string, string | undefined> = { [attributeId]: termId };
+
+  for (const attribute of attributes) {
+    if (attribute.id === attributeId) {
+      continue;
+    }
+
+    const availableTermIds = getAvailableTermIdsForAttribute(variants, attribute.id, next);
+    const kept = current[attribute.id];
+
+    if (kept && availableTermIds.has(kept)) {
+      next[attribute.id] = kept;
+      continue;
+    }
+
+    const fallback = attribute.terms.find((term) => availableTermIds.has(term.id));
+    if (fallback) {
+      next[attribute.id] = fallback.id;
+    }
+  }
+
+  return next;
+}
+
 export function normalizeSelectionsToAvailableVariants(
   attributes: ProductAttribute[],
   variants: ProductVariant[],

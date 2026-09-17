@@ -1,4 +1,5 @@
 import React from "react";
+import { StockPhotoCreditPhrase } from "./StockPhotoCreditPhrase";
 
 // Stock-photo attribution. Field names match the search_stock_photos result +
 // the ImageAttribution schema; snake_case is tolerated defensively.
@@ -132,7 +133,7 @@ export function StockPhotoCredit({
 
   return (
     <span className={className}>
-      Photo by{" "}
+      <StockPhotoCreditPhrase part="by" />{" "}
       {photographer ? (
         photographerUrl ? (
           <a
@@ -147,11 +148,12 @@ export function StockPhotoCredit({
           photographer
         )
       ) : (
-        "a photographer"
+        <StockPhotoCreditPhrase part="anonymous" />
       )}
       {provider ? (
         <>
-          {" on "}
+          {" "}
+          <StockPhotoCreditPhrase part="on" />{" "}
           <a
             href={withUtm(sourceUrl || provider.home, attribution)}
             target="_blank"

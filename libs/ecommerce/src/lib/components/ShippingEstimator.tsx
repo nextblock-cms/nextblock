@@ -8,7 +8,8 @@ import { Truck, Calculator, Loader2 } from 'lucide-react';
 import { countries } from '../countries';
 import { getShippingEstimates } from '../server-actions/shipping-actions';
 import { ResolvedShippingMethod } from '../shipping/resolver';
-import { formatPrice, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 import { countryUsesStructuredStates, getStatesForCountry } from '../states';
 import { useCurrency } from '../CurrencyProvider';
 
@@ -17,6 +18,8 @@ interface ShippingEstimatorProps {
 }
 
 export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) => {
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const [country, setCountry] = useState('CA');
   const [state, setState] = useState('');
   const [postalCode, setPostalCode] = useState('');
@@ -39,30 +42,43 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
     setError(null);
     setRates(null);
 
-    const result = await getShippingEstimates(
-      physicalSubtotal,
-      {
-        country,
-        state: state || undefined,
-        postal_code: postalCode,
-      },
-      lang,
-      activeCurrencyCode
-    );
-
-    if (result.success && result.methods) {
-      setRates(result.methods);
-    } else {
-      setError(
-        result.errorKey
-          ? translateOrFallback(
-              result.errorKey,
-              result.error || t('ecommerce.no_rates_found')
-            )
-          : result.error || t('ecommerce.no_rates_found')
+    // try/finally: a rejected server action (offline, a deploy in progress) used to leave
+    // `isCalculating` true, so the button stayed disabled for the rest of the visit.
+    try {
+      const result = await getShippingEstimates(
+        physicalSubtotal,
+        {
+          country,
+          state: state || undefined,
+          postal_code: postalCode,
+        },
+        lang,
+        activeCurrencyCode
       );
+
+      if (result.success && result.methods) {
+        setRates(result.methods);
+      } else {
+        setError(
+          result.errorKey
+            ? translateOrFallback(
+                result.errorKey,
+                result.error || t('ecommerce.no_rates_found')
+              )
+            : result.error || t('ecommerce.no_rates_found')
+        );
+      }
+    } catch (estimateError) {
+      console.error('[ShippingEstimator] Failed to load rates:', estimateError);
+      setError(
+        translateOrFallback(
+          'ecommerce.shipping_calculation_failed',
+          "We couldn't calculate shipping right now. Please try again."
+        )
+      );
+    } finally {
+      setIsCalculating(false);
     }
-    setIsCalculating(false);
   };
 
   return (
@@ -79,6 +95,8 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
           </Label>
           <select
             id="estimate-country"
+            name="estimate-country"
+            autoComplete="shipping country"
             value={country}
             onChange={(event) => {
               const nextCountry = event.target.value;
@@ -105,6 +123,8 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
             </Label>
             <select
               id="estimate-state"
+              name="estimate-state"
+              autoComplete="shipping address-level1"
               value={state}
               onChange={(event) => setState(event.target.value)}
               className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
@@ -126,9 +146,18 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
           <div className="flex gap-2">
             <Input
               id="estimate-postal"
-              placeholder="A1A 1A1"
+              name="estimate-postal"
+              autoComplete="shipping postal-code"
+              // The Canadian pattern only where it applies.
+              placeholder={country === 'CA' ? 'A1A 1A1' : undefined}
               value={postalCode}
               onChange={(e) => setPostalCode(e.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !isCalculating) {
+                  event.preventDefault();
+                  void handleCalculate();
+                }
+              }}
               className="h-9 text-sm bg-background"
             />
             <Button
@@ -138,15 +167,17 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
               disabled={isCalculating}
               className="shrink-0"
             >
-              {isCalculating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Calculator className="h-4 w-4 mr-1.5" />}
+              {isCalculating ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : <Calculator className="h-4 w-4 mr-1.5" />}
               {t('ecommerce.calculate')}
             </Button>
           </div>
         </div>
       </div>
 
-      {error && <p className="text-xs text-destructive mt-2">{error}</p>}
+      {error && <p role="alert" className="text-xs text-destructive mt-2">{error}</p>}
 
+      {/* Always mounted, so results that arrive later are announced. */}
+      <div aria-live="polite">
       {rates && rates.length > 0 && (
         <div className="mt-4 space-y-2 border-t pt-3">
           <p className="text-xs font-medium text-muted-foreground uppercase">{t('ecommerce.available_rates')}:</p>
@@ -156,7 +187,7 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
                 <Truck className="h-4 w-4 text-muted-foreground" />
                 <span className="text-sm font-medium">{rate.name}</span>
               </div>
-              <span className="text-sm font-bold">
+              <span className="text-sm font-bold tabular-nums">
                 {rate.amount === 0 ? t('ecommerce.free') : formatPrice(rate.amount, activeCurrencyCode)}
               </span>
             </div>
@@ -167,6 +198,7 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
       {rates && rates.length === 0 && !error && (
         <p className="text-xs text-muted-foreground mt-2 italic">{t('ecommerce.no_rates_found')}</p>
       )}
+      </div>
     </div>
   );
 };

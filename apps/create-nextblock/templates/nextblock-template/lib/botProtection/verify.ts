@@ -10,12 +10,18 @@
 
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 
+import {
+  HONEYPOT_FIELD,
+  LEGACY_HONEYPOT_FIELD,
+  RECAPTCHA_TOKEN_FIELD,
+  TURNSTILE_TOKEN_FIELD,
+} from './fields';
+
 export type BotProtectionProvider = 'none' | 'turnstile' | 'recaptcha';
 
-// Shared field names — the client widgets emit these, the verifier reads them.
-export const HONEYPOT_FIELD = 'verification_secondary_email';
-export const TURNSTILE_TOKEN_FIELD = 'cf-turnstile-response';
-export const RECAPTCHA_TOKEN_FIELD = 'g-recaptcha-response';
+// Shared field names — the client widgets emit these, the verifier reads them. They live in
+// ./fields so client components can import them without this server-only module.
+export { HONEYPOT_FIELD, LEGACY_HONEYPOT_FIELD, RECAPTCHA_TOKEN_FIELD, TURNSTILE_TOKEN_FIELD };
 
 export type BotProtectionResult =
   // Passed (or nothing configured beyond the honeypot).
@@ -45,8 +51,11 @@ export async function verifyBotProtection(
   options?: VerifyOptions
 ): Promise<BotProtectionResult> {
   // Phase 1: Honeypot validation
-  const honeypot = formData.get(HONEYPOT_FIELD);
-  if (honeypot && typeof honeypot === 'string' && honeypot.length > 0) {
+  const honeypotFilled = [HONEYPOT_FIELD, LEGACY_HONEYPOT_FIELD].some((field) => {
+    const value = formData.get(field);
+    return typeof value === 'string' && value.length > 0;
+  });
+  if (honeypotFilled) {
     console.warn('[Bot Protection] Honeypot triggered. Discarding submission from bot.');
     return { ok: false, reason: 'honeypot' };
   }

@@ -27,7 +27,8 @@ import {
   Package,
   Download,
 } from 'lucide-react';
-import { formatPrice, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 import { countries, normalizeCountryCode } from '../countries';
 import { usePaymentReadiness } from '../PaymentReadinessProvider';
 import { getShippingEstimates } from '../server-actions/shipping-actions';
@@ -114,7 +115,17 @@ function AddressForm({
   value: AddressState;
   onChange: (nextValue: AddressState) => void;
 }) {
-  const { t } = useTranslations();
+  const { t, lang } = useTranslations();
+  // Country names in the visitor's language; the bundled list is English only. Checkout
+  // renders after the cart store hydrates (client only), so there is no server HTML for an
+  // ICU difference to mismatch.
+  const regionNames = useMemo(() => {
+    try {
+      return new Intl.DisplayNames([lang], { type: 'region' });
+    } catch {
+      return null;
+    }
+  }, [lang]);
   const companyNameLabel =
     t('company_name') === 'company_name' ? 'Company name' : t('company_name');
   const selectOptionLabel =
@@ -131,7 +142,8 @@ function AddressForm({
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="flex items-center gap-2">
+        {/* CardTitle is a <div>: without the role the page had one h1 and no section headings. */}
+        <CardTitle role="heading" aria-level={2} className="flex items-center gap-2">
           <MapPin className="w-5 h-5" />
           {title}
         </CardTitle>
@@ -143,6 +155,8 @@ function AddressForm({
             <Label htmlFor={`${idPrefix}-company`}>{companyNameLabel}</Label>
             <Input
               id={`${idPrefix}-company`}
+              name={`${idPrefix}-company`}
+              autoComplete={`${idPrefix} organization`}
               value={value.company_name}
               onChange={(e) => onChange({ ...value, company_name: e.target.value })}
             />
@@ -151,6 +165,9 @@ function AddressForm({
             <Label htmlFor={`${idPrefix}-name`}>{t('full_name')}</Label>
             <Input
               id={`${idPrefix}-name`}
+              name={`${idPrefix}-name`}
+              autoComplete={`${idPrefix} name`}
+              required
               value={value.recipient_name}
               onChange={(e) => onChange({ ...value, recipient_name: e.target.value })}
             />
@@ -159,7 +176,10 @@ function AddressForm({
             <Label htmlFor={`${idPrefix}-country`}>{t('country')}</Label>
             <select
               id={`${idPrefix}-country`}
-              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              name={`${idPrefix}-country`}
+              autoComplete={`${idPrefix} country`}
+              required
+              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               value={value.country_code}
               onChange={(e) => {
                 const nextCountryCode = e.target.value;
@@ -173,7 +193,7 @@ function AddressForm({
             >
               {countries.map((country) => (
                 <option key={country.code} value={country.code}>
-                  {country.name}
+                  {regionNames?.of(country.code) ?? country.name}
                 </option>
               ))}
             </select>
@@ -184,6 +204,9 @@ function AddressForm({
           <Label htmlFor={`${idPrefix}-line1`}>{t('address_line_1')}</Label>
           <Input
             id={`${idPrefix}-line1`}
+            name={`${idPrefix}-line1`}
+            autoComplete={`${idPrefix} address-line1`}
+            required
             value={value.line1}
             onChange={(e) => onChange({ ...value, line1: e.target.value })}
           />
@@ -193,6 +216,8 @@ function AddressForm({
           <Label htmlFor={`${idPrefix}-line2`}>{t('address_line_2')}</Label>
           <Input
             id={`${idPrefix}-line2`}
+            name={`${idPrefix}-line2`}
+            autoComplete={`${idPrefix} address-line2`}
             value={value.line2}
             onChange={(e) => onChange({ ...value, line2: e.target.value })}
           />
@@ -203,6 +228,9 @@ function AddressForm({
             <Label htmlFor={`${idPrefix}-city`}>{t('city')}</Label>
             <Input
               id={`${idPrefix}-city`}
+              name={`${idPrefix}-city`}
+              autoComplete={`${idPrefix} address-level2`}
+              required
               value={value.city}
               onChange={(e) => onChange({ ...value, city: e.target.value })}
             />
@@ -212,7 +240,10 @@ function AddressForm({
             {usesStructuredStates ? (
               <select
                 id={`${idPrefix}-state`}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                name={`${idPrefix}-state`}
+                autoComplete={`${idPrefix} address-level1`}
+                required
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                 value={value.state}
                 onChange={(e) => onChange({ ...value, state: e.target.value })}
               >
@@ -226,6 +257,8 @@ function AddressForm({
             ) : (
               <Input
                 id={`${idPrefix}-state`}
+                name={`${idPrefix}-state`}
+                autoComplete={`${idPrefix} address-level1`}
                 value={value.state}
                 onChange={(e) => onChange({ ...value, state: e.target.value })}
               />
@@ -235,6 +268,9 @@ function AddressForm({
             <Label htmlFor={`${idPrefix}-postal`}>{t('postal_zip_code')}</Label>
             <Input
               id={`${idPrefix}-postal`}
+              name={`${idPrefix}-postal`}
+              autoComplete={`${idPrefix} postal-code`}
+              required
               value={value.postal_code}
               onChange={(e) => onChange({ ...value, postal_code: e.target.value })}
             />
@@ -261,7 +297,7 @@ function CheckoutSection({
       <CardHeader>
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div>
-            <CardTitle>{title}</CardTitle>
+            <CardTitle role="heading" aria-level={2}>{title}</CardTitle>
             <p className="mt-1 text-sm text-muted-foreground">{description}</p>
           </div>
           {badgeLabel ? <Badge variant="secondary">{badgeLabel}</Badge> : null}
@@ -273,6 +309,8 @@ function CheckoutSection({
 }
 
 export const Checkout = ({ initialCustomer }: CheckoutProps) => {
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const [trialPreferences, setTrialPreferences] = useState<Record<string, 'free' | 'paid'>>({});
   const [processingKey, setProcessingKey] = useState<string | null>(null);
   const [checkoutErrors, setCheckoutErrors] = useState<Partial<Record<ProviderName, string>>>({});
@@ -282,6 +320,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
   const [showSandboxModal, setShowSandboxModal] = useState(false);
   const [sandboxProvider, setSandboxProvider] = useState<ProviderName | null>(null);
   const [isLoadingRates, setIsLoadingRates] = useState(false);
+  const [ratesFailed, setRatesFailed] = useState(false);
   const [isLoadingTaxes, setIsLoadingTaxes] = useState(false);
   const [shippingMethods, setShippingMethods] = useState<ResolvedShippingMethod[]>([]);
   const [selectedMethodId, setSelectedMethodId] = useState<string | null>(null);
@@ -435,22 +474,28 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
       return;
     }
 
-    if (isAuthenticated) {
-      window.localStorage.removeItem(CHECKOUT_DRAFT_STORAGE_KEY);
-      return;
-    }
+    // Storage can be blocked or full (private mode, site-data settings). The read above was
+    // guarded, these writes were not: a throw inside an effect unmounted the whole checkout.
+    try {
+      if (isAuthenticated) {
+        window.localStorage.removeItem(CHECKOUT_DRAFT_STORAGE_KEY);
+        return;
+      }
 
-    window.localStorage.setItem(
-      CHECKOUT_DRAFT_STORAGE_KEY,
-      JSON.stringify({
-        email,
-        phone,
-        billingAddress,
-        shippingAddress,
-        useBillingForShipping,
-        selectedMethodId,
-      })
-    );
+      window.localStorage.setItem(
+        CHECKOUT_DRAFT_STORAGE_KEY,
+        JSON.stringify({
+          email,
+          phone,
+          billingAddress,
+          shippingAddress,
+          useBillingForShipping,
+          selectedMethodId,
+        })
+      );
+    } catch {
+      // The draft is a convenience; checkout works without it.
+    }
   }, [
     billingAddress,
     email,
@@ -484,35 +529,56 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
       }
 
       setIsLoadingRates(true);
-      const result = await getShippingEstimates(
-        discountedStripeSubtotal,
-        {
-          country: shippingAddressForRates.country_code,
-          state: shippingAddressForRates.state,
-          postal_code: shippingAddressForRates.postal_code,
-        },
-        lang,
-        activeCurrencyCode
-      );
+      setRatesFailed(false);
 
-      if (isCancelled) {
-        return;
-      }
+      try {
+        const result = await getShippingEstimates(
+          discountedStripeSubtotal,
+          {
+            country: shippingAddressForRates.country_code,
+            state: shippingAddressForRates.state,
+            postal_code: shippingAddressForRates.postal_code,
+          },
+          lang,
+          activeCurrencyCode
+        );
 
-      if (result.success && result.methods) {
-        setShippingMethods(result.methods);
-        if (
-          result.methods.length > 0 &&
-          (!selectedMethodId || !result.methods.find((method) => method.id === selectedMethodId))
-        ) {
-          setSelectedMethodId(result.methods[0].id);
+        if (isCancelled) {
+          return;
         }
-      } else {
+
+        if (result.success && result.methods) {
+          const methods = result.methods;
+          setShippingMethods(methods);
+          // A functional update keeps the shopper's pick when it is still offered WITHOUT
+          // listing `selectedMethodId` as a dependency. It used to be one, so every click on
+          // a rate (and the auto-select below) re-ran this effect: the list flashed back to a
+          // spinner, the pay button disabled, and each address change fetched twice.
+          setSelectedMethodId((current) =>
+            current && methods.some((method) => method.id === current)
+              ? current
+              : (methods[0]?.id ?? null)
+          );
+        } else {
+          setShippingMethods([]);
+          setSelectedMethodId(null);
+        }
+      } catch (error) {
+        // A rejected server action (offline, a deploy in progress) used to leave
+        // `isLoadingRates` true forever: endless spinner, pay button disabled for good.
+        if (isCancelled) {
+          return;
+        }
+
+        console.error('[Checkout] Failed to load shipping rates:', error);
         setShippingMethods([]);
         setSelectedMethodId(null);
+        setRatesFailed(true);
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingRates(false);
+        }
       }
-
-      setIsLoadingRates(false);
     };
 
     const timer = setTimeout(fetchRates, 400);
@@ -525,7 +591,6 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
     hasPhysicalProducts,
     isShippingAddressReadyForRates,
     lang,
-    selectedMethodId,
     shippingAddressForRates.country_code,
     shippingAddressForRates.postal_code,
     shippingAddressForRates.state,
@@ -533,6 +598,10 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
   ]);
 
   useEffect(() => {
+    // Without this flag a slow response for an OLD address could land after a newer one and
+    // overwrite it: wrong tax, wrong total. (The rates effect above always had one.)
+    let isCancelled = false;
+
     const loadTaxes = async () => {
       if (!hasPhysicalProducts || !taxAddress.country_code) {
         setIsLoadingTaxes(false);
@@ -547,28 +616,44 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
       }
 
       setIsLoadingTaxes(true);
-      const result = await getTaxEstimate(
-        stripeItems,
-        {
-          country_code: taxAddress.country_code,
-          state: taxAddress.state,
-        },
-        activeCurrencyCode,
-        couponQuote?.code ?? null,
-        items
-      );
 
-      if (result.success && result.tax) {
-        setTaxEstimate(result.tax);
-      } else {
+      try {
+        const result = await getTaxEstimate(
+          stripeItems,
+          {
+            country_code: taxAddress.country_code,
+            state: taxAddress.state,
+          },
+          activeCurrencyCode,
+          couponQuote?.code ?? null,
+          items
+        );
+
+        if (isCancelled) {
+          return;
+        }
+
+        setTaxEstimate(result.success && result.tax ? result.tax : null);
+      } catch (error) {
+        if (isCancelled) {
+          return;
+        }
+
+        // A rejected action used to leave the tax line on its placeholder forever.
+        console.error('[Checkout] Failed to load the tax estimate:', error);
         setTaxEstimate(null);
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingTaxes(false);
+        }
       }
-
-      setIsLoadingTaxes(false);
     };
 
     const timer = setTimeout(loadTaxes, 300);
-    return () => clearTimeout(timer);
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
   }, [
     activeCurrencyCode,
     hasPhysicalProducts,
@@ -578,6 +663,19 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
     couponQuote?.code,
     items,
   ]);
+
+  // Back from Stripe through the back/forward cache restores this page exactly as it was
+  // left: `processingKey` still set, every pay button spinning and disabled, no way out.
+  useEffect(() => {
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        setProcessingKey(null);
+      }
+    };
+
+    window.addEventListener('pageshow', handlePageShow);
+    return () => window.removeEventListener('pageshow', handlePageShow);
+  }, []);
 
   if (!store) {
     return null;
@@ -590,16 +688,26 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
 
   const sandboxModal = showSandboxModal ? (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center overscroll-contain bg-black/60 backdrop-blur-sm"
       onClick={closeSandboxModal}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') closeSandboxModal();
+      }}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sandbox-checkout-title"
         className="relative bg-background border rounded-xl shadow-2xl p-8 max-w-md mx-4"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* autoFocus: keyboard focus starts inside the dialog, where Escape is handled. */}
         <button
+          type="button"
+          autoFocus
           onClick={closeSandboxModal}
-          className="absolute top-4 right-4 text-muted-foreground hover:text-foreground transition-colors"
+          aria-label={translateOrFallback('close', 'Close')}
+          className="absolute top-4 right-4 inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
         >
           <X className="w-5 h-5" />
         </button>
@@ -607,7 +715,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           <div className="p-2 rounded-full bg-amber-100 dark:bg-amber-900/20">
             <FlaskConical className="h-6 w-6 text-amber-600 dark:text-amber-400" />
           </div>
-          <h2 className="text-xl font-semibold">{t('ecommerce.checkout_successful')}</h2>
+          <h2 id="sandbox-checkout-title" className="text-xl font-semibold">{t('ecommerce.checkout_successful')}</h2>
         </div>
         <p className="text-muted-foreground mb-2">{t('ecommerce.sandbox_notice')}</p>
         <p className="text-muted-foreground mb-2">
@@ -634,16 +742,39 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
     </div>
   ) : null;
 
+  // Validation answers inline, in the error box beside the button that was pressed, and
+  // moves focus to the field that needs attention. It used to call `alert()`, and the email
+  // error only appeared in a field that on a phone sits several screens above the pay
+  // button, so the press looked dead.
+  const failValidation = (provider: ProviderName, message: string, focusId?: string) => {
+    setCheckoutErrors((current) => ({ ...current, [provider]: message }));
+    if (focusId) {
+      document.getElementById(focusId)?.focus();
+    }
+    return null;
+  };
+  const firstMissingAddressFieldId = (prefix: string, address: AddressState) => {
+    if (!address.recipient_name.trim()) return `${prefix}-name`;
+    if (!address.line1.trim()) return `${prefix}-line1`;
+    if (!address.city.trim()) return `${prefix}-city`;
+    if (countryUsesStructuredStates(address.country_code) && !address.state) return `${prefix}-state`;
+    if (!address.postal_code.trim()) return `${prefix}-postal`;
+    return `${prefix}-line1`;
+  };
+
   const validateSharedFields = (provider: ProviderName) => {
     if (!isAuthenticated && (!email || !/^\S+@\S+\.\S+$/.test(email))) {
       setEmailError(t('ecommerce.invalid_email'));
-      return null;
+      return failValidation(provider, t('ecommerce.invalid_email'), 'checkout-email');
     }
 
     const normalizedBillingAddress = normalizeCustomerAddress(billingAddress);
     if (!isCustomerAddressComplete(normalizedBillingAddress)) {
-      alert(t('checkout_complete_billing_address'));
-      return null;
+      return failValidation(
+        provider,
+        t('checkout_complete_billing_address'),
+        firstMissingAddressFieldId('billing', billingAddress)
+      );
     }
 
     const normalizedShippingAddress = hasPhysicalProducts
@@ -652,18 +783,23 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
 
     if (provider === 'stripe') {
       if (!isCustomerAddressComplete(normalizedShippingAddress)) {
-        alert(t('checkout_complete_shipping_address'));
-        return null;
+        return failValidation(
+          provider,
+          t('checkout_complete_shipping_address'),
+          useBillingForShipping
+            ? firstMissingAddressFieldId('billing', billingAddress)
+            : firstMissingAddressFieldId('shipping', shippingAddress)
+        );
       }
 
       if (!selectedMethodId) {
-        alert(
+        return failValidation(
+          provider,
           translateOrFallback(
             'ecommerce.shipping_method_required',
             'Please select a shipping method before continuing.'
           )
         );
-        return null;
       }
     }
 
@@ -702,7 +838,11 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
       setShowSandboxModal(true);
 
       if (typeof window !== 'undefined' && remainingItems.length === 0) {
-        window.localStorage.removeItem(CHECKOUT_DRAFT_STORAGE_KEY);
+        try {
+          window.localStorage.removeItem(CHECKOUT_DRAFT_STORAGE_KEY);
+        } catch {
+          // Blocked storage must not stop the sandbox confirmation.
+        }
       }
 
       return;
@@ -807,10 +947,13 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           const handler = new FreemiusCheckout(checkoutConfig);
           handler.open(openConfig);
           setProcessingKey(null);
-        } catch (error: any) {
-          alert(
-            t('ecommerce.checkout_popup_blocked') + ' ' + (error.message || String(error))
-          );
+        } catch (error) {
+          // Shown in the error box, without the raw (English) exception text.
+          console.error('[Checkout] Freemius overlay failed to open:', error);
+          setCheckoutErrors((current) => ({
+            ...current,
+            [provider]: t('ecommerce.checkout_popup_blocked'),
+          }));
           if (data.url) {
             window.location.href = data.url;
           }
@@ -846,6 +989,8 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           <h1 className="mb-4 text-2xl font-bold">{t('ecommerce.cart_empty')}</h1>
           <p className="mb-8 text-muted-foreground">{t('ecommerce.cart_empty_description')}</p>
           <Button asChild>
+            {/* `/shop` for every language: the page redirects to its translation when one
+                exists, and a translated slug here would 404 on installs without that page. */}
             <a href="/shop">{t('ecommerce.go_to_shop')}</a>
           </Button>
         </div>
@@ -944,7 +1089,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           <div className="lg:col-span-8 space-y-6">
             <Card>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2">
+                <CardTitle role="heading" aria-level={2} className="flex items-center gap-2">
                   <CreditCard className="w-5 h-5" />
                   {t('ecommerce.contact_information')}
                 </CardTitle>
@@ -961,7 +1106,12 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                     </Label>
                     <Input
                       id="checkout-email"
+                      name="email"
                       type="email"
+                      autoComplete="email"
+                      spellCheck={false}
+                      aria-invalid={emailError ? true : undefined}
+                      aria-describedby={emailError ? 'checkout-email-error' : undefined}
                       placeholder={t('ecommerce.email_placeholder')}
                       value={email}
                       onChange={(e) => {
@@ -972,7 +1122,11 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                       }}
                       required
                     />
-                    {emailError ? <p className="text-xs text-destructive mt-1">{emailError}</p> : null}
+                    {emailError ? (
+                      <p id="checkout-email-error" role="alert" className="text-xs text-destructive mt-1">
+                        {emailError}
+                      </p>
+                    ) : null}
                   </div>
                 )}
 
@@ -980,6 +1134,10 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                   <Label htmlFor="checkout-phone">{t('phone_number')}</Label>
                   <Input
                     id="checkout-phone"
+                    name="phone"
+                    type="tel"
+                    inputMode="tel"
+                    autoComplete="tel"
                     placeholder={t('optional')}
                     value={phone}
                     onChange={(e) => setPhone(e.target.value)}
@@ -1027,46 +1185,55 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
             {hasPhysicalProducts ? (
               <Card>
                 <CardHeader>
-                  <CardTitle className="flex items-center gap-2">
+                  <CardTitle role="heading" aria-level={2} className="flex items-center gap-2">
                     <ChevronRight className="w-5 h-5 text-primary" />
                     {t('ecommerce.shipping_method')}
                   </CardTitle>
                 </CardHeader>
                 <CardContent>
                   {isLoadingRates ? (
-                    <div className="flex items-center justify-center py-6">
+                    <div role="status" className="flex items-center justify-center py-6">
                       <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                      <span className="sr-only">
+                        {translateOrFallback('ecommerce.calculating_shipping', 'Calculating shipping…')}
+                      </span>
+                    </div>
+                  ) : ratesFailed ? (
+                    <div role="alert" className="rounded-lg bg-destructive/10 px-4 py-3 text-center text-sm text-destructive">
+                      {translateOrFallback(
+                        'ecommerce.shipping_calculation_failed',
+                        "We couldn't calculate shipping right now. Please try again."
+                      )}
                     </div>
                   ) : shippingMethods.length > 0 ? (
-                    <div className="space-y-3">
+                    // A real radio group. These rows used to be <div onClick>: no role, no
+                    // tab stop, no keys, so a keyboard user could not change the shipping method.
+                    <RadioGroup
+                      value={selectedMethodId ?? ''}
+                      onValueChange={setSelectedMethodId}
+                      aria-label={t('ecommerce.shipping_method')}
+                      className="space-y-3"
+                    >
                       {shippingMethods.map((method) => (
-                        <div
+                        <Label
                           key={method.id}
-                          onClick={() => setSelectedMethodId(method.id)}
-                          className={`flex items-center justify-between p-4 rounded-lg border-2 cursor-pointer transition-all ${
+                          htmlFor={`shipping-method-${method.id}`}
+                          className={`flex items-center justify-between gap-3 p-4 rounded-lg border-2 cursor-pointer transition-colors ${
                             selectedMethodId === method.id
                               ? 'border-primary bg-primary/5'
-                              : 'border-neutral-100 hover:border-neutral-200'
+                              : 'border-border hover:border-muted-foreground/40'
                           }`}
                         >
-                          <div className="flex items-center gap-3">
-                            <div
-                              className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                                selectedMethodId === method.id ? 'border-primary' : 'border-neutral-300'
-                              }`}
-                            >
-                              {selectedMethodId === method.id ? (
-                                <div className="w-2 h-2 rounded-full bg-primary" />
-                              ) : null}
-                            </div>
-                            <span className="font-medium">{method.name}</span>
-                          </div>
-                          <span className="font-bold">
+                          <span className="flex min-w-0 items-center gap-3">
+                            <RadioGroupItem id={`shipping-method-${method.id}`} value={method.id} />
+                            <span className="font-medium break-words">{method.name}</span>
+                          </span>
+                          <span className="font-bold tabular-nums">
                             {formatPrice(method.amount, activeCurrencyCode)}
                           </span>
-                        </div>
+                        </Label>
                       ))}
-                    </div>
+                    </RadioGroup>
                   ) : (
                     <div className="py-4 text-center text-muted-foreground bg-muted/30 rounded-lg italic">
                       {isShippingAddressReadyForRates
@@ -1085,7 +1252,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           <div className="lg:col-span-4 space-y-6">
             <Card className="top-6">
               <CardHeader>
-                <CardTitle>{t('ecommerce.order_summary')}</CardTitle>
+                <CardTitle role="heading" aria-level={2}>{t('ecommerce.order_summary')}</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-3 max-h-[260px] overflow-y-auto pr-2">
@@ -1094,7 +1261,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                       currencyCode: activeCurrencyCode,
                       currencies,
                     });
-                    const trialSummary = getTrialSummary(item);
+                    const trialSummary = getTrialSummary(item, t);
 
                     return (
                       <div key={`${item.id}-${item.variant_id || 'base'}`} className="flex items-start justify-between gap-4">
@@ -1304,7 +1471,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                 ) : null}
 
                 {checkoutErrors.stripe ? (
-                  <div className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <div role="alert" className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                     {checkoutErrors.stripe}
                   </div>
                 ) : null}
@@ -1341,7 +1508,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                       currencyCode: activeCurrencyCode,
                       currencies,
                     });
-                    const trialSummary = getTrialSummary(item);
+                    const trialSummary = getTrialSummary(item, t);
                     const itemKey = `freemius:${item.id}`;
                     const selectedTrialPreference = trialSummary
                       ? trialPreferences[itemKey] || 'paid'
@@ -1479,7 +1646,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                 ) : null}
 
                 {checkoutErrors.freemius ? (
-                  <div className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                  <div role="alert" className="rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                     {checkoutErrors.freemius}
                   </div>
                 ) : null}

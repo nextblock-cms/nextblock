@@ -23,3 +23,26 @@
   );
   animation: shimmer 2s infinite;
 }
+
+/*─────────────────────────────────────────────────────────────────────────────
+  6. Reduced motion
+
+  One global switch instead of a `motion-reduce:` variant on every animated
+  element: enter/exit animations (dialog, sheet, popover, select, tooltip),
+  `animate-spin` / `animate-pulse`, `.shimmer`, hover zooms and every
+  `transition-*`. Durations collapse to 0.01ms rather than `none` so
+  `animationend` / `transitionend` still fire; Radix waits on them to unmount.
+  `!important` is required: utilities are unlayered in the compiled sheet.
+  JS-driven motion (slider autoplay, smooth scrolling) checks the same media
+  query in code.
+─────────────────────────────────────────────────────────────────────────────*/
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -23,13 +23,13 @@ const TestimonialBlockRenderer: React.FC<TestimonialBlockRendererProps> = ({
   const authorName = content.author_name || "Customer";
 
   return (
-    <div className="container m-8" {...visualEditAttributes}>
+    <div className="container mx-auto my-8" {...visualEditAttributes}>
       <Card className="h-full">
         <CardContent className="pt-6 flex flex-col gap-4 h-full">
           <MessageSquareQuote className="w-8 h-8 text-primary/40" />
           {content.quote && (
             <blockquote className="flex-grow text-lg italic text-muted-foreground">
-              &quot;{content.quote}&quot;
+              &ldquo;{content.quote}&rdquo;
             </blockquote>
           )}
           <div className="flex items-center gap-3 mt-4">

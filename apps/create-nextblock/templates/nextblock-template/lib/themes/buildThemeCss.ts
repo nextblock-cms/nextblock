@@ -118,6 +118,32 @@ export function activeThemeSlugs(themes: SiteTheme[]): string[] {
     .map((theme) => theme.slug);
 }
 
+const FALLBACK_THEME_COLOR = '#ffffff';
+
+/**
+ * A stored HSL triplet (`"222 47% 11%"`) as a colour the `theme-color` meta tag accepts.
+ * Emitted in the legacy comma form, which every browser's meta parser understands.
+ */
+export function tripletToThemeColor(triplet: string | null | undefined): string | null {
+  if (typeof triplet !== 'string' || !isValidTokenValue('background', triplet)) return null;
+
+  const [h, s, l] = triplet.match(/-?\d+(?:\.\d+)?/g) ?? [];
+
+  return h !== undefined && s !== undefined && l !== undefined ? `hsl(${h}, ${s}%, ${l}%)` : null;
+}
+
+/**
+ * `<meta name="theme-color">` for the first paint: the default theme's `--background`, so the
+ * browser chrome (mobile address bar, installed-app title bar) matches the page. Falls back
+ * to white, the background of the palette shipped in libs/ui/src/styles/theme.css.
+ */
+export function themeColorFor(themes: SiteTheme[]): string {
+  const active = themes.filter((theme) => theme.is_active && isValidThemeSlug(theme.slug));
+  const fallback = active.find((theme) => theme.is_default) ?? active[0];
+
+  return tripletToThemeColor(fallback?.tokens?.background) ?? FALLBACK_THEME_COLOR;
+}
+
 export function defaultThemeSlug(themes: SiteTheme[]): string {
   const active = themes.filter((theme) => theme.is_active && isValidThemeSlug(theme.slug));
   return (active.find((theme) => theme.is_default) ?? active[0])?.slug ?? 'light';

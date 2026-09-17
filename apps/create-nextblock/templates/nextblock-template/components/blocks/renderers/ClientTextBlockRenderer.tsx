@@ -32,13 +32,24 @@ function normalizeHtmlEncodingArtifacts(html: string): string {
     .replaceAll("âœ”", "&#10003;");
 }
 
-function normalizeImageAttributes(attribs: Record<string, string>) {
+function normalizeImageAttributes(attribs: Record<string, string>, priority = false) {
   if (attribs['fetchpriority']) {
     attribs.fetchPriority = attribs['fetchpriority'];
     delete attribs['fetchpriority'];
   }
 
-  if (!attribs.loading) {
+  // An <img> with no alt attribute is announced by its file name; empty alt marks it as
+  // decorative, which is the honest default when the author gave none.
+  if (attribs.alt === undefined) {
+    attribs.alt = '';
+  }
+
+  if (priority) {
+    // The first image of an above-the-fold block is the likely LCP element: lazy-loading
+    // it (the old default for every pass-through image) delays the paint it is measured by.
+    attribs.loading = 'eager';
+    attribs.fetchPriority = 'high';
+  } else if (!attribs.loading) {
     attribs.loading = 'lazy';
   }
 
@@ -214,7 +225,7 @@ function renderOptimizedCmsImage(attribs: Record<string, string>, forcePriority 
   const image = getKnownCmsImage(attribs.src);
 
   if (!image) {
-    normalizeImageAttributes(attribs);
+    normalizeImageAttributes(attribs, forcePriority);
     return undefined;
   }
 
@@ -285,7 +296,9 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
         if (domNode.name === 'img') {
           const claimImagePriority = priority && !priorityImageClaimed;
           const rendered = renderOptimizedCmsImage(domNode.attribs, claimImagePriority);
-          if (rendered && claimImagePriority) priorityImageClaimed = true;
+          // Claimed whether or not the image is in the registry: a pass-through <img> is
+          // promoted in place, and only ONE image per block may be promoted.
+          if (claimImagePriority) priorityImageClaimed = true;
           return rendered;
         } else if (domNode.attribs['fetchpriority']) {
           domNode.attribs.fetchPriority = domNode.attribs['fetchpriority'];

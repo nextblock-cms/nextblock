@@ -6,6 +6,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react'
 import type { Database } from '@nextblock-cms/db' // Relative path from components/
 import { useCurrentContent } from '../context/CurrentContentContext';
 import { useTranslations } from '@nextblock-cms/utils';
+import { useLabel } from '../lib/i18n/use-label';
 import { DeferredGlobalSearch } from './DeferredGlobalSearch';
 import { resolveMediaUrl } from '../lib/media/resolveMediaUrl';
 
@@ -27,6 +28,7 @@ const ChevronDownIcon = (props: React.SVGProps<SVGSVGElement>) => (
     xmlns="http://www.w3.org/2000/svg"
     viewBox="0 0 20 20"
     fill="currentColor"
+    aria-hidden="true"
     {...props}
   >
     <path
@@ -87,6 +89,83 @@ function ClientOnly({ children }: { children: React.ReactNode }) {
   return mounted ? <>{children}</> : null;
 }
 
+/**
+ * One desktop menu entry. Opening stays CSS-driven (`group-hover` / `group-focus-within`) so
+ * it works before hydration; the state only mirrors it for `aria-expanded` and lets Escape
+ * dismiss the flyout (WCAG 1.4.13) until the pointer or focus leaves the entry.
+ */
+function DesktopNavItem({
+  item,
+  isSubmenu,
+  renderChildren,
+}: {
+  item: HierarchicalNavigationItem;
+  isSubmenu: boolean;
+  renderChildren: (items: HierarchicalNavigationItem[]) => React.ReactNode;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [isDismissed, setIsDismissed] = useState(false);
+  const linkRef = useRef<HTMLAnchorElement>(null);
+  const hasChildren = item.children.length > 0;
+  const linkClassName = `flex items-center justify-between hover:underline px-3 py-2 text-sm text-foreground ${isSubmenu ? 'w-full hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md' : ''}`;
+
+  if (!hasChildren) {
+    return (
+      <div className={`relative ${isSubmenu ? 'w-full' : ''}`}>
+        <Link href={item.url} className={linkClassName}>
+          {item.label}
+        </Link>
+      </div>
+    );
+  }
+
+  const close = () => {
+    setIsOpen(false);
+    setIsDismissed(false);
+  };
+
+  return (
+    <div
+      className={`relative group ${isSubmenu ? 'w-full' : ''}`}
+      onMouseEnter={() => setIsOpen(true)}
+      onMouseLeave={close}
+      onFocus={() => setIsOpen(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) close();
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== 'Escape' || !isOpen || isDismissed) return;
+        event.stopPropagation();
+        setIsDismissed(true);
+        linkRef.current?.focus();
+      }}
+    >
+      <Link
+        ref={linkRef}
+        href={item.url}
+        className={linkClassName}
+        aria-haspopup="true"
+        aria-expanded={isOpen && !isDismissed}
+      >
+        {item.label}
+        <ChevronDownIcon
+          className={`ml-1 h-4 w-4 transition-transform duration-200 ${isDismissed ? '' : 'group-hover:rotate-180 group-focus-within:rotate-180'}`}
+        />
+      </Link>
+      <div
+        className={`
+          absolute top-full left-0 mt-0 w-56 bg-background border border-gray-200 dark:border-gray-700 rounded-md shadow-lg py-1
+          opacity-0 invisible transition-[opacity,visibility] duration-200 ease-in-out z-50
+          ${isDismissed ? '' : 'group-hover:opacity-100 group-hover:visible group-focus-within:opacity-100 group-focus-within:visible'}
+          ${isSubmenu ? 'left-full top-0 -mt-[2px] ml-0' : ''}
+        `}
+      > {/* -mt-[2px] to align better with parent item border */}
+        {renderChildren(item.children)}
+      </div>
+    </div>
+  );
+}
+
 export default function ResponsiveNav({
   homeLinkHref,
   navItems,
@@ -102,8 +181,11 @@ export default function ResponsiveNav({
   isEcommerceActive = false,
 }: ResponsiveNavProps) {
   const { t } = useTranslations();
+  const label = useLabel();
   const pathname = usePathname() || '/';
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const wasMobileMenuOpenRef = useRef(false);
+  const closeMenuLabel = label('close_main_menu', 'Close main menu', 'Fermer le menu principal');
   const [expandedMobileItems, setExpandedMobileItems] = useState<Record<string, boolean>>({});
 
   const menuButtonRef = useRef<HTMLButtonElement>(null);
@@ -192,6 +274,13 @@ export default function ResponsiveNav({
     if (!menuElement) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      // The toggle sits outside the focus trap and the drawer has no close button of its
+      // own, so without Escape a keyboard user could not leave the open menu.
+      if (event.key === 'Escape') {
+        setIsMobileMenuOpen(false);
+        return;
+      }
+
       if (event.key !== 'Tab') return;
 
       const focusableElements = menuElement.querySelectorAll<HTMLElement>(
@@ -228,12 +317,28 @@ export default function ResponsiveNav({
       }
       
       document.addEventListener('keydown', handleKeyDown);
-    } else {
-      menuButtonRef.current?.focus();
+    } else if (wasMobileMenuOpenRef.current) {
+      // Hand focus back only after a real close. This effect also runs on mount, where it
+      // used to pull focus (and the scroll position) onto the hamburger on every page load.
+      menuButtonRef.current?.focus({ preventScroll: true });
     }
+
+    wasMobileMenuOpenRef.current = isMobileMenuOpen;
 
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isMobileMenuOpen]);
+
+  // The page behind the scrim must not scroll while the drawer is open.
+  useEffect(() => {
+    if (!isMobileMenuOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
     };
   }, [isMobileMenuOpen]);
 
@@ -246,7 +351,7 @@ export default function ResponsiveNav({
           {/* Only the label is a clickable link */}
           <Link
             href={item.url}
-            className="py-0 px-0 mr-2 focus:underline focus:outline-none"
+            className="py-0 px-0 mr-2 rounded-sm focus-visible:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
             onClick={() => {
               toggleMobileMenu();
             }}
@@ -257,10 +362,15 @@ export default function ResponsiveNav({
           {item.children && item.children.length > 0 && (
             <button
               type="button"
-              className="flex flex-1 items-center h-full cursor-pointer bg-transparent border-none outline-none px-1 justify-end"
+              className="flex flex-1 items-center h-full cursor-pointer bg-transparent border-none rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring px-1 justify-end"
               style={{ minWidth: 0 }}
               aria-expanded={!!expandedMobileItems[String(item.id)]}
-              aria-label={`Toggle submenu for ${item.label}`}
+              aria-label={label(
+                'nav.toggle_submenu',
+                'Toggle submenu for {label}',
+                'Afficher ou masquer le sous-menu de {label}',
+                { label: item.label }
+              )}
               onClick={e => {
                 e.stopPropagation();
                 toggleMobileSubmenu(String(item.id));
@@ -282,28 +392,12 @@ export default function ResponsiveNav({
 
   const renderDesktopNavItems = (items: HierarchicalNavigationItem[], isSubmenu = false): React.JSX.Element[] => {
     return items.map(item => (
-      <div key={item.id} className={`relative group ${isSubmenu ? 'w-full' : ''}`}>
-        <Link
-          href={item.url}
-          className={`flex items-center justify-between hover:underline px-3 py-2 text-sm text-foreground ${isSubmenu ? 'w-full hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md' : ''}`}
-        >
-          {item.label}
-          {item.children && item.children.length > 0 && (
-            <ChevronDownIcon className={`ml-1 h-4 w-4 transition-transform duration-200 group-hover:rotate-180 ${isSubmenu ? '' : ''}`} />
-          )}
-        </Link>
-        {item.children && item.children.length > 0 && (
-          <div
-            className={`
-              absolute top-full left-0 mt-0 w-56 bg-background border border-gray-200 dark:border-gray-700 rounded-md shadow-lg py-1
-              opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 ease-in-out z-50
-              ${isSubmenu ? 'left-full top-0 -mt-[2px] ml-0' : ''}
-            `}
-          > {/* -mt-[2px] to align better with parent item border */}
-            {renderDesktopNavItems(item.children, true)}
-          </div>
-        )}
-      </div>
+      <DesktopNavItem
+        key={item.id}
+        item={item}
+        isSubmenu={isSubmenu}
+        renderChildren={(children) => renderDesktopNavItems(children, true)}
+      />
     ));
   };
 
@@ -385,16 +479,16 @@ export default function ResponsiveNav({
           <button
             ref={menuButtonRef}
             onClick={toggleMobileMenu}
-            className="p-2 rounded-md text-foreground hover:text-primary focus:outline-none focus:ring-2 focus:ring-inset focus:ring-primary"
-            aria-label={t('open_main_menu')}
+            className="p-2 rounded-md text-foreground hover:text-primary focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary"
+            aria-label={isMobileMenuOpen ? closeMenuLabel : t('open_main_menu')}
             aria-expanded={isMobileMenuOpen}
           >
             {isMobileMenuOpen ? (
-              <svg className="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24">
+              <svg className="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
               </svg>
             ) : (
-              <svg className="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24">
+              <svg className="h-6 w-6" stroke="currentColor" fill="none" viewBox="0 0 24 24" aria-hidden="true">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16" />
               </svg>
             )}
@@ -414,16 +508,23 @@ export default function ResponsiveNav({
       {/* Slide-in Mobile Menu Container (for the sliding content) */}
       <div
         ref={menuContainerRef}
-        className={`fixed inset-0 z-40 transform transition-transform ease-in-out duration-300 md:hidden ${
-          isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'
+        // Closed, the drawer used to be merely translated off-screen: its links stayed in the
+        // tab order and the dialog role stayed exposed. `visibility` transitions at the end of
+        // the slide-out, and `inert` covers the 300 ms in between.
+        className={`fixed inset-0 z-40 transform transition-[transform,visibility] ease-in-out duration-300 md:hidden ${
+          isMobileMenuOpen ? 'visible translate-x-0' : 'invisible -translate-x-full'
         }`}
+        inert={!isMobileMenuOpen}
         role="dialog"
         aria-modal="true"
         aria-label={t('mobile_navigation_menu')}
       >
         {/* Menu Content (this part slides with the container above) */}
-        <div className="fixed top-16 left-0 h-[calc(100vh-4rem)] w-full max-w-sm bg-background text-foreground shadow-xl p-5 z-50 flex flex-col">
-          <nav className="flex-grow flex flex-col space-y-1 overflow-y-auto pt-6"> 
+        <div className="fixed top-16 left-0 h-[calc(100dvh-4rem)] w-full max-w-sm bg-background text-foreground shadow-xl p-5 z-50 flex flex-col">
+          <nav
+            aria-label={t('mobile_navigation_menu')}
+            className="flex-grow flex flex-col space-y-1 overflow-y-auto overscroll-contain pt-6"
+          >
             <div className="space-y-1">
               {renderMobileNavItems(hierarchicalNavItems)}
             </div>

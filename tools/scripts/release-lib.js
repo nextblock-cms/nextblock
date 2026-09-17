@@ -3,6 +3,8 @@
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { CORTEX_EXPORTS, ECOM_EXPORTS } = require('./lib-publish-exports');
+const { verifyLibDist } = require('./verify-lib-dist');
 
 const args = process.argv.slice(2);
 
@@ -95,29 +97,8 @@ function finalizeEcomDistPackageJson(distPkgPath) {
   pkg.main = './index.cjs.js';
   pkg.module = './index.es.js';
   pkg.types = './index.d.ts';
-  pkg.exports = {
-    '.': {
-      types: './index.d.ts',
-      import: './index.es.js',
-      require: './index.cjs.js',
-    },
-    './server': {
-      types: './server.d.ts',
-      import: './server.es.js',
-      require: './server.cjs.js',
-    },
-    './package.json': './package.json',
-    // preserveModules emits one file per source module under dist/lib/* (JS) with the .d.ts
-    // tree mirroring it (entryRoot 'src'), so every deep subpath the app imports —
-    // ./cart-store, ./currency, ./currency-constants, ./types, ./use-cart, ./variation-utils,
-    // ./CurrencyProvider, ./server-actions/*, ./components/* — resolves through this wildcard.
-    // Exact keys above win for "." and "server".
-    './*': {
-      types: './lib/*.d.ts',
-      import: './lib/*.es.js',
-      require: './lib/*.cjs.js',
-    },
-  };
+  // Defined in lib-publish-exports.js (shared with the publish check).
+  pkg.exports = ECOM_EXPORTS;
 
   resolveWorkspaceDeps(pkg);
 
@@ -136,19 +117,7 @@ function finalizeCortexDistPackageJson(distPkgPath) {
   pkg.main = './index.cjs.js';
   pkg.module = './index.es.js';
   pkg.types = './index.d.ts';
-  pkg.exports = {
-    '.': {
-      types: './index.d.ts',
-      import: './index.es.js',
-      require: './index.cjs.js',
-    },
-    './client': {
-      types: './client.d.ts',
-      import: './client.es.js',
-      require: './client.cjs.js',
-    },
-    './package.json': './package.json',
-  };
+  pkg.exports = CORTEX_EXPORTS;
 
   resolveWorkspaceDeps(pkg);
 
@@ -194,9 +163,15 @@ try {
   // preceding lib builds — that handshake intermittently misses the window and the run
   // dies with "Plugin worker ... exited unexpectedly" / "Failed to load 1 default Nx
   // plugin(s)". Loading plugins in-process removes the fork, the socket, and the timeout.
+  //
+  // NODE_ENV is forced to production. Left unset, the Nx Vite executor builds in development
+  // mode, so plugin-react emits `jsxDEV(..., this)` with this machine's absolute source
+  // paths. That shipped in 0.19.0: the `this` argument is illegal inside files with inline
+  // server actions, so every scaffolded project failed `next build` with "Server Actions
+  // cannot use `this`" (85 times, all from @nextblock-cms/ecom).
   run(buildCommand, {
     cwd: workspaceRoot,
-    env: { ...process.env, NX_DAEMON: 'false', NX_ISOLATE_PLUGINS: 'false' },
+    env: { ...process.env, NODE_ENV: 'production', NX_DAEMON: 'false', NX_ISOLATE_PLUGINS: 'false' },
   });
 
   if (!fs.existsSync(distDir)) {
@@ -211,6 +186,14 @@ try {
   if (library === 'cortex') {
     finalizeCortexDistPackageJson(path.join(distDir, 'package.json'));
   }
+
+  // Never publish a build that would break `next build` in a scaffolded project: development
+  // JSX, consumed subpaths that were not emitted, or exports lost to a stale `.js` twin.
+  // Runs AFTER the manifests are finalized, so it judges the package.json that actually
+  // ships. Run before, it rejected ecommerce 0.19.1: the raw manifest has no `exports` yet.
+  console.log('\n→ Verifying the build is publishable');
+  verifyLibDist(library);
+  console.log('✓ Build verified');
 
   // -------------------------------------------------------------------------
   // PUBLISH TO NPM (PUBLIC)

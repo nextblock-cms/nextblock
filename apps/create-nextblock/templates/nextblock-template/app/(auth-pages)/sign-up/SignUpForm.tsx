@@ -93,7 +93,7 @@ export default function SignUpForm({ botProtection, scriptNonce }: SignUpFormPro
         </p>
         <p className="text-sm text-foreground">
           {t('already_have_account')}{" "}
-          <Link className="text-foreground font-medium underline" href="/sign-in">
+          <Link className="text-foreground font-medium underline transition-colors hover:text-primary" href="/sign-in">
             {t('sign_in')}
           </Link>
         </p>
@@ -101,11 +101,21 @@ export default function SignUpForm({ botProtection, scriptNonce }: SignUpFormPro
         <div className="mt-8 flex flex-col gap-2">
           <div className="flex flex-col gap-2 [&>input]:mb-3">
             <Label htmlFor="email">{t('email')}</Label>
-            <Input name="email" placeholder={t('you_at_example_com')} required />
+            <Input
+              id="email"
+              type="email"
+              name="email"
+              autoComplete="email"
+              spellCheck={false}
+              placeholder={t('you_at_example_com')}
+              required
+            />
             <Label htmlFor="password">{t('password')}</Label>
             <Input
+              id="password"
               type="password"
               name="password"
+              autoComplete="new-password"
               placeholder={t('your_password')}
               minLength={6}
               required

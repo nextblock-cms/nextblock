@@ -65,6 +65,7 @@ const ImageBlockRenderer: React.FC<ImageBlockRendererProps> = ({
               ? { width: content.width as number, height: content.height as number }
               : {})}
             loading={priority ? "eager" : "lazy"}
+            fetchPriority={priority ? "high" : undefined}
             decoding="async"
             className="rounded-md border max-w-full h-auto mx-auto"
           />
@@ -84,6 +85,13 @@ const ImageBlockRenderer: React.FC<ImageBlockRendererProps> = ({
     );
   }
 
+  // The two notes below are for whoever is editing the page. `visualEditAttributes` only
+  // exists while visual editing is on; public visitors get nothing instead of a grey box
+  // saying "object_key missing".
+  if ((!content.media_id || !content.object_key) && !visualEditAttributes) {
+    return null;
+  }
+
   if (!content.media_id || !content.object_key) {
     return (
       <div
@@ -95,6 +103,16 @@ const ImageBlockRenderer: React.FC<ImageBlockRendererProps> = ({
     );
   }
   
+  const hasValidDimensions =
+    typeof content.width === "number" &&
+    typeof content.height === "number" &&
+    content.width > 0 &&
+    content.height > 0;
+
+  if (!hasValidDimensions && !visualEditAttributes) {
+    return null;
+  }
+
   if (
     typeof content.width !== "number" ||
     typeof content.height !== "number" ||

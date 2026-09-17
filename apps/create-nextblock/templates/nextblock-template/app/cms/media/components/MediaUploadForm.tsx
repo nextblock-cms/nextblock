@@ -314,7 +314,7 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
           <div className="mt-2 flex items-center justify-center w-full">
             <label
               htmlFor="media-file-input"
-              className={`flex flex-col items-center justify-center w-full ${compact ? "h-28" : "h-40"} border-2 border-dashed rounded-lg cursor-pointer bg-muted/30 hover:bg-muted/50 transition-colors ${
+              className={`flex flex-col items-center justify-center w-full ${compact ? "h-28" : "h-40"} border-2 border-dashed rounded-lg cursor-pointer bg-muted/30 hover:bg-muted/50 transition-colors focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2 ${
                 isDraggingOver ? "border-primary bg-primary-foreground/20" : "border-input"
               }`}
               onDrop={handleDrop}
@@ -329,7 +329,7 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
                 </p>
                 <p className="text-xs text-muted-foreground">SVG, PNG, JPG, GIF, MP4, PDF (MAX. 10MB)</p>
               </div>
-              <Input id="media-file-input" type="file" className="hidden" onChange={handleFileChange} ref={fileInputRef} />
+              <Input id="media-file-input" type="file" className="sr-only h-px w-px border-0 p-0" onChange={handleFileChange} ref={fileInputRef} />
             </label>
           </div>
           {previewUrl && file && file.type.startsWith("image/") && (

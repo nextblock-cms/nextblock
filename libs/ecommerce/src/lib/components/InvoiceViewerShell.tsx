@@ -31,6 +31,9 @@ interface InvoiceViewerShellProps {
   loading?: boolean;
   loadingMessage?: string;
   error?: string | null;
+  /** With `retryLabel`, shows a retry button beside the error. */
+  onRetry?: () => void;
+  retryLabel?: string;
   emptyMessage?: string;
   className?: string;
   showHeader?: boolean;
@@ -50,6 +53,8 @@ export function InvoiceViewerShell({
   loading = false,
   loadingMessage,
   error,
+  onRetry,
+  retryLabel,
   emptyMessage,
   className = '',
   showHeader = true,
@@ -123,14 +128,19 @@ export function InvoiceViewerShell({
         ) : null}
 
         {loading ? (
-          <div className="mb-6 flex items-center justify-center gap-3 rounded-2xl border bg-background px-5 py-4 text-sm text-muted-foreground print:hidden">
+          <div role="status" className="mb-6 flex items-center justify-center gap-3 rounded-2xl border bg-background px-5 py-4 text-sm text-muted-foreground print:hidden">
             {loadingMessage}
           </div>
         ) : null}
 
         {error ? (
-          <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-700 print:hidden">
-            {error}
+          <div role="alert" className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800 print:hidden dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+            <span>{error}</span>
+            {onRetry && retryLabel ? (
+              <Button type="button" size="sm" variant="outline" onClick={onRetry}>
+                {retryLabel}
+              </Button>
+            ) : null}
           </div>
         ) : null}
 

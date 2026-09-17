@@ -7,6 +7,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import { getContentTranslations, getContentMetadataBySlugAndLocale } from '../app/actions/languageActions';
 import { Language } from '../app/actions/languageActions';
 import { useCurrentContent } from '../context/CurrentContentContext';
+import { useLabel } from '../lib/i18n/use-label';
 
 interface CurrentPageInfo {
   slug: string;
@@ -22,6 +23,7 @@ export default function LanguageSwitcher({ currentPageData }: LanguageSwitcherPr
   const { currentLocale, setCurrentLocale, availableLanguages, isLoadingLanguages } = useLanguage();
   const router = useRouter();
   const pathname = usePathname();
+  const label = useLabel();
 
   if (isLoadingLanguages || availableLanguages.length <= 1) {
     return null;
@@ -107,15 +109,18 @@ export default function LanguageSwitcher({ currentPageData }: LanguageSwitcherPr
     }, 50); // Adjust delay as needed
   };
 
+  const languageLabel = label('language_switcher', 'Language', 'Langue');
+
   return (
     <div className="flex items-center">
-      <Select value={currentLocale} onValueChange={handleValueChange} aria-label="Language Switcher">
-        <SelectTrigger className="h-9 text-xs sm:text-sm" aria-label="Language Switcher">
-          <SelectValue placeholder="Language" aria-label="Language Switcher"/>
+      <Select value={currentLocale} onValueChange={handleValueChange}>
+        <SelectTrigger className="h-9 text-xs sm:text-sm" aria-label={languageLabel}>
+          <SelectValue placeholder={languageLabel} />
         </SelectTrigger>
         <SelectContent>
           {availableLanguages.map((lang: Language) => (
-            <SelectItem key={lang.code} value={lang.code}>
+            // `lang` so a screen reader pronounces each language name in that language.
+            <SelectItem key={lang.code} value={lang.code} lang={lang.code}>
               {lang.name}
             </SelectItem>
           ))}

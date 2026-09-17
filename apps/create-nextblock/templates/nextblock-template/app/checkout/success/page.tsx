@@ -36,6 +36,7 @@ export default function CheckoutSuccessPage() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [hasRemainingCheckoutItems, setHasRemainingCheckoutItems] = useState(false);
   const [orderStatus, setOrderStatus] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const processedSessionIdRef = useRef<string | null>(null);
 
   const labels = useMemo(() => buildInvoiceDocumentLabels(t), [t]);
@@ -118,6 +119,17 @@ export default function CheckoutSuccessPage() {
 
           setInvoice(resolvedInvoice);
         }
+      } catch (error) {
+        // A rejected action (offline, a deploy in progress) used to surface nowhere: no
+        // message, and the page sat on "your invoice will appear here" for good.
+        console.error('[CheckoutSuccess] Failed to finalize the order:', error);
+        setSyncError(
+          translateOrFallback(
+            t,
+            'checkout_success_sync_failed',
+            'We could not finalize your invoice yet. Please refresh shortly.'
+          )
+        );
       } finally {
         setIsSyncing(false);
       }
@@ -131,15 +143,31 @@ export default function CheckoutSuccessPage() {
       processedSessionIdRef.current = sessionId;
       void finalizeOrder();
     }
-  }, [isCartHydrated, sessionId, t]);
+    // `attempt` re-runs this after the visitor presses Retry (which also clears the ref).
+  }, [attempt, isCartHydrated, sessionId, t]);
+
+  const hasOutcome = Boolean(invoice);
+  const retry = () => {
+    processedSessionIdRef.current = null;
+    setAttempt((current) => current + 1);
+  };
 
   return (
     <InvoiceViewerShell
       invoice={localizedInvoice}
       labels={labels}
       locale={getInvoiceLocale(lang)}
+      // Only a confirmed order gets the success title and the green check. They used to show
+      // whenever `orderStatus` was null too: no session id, a cancelled or still-pending
+      // payment, an order that was not found.
       title={
-        orderStatus === 'trial'
+        !hasOutcome
+          ? syncError
+            ? translateOrFallback(t, 'checkout_success_unconfirmed', 'We could not confirm your order')
+            : sessionId
+              ? translateOrFallback(t, 'checkout_success_confirming', 'Confirming your order…')
+              : translateOrFallback(t, 'checkout_success_no_session', 'No order to show')
+          : orderStatus === 'trial'
           ? translateOrFallback(
               t,
               'ecommerce.checkout_trial_started',
@@ -168,9 +196,11 @@ export default function CheckoutSuccessPage() {
         'Print / Save as PDF'
       )}
       headerVisual={
-        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100">
-          <CheckCircle2 className="h-8 w-8 text-emerald-600" />
-        </div>
+        hasOutcome ? (
+          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-emerald-100 dark:bg-emerald-500/15">
+            <CheckCircle2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
+          </div>
+        ) : undefined
       }
       action={action}
       beforeInvoice={<FreemiusLicensePanel license={license} />}
@@ -178,9 +208,11 @@ export default function CheckoutSuccessPage() {
       loadingMessage={translateOrFallback(
         t,
         'receipt_finalizing',
-        'Finalizing your invoice and payment details...'
+        'Finalizing your invoice and payment details…'
       )}
       error={syncError}
+      onRetry={sessionId ? retry : undefined}
+      retryLabel={translateOrFallback(t, 'retry', 'Try again')}
       emptyMessage={translateOrFallback(
         t,
         'receipt_not_ready',

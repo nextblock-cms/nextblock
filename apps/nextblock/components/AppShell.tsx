@@ -9,6 +9,7 @@ import FooterNavigation from './FooterNavigation';
 import { EnvVarWarning } from './env-var-warning';
 import { SandboxBanner } from './SandboxBanner';
 import { ThemeSwitcher } from './theme-switcher';
+import { useLabel } from '../lib/i18n/use-label';
 
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 type Logo =
@@ -69,6 +70,8 @@ export function AppShell({
   const isCmsRequest = pathname.startsWith('/cms');
   const isSetupRequest = pathname === '/setup' || pathname.startsWith('/setup/');
   const branding = useMemo(() => ({ logo, siteTitle }), [logo, siteTitle]);
+  const label = useLabel();
+  const skipLabel = label('skip_to_content', 'Skip to main content', 'Aller au contenu principal');
 
   // The first-boot setup wizard renders on its own clean, chrome-free page: no header
   // or footer, and crucially no EnvVarWarning — the whole point of /setup is to supply
@@ -83,6 +86,14 @@ export function AppShell({
 
   return (
     <AppBrandingContext.Provider value={branding}>
+      {/* First focusable element on every page. Kept off-screen with a transform (not
+          `sr-only`, whose `position` would fight `fixed`) until it receives keyboard focus. */}
+      <a
+        href="#main-content"
+        className="fixed left-4 top-4 z-[100] -translate-y-[200%] rounded-md bg-background px-4 py-2 text-sm font-medium text-foreground shadow-lg ring-2 ring-ring transition-transform focus-visible:translate-y-0"
+      >
+        {skipLabel}
+      </a>
       {process.env.NEXT_PUBLIC_IS_SANDBOX === 'true' && !isCmsRequest && <SandboxBanner />}
       <div
         className={cn(
@@ -98,7 +109,10 @@ export function AppShell({
             !isCmsRequest && 'items-center'
           )}
         >
-          <nav className="w-full flex justify-center border-b border-b-foreground/10 h-16 shrink-0">
+          <nav
+            aria-label={label('main_navigation', 'Main navigation', 'Navigation principale')}
+            className="w-full flex justify-center border-b border-b-foreground/10 h-16 shrink-0"
+          >
             <div className="w-full max-w-7xl flex justify-between items-center p-3 px-5 text-sm">
               {!hasSupabaseEnv ? (
                 <EnvVarWarning />
@@ -115,8 +129,10 @@ export function AppShell({
             </div>
           </nav>
           <main
+            id="main-content"
+            tabIndex={-1}
             className={cn(
-              'w-full',
+              'w-full outline-hidden',
               isCmsRequest ? 'flex flex-1 min-h-0 overflow-hidden' : 'flex-grow'
             )}
           >
@@ -125,7 +141,10 @@ export function AppShell({
           {!isCmsRequest && (
             <footer className="w-full border-t py-6">
               <div className="mx-auto flex flex-col items-center justify-center gap-6 text-center text-xs">
-                <FooterNavigation navItems={footerNavItems} />
+                <FooterNavigation
+                  navItems={footerNavItems}
+                  ariaLabel={label('footer_navigation', 'Footer navigation', 'Navigation du pied de page')}
+                />
                 {/* Corporate line: slate-600 alone is ~2.7:1 on the dark background (a
                     Lighthouse contrast failure in dark mode); the mailto link inherits
                     the paragraph colour, so the dark variant covers both. */}
@@ -159,6 +178,7 @@ export function AppShell({
                         href="https://nextblock.dev"
                         target="_blank"
                         rel="noopener"
+                        translate="no"
                         className="font-medium hover:underline"
                       >
                         NextBlock&trade; CMS

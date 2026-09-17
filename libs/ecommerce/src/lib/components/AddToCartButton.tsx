@@ -53,7 +53,11 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
   if (requiresVariantSelection) {
     return (
       <Button asChild className={className}>
-        <Link href={`/product/${product.slug}`}>Select Options</Link>
+        <Link href={`/product/${product.slug}`}>
+          {t('ecommerce.select_options') === 'ecommerce.select_options'
+            ? 'Select options'
+            : t('ecommerce.select_options')}
+        </Link>
       </Button>
     );
   }
@@ -85,7 +89,7 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
   const handleAddToCart = () => {
     const provider = getProductPaymentProvider(product) ?? 'stripe';
 
-    const { success, error } = addItem({
+    const { success, error, errorKey, errorParams } = addItem({
       id: product.variant_id || product.id,
       product_id: product.id,
       title: product.title,
@@ -93,6 +97,15 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
       prices: product.prices,
       sale_price: product.sale_price,
       sale_prices: product.sale_prices,
+      // The sale window and the scheduled price travel with the line. The cart prices a line
+      // with `resolveEffectivePriceForCurrency`, where a missing window means "always on":
+      // without these an expired or not-yet-started sale showed the regular price on the
+      // product page and the sale price in the cart, the drawer and the subtotal.
+      sale_start_at: product.sale_start_at,
+      sale_end_at: product.sale_end_at,
+      scheduled_price: product.scheduled_price,
+      scheduled_prices: product.scheduled_prices,
+      scheduled_price_at: product.scheduled_price_at,
       is_taxable: product.is_taxable,
       image_url: product.image_url,
       slug: product.slug,
@@ -118,7 +131,12 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
     if (success) {
       toast.success(t('ecommerce.added_to_cart_success', { item: product.title }));
     } else {
-      toast.error(error || t('ecommerce.added_to_cart_error'));
+      const translatedError = errorKey ? t(errorKey, errorParams) : null;
+      toast.error(
+        translatedError && translatedError !== errorKey
+          ? translatedError
+          : error || t('ecommerce.added_to_cart_error')
+      );
     }
   };
 

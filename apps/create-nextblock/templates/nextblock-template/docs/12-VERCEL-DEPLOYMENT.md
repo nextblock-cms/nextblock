@@ -14,6 +14,7 @@ The badge links to `https://vercel.com/new/clone` with these query parameters:
 | `repository-url` | The NextBlock repo to clone into the user's Git provider. |
 | `project-name` / `repository-name` | Pre-fill the new Vercel project and Git repo names. |
 | `stores=[{"type":"integration","integrationSlug":"supabase","productSlug":"supabase"}]` | Vercel's **native Supabase Marketplace integration**. During import you're prompted to **create a Supabase database** (name + region); Vercel **provisions it, connects it to the project, and injects the env vars before the first build**. |
+| `demo-title` / `demo-description` / `demo-url` / `demo-image` | The preview card on the import page: name, one-line pitch, a link to the live sandbox (`https://cms.nextblock.dev/`) and the README banner served by that site (`/assets/nextblock-banner.jpg`, 1672×941). Vercel renders the card **only when all four are present**, so change them together. |
 
 There is deliberately **no `env=` parameter** — the deploy prompts for **zero** values you
 have to type (see "No environment variables required" below). The only interaction is the

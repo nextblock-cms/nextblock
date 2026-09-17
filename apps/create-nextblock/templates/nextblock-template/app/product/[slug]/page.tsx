@@ -281,11 +281,15 @@ export default async function ProductPage({ params }: ProductPageProps) {
 
   // 3. Fallback or Use Template
   let blocks: BlockType[] = [];
-  let languageId = 1; // Default to 1 if not found
+  // The PRODUCT's language drives every data query under the blocks (the "latest products"
+  // grid, above all). This used to be a hardcoded 1, and no migration seeds a
+  // `product-template` page, so the fallback below is the normal path: French product pages
+  // listed English products.
+  const languageId: number = productRecord.language_id ?? templatePage?.language_id ?? 1;
+  const isFrenchProduct = String(productRecord.language_code ?? '').toLowerCase().startsWith('fr');
 
   if (templatePage) {
     blocks = templatePage.blocks;
-    languageId = templatePage.language_id;
   } else {
     // Fallback Layout if no template exists
     // We cast to any to avoid strict DB type matching for fallback mocks, specifically for UUID/Dates
@@ -296,17 +300,21 @@ export default async function ProductPage({ params }: ProductPageProps) {
         content: {},
         page_id: 'temp',
         order: 0,
-        language_id: 1,
+        language_id: languageId,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       },
       {
          id: 'fallback-product-grid',
          block_type: 'product_grid',
-         content: { type: 'latest', limit: 4, title: "You might also like" },
+         content: {
+           type: 'latest',
+           limit: 4,
+           title: isFrenchProduct ? 'Vous aimerez peut-être aussi' : 'You might also like',
+         },
          page_id: 'temp',
          order: 1,
-         language_id: 1,
+         language_id: languageId,
          created_at: new Date().toISOString(),
          updated_at: new Date().toISOString()
       }
@@ -330,7 +338,7 @@ export default async function ProductPage({ params }: ProductPageProps) {
   // Value Mapping
   // Image URL resolution
   let imageUrl: string | undefined = undefined;
-  const images: { url: string; alt?: string }[] = [];
+  const images: { url: string; alt?: string; width?: number; height?: number }[] = [];
   
   if (productRecord.product_media && productRecord.product_media.length > 0) {
       // Sort by sort_order
@@ -347,7 +355,13 @@ export default async function ProductPage({ params }: ProductPageProps) {
                   url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${pm.media.file_path}`;
               }
               
-              images.push({ url, alt: productRecord.title });
+              images.push({
+                url,
+                alt: productRecord.title,
+                // Intrinsic size, so the gallery reserves the right box before the file loads.
+                width: typeof pm.media.width === 'number' && pm.media.width > 0 ? pm.media.width : undefined,
+                height: typeof pm.media.height === 'number' && pm.media.height > 0 ? pm.media.height : undefined,
+              });
               
               // Set primary image if it's the first one
               if (!imageUrl) imageUrl = url;

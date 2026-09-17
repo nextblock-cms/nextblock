@@ -287,7 +287,10 @@ export function CustomerProfileForm({
       }
 
       console.error(error);
-      setMsg({ type: 'error', text: error.message || t('profile_update_failed') });
+      // Never `error.message`: the action throws on the server, and in production Next swaps
+      // a thrown message for a long English sentence about digests, so the translated
+      // fallback never showed.
+      setMsg({ type: 'error', text: t('profile_update_failed') });
     } finally {
       setLoading(false);
     }
@@ -304,15 +307,26 @@ export function CustomerProfileForm({
         <CardContent className="flex flex-col items-center text-center space-y-4">
           <div className="relative group">
             <Avatar className="h-32 w-32 border-4 border-muted">
-              <AvatarImage src={watch('avatar_url') || undefined} className="object-cover" />
+              <AvatarImage src={watch('avatar_url') || undefined} alt={watch('full_name') || ''} className="object-cover" />
               <AvatarFallback className="text-4xl bg-secondary">
                 {watch('full_name')?.charAt(0)?.toUpperCase() || <UserIcon className="h-12 w-12" />}
               </AvatarFallback>
             </Avatar>
             {MediaPickerComponent && (
-              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity bg-black/40 rounded-full cursor-pointer">
+              // Hover alone hid this from keyboard focus (focusable but invisible) and from
+              // touch screens, which have no hover at all.
+              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity bg-black/40 rounded-full cursor-pointer">
                 <MediaPickerComponent
-                  triggerLabel={<Upload className="h-6 w-6 text-white" />}
+                  triggerLabel={
+                    <>
+                      <Upload className="h-6 w-6 text-white" />
+                      <span className="sr-only">
+                        {t('profile_change_avatar') === 'profile_change_avatar'
+                          ? 'Change profile picture'
+                          : t('profile_change_avatar')}
+                      </span>
+                    </>
+                  }
                   triggerVariant="ghost"
                   title={t('customer_profile')}
                   onSelect={handleMediaSelect}
@@ -328,7 +342,7 @@ export function CustomerProfileForm({
               <Label htmlFor="avatar_url" className="sr-only">
                 {t('avatar_url')}
               </Label>
-              <Input id="avatar_url" {...register('avatar_url')} placeholder="https://..." className="mt-2" />
+              <Input id="avatar_url" type="url" autoComplete="off" {...register('avatar_url')} placeholder="https://…" className="mt-2" />
             </div>
           )}
 
@@ -359,7 +373,10 @@ export function CustomerProfileForm({
           <CardContent className="space-y-6">
             {email && (
               <div className="space-y-2">
-                <Label htmlFor="email">{t('email') || 'Email'} (Read-only)</Label>
+                <Label htmlFor="email">
+                  {t('email') === 'email' ? 'Email' : t('email')} (
+                  {t('read_only') === 'read_only' ? 'read-only' : t('read_only')})
+                </Label>
                 <Input id="email" value={email} readOnly disabled className="bg-muted/50" />
               </div>
             )}
@@ -373,13 +390,13 @@ export function CustomerProfileForm({
                 <Label htmlFor="full_name" className="flex items-center gap-2">
                   <UserIcon className="h-4 w-4" /> {t('full_name')}
                 </Label>
-                <Input id="full_name" {...register('full_name')} />
+                <Input id="full_name" autoComplete="name" {...register('full_name')} />
               </div>
               <div className="space-y-2">
                 <Label htmlFor="phone" className="flex items-center gap-2">
                   <Phone className="h-4 w-4" /> {t('phone_number')}
                 </Label>
-                <Input id="phone" {...register('phone')} />
+                <Input id="phone" type="tel" inputMode="tel" autoComplete="tel" {...register('phone')} />
               </div>
             </div>
 
@@ -387,7 +404,7 @@ export function CustomerProfileForm({
               <Label htmlFor="website" className="flex items-center gap-2">
                 <Globe className="h-4 w-4" /> {t('website')}
               </Label>
-              <Input id="website" {...register('website')} placeholder="https://example.com" />
+              <Input id="website" type="url" autoComplete="url" {...register('website')} placeholder="https://example.com" />
             </div>
 
             <Separator className="my-2" />
@@ -422,6 +439,7 @@ export function CustomerProfileForm({
 
             {msg && (
               <div
+                role={msg.type === 'error' ? 'alert' : 'status'}
                 className={`mt-4 rounded-xl border p-4 text-sm ${
                   msg.type === 'success'
                     ? 'border-emerald-200 bg-emerald-50 text-emerald-700'

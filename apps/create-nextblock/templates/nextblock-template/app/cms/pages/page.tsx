@@ -41,8 +41,8 @@ import TablePagination from "../components/TablePagination";
 
 async function getPagesWithDetails(
   filterLanguageId?: number,
-  pageNumber: number = 1,
-  pageSize: number = 25
+  pageNumber = 1,
+  pageSize = 25
 ): Promise<{
   items: { page: Page; languageCode: string; seoScore: number }[];
   totalCount: number;

@@ -384,6 +384,43 @@ exact same components. Audit parity with the anon REST API (`pages`, `posts`, `p
 grouped by `translation_group_id`, then `blocks` per row) before shipping a content
 migration — that is how the missing French Cortex posts were found.
 
+## Public UI Copy and Accessibility
+
+UI strings live in `public.translations` (`key`, `{ "en": …, "fr": … }`) and reach components
+through `useTranslations()`. Two rules keep raw keys and English out of French pages:
+
+- **`t(key)` answers an unseeded key with the key itself**, so `t('x') || 'Fallback'` never
+  falls back. In the app use `useLabel()` (`lib/i18n/use-label.ts`):
+  `label('pagination.next', 'Next', 'Suivant')`. In `libs/ecommerce` use
+  `translateOrFallback(t, key, fallback)`. In `libs/ui`, which must also work without a
+  provider, use `useOptionalTranslations()`.
+- **Every new key is seeded in English and French by a forward migration.** `02015` is the
+  model: French corrections guarded by the exact seeded text, `ON CONFLICT DO NOTHING` for
+  new keys, verified idempotent. Write `…`, never three dots, in loading copy.
+
+Shop prices go through `usePriceFormatter()` (`libs/ecommerce/src/lib/use-price-formatter.ts`),
+which binds `formatPrice` to the visitor's locale; the bare helper defaults to `en-US`.
+
+The public surface was audited against Vercel's Web Interface Guidelines in September 2026.
+The full `file:line` report, what was fixed and what is still open, is in
+`tools/audits/web-interface-guidelines-2026-09-17.md`. The parts that are easy to undo by
+accident:
+
+- `libs/ui/src/styles/animations.css` holds the one global `prefers-reduced-motion` rule.
+  Motion driven from JavaScript (slider autoplay, `scrollIntoView({ behavior: 'smooth' })`)
+  must check the media query itself: an explicit `behavior` beats the stylesheet.
+- Tailwind 4: write `max-h-(--some-var)`, not the v3 `max-h-[--some-var]` (it compiles to
+  invalid CSS and silently does nothing), and `outline-hidden`, not `outline-none` (which no
+  longer leaves a transparent outline for forced-colors mode).
+- Anything that replaces a form with a confirmation moves focus to it (`tabIndex={-1}` +
+  `role="status"`), and a server action that can fail echoes the typed `values` back:
+  React 19 resets an uncontrolled form when its action settles.
+- The honeypot field name lives in `lib/botProtection/fields.ts` and is deliberately not
+  email-like: browser autofill filled the old `verification_secondary_email`, and the server
+  then discarded a real visitor's sign-up or message with a fake success.
+- Grid pagination keeps its page in the URL through `hooks/usePageParam.ts` without reading
+  `searchParams` on the server, which would make every CMS page dynamic.
+
 ## Current Repo Notes
 
 Two repo facts are worth keeping in mind while contributing:

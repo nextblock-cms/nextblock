@@ -2,7 +2,6 @@
 
 import { useTranslations } from '@nextblock-cms/utils';
 import {
-  Button,
   Card,
   CardContent,
   CardDescription,
@@ -15,6 +14,7 @@ import {
 
 import type { ProfileAccountSummary, ProfileAccountUser } from '../account-types';
 import { ProfileAccountSidebar } from '../ProfileAccountSidebar';
+import { SubmitButton } from '../../../components/submit-button';
 import { changePasswordAction } from './actions';
 
 interface PasswordSettingsPageClientProps {
@@ -54,7 +54,9 @@ export function PasswordSettingsPageClient({
         <Card className="md:col-span-8">
           <form action={changePasswordAction}>
             <CardHeader>
-              <CardTitle>
+              {/* CardTitle is a <div>, so the page had no h1. A real <h1> would pick up the
+                  global heading margins; the role keeps the card layout unchanged. */}
+              <CardTitle role="heading" aria-level={1}>
                 {t('profile_password_title') === 'profile_password_title'
                   ? 'Change your password'
                   : t('profile_password_title')}
@@ -107,18 +109,20 @@ export function PasswordSettingsPageClient({
               ) : null}
 
               {errorMessage ? (
-                <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                <div role="alert" className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                   {translateMessage(t, errorMessage)}
                 </div>
               ) : null}
             </CardContent>
 
             <CardFooter className="flex justify-end">
-              <Button type="submit" size="lg">
+              {/* useFormStatus-backed: the plain button gave no feedback while the action ran,
+                  which invited a second submit. */}
+              <SubmitButton size="lg" pendingText={t('saving') === 'saving' ? 'Saving…' : t('saving')}>
                 {t('save_changes') === 'save_changes'
                   ? 'Save changes'
                   : t('save_changes')}
-              </Button>
+              </SubmitButton>
             </CardFooter>
           </form>
         </Card>

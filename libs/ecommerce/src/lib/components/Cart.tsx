@@ -15,18 +15,29 @@ import { Minus, Plus, Trash2 } from 'lucide-react';
 import { getCartItemActivePrice, useCartSubtotal } from '../cart-store';
 import { useCart } from '../use-cart';
 import { isDigitalItem } from '../types';
-import { useRouter } from 'next/navigation';
-import { formatPrice, useTranslations } from '@nextblock-cms/utils';
+import Link from 'next/link';
+import { useTranslations } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 import { ShippingEstimator } from './ShippingEstimator';
 import { useCurrency } from '../CurrencyProvider';
 import { getTrialSummary } from '../trials';
 import { CouponForm } from './CouponForm';
 
 export const Cart = () => {
-  const router = useRouter();
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const store = useCart((state) => state);
   const subtotal = useCartSubtotal();
   const { t } = useTranslations();
+  const label = (key: string, fallback: string, params?: Record<string, string | number>) => {
+    const translated = t(key, params);
+    return translated === key ? fallback : translated;
+  };
+  // `/shop` for every language, on purpose. The page itself sends a visitor to its
+  // translation when one exists (`/boutique` on the seeded site, see PageClientContent) and
+  // stays put when it does not. Linking to a translated slug from here would be a 404 on
+  // every install whose French shop page has another slug, or none.
+  const shopHref = '/shop';
   const { activeCurrencyCode, currencies } = useCurrency();
   const items = store?.items ?? [];
 
@@ -59,17 +70,14 @@ export const Cart = () => {
       return accumulator + cartItem.quantity;
     }, 0);
 
-  const handleCheckout = () => {
-    router.push('/checkout');
-  };
-
   if (items.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center space-y-4 py-12">
-        <h2 className="text-2xl font-bold">{t('ecommerce.cart_empty')}</h2>
+        {/* h1: with an empty cart this is the only heading on the page. */}
+        <h1 className="text-2xl font-bold">{t('ecommerce.cart_empty')}</h1>
         <p className="text-muted-foreground">{t('ecommerce.cart_empty_description')}</p>
         <Button asChild>
-          <a href="/shop">{t('ecommerce.continue_shopping')}</a>
+          <Link href={shopHref}>{t('ecommerce.continue_shopping')}</Link>
         </Button>
       </div>
     );
@@ -89,7 +97,9 @@ export const Cart = () => {
                   <TableHead>{t('ecommerce.quantity')}</TableHead>
                   <TableHead className="text-right">{t('ecommerce.price')}</TableHead>
                   <TableHead className="text-right">{t('ecommerce.total')}</TableHead>
-                  <TableHead className="w-[50px]"></TableHead>
+                  <TableHead className="w-[50px]">
+                    <span className="sr-only">{label('ecommerce.actions', 'Actions')}</span>
+                  </TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -99,7 +109,7 @@ export const Cart = () => {
                     currencyCode: activeCurrencyCode,
                     currencies,
                   });
-                  const trialSummary = getTrialSummary(item);
+                  const trialSummary = getTrialSummary(item, t);
 
                   return (
                     <TableRow key={item.id}>
@@ -120,7 +130,7 @@ export const Cart = () => {
                               </span>
                             </div>
                           )}
-                          <div>
+                          <div className="min-w-0 break-words">
                             <div className="font-medium">{item.title}</div>
                             {item.variant_label && (
                               <div className="mt-1 text-xs text-muted-foreground">
@@ -128,8 +138,11 @@ export const Cart = () => {
                               </div>
                             )}
                             {isDigitalItem(item) && item.billing_cycle && (
-                              <div className="mt-1 text-xs capitalize text-muted-foreground">
-                                {item.billing_cycle} Subscription
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {label(
+                                  `ecommerce.checkout_billing_cycle_${item.billing_cycle}`,
+                                  `${item.billing_cycle} subscription`
+                                )}
                               </div>
                             )}
                             {trialSummary && (
@@ -143,23 +156,31 @@ export const Cart = () => {
                       <TableCell>
                         {isDigitalItem(item) ? (
                           <Badge variant="secondary" className="font-normal text-xs">
-                            1 (License)
+                            {label('ecommerce.license_count_one', '1 license', { count: 1 })}
                           </Badge>
                         ) : (
-                          <div className="flex items-center gap-2">
+                          <div
+                            role="group"
+                            aria-label={`${label('ecommerce.quantity', 'Quantity')}: ${item.title}`}
+                            className="flex items-center gap-2"
+                          >
                             <Button
                               variant="outline"
                               size="icon"
                               className="h-8 w-8"
+                              aria-label={label('ecommerce.decrease_quantity', 'Decrease quantity')}
                               onClick={() => updateQuantity(item.id, item.quantity - 1)}
                             >
                               <Minus className="h-4 w-4" />
                             </Button>
-                            <span className="w-8 text-center">{item.quantity}</span>
+                            <span aria-live="polite" aria-atomic="true" className="w-8 text-center tabular-nums">
+                              {item.quantity}
+                            </span>
                             <Button
                               variant="outline"
                               size="icon"
                               className="h-8 w-8"
+                              aria-label={label('ecommerce.increase_quantity', 'Increase quantity')}
                               onClick={() => updateQuantity(item.id, item.quantity + 1)}
                               disabled={
                                 typeof item.stock === 'number' &&
@@ -172,18 +193,22 @@ export const Cart = () => {
                         )}
                       </TableCell>
                       <TableCell className="text-right">
-                        <div className="flex flex-col items-end">
+                        <div className="flex flex-col items-end tabular-nums">
                           <span className="font-medium">
+                            {activePrice.sale_price && (
+                              <span className="sr-only">{label('ecommerce.sale_price', 'Sale price')} </span>
+                            )}
                             {formatPrice(activePrice.sale_price ?? activePrice.price, activeCurrencyCode)}
                           </span>
                           {activePrice.sale_price && (
-                            <span className="text-xs text-muted-foreground line-through">
-                              {formatPrice(activePrice.price, activeCurrencyCode)}
+                            <span className="text-xs text-muted-foreground">
+                              <span className="sr-only">{label('ecommerce.regular_price', 'Regular price')} </span>
+                              <s>{formatPrice(activePrice.price, activeCurrencyCode)}</s>
                             </span>
                           )}
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-medium">
+                      <TableCell className="text-right font-medium tabular-nums">
                         {formatPrice(
                           (activePrice.sale_price ?? activePrice.price) * item.quantity,
                           activeCurrencyCode
@@ -194,6 +219,7 @@ export const Cart = () => {
                           variant="ghost"
                           size="icon"
                           onClick={() => removeItem(item.id)}
+                          aria-label={label('ecommerce.remove_item', `Remove ${item.title} from cart`, { item: item.title })}
                           className="text-muted-foreground hover:text-destructive"
                         >
                           <Trash2 className="h-4 w-4" />
@@ -212,7 +238,7 @@ export const Cart = () => {
                 <h2 className="mb-4 text-lg font-semibold">{t('ecommerce.order_summary')}</h2>
                 <div className="flex justify-between border-b pb-4">
                     <span>{t('ecommerce.subtotal')}</span>
-                    <span className="font-medium">{formatPrice(subtotal, activeCurrencyCode)}</span>
+                    <span className="font-medium tabular-nums">{formatPrice(subtotal, activeCurrencyCode)}</span>
                 </div>
                  <div className="mt-4 flex flex-col gap-4">
                     <p className="text-sm text-muted-foreground">
@@ -229,8 +255,9 @@ export const Cart = () => {
                       compact
                     />
 
-                    <Button className="w-full mt-4" size="lg" onClick={handleCheckout}>
-                        {t('ecommerce.proceed_to_checkout')}
+                    {/* A link, not a button with router.push: it can be opened in a new tab. */}
+                    <Button asChild className="w-full mt-4" size="lg">
+                        <Link href="/checkout">{t('ecommerce.proceed_to_checkout')}</Link>
                     </Button>
                  </div>
             </div>

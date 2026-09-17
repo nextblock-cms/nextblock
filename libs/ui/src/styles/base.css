@@ -209,6 +209,27 @@
     cursor: default;
   }
 
+  /* Drops the double-tap-to-zoom delay on touch devices; pinch zoom still works. */
+  a,
+  button,
+  input,
+  label,
+  select,
+  summary,
+  textarea,
+  [role='button'],
+  [tabindex]:not([tabindex='-1']) {
+    touch-action: manipulation;
+  }
+
+  /* The native <select> popup does not inherit the page background. With `color: inherit`
+     alone, a dark theme on Windows draws light option text on a white list. */
+  select option,
+  select optgroup {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+  }
+
   audio,
   canvas,
   embed,

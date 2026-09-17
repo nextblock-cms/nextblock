@@ -61,7 +61,8 @@ export function FreemiusLicensePanel({ license }: FreemiusLicensePanelProps) {
           </p>
 
           <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
-            <code className="flex-1 overflow-x-auto rounded-lg border bg-background px-3 py-2 font-mono text-sm">
+            {/* translate="no": a browser's auto-translate must never rewrite a license key. */}
+            <code translate="no" className="flex-1 select-all overflow-x-auto rounded-lg border bg-background px-3 py-2 font-mono text-sm">
               {license.licenseKey}
             </code>
             <Button

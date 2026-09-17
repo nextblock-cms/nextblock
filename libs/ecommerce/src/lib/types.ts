@@ -124,7 +124,7 @@ export interface Product {
   price_range_min?: number | null;
   price_range_max?: number | null;
   image_url?: string; // Resolved URL of the primary image
-  images?: { url: string; alt?: string }[]; // Array of resolved image URLs
+  images?: { url: string; alt?: string; width?: number; height?: number }[]; // Array of resolved image URLs
   short_description?: string | null;
   description_json?: any; // Tiptap JSON content
   description_blocks?: any[];

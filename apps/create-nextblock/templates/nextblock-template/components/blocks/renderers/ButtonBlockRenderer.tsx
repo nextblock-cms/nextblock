@@ -28,6 +28,8 @@ const ButtonBlockRenderer: React.FC<ButtonBlockRendererProps> = ({
     content.url?.startsWith("mailto:") ||
     content.url?.startsWith("tel:");
   const isAnchor = content.url?.startsWith("#");
+  // mailto: and tel: hand off to another app; `target="_blank"` only leaves an empty tab behind.
+  const opensNewTab = Boolean(content.url?.startsWith("http"));
 
   const buttonText = content.text || "Button";
   // Map variant name if needed or pass directly if it matches
@@ -73,8 +75,8 @@ const ButtonBlockRenderer: React.FC<ButtonBlockRendererProps> = ({
       (isExternal || isAnchor) && !!content.url ? (
         <a
           href={content.url}
-          target={isExternal ? "_blank" : undefined}
-          rel={isExternal ? "noopener noreferrer" : undefined}
+          target={opensNewTab ? "_blank" : undefined}
+          rel={opensNewTab ? "noopener noreferrer" : undefined}
           className={classes}
         >
           {buttonText}

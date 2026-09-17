@@ -8,6 +8,8 @@ import {
   SelectValue,
 } from '@nextblock-cms/ui/select';
 
+import { useTranslations } from '@nextblock-cms/utils';
+
 import { useCurrency } from '../CurrencyProvider';
 
 export function CurrencySwitcher() {
@@ -16,6 +18,8 @@ export function CurrencySwitcher() {
     currencies,
     setActiveCurrencyCode,
   } = useCurrency();
+  const { t } = useTranslations();
+  const currencyLabel = t('ecommerce.currency') === 'ecommerce.currency' ? 'Currency' : t('ecommerce.currency');
 
   if (currencies.length <= 1) {
     return null;
@@ -23,7 +27,8 @@ export function CurrencySwitcher() {
 
   return (
     <Select value={activeCurrencyCode} onValueChange={setActiveCurrencyCode}>
-      <SelectTrigger className="h-9 w-[88px] text-xs font-semibold">
+      {/* Without a label the control's whole accessible name was "CAD". */}
+      <SelectTrigger aria-label={currencyLabel} className="h-9 w-[88px] text-xs font-semibold">
         <SelectValue placeholder={activeCurrencyCode} />
       </SelectTrigger>
       <SelectContent>

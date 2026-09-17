@@ -150,6 +150,17 @@ classes, and resolves each `field_render` against the instance content
 definition matches, the renderer shows an "Unsupported block type" notice with
 the offending slug.
 
+Both call sites pass two props that matter on the public site:
+
+- `showDiagnostics` — the red developer warnings (unknown field, missing image, invalid
+  layout node) render only while visual editing is on. A visitor gets nothing in their
+  place. Outside production the default is on.
+- `locale` — the page's language code, resolved from `language_id` by
+  `lib/languages/cached-language-code.ts`. Price columns of a `db_relation` are formatted
+  with `Intl.NumberFormat` for that locale; a multi-currency map (`{ "EUR": 1999 }`) is
+  shown in its own currency (optionally the one named by the `currency` prop), and
+  zero-decimal currencies are not divided by 100.
+
 CMS-side editing of an instance uses
 `app/cms/blocks/editors/DynamicCustomBlockEditor.tsx` and
 `app/cms/blocks/components/CustomBlockEditorPreview.tsx`.

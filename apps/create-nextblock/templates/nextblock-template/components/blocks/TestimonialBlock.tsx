@@ -22,13 +22,13 @@ export type TestimonialBlockContent = z.infer<typeof TestimonialSchema>;
 // 3. Create the Renderer Component
 const TestimonialBlockRenderer: React.FC<BlockProps<typeof TestimonialSchema>> = ({ content }) => {
   return (
-    <div className="container m-8">
+    <div className="container mx-auto my-8">
     <Card className="h-full">
       <CardContent className="pt-6 flex flex-col gap-4 h-full">
         <MessageSquareQuote className="w-8 h-8 text-primary/40" />
         
         <blockquote className="flex-grow text-lg italic text-muted-foreground">
-          "{content.quote}"
+          &ldquo;{content.quote}&rdquo;
         </blockquote>
 
         <div className="flex items-center gap-3 mt-4">

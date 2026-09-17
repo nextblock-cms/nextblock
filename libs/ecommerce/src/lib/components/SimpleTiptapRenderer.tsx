@@ -193,8 +193,14 @@ const renderNode = (node: TiptapNode, index: number): React.ReactNode => {
         <img
           key={index}
           src={src}
-          alt={alt}
+          alt={alt ?? ''}
           title={title}
+          // Numeric sizes also go on the element: the attributes (not the inline style) are
+          // what lets the browser reserve the box before the file arrives.
+          width={typeof width === 'number' ? width : undefined}
+          height={typeof height === 'number' ? height : undefined}
+          loading="lazy"
+          decoding="async"
           style={Object.keys(style).length ? style : undefined}
           className="max-w-full h-auto rounded my-4"
         />
@@ -250,6 +256,7 @@ const renderNode = (node: TiptapNode, index: number): React.ReactNode => {
         <div key={index} className="relative my-4 overflow-hidden rounded-lg" style={{ aspectRatio: `${width}/${height}`, maxWidth: width }}>
           <iframe
             src={src}
+            title={(node.attrs?.title as string) || 'Embedded video'}
             allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
             allowFullScreen
             loading="lazy"
@@ -262,7 +269,13 @@ const renderNode = (node: TiptapNode, index: number): React.ReactNode => {
       const src = toNoCookieEmbedSrc(node.attrs?.src as string);
       return (
         <div key={index} className="my-4 overflow-hidden rounded-lg" style={{ aspectRatio: '16/9' }}>
-          <iframe src={src} allowFullScreen loading="lazy" className="w-full h-full border-0" />
+          <iframe
+            src={src}
+            title={(node.attrs?.title as string) || 'Embedded content'}
+            allowFullScreen
+            loading="lazy"
+            className="w-full h-full border-0"
+          />
         </div>
       );
     }

@@ -6,7 +6,8 @@ import { Badge } from '@nextblock-cms/ui/badge';
 import { Button } from '@nextblock-cms/ui/button';
 import { Label } from '@nextblock-cms/ui/label';
 import { Separator } from '@nextblock-cms/ui/separator';
-import { cn, formatPrice, useTranslations } from '@nextblock-cms/utils';
+import { cn, useTranslations } from '@nextblock-cms/utils';
+import { usePriceFormatter } from '../use-price-formatter';
 
 import { useProduct } from '../product-context';
 import { ProductGallery } from './ProductGallery';
@@ -16,6 +17,7 @@ import { SimpleTiptapRenderer, toNoCookieEmbedSrc } from './SimpleTiptapRenderer
 import {
   chooseInitialVariantSelections,
   findMatchingVariant,
+  applyVariantSelection,
   getAvailableTermIdsForAttribute,
   normalizeSelectionsToAvailableVariants,
   resolveTranslatedText,
@@ -126,6 +128,8 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
 }) => {
   const product = useProduct();
   const { t, lang } = useTranslations();
+  // Locale-aware: see use-price-formatter.ts.
+  const formatPrice = usePriceFormatter();
   const { activeCurrencyCode, currencies } = useCurrency();
   const titleVisualEditAttributes = visualEditingEnabled
     ? buildProductVisualEditAttributes(
@@ -171,7 +175,7 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
   const isFreemius =
     (product as any).custom_props?.provider === 'freemius' ||
     isDigitalProduct(product);
-  const trialSummary = getTrialSummary(product);
+  const trialSummary = getTrialSummary(product, t);
   const hasVariants =
     !isFreemius &&
     Boolean(
@@ -258,9 +262,17 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
   const effectivePrice = resolvedVariantPrice?.price ?? resolvedBasePrice.price;
   const effectiveSalePrice =
     resolvedVariantPrice?.sale_price ?? resolvedBasePrice.sale_price;
-  const effectiveStock = hasVariants
+  // `null` = not inventory-tracked (`products.stock` is nullable). It used to collapse to 0,
+  // so an untracked product said "Out of stock" and lost its quantity stepper while the
+  // add-to-cart button, which already treats null as unlimited, stayed enabled.
+  const effectiveStock: number | null = hasVariants
     ? (selectedVariant?.stock_quantity ?? 0)
-    : (product.stock ?? 0);
+    : (product.stock ?? null);
+  const isInStock = effectiveStock === null || effectiveStock > 0;
+  // Clamped at render: switching to a variant with less stock used to keep e.g. 8 selected
+  // when 3 exist, and the add then failed in the cart store.
+  const effectiveQuantity =
+    effectiveStock === null ? quantity : Math.max(1, Math.min(quantity, Math.max(effectiveStock, 1)));
 
   const displayImages = useMemo(() => {
     if (!selectedVariant?.image_url) {
@@ -296,6 +308,12 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
               ? selectedVariant.sale_price
               : null,
           sale_prices: selectedVariant.sale_prices,
+          // The variant's own sale window and scheduled price, not the parent product's.
+          sale_start_at: selectedVariant.sale_start_at,
+          sale_end_at: selectedVariant.sale_end_at,
+          scheduled_price: selectedVariant.scheduled_price,
+          scheduled_prices: selectedVariant.scheduled_prices,
+          scheduled_price_at: selectedVariant.scheduled_price_at,
           image_url: selectedVariant.image_url || product.image_url,
           stock: selectedVariant.stock_quantity,
           variant_id: selectedVariant.id,
@@ -310,18 +328,16 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
 
   const handleSelectionChange = (attributeId: string, termId: string) => {
     setSelectedTerms((current) =>
-      normalizeSelectionsToAvailableVariants(attributes, variants, {
-        ...current,
-        [attributeId]: termId,
-      }),
+      applyVariantSelection(attributes, variants, current, attributeId, termId),
     );
   };
 
-  const inStockLabel = translateOrFallback(
-    'ecommerce.in_stock',
-    `${effectiveStock} in stock`,
-    { count: String(effectiveStock) },
-  );
+  const inStockLabel =
+    effectiveStock === null
+      ? translateOrFallback('ecommerce.in_stock_untracked', 'In stock')
+      : translateOrFallback('ecommerce.in_stock', `${effectiveStock} in stock`, {
+          count: String(effectiveStock),
+        });
   const outOfStockLabel = translateOrFallback(
     'ecommerce.out_of_stock',
     'Out of stock',
@@ -448,7 +464,7 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                       })}
                     </Badge>
                   )}
-                  {!isFreemius && effectiveStock > 0 && effectiveStock < 10 && (
+                  {!isFreemius && effectiveStock !== null && effectiveStock > 0 && effectiveStock < 10 && (
                     <Badge
                       variant="outline"
                       className="text-amber-600 border-amber-200 bg-amber-50"
@@ -471,7 +487,9 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
             </div>
 
             {/* Unified Purchase Card */}
-            <div className="p-5 rounded-2xl bg-card/60 border border-border/80 shadow-md backdrop-blur-md space-y-4">
+            {/* Opaque on purpose: this card is above the fold, and `backdrop-blur-*` there costs
+                a compositing pass on the first frame (project rule). */}
+            <div className="p-5 rounded-2xl bg-card border border-border/80 shadow-md space-y-4">
               {!canPurchase ? (
                 purchaseFallbackNode
               ) : isFreemius ? (
@@ -504,13 +522,13 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                         <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest block">
                           {!hasVariants && product.sku && (
                             <span className="mr-2 font-normal lowercase normal-case text-muted-foreground/70">
-                              SKU: {product.sku}
+                              {translateOrFallback('ecommerce.sku', 'SKU')}: {product.sku}
                             </span>
                           )}
                           {translateOrFallback('ecommerce.status', 'Status')}
                         </span>
-                        <div className={(effectiveStock ?? 0) > 0 ? 'text-emerald-600 dark:text-emerald-400 font-semibold text-sm' : 'text-destructive font-semibold text-sm'}>
-                          {(effectiveStock ?? 0) > 0 ? inStockLabel : outOfStockLabel}
+                        <div className={isInStock ? 'text-emerald-600 dark:text-emerald-400 font-semibold text-sm' : 'text-destructive font-semibold text-sm'}>
+                          {isInStock ? inStockLabel : outOfStockLabel}
                         </div>
                       </div>
                     )}
@@ -520,12 +538,16 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                   {hasVariants && (
                     <div className="space-y-3">
                       <div className="grid gap-3 sm:grid-cols-2">
-                        {attributes.map((attribute) => {
+                        {attributes.map((attribute, attributeIndex) => {
+                          // Unconstrained on purpose: a term is only disabled when NO variant
+                          // uses it. Disabling against the other dropdowns' current values made
+                          // whole combinations unreachable (with just Red/S and Blue/M, both
+                          // Blue and M stayed greyed out forever).
                           const availableTermIds =
                             getAvailableTermIdsForAttribute(
                               variants,
                               attribute.id,
-                              normalizedSelections,
+                              {},
                             );
 
                           return (
@@ -537,7 +559,8 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                                 >
                                   {attribute.name}
                                 </Label>
-                                {selectedVariant?.sku && (
+                                {/* Once, not once per attribute. */}
+                                {attributeIndex === 0 && selectedVariant?.sku && (
                                   <span className="text-[10px] text-muted-foreground font-mono">
                                     {selectedVariant.sku}
                                   </span>
@@ -545,7 +568,7 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                               </div>
                               <select
                                 id={`attribute-${attribute.id}`}
-                                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
                                 value={normalizedSelections[attribute.id] || ''}
                                 onChange={(event) =>
                                   handleSelectionChange(
@@ -579,40 +602,46 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
 
                   {/* Qty Selector & Add to Cart button */}
                   <div className="flex items-center gap-3 pt-1">
-                    {!isFreemius && (effectiveStock ?? 0) > 0 && (
-                      <div className="flex items-center border rounded-lg h-12 bg-background border-input select-none">
+                    {!isFreemius && isInStock && (
+                      <div
+                        role="group"
+                        aria-label={translateOrFallback('ecommerce.quantity', 'Quantity')}
+                        className="flex items-center border rounded-lg h-12 bg-background border-input select-none"
+                      >
                         <button
                           type="button"
-                          onClick={() => setQuantity((q) => Math.max(1, q - 1))}
-                          className="px-3 h-full flex items-center justify-center text-muted-foreground hover:text-foreground active:scale-95 transition-all text-lg font-medium"
-                          disabled={quantity <= 1}
+                          onClick={() => setQuantity(Math.max(1, effectiveQuantity - 1))}
+                          aria-label={translateOrFallback('ecommerce.decrease_quantity', 'Decrease quantity')}
+                          className="px-3 h-full flex items-center justify-center rounded-l-lg text-muted-foreground hover:text-foreground active:scale-95 transition-colors text-lg font-medium focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          disabled={effectiveQuantity <= 1}
                         >
-                          -
+                          <span aria-hidden="true">-</span>
                         </button>
-                        <span className="w-8 text-center text-sm font-semibold">
-                          {quantity}
+                        <span aria-live="polite" aria-atomic="true" className="w-8 text-center text-sm font-semibold tabular-nums">
+                          {effectiveQuantity}
                         </span>
                         <button
                           type="button"
                           onClick={() =>
-                            setQuantity((q) =>
-                              effectiveStock !== null && q >= effectiveStock
-                                ? q
-                                : q + 1,
+                            setQuantity(
+                              effectiveStock !== null && effectiveQuantity >= effectiveStock
+                                ? effectiveQuantity
+                                : effectiveQuantity + 1,
                             )
                           }
-                          className="px-3 h-full flex items-center justify-center text-muted-foreground hover:text-foreground active:scale-95 transition-all text-lg font-medium"
+                          aria-label={translateOrFallback('ecommerce.increase_quantity', 'Increase quantity')}
+                          className="px-3 h-full flex items-center justify-center rounded-r-lg text-muted-foreground hover:text-foreground active:scale-95 transition-colors text-lg font-medium focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                           disabled={
                             effectiveStock !== null &&
-                            quantity >= effectiveStock
+                            effectiveQuantity >= effectiveStock
                           }
                         >
-                          +
+                          <span aria-hidden="true">+</span>
                         </button>
                       </div>
                     )}
                     {hasVariants &&
-                    (!selectedVariant || (effectiveStock ?? 0) <= 0) ? (
+                    (!selectedVariant || !isInStock) ? (
                       <Button
                         disabled
                         className="flex-1 h-12 text-md font-bold shadow-md"
@@ -622,8 +651,8 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                     ) : (
                       <AddToCartButton
                         product={addToCartProduct}
-                        quantity={quantity}
-                        className="flex-1 h-12 text-md font-bold shadow-md transition-all hover:shadow-lg active:scale-[0.98]"
+                        quantity={effectiveQuantity}
+                        className="flex-1 h-12 text-base font-bold shadow-md transition-shadow hover:shadow-lg active:scale-[0.98]"
                       />
                     )}
                   </div>
