@@ -1389,15 +1389,26 @@ Deliberate behaviours, each of which breaks a real client if changed:
 
 ### Authentication
 
-Three accepted paths, in priority order, all gated behind
-`verifyPackageOnline('cortex-ai')` and the `enabled` setting:
+Four accepted paths, in priority order, all gated behind
+`verifyPackageOnline('cortex-ai')`; the last three also require the `enabled` setting:
 
+0. **Environment bootstrap token** — `MCP_BEARER_TOKEN` (≥ 32 chars), compared in
+   constant time (`matchesCortexAiMcpEnvToken`, `mcp-tokens.ts`). Written by
+   `create-nextblock --non-interactive` so a coding agent can operate the site before
+   any admin has opened the dashboard. Setting the variable *is* the opt-in, so this
+   path ignores the database `enabled` flag; it grants `read` + `write`, and writes are
+   attributed to the first ADMIN profile — an instance with no admin yet refuses it
+   (401) and `GET /api/setup/status` says to bootstrap first. See "Headless bootstrap".
 1. **Bearer token** from `public.mcp_access_tokens` — what every external client uses.
 2. **Authenticated ADMIN cookie session** — lets the dashboard reach the endpoint
    without minting a token.
 3. **Loopback in development** — only when `allowLocalhostWithoutToken` is on *and*
    `NODE_ENV !== 'production'`. Behind a proxy the `Host` header is attacker-
    controllable, so localhost trust is a development affordance only.
+
+The proxy allowlists `/api/mcp` alongside `/api/setup/*`, so an unprovisioned instance
+answers MCP calls with its own JSON (503 while Supabase is unconfigured, 401 otherwise)
+instead of a 307 to the HTML wizard.
 
 Tokens are stored as **SHA-256 hashes**; the plaintext (`nbmcp_` + 256 bits base64url)
 is shown once at mint time and is unrecoverable. This differs from the OpenRouter BYOK
@@ -1412,9 +1423,10 @@ and the server access log.
 
 ### Scopes
 
-`CORTEX_MCP_TOOL_KINDS` classifies all 29 registry tools as `read` or `write`. A
-read-only token does not merely get refused on a write — the mutating tools are absent
-from its `tools/list` entirely, aliases included.
+`CORTEX_MCP_TOOL_KINDS` classifies every registry tool (50 canonical names as of this
+writing, plus the six aliases below) as `read` or `write`. A read-only token does not
+merely get refused on a write — the mutating tools are absent from its `tools/list`
+entirely, aliases included.
 
 The table is **exhaustive by construction**: `assertCortexMcpToolCoverage` compares its
 keys against the live factory output, and a unit test fails if they diverge. An
@@ -1432,7 +1444,7 @@ is therefore `true` for all MCP calls.
 
 ### MCP-contract tool names
 
-Five names are exposed as aliases forwarding to existing executors, so external clients
+Six names are exposed as aliases forwarding to existing executors, so external clients
 get the documented contract without forking tested code. The canonical names remain
 listed too, and each alias description begins with "Alias of `<canonical>`" so a model
 does not call both.
@@ -1440,10 +1452,67 @@ does not call both.
 | MCP name | Forwards to |
 | --- | --- |
 | `get_database_schema` | `describe_database_schema` |
+| `create_page_layout` | `create_cms_page` (new page from slug + title + validated blocks; `status: "published"` to go live) |
 | `generate_jsonb_layout` | `rewrite_page_draft` (stages a Live Draft; nothing goes live unpublished) |
 | `query_site_analytics` | `fetch_ecommerce_stats` |
 | `update_site_navigation` | `update_navigation_bar` |
 | `search_stock_media` | `search_stock_photos` |
+
+Every block that reaches `create_page_layout` / `generate_jsonb_layout` is normalized
+and validated against the app's own Zod registry (`validateBlockContent`, injected into
+the tool context by the route) before anything is written — see "Validation" below.
+Rich-text blocks carry HTML by design (`text.content.html_content`); the schema, not a
+blanket HTML ban, is what keeps the payload well-formed.
+
+### Headless bootstrap (agent-driven installs)
+
+`create-nextblock --non-interactive` (docs/06) needs the instance to answer three
+questions without a browser. All three live under prefixes the proxy allowlists:
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /api/setup/status` | none | Readiness report: `initialized` (Supabase + schema + first admin), `dbReady`, `mcpReady` (initialized + Cortex active + at least one MCP auth method), `channel`, `license`, `mcp.authMethods`, `handoff` (`agentInitiated`, `setupUrl`, `welcomeUrl`) and `nextSteps`. When `MCP_BEARER_TOKEN` is set the steps are written for an agent relaying them to a human ("Ask the user to open … and create their administrator account"; "… start the free trial at /cms/welcome"; "Keep polling"). 200 once initialized, 503 (with `Retry-After`) before. Reveals booleans and guidance only. Pure assembly in `lib/setup/readiness.ts` (unit-tested), I/O in `readiness-service.ts`. |
+| `POST /api/setup/bootstrap` | `MCP_BEARER_TOKEN` bearer | Creates the first administrator through `provisionFirstAdmin` (`lib/setup/provision-admin.ts`, the same core the `/setup` wizard's `completeSetup` now calls) and activates the environment license. 404 when no env token is configured, idempotent on a provisioned instance. |
+| `POST /api/packages/provision-trial` | none (vendor only) | On nextblock.dev (`NEXTBLOCK_LICENSE_CLAIM_ENABLED=true`): mints a 30-day Cortex AI key for a name + email. |
+
+**Agent-aware first run.** The same `MCP_BEARER_TOKEN` signal (`readCortexAiMcpEnvToken`)
+drives three UI touches so the attended headless flow needs no explanation from the agent:
+the `/setup` admin step says a coding agent is waiting, `CortexOfferStep` on `/cms/welcome`
+explains that the trial unlocks the agent's MCP access, and once Cortex AI is active
+`/cms/welcome` renders `AgentHandoffDone` ("return to your terminal", with the in-dashboard
+AI setup offered as optional) instead of the model-key wizard. The trial started there is a
+real Freemius trial (overlay → `claim-license` → activation with `is_trial`), so Freemius's
+own trial emails and webhooks apply. Self-hosted Docker no longer sets
+`NEXT_PUBLIC_IS_SANDBOX` since this change (docker-setup also drops a stale `true` on
+re-run); the flag would otherwise redirect `/cms/welcome` to the dashboard and refuse
+activation.
+
+**Environment-seeded license.** `NEXTBLOCK_LICENSE_KEY` (+ optional
+`NEXTBLOCK_LICENSE_KIND=trial|paid`, `NEXTBLOCK_LICENSE_PACKAGE`) is activated on first
+use by `ensureEnvLicenseActivation` (`lib/packages/env-license.ts`), called from the
+status route, the MCP route and the bootstrap route. It goes through the same Freemius
+`licenses/activate.json` call and the same `package_activations` row as a pasted key
+(the core moved to `lib/packages/activate-license.ts`, shared with the `activatePackage`
+server action), with provenance `source: 'env'`, so expiry, daily revalidation and the
+packages page behave exactly as for a checkout-issued license. Failures are memoized for
+10 minutes per process so a polling agent cannot hammer Freemius. It is deliberately not
+gated on `NEXT_PUBLIC_IS_SANDBOX` — the Docker sandbox sets that flag, and an operator
+who put a key in the environment wants it used; the shared demo sandbox never sets the
+variable.
+
+**Vendor trial provisioning.** Freemius cannot create a real *trial* (a trialing
+subscription) from a name and an email — its trial endpoint is install-scoped, and an
+install only exists after the buyer's site activates something. What the vendor can do
+(`libs/ecommerce/src/lib/freemius-trial-provision.ts`) is mint a time-boxed license on
+the plan's single-site pricing (`POST .../plans/{plan}/pricing/{pricing}/licenses.json`,
+`expires_at` = now + 30 days, `is_block_features: true`) and then assign it to the email
+(`PUT /products/{product}/licenses.json`), which creates the Freemius user if needed and
+sends the welcome email carrying the key. One trial per email per product: any existing
+license for the product, whatever its state, refuses a new one (409 `TRIAL_ALREADY_USED`).
+The route rate-limits per address (5/hour) and per email (3/day), best-effort per
+process, like `claim-license`. The result is functionally the overlay's no-card trial;
+what it is not is a subscription, so it never auto-converts — which a no-card trial
+cannot do anyway.
 
 ### Resources and prompts
 
@@ -1478,6 +1547,38 @@ and the first-run wizard):
 - **Claude Desktop** — `claude_desktop_config.json` is stdio-only, so a remote server
   needs either the Connectors UI (which dials out from Anthropic's cloud, so localhost
   and firewalled sites will not connect) or the `mcp-remote` stdio bridge.
+
+### Directory listings (official MCP Registry, Glama, Smithery)
+
+NextBlock's MCP server is per site (`https://<their-site>/api/mcp`), which only the
+official registry models natively:
+
+- **Official MCP Registry** — `server.json` at the repo root is the manifest (validated with
+  `mcp-publisher validate` against the live registry): a `remotes[]` entry with the
+  templated URL `https://{site_host}/api/mcp` and an `Authorization: Bearer {mcp_token}`
+  header, both declared as variables the client prompts for. The `dev.nextblock/*`
+  namespace is proven with a DNS TXT record at the apex of nextblock.dev
+  (`v=MCPv1; k=ed25519; p=<public key>`); the private key (hex) is the
+  `MCP_PRIVATE_KEY` GitHub secret used by `.github/workflows/publish-mcp-registry.yml`
+  (manual dispatch with a version, because registry versions are immutable). PulseMCP,
+  Glama and the GitHub/VS Code registry all read from this registry.
+- **Glama** — lists the open-source repo (submit from glama.ai/mcp/servers with a GitHub
+  account that has write access; claim the listing with a root `glama.json` naming the
+  maintainers) and, separately, remote "Connectors" with a fixed URL. Glama mirrors only
+  fixed-URL registry entries, so the connector is the vendor's own public instance; its
+  ownership claim is served by `app/.well-known/glama.json/route.ts` from the
+  `GLAMA_CLAIM_TOKEN` env var (404 everywhere else).
+- **Smithery** — publish-by-URL only, one fixed upstream, and its scanner cannot run
+  `tools/list` behind a bearer wall (it expects OAuth discovery, which `/api/mcp` avoids on
+  purpose). `app/.well-known/mcp/server-card.json/route.ts` serves the static card the
+  scanner reads instead: server info, endpoint, how to authenticate, and the tool /
+  resource / prompt inventory straight from the registry (`buildCortexMcpToolDefinitions`),
+  only on sites where the MCP server is enabled (env token or the database flag).
+- **Claude Connectors Directory** needs OAuth (DCR or CIMD) for URL-pattern servers, so it
+  waits until `/api/mcp` grows an OAuth path. Cursor's directory
+  (cursor.directory/plugins/new), mcp.so, LobeHub and Docker's catalog each take one fixed
+  URL: use the vendor instance. `/.well-known/*` is allowlisted in the proxy so these files
+  are reachable on an unprovisioned instance too.
 
 ### Related hardening
 

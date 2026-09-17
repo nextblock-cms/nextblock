@@ -77,6 +77,10 @@ function isSetupAllowlisted(pathname: string): boolean {
     pathname === '/setup' ||
     pathname.startsWith('/setup/') ||
     pathname.startsWith('/api/setup') ||
+    // The MCP endpoint authenticates every call itself (bearer token / admin session)
+    // and answers 503 while unconfigured. Letting it through means a coding agent gets a
+    // JSON error it can act on instead of a 307 to the HTML wizard.
+    pathname === '/api/mcp' ||
     pathname.startsWith('/auth/') ||
     pathname.startsWith('/_next/') ||
     pathname.startsWith('/favicon') ||
@@ -90,6 +94,10 @@ function isSetupAllowlisted(pathname: string): boolean {
     // deploy never redirects robots.txt / the sitemap to /setup (which would let crawlers
     // treat the wizard as the canonical entry point).
     pathname === '/robots.txt' ||
+    pathname === '/llms.txt' ||
+    // Machine-discovery files (Glama claim, MCP server card, UCP): each route decides for
+    // itself what to serve, and a redirect to the wizard would only confuse a crawler.
+    pathname.startsWith('/.well-known/') ||
     pathname.startsWith('/sitemap')
   );
 }

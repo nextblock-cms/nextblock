@@ -38,6 +38,120 @@ The default create flow is what powers:
 npm create nextblock@latest
 ```
 
+## Headless mode (`--non-interactive`) for coding agents
+
+A terminal agent (Claude Code, Cursor, Codex) can take one prompt — "build me a landing
+page with NextBlock about X" — and scaffold, boot, and wire up the site, leaving the human
+exactly two browser steps: create their administrator account and start the free Cortex AI
+trial (a real Freemius trial, with its reminder emails). No personal details pass through
+the agent:
+
+```bash
+npx create-nextblock@latest my-site --non-interactive
+#                                     --mode docker|cloud   (default: docker)
+#                                     --project-name <dir>  (same as the positional)
+#                                     --name … --email …    (unattended: headless admin + vendor trial key)
+#                                     --license-key <key>   (activate this key instead)
+#                                     --no-trial            (unattended only: no license at all)
+#                                     --skip-install
+```
+
+**Attended (default).** Without `--name`/`--email` the CLI scaffolds, boots (Docker), writes
+the MCP client configs, and prints a `handoff` with the setup URL. The agent asks the user
+to open `/setup`, create their account, and start the trial on the welcome screen that
+follows, while polling `GET /api/setup/status` until `mcpReady`. The app knows it was
+installed for an agent (the `MCP_BEARER_TOKEN` in its env): the wizard's admin step says a
+coding agent is waiting, the welcome screen explains that the trial unlocks the agent's
+MCP access, and once Cortex AI is active `/cms/welcome` tells the user to return to their
+terminal instead of pushing the optional in-dashboard AI setup. The status route's
+`nextSteps` carry the same guidance with absolute links (`handoff.setupUrl`,
+`handoff.welcomeUrl`).
+
+**Unattended.** With both `--name` and `--email` the CLI also creates the administrator
+through `POST /api/setup/bootstrap` (Docker) and requests a trial key from the vendor. That
+key is a plain 30-day expiring license, not a Freemius trial, so Freemius sends no trial
+emails for it; use this only for demos and CI. Passing one of the two flags, or an invalid
+email, exits 1 with `MISSING_ONBOARDING_CREDENTIALS`.
+
+Always document the `npx` form. `npm create nextblock@latest -- my-site --non-interactive …`
+is equivalent on bash/zsh/cmd, but **Windows PowerShell strips the bare `--`**, after which
+npm treats `--non-interactive` as one of its own config flags ("Unknown cli config") and the
+CLI silently starts the *interactive* prompts. `npx <package> <flags>` needs no `--`, so it
+behaves the same on every shell (verified on PowerShell 5.1 with npm 11).
+
+Two safety nets exist for that case. Every flag has an environment-variable twin that
+survives any shell and any npm wrapper — `NEXTBLOCK_NON_INTERACTIVE=1`, `NEXTBLOCK_NAME`,
+`NEXTBLOCK_EMAIL`, `NEXTBLOCK_MODE`, `NEXTBLOCK_PROJECT_NAME`, `NEXTBLOCK_LICENSE_KEY`,
+`NEXTBLOCK_TRIAL=false` (flags win, variables fill the gaps, and the interactive flow
+ignores them). And when npm has eaten the flag it still forwards it as
+`npm_config_non_interactive=true`; the CLI detects that and exits 1 with a
+`FLAGS_NOT_DELIVERED` JSON error naming the `npx` form, instead of dropping an agent into
+prompts it cannot answer.
+
+The contract is designed to be parsed, not read:
+
+- **stdout carries exactly one JSON document** on success (project dir, app URL, the
+  status URL, which agent config files were written, license and admin state, and
+  `nextSteps`). Every progress line goes to **stderr**.
+- **Any failure prints one JSON document on stderr and exits 1**, for example:
+
+  ```json
+  {"error":"DOCKER_UNAVAILABLE","message":"Docker is not installed or the Docker engine is not running. Start Docker Desktop and retry, or pass --mode cloud.","hint":"…"}
+  ```
+
+  Other codes: `MISSING_ONBOARDING_CREDENTIALS` (half a credential pair), `INVALID_MODE`, `INVALID_PROJECT_NAME`, `DIRECTORY_NOT_EMPTY`,
+  `DOCKER_UNAVAILABLE` (engine not running — start Docker Desktop or pass `--mode cloud`),
+  `DOCKER_SETUP_FAILED`, `STACK_NOT_READY`, `BOOTSTRAP_FAILED`, `SCAFFOLD_FAILED`. Every
+  payload has `error`, `message`, and usually a `hint`.
+- **Secrets are never printed.** The MCP bearer token (`crypto.randomBytes(32)` as hex),
+  the license key, and the generated admin password are written to the project's env
+  file only; the JSON names *where* they live (`.env (MCP_BEARER_TOKEN)`).
+
+What happens, in order (`handleHeadlessCommand` in `bin/create-nextblock.js`, helpers in
+`bin/lib/headless.js`):
+
+1. Validate the flags (a known mode, a directory-safe project name; in unattended mode a
+   name and a WHATWG-valid email). In Docker mode, preflight `docker info` before creating
+   anything.
+2. Scaffold exactly as the interactive flow does (`scaffoldProject`), including the agent
+   guardrails every scaffold now gets: `.claude/settings.json` with
+   `permissions.deny: ["Read(./.env)", "Read(./.env.*)"]` and a `.cursorignore` for the
+   same files, so an agent cannot pull database or bearer credentials into its context.
+   (`.claudeignore` is not a mechanism Claude Code has; the permission deny rule is.)
+3. Unattended only: ask the NextBlock license service for a Cortex AI trial key —
+   `POST ${NEXTBLOCK_LICENSE_SERVICE_URL:-https://nextblock.dev}/api/packages/provision-trial`
+   with the name and email, 5-second abort. A refusal (trial already used for that
+   email), a 404 (service not deployed), or a timeout is **reported, not fatal**: the
+   site still scaffolds and boots, and the summary says the trial must be started from
+   `/cms/settings/packages`. `--license-key` skips the request; `--no-trial` skips it and
+   writes no key. Attended installs never call it: the browser trial is the real one.
+4. Write `MCP_BEARER_TOKEN` (and, unattended, `NEXTBLOCK_LICENSE_KEY` +
+   `NEXTBLOCK_LICENSE_KIND=trial`) to the env file. Docker: they travel through the
+   process environment into `scripts/docker-setup.mjs`, which persists them into the
+   `.env` compose reads (and `docker-compose.yml` passes them to the app container).
+   Cloud: `.env.local`.
+5. Docker only: boot the stack, read the app URL back from `.env` (docker-setup may
+   remap port 3000), and poll `GET /api/setup/status` until `dbReady`. Attended: stop
+   here and print the handoff. Unattended: `POST /api/setup/bootstrap` with the bearer
+   token to create the first administrator (`--name` / `--email`, generated password
+   stored as `NEXTBLOCK_ADMIN_PASSWORD` in `.env`) and activate the env license. Cloud
+   mode stops after step 4 and tells the agent to run `npm run dev` and hand `/setup`
+   to the user.
+6. Write the MCP client configs with the literal token: `.mcp.json` (Claude Code —
+   `"type": "http"` is mandatory) and `.cursor/mcp.json` (Cursor). Both are gitignored by
+   the scaffold. The token is written literally because both clients expand `${VAR}`
+   from the shell environment only, never from a project `.env`. Agents must restart
+   their session to load the new server.
+
+The app side of this contract lives in `apps/nextblock`: `app/api/setup/status`,
+`app/api/setup/bootstrap`, `lib/packages/env-license.ts`, and the `MCP_BEARER_TOKEN`
+auth path in `app/api/mcp/route.ts` — see `docs/08` → "Headless bootstrap". The vendor
+side is `app/api/packages/provision-trial` (enabled only on nextblock.dev).
+
+`bin/lib/headless.test.js` covers the validation, env editing, client config shapes,
+trial request handling, readiness polling and bootstrap call
+(`npx vitest run apps/create-nextblock/bin/lib/headless.test.js`).
+
 ## What the Create Flow Actually Does
 
 When the CLI creates a project it currently:
@@ -50,13 +164,21 @@ When the CLI creates a project it currently:
 6. generates UI proxy modules
 7. copies editor utility shims when needed
 8. ensures `.gitignore`, `.env.example`, layout files, and config files are in
-   the expected generated-project shape
+   the expected generated-project shape (`next.config.js` is the app's own file with
+   anchored standalone patches applied by `bin/lib/next-config.js` — tracing root,
+   the seven published packages to transpile, no build-time type-check of pre-built
+   deps; a required anchor that disappears throws at scaffold time and fails
+   `next-config.test.js`, which runs the patches against `apps/nextblock/next.config.js`)
 9. rewrites `package.json` away from workspace dependencies and toward published
    packages
 10. writes a project-level `.npmrc` for public package resolution
-11. optionally installs dependencies
-12. optionally runs the generated-project setup wizard
-13. initializes git
+11. writes the coding-agent guardrails (`.claude/settings.json` deny rules for `.env*`,
+    `.cursorignore`)
+12. initializes git
+13. optionally installs dependencies
+14. Docker profile: runs `scripts/docker-setup.mjs`; otherwise points at the browser
+    `/setup` wizard (headless mode continues with readiness polling, bootstrap and the
+    MCP client configs — see above)
 
 ## Package Version Sources
 

@@ -131,7 +131,9 @@ services:
   # MinIO — S3-compatible object storage for media (sovereign, on-disk)
   ###########################################################################
   minio:
-    image: ${MINIO_IMAGE:-minio/minio:latest}
+    # MinIO stopped publishing to Docker Hub (`minio/minio` now answers "pull access denied");
+    # quay.io is the official registry. Pinned like every other image; override with MINIO_IMAGE.
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -145,7 +147,7 @@ services:
 
   # One-shot: create the media bucket and make it public-read so next/image can fetch assets.
   minio-init:
-    image: ${MINIO_MC_IMAGE:-minio/mc:latest}
+    image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z}
     restart: 'no'
     depends_on:
       minio:
@@ -197,7 +199,7 @@ services:
         NEXT_PUBLIC_R2_PUBLIC_URL: ${NEXT_PUBLIC_R2_PUBLIC_URL}
         NEXT_PUBLIC_R2_BASE_URL: ${NEXT_PUBLIC_R2_BASE_URL}
         NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
-        NEXT_PUBLIC_IS_SANDBOX: ${NEXT_PUBLIC_IS_SANDBOX:-true}
+        NEXT_PUBLIC_IS_SANDBOX: ${NEXT_PUBLIC_IS_SANDBOX:-false}
     restart: unless-stopped
     depends_on:
       migrate:
@@ -217,11 +219,16 @@ services:
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
       SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
       NEXT_PUBLIC_URL: ${NEXT_PUBLIC_URL:-http://localhost:3000}
-      NEXT_PUBLIC_IS_SANDBOX: ${NEXT_PUBLIC_IS_SANDBOX:-true}
+      NEXT_PUBLIC_IS_SANDBOX: ${NEXT_PUBLIC_IS_SANDBOX:-false}
       CRON_SECRET: ${CRON_SECRET}
       DRAFT_MODE_SECRET: ${DRAFT_MODE_SECRET}
       REVALIDATE_SECRET_TOKEN: ${REVALIDATE_SECRET_TOKEN}
       CORTEX_AI_ENCRYPTION_KEY: ${CORTEX_AI_ENCRYPTION_KEY:-}
+      # Headless install: the scaffold's MCP bearer token and the provisioned package key
+      # (see .env.example). Blank on a hand-driven install.
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:-}
+      NEXTBLOCK_LICENSE_KEY: ${NEXTBLOCK_LICENSE_KEY:-}
+      NEXTBLOCK_LICENSE_KIND: ${NEXTBLOCK_LICENSE_KIND:-}
       # Storage (MinIO over the S3 protocol). Server ops use the internal endpoint; presigned
       # upload URLs are signed for the browser-facing endpoint (see libs/utils getS3PresignClient).
       R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-minio}

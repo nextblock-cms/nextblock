@@ -45,6 +45,8 @@ export interface SupabaseEnvDetected {
 }
 
 interface Props {
+  /** A coding agent installed this site headlessly and is waiting for the first admin + Cortex trial. */
+  agentInitiated?: boolean;
   channel: DeployChannel;
   configured: boolean;
   writable: boolean;
@@ -75,6 +77,7 @@ const CHANNEL_LABEL: Record<DeployChannel, string> = {
 type Msg = { ok: string } | { err: string } | null;
 
 export default function SetupWizard({
+  agentInitiated = false,
   channel,
   configured,
   writable,
@@ -380,6 +383,13 @@ export default function SetupWizard({
 
           {current === 'admin' && (
             <div className="space-y-4">
+              {agentInitiated && (
+                <p className="rounded-md border border-primary/30 bg-primary/[0.04] p-3 text-sm text-muted-foreground">
+                  A coding agent set this site up and is waiting for you. Create your administrator
+                  account here; the next screen starts your free Cortex AI trial, which unlocks the
+                  agent&apos;s access. After that you can return to your terminal.
+                </p>
+              )}
               <Field label="Full name" htmlFor="adminName">
                 <Input
                   id="adminName"

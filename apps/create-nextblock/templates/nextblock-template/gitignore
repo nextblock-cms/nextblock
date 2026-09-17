@@ -29,3 +29,9 @@ supabase/.branches
 
 # Local safety copies written by `npm run update` when it replaces a framework file.
 .nextblock-backup/
+
+# Coding-agent MCP client configs written by `create-nextblock --non-interactive`.
+# They carry the instance's MCP bearer token verbatim, so they must never be committed.
+.mcp.json
+.cursor/mcp.json
+.claude/settings.local.json

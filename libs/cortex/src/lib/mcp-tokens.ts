@@ -289,3 +289,65 @@ export function shouldTrustLocalMcpRequest(params: {
 
   return isLocalhostHost(params.hostHeader);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Environment-provided bootstrap token                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Name of the environment variable that carries an operator-provisioned MCP bearer
+ * token. `create-nextblock --non-interactive` generates one at scaffold time and writes
+ * it to the project's `.env` / `.env.local` (Docker / cloud) together with the agent
+ * client configs, so a coding agent can reach `/api/mcp` before any admin has opened
+ * the dashboard to mint a database token.
+ *
+ * Setting the variable is the opt-in: the endpoint accepts this token even while the
+ * database `enabled` flag is still off (the flag guards *unattended* exposure, and an
+ * operator who put a secret in the environment has attended to it). Everything else
+ * still applies — the Cortex AI license gate, the Origin check, and the scope rules.
+ */
+export const CORTEX_AI_MCP_ENV_TOKEN_VAR = 'MCP_BEARER_TOKEN';
+
+/**
+ * Anything shorter is refused outright rather than honoured: a short value is far more
+ * likely to be a placeholder left in an example file than a deliberate secret.
+ */
+export const CORTEX_AI_MCP_ENV_TOKEN_MIN_LENGTH = 32;
+
+/** Read the configured environment token, or null when unset, blank or too short. */
+export function readCortexAiMcpEnvToken(
+  env: Record<string, string | undefined> = process.env
+): string | null {
+  const value = env[CORTEX_AI_MCP_ENV_TOKEN_VAR]?.trim();
+
+  if (!value || value.length < CORTEX_AI_MCP_ENV_TOKEN_MIN_LENGTH) {
+    return null;
+  }
+
+  return value;
+}
+
+/**
+ * Constant-time comparison of a presented bearer credential against the configured
+ * environment token. Both sides are hashed first so the comparison length never
+ * depends on the caller's input, which keeps `timingSafeEqual`'s precondition (equal
+ * buffer lengths) satisfied without leaking the configured token's length.
+ */
+export function matchesCortexAiMcpEnvToken(
+  presented: string | null | undefined,
+  configured: string | null | undefined
+): boolean {
+  assertServerOnly();
+
+  const candidate = presented?.trim();
+  const expected = configured?.trim();
+
+  if (!candidate || !expected || expected.length < CORTEX_AI_MCP_ENV_TOKEN_MIN_LENGTH) {
+    return false;
+  }
+
+  return timingSafeEqual(
+    Buffer.from(hashCortexAiMcpToken(candidate), 'utf8'),
+    Buffer.from(hashCortexAiMcpToken(expected), 'utf8')
+  );
+}

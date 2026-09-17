@@ -10,7 +10,9 @@ import {
   CORTEX_AI_PACKAGE_ID,
   handleCortexMcpMessage,
   isLocalhostHost,
+  matchesCortexAiMcpEnvToken,
   parseBearerToken,
+  readCortexAiMcpEnvToken,
   resolveCortexAiMcpSettings,
   shouldTrustLocalMcpRequest,
   touchCortexAiMcpToken,
@@ -21,6 +23,8 @@ import {
 } from '@nextblock-cms/cortex';
 
 import { validateBlockContent } from '../../../lib/blocks/blockRegistry';
+import { ensureEnvLicenseActivation } from '../../../lib/packages/env-license';
+import { isFullyConfigured, isSupabaseConfigured } from '../../../lib/setup/env-status';
 import { importExternalImageToMedia } from '../../cms/media/import-external-image';
 import { captureRevisionBaseline, commitRevisionFromBaseline } from '../../cms/revisions/service';
 import type { AnyFullContent } from '../../cms/revisions/utils';
@@ -69,7 +73,7 @@ type McpAuth = {
    */
   actorFromOrphanedToken: boolean;
   scopes: CortexAiMcpScope[];
-  source: 'admin-session' | 'localhost' | 'token';
+  source: 'admin-session' | 'env-token' | 'localhost' | 'token';
 };
 
 /**
@@ -171,7 +175,13 @@ function isOriginAllowed(request: Request): boolean {
 /**
  * Establish who is calling.
  *
- * Three accepted paths, in priority order:
+ * Four accepted paths, in priority order:
+ *  0. The environment bootstrap token (`MCP_BEARER_TOKEN`), written by
+ *     `create-nextblock --non-interactive` so a coding agent can operate the site
+ *     before any admin has opened the dashboard. Setting the variable is the opt-in,
+ *     so this path does not wait for the database `enabled` flag; it still needs the
+ *     Cortex AI license (checked before we get here) and a provisioned admin to
+ *     attribute writes to.
  *  1. A bearer token from `mcp_access_tokens` — the path every external client uses.
  *  2. An authenticated ADMIN cookie session — lets the dashboard's own "Test
  *     connection" button reach the endpoint without minting a token first.
@@ -179,13 +189,31 @@ function isOriginAllowed(request: Request): boolean {
  */
 async function authenticateMcpRequest(request: Request): Promise<McpAuth | null> {
   const serviceClient = getServiceRoleSupabaseClient();
+  const bearer = parseBearerToken(request.headers.get('authorization'));
+  const envToken = readCortexAiMcpEnvToken();
+
+  if (bearer && envToken && matchesCortexAiMcpEnvToken(bearer, envToken)) {
+    const actorUserId = await resolveFallbackAdminUserId();
+
+    // No admin yet means nothing can be attributed — refuse rather than let writes
+    // land with no author. The status route tells the agent to bootstrap first.
+    if (!actorUserId) {
+      return null;
+    }
+
+    return {
+      actorFromOrphanedToken: false,
+      actorUserId,
+      scopes: ['read', 'write'],
+      source: 'env-token',
+    };
+  }
+
   const settings = await resolveCortexAiMcpSettings(serviceClient);
 
   if (!settings.enabled) {
     return null;
   }
-
-  const bearer = parseBearerToken(request.headers.get('authorization'));
 
   if (bearer) {
     const verification = await verifyCortexAiMcpToken(serviceClient, bearer);
@@ -338,6 +366,24 @@ export async function POST(request: Request): Promise<Response> {
     });
   }
 
+  // The proxy lets this route through before the instance is set up (so agents get a
+  // real answer instead of a redirect to the wizard); say so plainly when nothing can
+  // work yet.
+  if (!isSupabaseConfigured()) {
+    return new Response(
+      JSON.stringify({
+        error: 'This NextBlock instance is not configured yet. Poll GET /api/setup/status until it reports initialized.',
+      }),
+      { headers: { ...JSON_HEADERS, 'Retry-After': '5' }, status: 503 }
+    );
+  }
+
+  // A key seeded through NEXTBLOCK_LICENSE_KEY is activated on first use; a cached
+  // no-op read when there is nothing to do.
+  if (isFullyConfigured()) {
+    await ensureEnvLicenseActivation();
+  }
+
   const isCortexAiActive = await verifyPackageOnline(CORTEX_AI_PACKAGE_ID);
 
   if (!isCortexAiActive) {
@@ -351,7 +397,7 @@ export async function POST(request: Request): Promise<Response> {
 
   if (!auth) {
     return unauthorized(
-      'A valid NextBlock MCP access token is required. Generate one in CMS Settings → Cortex AI, and confirm the MCP server is enabled there.'
+      'A valid NextBlock MCP access token is required. Generate one in CMS Settings → Cortex AI and confirm the MCP server is enabled there, or set MCP_BEARER_TOKEN in the environment (and make sure the first administrator exists — see GET /api/setup/status).'
     );
   }
 

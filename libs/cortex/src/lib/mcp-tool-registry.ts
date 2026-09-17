@@ -98,6 +98,12 @@ export type CortexMcpCanonicalToolName = keyof typeof CORTEX_MCP_TOOL_KINDS;
  * in-app vocabulary.
  */
 export const CORTEX_MCP_TOOL_ALIASES = {
+  create_page_layout: {
+    canonical: 'create_cms_page',
+    description:
+      'Create a new page from a slug, a title and a strictly typed block layout in one call. Every block is normalized and validated against the NextBlock block schema (built-in types from the `cortex://schema/blocks` resource, or a custom block slug from `list_custom_blocks`) before anything is written; an invalid block rejects the whole call. Pass `status: "published"` to go live immediately, or leave the default draft and publish later. To rewrite an existing page instead, use `generate_jsonb_layout`. Alias of `create_cms_page`.',
+    title: 'Create page layout',
+  },
   generate_jsonb_layout: {
     canonical: 'rewrite_page_draft',
     description:

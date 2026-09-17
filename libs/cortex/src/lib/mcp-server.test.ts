@@ -21,9 +21,11 @@ import {
 import {
   hashCortexAiMcpToken,
   isLocalhostHost,
+  matchesCortexAiMcpEnvToken,
   mintCortexAiMcpToken,
   normalizeCortexAiMcpSettings,
   parseBearerToken,
+  readCortexAiMcpEnvToken,
   shouldTrustLocalMcpRequest,
   verifyCortexAiMcpToken,
 } from './mcp-tokens';
@@ -505,5 +507,29 @@ describe('MCP JSON-RPC protocol', () => {
     );
 
     expect((resultOf(response)?.['tools'] as unknown[]).length).toBeGreaterThan(0);
+  });
+});
+
+describe('MCP environment bootstrap token', () => {
+  it('reads the token only when it is long enough to be a real secret', () => {
+    expect(readCortexAiMcpEnvToken({})).toBeNull();
+    expect(readCortexAiMcpEnvToken({ MCP_BEARER_TOKEN: '   ' })).toBeNull();
+    expect(readCortexAiMcpEnvToken({ MCP_BEARER_TOKEN: 'short-placeholder' })).toBeNull();
+    expect(readCortexAiMcpEnvToken({ MCP_BEARER_TOKEN: ` ${'a'.repeat(64)} ` })).toBe('a'.repeat(64));
+  });
+
+  it('matches the presented bearer against the configured token in constant time', () => {
+    const configured = 'f'.repeat(64);
+
+    expect(matchesCortexAiMcpEnvToken(configured, configured)).toBe(true);
+    expect(matchesCortexAiMcpEnvToken(` ${configured} `, configured)).toBe(true);
+    expect(matchesCortexAiMcpEnvToken(`${configured}0`, configured)).toBe(false);
+    expect(matchesCortexAiMcpEnvToken('e'.repeat(64), configured)).toBe(false);
+    expect(matchesCortexAiMcpEnvToken(configured, null)).toBe(false);
+    expect(matchesCortexAiMcpEnvToken(null, configured)).toBe(false);
+  });
+
+  it('never honours a configured token below the minimum length, even on an exact match', () => {
+    expect(matchesCortexAiMcpEnvToken('tooshort', 'tooshort')).toBe(false);
   });
 });

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.nextblock/nextblock",
+  "title": "NextBlock CMS",
+  "description": "Manage pages, posts, blocks, media and settings of your self-hosted NextBlock site.",
+  "version": "1.0.0",
+  "websiteUrl": "https://nextblock.dev",
+  "repository": {
+    "url": "https://github.com/nextblock-cms/nextblock",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{site_host}/api/mcp",
+      "variables": {
+        "site_host": {
+          "description": "Hostname of your NextBlock site (no scheme, no path), e.g. www.example.com",
+          "isRequired": true,
+          "placeholder": "www.example.com"
+        }
+      },
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer {mcp_token}",
+          "isRequired": true,
+          "isSecret": true,
+          "description": "MCP access token created in your NextBlock CMS (Settings > Cortex AI > MCP tokens)",
+          "variables": {
+            "mcp_token": {
+              "description": "NextBlock MCP access token",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

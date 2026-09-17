@@ -1,4 +1,5 @@
 import { redirect } from 'next/navigation';
+import { readCortexAiMcpEnvToken } from '@nextblock-cms/cortex';
 import { createClient } from '@nextblock-cms/db/server';
 import {
   detectChannel,
@@ -86,6 +87,9 @@ export default async function SetupPage() {
 
   return (
     <SetupWizard
+      // An MCP_BEARER_TOKEN means `create-nextblock --non-interactive` made this install
+      // for a coding agent that is now polling /api/setup/status; the wizard says so.
+      agentInitiated={readCortexAiMcpEnvToken() !== null}
       channel={channel}
       configured={isSupabaseConfigured()}
       writable={isLocalWritableEnv()}

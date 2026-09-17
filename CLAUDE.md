@@ -49,6 +49,11 @@ Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` →
   installs inject `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` beside the
   legacy `NEXT_PUBLIC_SUPABASE_*` names. Libs inline the same alias chain.
 - Premium gating: `verifyPackageOnline('ecommerce' | 'cortex-ai')` (cached 60 s).
+- Headless installs (`create-nextblock --non-interactive`, docs/06): `GET /api/setup/status`
+  (public readiness), `POST /api/setup/bootstrap` (first admin, bearer = `MCP_BEARER_TOKEN`),
+  `NEXTBLOCK_LICENSE_KEY` activated on first use by `lib/packages/env-license.ts`, and the
+  env-token auth path in `app/api/mcp/route.ts`. The vendor mints the trial key in
+  `app/api/packages/provision-trial`. Docs/08 → "Headless bootstrap".
 
 ## Commands
 

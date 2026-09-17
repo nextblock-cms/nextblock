@@ -1,0 +1,38 @@
+# Publish server.json (the NextBlock MCP server manifest) to the official MCP Registry.
+#
+# Manual, on purpose: registry versions are immutable, so a publish is a deliberate act
+# tied to a release. Namespace `dev.nextblock/*` is proven with a DNS TXT record on
+# nextblock.dev (see docs/08 → "Directory listings"); the matching Ed25519 private key
+# (hex) lives in the MCP_PRIVATE_KEY repository secret.
+name: Publish to MCP Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (must be new; e.g. 1.0.1 or 1.0.1-1 for a metadata-only change)
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Stamp the version
+        run: |
+          jq --arg v "${{ inputs.version }}" '.version = $v' server.json > server.tmp && mv server.tmp server.json
+          ./mcp-publisher validate server.json
+
+      - name: Log in with the nextblock.dev DNS proof
+        run: ./mcp-publisher login dns --domain nextblock.dev --private-key "${{ secrets.MCP_PRIVATE_KEY }}"
+
+      - name: Publish
+        run: ./mcp-publisher publish server.json

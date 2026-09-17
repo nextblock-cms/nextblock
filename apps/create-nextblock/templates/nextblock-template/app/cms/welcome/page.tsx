@@ -1,7 +1,10 @@
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
+import { Bot, CheckCircle2 } from 'lucide-react';
 
-import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
+import { CORTEX_AI_PACKAGE_ID, readCortexAiMcpEnvToken } from '@nextblock-cms/cortex';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
+import { Button } from '@nextblock-cms/ui';
 import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
 
 import { resolveCortexWelcomeDestination } from '../../../lib/cortex-ai/setup-state';
@@ -42,8 +45,18 @@ export default async function CmsWelcomePage() {
 
   const isCortexActive = await verifyPackageOnline(CORTEX_AI_PACKAGE_ID).catch(() => false);
 
+  // A headless install (`create-nextblock --non-interactive`) leaves an MCP_BEARER_TOKEN
+  // behind: a coding agent is waiting on `/api/setup/status` for the MCP server, which
+  // needs Cortex AI. The offer explains that, and once the trial is active the operator is
+  // sent back to the agent rather than into the (optional) model-key wizard.
+  const agentInitiated = readCortexAiMcpEnvToken() !== null;
+
   if (!isCortexActive) {
-    return <CortexOfferStep pkg={NEXTBLOCK_PACKAGES['cortex-ai']} />;
+    return <CortexOfferStep agentInitiated={agentInitiated} pkg={NEXTBLOCK_PACKAGES['cortex-ai']} />;
+  }
+
+  if (agentInitiated) {
+    return <AgentHandoffDone />;
   }
 
   const status = await getCortexSetupStatus();
@@ -72,6 +85,50 @@ export default async function CmsWelcomePage() {
 
   const props = await loadCortexSetupWizardProps(status);
 
+  return (
+    <CortexSetupWizardWithHeading props={props} />
+  );
+}
+
+/**
+ * The end of the attended headless flow: Cortex AI is active, so the agent's MCP token
+ * works from the next `/api/setup/status` poll. The model-key wizard is offered, not
+ * imposed — over MCP the coding agent is the model, so an OpenRouter key is only needed
+ * for the in-dashboard chat and the AI-generating tools.
+ */
+function AgentHandoffDone() {
+  return (
+    <div className="mx-auto w-full max-w-2xl space-y-6 px-4 py-12">
+      <section className="space-y-4 rounded-xl border border-emerald-500/40 bg-emerald-50/60 p-6 dark:bg-emerald-950/20">
+        <div className="flex items-start gap-3">
+          <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600" />
+          <div className="space-y-1">
+            <h1 className="text-xl font-semibold">All set — your coding agent can take it from here</h1>
+            <p className="text-sm text-muted-foreground">
+              Cortex AI is active on this site, which unlocks the MCP server your agent was set up
+              with. You can close this tab and return to your terminal: the agent picks this up on
+              its next status check, usually within a minute.
+            </p>
+          </div>
+        </div>
+        <p className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Bot className="h-4 w-4 shrink-0" />
+          Prefer to work in the dashboard too? Everything the agent can do is also here.
+        </p>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Button asChild size="lg" variant="outline">
+            <Link href="/cms/settings/cortex-ai/setup?intent=site-builder">Set up in-dashboard AI (optional)</Link>
+          </Button>
+          <Button asChild size="lg" variant="ghost">
+            <Link href="/cms/dashboard">Open the dashboard</Link>
+          </Button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function CortexSetupWizardWithHeading({ props }: { props: Awaited<ReturnType<typeof loadCortexSetupWizardProps>> }) {
   return (
     <CortexSetupWizard
       {...props}

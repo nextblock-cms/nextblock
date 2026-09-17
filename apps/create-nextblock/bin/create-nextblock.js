@@ -11,6 +11,29 @@ import { execa } from 'execa';
 import { program } from 'commander';
 import chalk from 'chalk';
 import fs from 'fs-extra';
+import {
+  DEFAULT_LICENSE_SERVICE_URL,
+  HeadlessError,
+  SWALLOWED_FLAGS_ERROR,
+  bootstrapInstance,
+  checkDockerAvailable,
+  detectSwallowedHeadlessFlags,
+  emitJsonError,
+  emitJsonResult,
+  generateAdminPassword,
+  generateMcpBearerToken,
+  mergeHeadlessOptions,
+  readEnvFile,
+  requestTrialLicense,
+  resolveAppUrlFromEnv,
+  summarizeReadiness,
+  upsertEnvFile,
+  validateHeadlessOptions,
+  waitForReadiness,
+  writeAgentGuardrails,
+  writeAgentMcpConfigs,
+} from './lib/headless.js';
+import { patchNextConfigForStandalone } from './lib/next-config.js';
 
 const DEFAULT_PROJECT_NAME = 'nextblock-cms';
 const __filename = fileURLToPath(import.meta.url);
@@ -64,6 +87,16 @@ program
   .description('Bootstrap a NextBlock™ CMS project')
   .option('--skip-install', 'Skip installing dependencies')
   .option('-y, --yes', 'Skip all interactive prompts and use defaults')
+  .option(
+    '--non-interactive',
+    'Headless run for coding agents: no prompts, JSON result on stdout, JSON errors on stderr. Requires --name and --email.',
+  )
+  .option('--name <name>', 'Your full name (headless: first administrator and trial owner)')
+  .option('--email <email>', 'Your email address (headless: first administrator and trial owner)')
+  .option('--mode <mode>', 'Headless hosting profile: docker (default) or cloud')
+  .option('--project-name <name>', 'Project directory name (same as the positional argument)')
+  .option('--license-key <key>', 'Headless: activate this NextBlock package key instead of provisioning a trial')
+  .option('--no-trial', 'Headless: do not request a Cortex AI trial key')
   .action(handleCommand);
 
 program
@@ -78,7 +111,21 @@ await program.parseAsync(process.argv).catch((error) => {
   process.exit(1);
 });
 
-async function handleCommand(projectDirectory, options) {
+async function handleCommand(projectDirectory, rawOptions) {
+  // NEXTBLOCK_* variables are the shell-proof form of the headless flags (PowerShell
+  // strips the `--` that `npm create nextblock -- --flag` depends on).
+  const options = mergeHeadlessOptions(rawOptions, process.env);
+
+  if (options.nonInteractive) {
+    return handleHeadlessCommand(projectDirectory, options);
+  }
+
+  if (detectSwallowedHeadlessFlags(process.env)) {
+    // npm ate the flag; an agent must not be dropped into interactive prompts silently.
+    emitJsonError(SWALLOWED_FLAGS_ERROR);
+    process.exit(1);
+  }
+
   const { skipInstall, yes } = options;
 
   try {
@@ -173,63 +220,7 @@ async function handleCommand(projectDirectory, options) {
       ),
     );
 
-    console.log(chalk.blue('Copying project files...'));
-    await copyTemplateTo(projectDir);
-    console.log(chalk.green('Template copied successfully.'));
-
-    await removeBackups(projectDir);
-
-    await ensureClientComponents(projectDir);
-    console.log(chalk.green('Client component directives applied.'));
-
-    await ensureClientProviders(projectDir);
-    console.log(chalk.green('Client provider wrappers configured.'));
-
-    await sanitizeBlockEditorImports(projectDir);
-    console.log(chalk.green('Block editor imports sanitized.'));
-
-    await sanitizeUiImports(projectDir);
-    console.log(chalk.green('UI component imports normalized.'));
-
-    await ensureUiProxies(projectDir);
-    console.log(chalk.green('UI proxy modules generated.'));
-
-    const editorUtilNames = await ensureEditorUtils(projectDir);
-    if (editorUtilNames.length > 0) {
-      console.log(chalk.green('Editor utility shims generated.'));
-    }
-
-    await ensureGitignore(projectDir);
-    console.log(chalk.green('.gitignore ready.'));
-
-    await ensureEnvExample(projectDir);
-    console.log(chalk.green('.env.example ready.'));
-
-    await sanitizeLayout(projectDir);
-    console.log(chalk.green('Global styles configured.'));
-
-    await sanitizeTailwindConfig(projectDir);
-    console.log(chalk.green('tailwind.config.js sanitized.'));
-
-    await normalizeTsconfig(projectDir);
-    console.log(chalk.green('tsconfig.json normalized.'));
-
-    await sanitizeNextConfig(projectDir, editorUtilNames);
-    console.log(chalk.green('next.config.js sanitized.'));
-
-    await transformPackageJson(projectDir);
-    console.log(chalk.green('Dependencies updated for public packages.'));
-
-    await ensurePublicNpmrc(projectDir);
-    console.log(chalk.green('Enforced public registry for initial install.'));
-
-    await initializeGit(projectDir);
-
-    if (!skipInstall) {
-      await installDependencies(projectDir);
-    } else {
-      console.log(chalk.yellow('Skipping dependency installation.'));
-    }
+    await scaffoldProject(projectDir, { skipInstall, log: console.log });
 
     // Run the post-scaffold flow after dependencies are installed so package assets are available.
     // Docker boots the local stack; everything else just materializes Supabase assets and points
@@ -245,6 +236,354 @@ async function handleCommand(projectDirectory, options) {
         error instanceof Error ? error.message : 'An unexpected error occurred',
       ),
     );
+    process.exit(1);
+  }
+}
+
+/**
+ * The scaffold pipeline shared by the interactive and headless flows: copy the template,
+ * apply the standalone-project transforms, and install. `log` receives every progress
+ * line so the headless flow can route it to stderr and keep stdout for its JSON result.
+ */
+async function scaffoldProject(projectDir, { skipInstall = false, log = console.log } = {}) {
+  log(chalk.blue('Copying project files...'));
+  await copyTemplateTo(projectDir);
+  log(chalk.green('Template copied successfully.'));
+
+  await removeBackups(projectDir);
+
+  await ensureClientComponents(projectDir);
+  log(chalk.green('Client component directives applied.'));
+
+  await ensureClientProviders(projectDir);
+  log(chalk.green('Client provider wrappers configured.'));
+
+  await sanitizeBlockEditorImports(projectDir);
+  log(chalk.green('Block editor imports sanitized.'));
+
+  await sanitizeUiImports(projectDir);
+  log(chalk.green('UI component imports normalized.'));
+
+  await ensureUiProxies(projectDir);
+  log(chalk.green('UI proxy modules generated.'));
+
+  const editorUtilNames = await ensureEditorUtils(projectDir);
+  if (editorUtilNames.length > 0) {
+    log(chalk.green('Editor utility shims generated.'));
+  }
+
+  await ensureGitignore(projectDir);
+  log(chalk.green('.gitignore ready.'));
+
+  await ensureEnvExample(projectDir);
+  log(chalk.green('.env.example ready.'));
+
+  await sanitizeLayout(projectDir);
+  log(chalk.green('Global styles configured.'));
+
+  await sanitizeTailwindConfig(projectDir);
+  log(chalk.green('tailwind.config.js sanitized.'));
+
+  await normalizeTsconfig(projectDir);
+  log(chalk.green('tsconfig.json normalized.'));
+
+  await sanitizeNextConfig(projectDir);
+  log(chalk.green('next.config.js sanitized.'));
+
+  await transformPackageJson(projectDir);
+  log(chalk.green('Dependencies updated for public packages.'));
+
+  await ensurePublicNpmrc(projectDir);
+  log(chalk.green('Enforced public registry for initial install.'));
+
+  // Keep `.env*` out of coding agents' context on every scaffold (Claude Code permission
+  // deny rules + .cursorignore). Harmless without an agent; essential with one.
+  await writeAgentGuardrails(projectDir);
+  log(chalk.green('Agent guardrails written (.claude/settings.json, .cursorignore).'));
+
+  await initializeGit(projectDir, { log });
+
+  if (!skipInstall) {
+    await installDependencies(projectDir, { log });
+  } else {
+    log(chalk.yellow('Skipping dependency installation.'));
+  }
+}
+
+/**
+ * `create-nextblock --non-interactive`: the agent-driven path.
+ *
+ * Contract: progress goes to stderr; success prints ONE JSON document on stdout; any
+ * failure prints ONE JSON document on stderr and exits 1. Secrets never appear in either.
+ *
+ * Docker mode (default) boots the whole stack, waits for `/api/setup/status`, creates the
+ * first administrator through `/api/setup/bootstrap`, and writes the MCP client configs
+ * so the agent's next session can mutate the site. Cloud mode stops after scaffolding and
+ * hands the Supabase connection to the browser wizard at /setup.
+ */
+async function handleHeadlessCommand(projectDirectory, options) {
+  const validation = validateHeadlessOptions({
+    ...options,
+    defaultProjectName: DEFAULT_PROJECT_NAME,
+    projectDirectory,
+  });
+
+  if (!validation.ok) {
+    emitJsonError(validation.error);
+    process.exit(1);
+  }
+
+  const { attended, email, licenseKey: providedLicenseKey, mode, name, projectName, trial } = validation.value;
+  const log = (message) => process.stderr.write(`${message}\n`);
+  const serviceUrl = (process.env.NEXTBLOCK_LICENSE_SERVICE_URL || DEFAULT_LICENSE_SERVICE_URL).trim();
+
+  // Attended mode (no --name/--email): the human creates the administrator and starts the
+  // free Cortex AI trial in the browser — a real Freemius trial with its reminder emails —
+  // and the agent polls /api/setup/status until "mcpReady". Nothing personal passes
+  // through the agent. Unattended mode (both given) does it all headlessly instead.
+  const handoffSteps = (appUrl, statusUrl) => [
+    `Tell the user to open ${appUrl}/setup in a browser and create their administrator account (their own name, email and password).`,
+    `On the welcome screen that follows, the user starts the free 30-day Cortex AI trial (no credit card). That unlocks the MCP server for you.`,
+    `Meanwhile poll GET ${statusUrl} until "mcpReady" is true, then restart your session so it loads .mcp.json / .cursor/mcp.json and call tools/list on the "nextblock" MCP server.`,
+  ];
+
+  try {
+    log(
+      chalk.bold.cyan(
+        `create-nextblock v${CLI_VERSION} — headless ${mode} install (${attended ? 'attended: the user finishes setup in the browser' : 'unattended'})`,
+      ),
+    );
+
+    if (mode === 'docker') {
+      const docker = checkDockerAvailable();
+      if (!docker.ok) {
+        throw new HeadlessError('DOCKER_UNAVAILABLE', docker.message, {
+          hint: 'Start Docker Desktop and retry, or pass --mode cloud to hand off to the browser setup wizard.',
+        });
+      }
+    }
+
+    const projectDir = resolve(process.cwd(), projectName);
+
+    try {
+      await ensureEmptyDirectory(projectDir);
+    } catch (error) {
+      throw new HeadlessError('DIRECTORY_NOT_EMPTY', error instanceof Error ? error.message : String(error), {
+        projectDir,
+      });
+    }
+
+    await scaffoldProject(projectDir, { skipInstall: options.skipInstall, log });
+
+    // License: an explicit key wins; otherwise ask the vendor for a trial. A refusal or an
+    // unreachable service is reported, not fatal — the site still scaffolds and boots, and
+    // the trial can be started from CMS Settings → Packages later.
+    let license;
+    if (providedLicenseKey) {
+      license = { key: providedLicenseKey, kind: null, status: 'provided' };
+    } else if (trial) {
+      log(chalk.blue('Requesting a Cortex AI trial key from the NextBlock license service...'));
+      const result = await requestTrialLicense({ cliVersion: CLI_VERSION, email, name, serviceUrl });
+      license = result.ok
+        ? { expiresAt: result.expiresAt, key: result.licenseKey, kind: result.kind, status: 'provisioned', trialDays: result.trialDays }
+        : { code: result.code, key: null, kind: null, message: result.message, status: 'unavailable' };
+      log(
+        result.ok
+          ? chalk.green('Trial key provisioned.')
+          : chalk.yellow(`Trial not provisioned (${result.code}): ${result.message}`),
+      );
+    } else {
+      license = { key: null, kind: null, status: 'skipped' };
+    }
+
+    const mcpToken = generateMcpBearerToken();
+    const envValues = {
+      MCP_BEARER_TOKEN: mcpToken,
+      ...(license.key
+        ? { NEXTBLOCK_LICENSE_KEY: license.key, NEXTBLOCK_LICENSE_KIND: license.kind ?? '' }
+        : {}),
+    };
+
+    const licenseSummary = {
+      status: attended ? 'browser' : license.status,
+      ...(attended
+        ? { message: 'The user starts the free Cortex AI trial on the welcome screen after creating their account.' }
+        : {}),
+      ...(license.kind ? { kind: license.kind } : {}),
+      ...(license.expiresAt ? { expiresAt: license.expiresAt } : {}),
+      ...(license.code ? { code: license.code, message: license.message } : {}),
+    };
+
+    if (mode === 'cloud') {
+      try {
+        await ensureSupabaseAssets(projectDir, { log, required: false });
+      } catch {
+        // Non-fatal: the wizard still works; db:migrate just needs these assets present.
+      }
+
+      await upsertEnvFile(resolve(projectDir, '.env.local'), envValues, {
+        header: '# Written by create-nextblock --non-interactive. Do not commit.',
+      });
+
+      const appUrl = 'http://localhost:3000';
+      const statusUrl = `${appUrl}/api/setup/status`;
+      const configFiles = await writeAgentMcpConfigs(projectDir, { token: mcpToken, url: `${appUrl}/api/mcp` });
+
+      emitJsonResult({
+        ok: true,
+        mode,
+        attended,
+        projectName,
+        projectDir,
+        appUrl,
+        statusUrl,
+        handoff: { setupUrl: `${appUrl}/setup`, welcomeUrl: `${appUrl}/cms/welcome` },
+        mcp: {
+          url: `${appUrl}/api/mcp`,
+          transport: 'http',
+          configFiles,
+          ready: false,
+          tokenLocation: '.env.local (MCP_BEARER_TOKEN)',
+        },
+        license: { ...licenseSummary, keyLocation: license.key ? '.env.local (NEXTBLOCK_LICENSE_KEY)' : null },
+        admin: { email: email ?? null, created: false },
+        nextSteps: [
+          `cd ${projectName} && npm run dev`,
+          `Tell the user to open ${appUrl}/setup in a browser to connect Supabase and create their administrator account${email ? ` (${email})` : ''}.`,
+          ...(attended
+            ? [handoffSteps(appUrl, statusUrl)[1]]
+            : [`The provisioned license key activates itself on the first GET ${statusUrl} after setup.`]),
+          `Poll GET ${statusUrl} until "mcpReady" is true, then restart your coding agent session so it loads .mcp.json / .cursor/mcp.json.`,
+        ],
+      });
+      return;
+    }
+
+    // Docker: the setup script persists the token and key into the .env compose reads, boots
+    // the stack, and may remap the app port — so the real URL is read back from .env.
+    await runDockerSetupHeadless(projectDir, { env: envValues, log });
+
+    const dockerEnv = await readEnvFile(resolve(projectDir, '.env'));
+    const appUrl = resolveAppUrlFromEnv(dockerEnv);
+    const statusUrl = `${appUrl}/api/setup/status`;
+
+    log(chalk.blue(`Waiting for ${statusUrl} to report the database ready...`));
+    const ready = await waitForReadiness(statusUrl, {
+      onTick: ({ attempt, lastError }) => {
+        if (attempt % 5 === 0) {
+          log(chalk.gray(`  still waiting (attempt ${attempt}${lastError ? `: ${lastError}` : ''})`));
+        }
+      },
+      timeoutMs: 5 * 60_000,
+      until: 'dbReady',
+    });
+
+    if (!ready.ok) {
+      throw new HeadlessError('STACK_NOT_READY', ready.message, {
+        hint: 'Check `docker compose logs -f nextblock-cms` in the project, then re-run `npm run docker:setup`.',
+        lastError: ready.lastError,
+        statusUrl,
+      });
+    }
+
+    const configFiles = await writeAgentMcpConfigs(projectDir, { token: mcpToken, url: `${appUrl}/api/mcp` });
+
+    if (attended) {
+      const readiness = summarizeReadiness(ready.report);
+
+      emitJsonResult({
+        ok: true,
+        mode,
+        attended: true,
+        projectName,
+        projectDir,
+        appUrl,
+        statusUrl,
+        handoff: { setupUrl: `${appUrl}/setup`, welcomeUrl: `${appUrl}/cms/welcome` },
+        mcp: {
+          url: `${appUrl}/api/mcp`,
+          transport: 'http',
+          configFiles,
+          ready: false,
+          tokenLocation: '.env (MCP_BEARER_TOKEN)',
+        },
+        license: { status: 'browser', message: 'The user starts the free Cortex AI trial on the welcome screen after creating their account.' },
+        admin: { email: null, created: false, createdBy: 'user in the browser setup wizard' },
+        readiness,
+        nextSteps: handoffSteps(appUrl, statusUrl),
+      });
+      return;
+    }
+
+    const adminPassword = generateAdminPassword();
+    log(chalk.blue(`Creating the first administrator (${email})...`));
+    const boot = await bootstrapInstance({
+      admin: { email, fullName: name, password: adminPassword },
+      appUrl,
+      token: mcpToken,
+    });
+
+    if (!boot.ok) {
+      throw new HeadlessError('BOOTSTRAP_FAILED', boot.message, {
+        hint: `Finish setup in a browser at ${appUrl}/setup, then restart your agent session.`,
+        status: boot.status,
+        statusUrl,
+      });
+    }
+
+    // The password is the operator's, not the agent's: it lives in the env file the agent
+    // guardrails deny, next to the other secrets, and is never printed.
+    await upsertEnvFile(resolve(projectDir, '.env'), {
+      NEXTBLOCK_ADMIN_EMAIL: email,
+      NEXTBLOCK_ADMIN_PASSWORD: adminPassword,
+    });
+
+    // Short, non-fatal wait for the license to land: the bootstrap already activated it
+    // when a key was provisioned; otherwise this simply reports what is still missing.
+    const final = await waitForReadiness(statusUrl, { intervalMs: 2_000, timeoutMs: 30_000, until: 'mcpReady' });
+    const readiness = summarizeReadiness(final.report ?? boot.body);
+    const bootLicense =
+      boot.body?.license?.env && typeof boot.body.license.env === 'object' ? boot.body.license.env : null;
+
+    emitJsonResult({
+      ok: true,
+      mode,
+      projectName,
+      projectDir,
+      appUrl,
+      statusUrl,
+      mcp: {
+        url: `${appUrl}/api/mcp`,
+        transport: 'http',
+        configFiles,
+        ready: readiness?.mcpReady === true,
+        tokenLocation: '.env (MCP_BEARER_TOKEN)',
+      },
+      license: {
+        ...licenseSummary,
+        keyLocation: license.key ? '.env (NEXTBLOCK_LICENSE_KEY)' : null,
+        activation: bootLicense ? { state: bootLicense.state ?? null, error: bootLicense.error ?? null } : null,
+      },
+      admin: {
+        email,
+        created: boot.body?.admin?.created === true,
+        passwordLocation: '.env (NEXTBLOCK_ADMIN_PASSWORD)',
+        signInUrl: `${appUrl}/sign-in`,
+      },
+      readiness,
+      nextSteps: [
+        ...(readiness?.mcpReady
+          ? ['Restart your coding agent session so it loads .mcp.json / .cursor/mcp.json, then call tools/list on the nextblock MCP server.']
+          : [`MCP is not ready yet — poll GET ${statusUrl} and follow its nextSteps.`]),
+        ...(readiness?.nextSteps ?? []),
+      ],
+    });
+  } catch (error) {
+    const payload =
+      error instanceof HeadlessError
+        ? error.toPayload()
+        : { error: 'SCAFFOLD_FAILED', message: error instanceof Error ? error.message : String(error) };
+    emitJsonError(payload);
     process.exit(1);
   }
 }
@@ -960,9 +1299,46 @@ async function runDockerSetup(projectDir, projectName) {
   // The script drives docker compose interactively; inherit stdio so its prompts work.
   await runCommand('node', ['scripts/docker-setup.mjs'], { cwd: projectPath });
 
+  // docker-setup may have remapped the app port; read the URL it actually chose.
+  const appUrl = resolveAppUrlFromEnv(await readEnvFile(resolve(projectPath, '.env')));
+
   clack.outro(
-    `🎉 Your NextBlock™ project ${projectName ? `"${projectName}" ` : ''}is running in Docker.\nApp: http://localhost:3000   (first sign-up becomes ADMIN)`,
+    `🎉 Your NextBlock™ project ${projectName ? `"${projectName}" ` : ''}is running in Docker.\nApp: ${appUrl}   (first sign-up becomes ADMIN)`,
   );
+}
+
+/**
+ * Headless Docker boot. The scaffold's MCP token and provisioned key travel to
+ * scripts/docker-setup.mjs through the environment, which persists them into the `.env`
+ * compose reads. The script's own output is routed to stderr so stdout stays reserved
+ * for the JSON result.
+ */
+async function runDockerSetupHeadless(projectDir, { env = {}, log }) {
+  const projectPath = resolve(projectDir);
+
+  await ensureSupabaseAssets(projectPath, { log, required: true });
+
+  const setupScript = resolve(projectPath, 'scripts', 'docker-setup.mjs');
+  if (!(await fs.pathExists(setupScript))) {
+    throw new HeadlessError(
+      'TEMPLATE_INCOMPLETE',
+      'scripts/docker-setup.mjs is missing from the template. Run `npm run sync:create-nextblock` and try again.',
+    );
+  }
+
+  log(chalk.blue('Booting the local Docker stack (first run pulls images and builds the app)...'));
+
+  try {
+    await runCommand('node', ['scripts/docker-setup.mjs'], {
+      cwd: projectPath,
+      env: { ...process.env, ...env },
+      stdio: ['ignore', process.stderr, process.stderr],
+    });
+  } catch (error) {
+    throw new HeadlessError('DOCKER_SETUP_FAILED', error instanceof Error ? error.message : String(error), {
+      hint: 'Re-run `npm run docker:setup` inside the project to see the full compose output.',
+    });
+  }
 }
 
 async function configureHostedSupabaseAuth(
@@ -1089,10 +1465,18 @@ async function ensureGitignore(projectDir) {
     'pnpm-debug.log*',
     '',
     '# Environment',
+    '.env',
     '.env.local',
     '.env.development.local',
     '.env.test.local',
     '.env.production.local',
+    '',
+    // Coding-agent MCP client configs carry the instance bearer token verbatim (the
+    // clients cannot read it from .env), so they must never be committed.
+    '# Coding agent MCP configs (contain the MCP bearer token)',
+    '.mcp.json',
+    '.cursor/mcp.json',
+    '.claude/settings.local.json',
     '',
     '# Backups',
     'backup/',
@@ -1253,7 +1637,7 @@ SUPABASE_AUTH_RATE_LIMIT_EMAIL_SENT=30
 }
 
 async function ensureSupabaseAssets(projectDir, options = {}) {
-  const { required = false } = options;
+  const { required = false, log = null } = options;
   const destSupabaseDir = resolve(projectDir, 'supabase');
   await fs.ensureDir(destSupabaseDir);
 
@@ -1268,7 +1652,13 @@ async function ensureSupabaseAssets(projectDir, options = {}) {
     if (required) {
       throw new Error(message);
     } else {
-      clack.note(message);
+      // The headless flow passes its stderr logger; clack draws to stdout, which is
+      // reserved for the JSON result there.
+      if (log) {
+        log(chalk.yellow(message));
+      } else {
+        clack.note(message);
+      }
       return { migrationsCopied: false, configCopied: false, projectId: null };
     }
   }
@@ -1793,10 +2183,14 @@ async function normalizeTsconfig(projectDir) {
   await fs.writeJSON(tsconfigPath, tsconfig, { spaces: 2 });
 }
 
-async function sanitizeNextConfig(projectDir, editorUtilNames = []) {
+/**
+ * The template ships the app's own next.config.js; derive the standalone variant from it
+ * (bin/lib/next-config.js) instead of rewriting the file from a string template that drifts.
+ */
+async function sanitizeNextConfig(projectDir) {
   const nextConfigPath = resolve(projectDir, 'next.config.js');
-  const content = buildNextConfigContent(editorUtilNames);
-  await fs.writeFile(nextConfigPath, content);
+  const source = await fs.readFile(nextConfigPath, 'utf8');
+  await fs.writeFile(nextConfigPath, patchNextConfigForStandalone(source));
 }
 
 async function ensurePublicNpmrc(projectDir) {
@@ -1922,25 +2316,35 @@ async function transformPackageJson(projectDir) {
   await fs.writeJSON(packageJsonPath, packageJson, { spaces: 2 });
 }
 
-async function installDependencies(projectDir) {
+async function installDependencies(projectDir, { log = console.log } = {}) {
   const npmCommand = IS_WINDOWS ? 'npm.cmd' : 'npm';
-  console.log(chalk.blue('Installing dependencies with npm...'));
-  await runCommand(npmCommand, ['install'], { cwd: projectDir });
-  console.log(chalk.green('Dependencies installed.'));
+  log(chalk.blue('Installing dependencies with npm...'));
+  // In the headless flow `log` writes to stderr; keep npm's own output there too so
+  // stdout stays reserved for the JSON result.
+  await runCommand(npmCommand, ['install'], {
+    cwd: projectDir,
+    ...(log === console.log ? {} : { stdio: ['ignore', process.stderr, process.stderr] }),
+  });
+  log(chalk.green('Dependencies installed.'));
 }
 
-async function initializeGit(projectDir) {
+async function initializeGit(projectDir, { log = console.log } = {}) {
   const gitDirectory = resolve(projectDir, '.git');
   if (await fs.pathExists(gitDirectory)) {
     return;
   }
 
   try {
-    console.log(chalk.blue('Initializing Git repository...'));
-    await runCommand('git', ['init'], { cwd: projectDir });
-    console.log(chalk.green('Git repository initialized.'));
+    log(chalk.blue('Initializing Git repository...'));
+    // In the headless flow `log` writes to stderr; keep git's own output there too so
+    // stdout stays reserved for the JSON result.
+    await runCommand('git', ['init'], {
+      cwd: projectDir,
+      ...(log === console.log ? {} : { stdio: ['ignore', process.stderr, process.stderr] }),
+    });
+    log(chalk.green('Git repository initialized.'));
   } catch (error) {
-    console.warn(
+    log(
       chalk.yellow(
         `Skipping Git initialization: ${error instanceof Error ? error.message : String(error)}`,
       ),
@@ -1980,192 +2384,3 @@ async function getSupabaseBinary(projectDir) {
   return 'npx';
 }
 
-function buildNextConfigContent(editorUtilNames) {
-  const aliasLines = [];
-
-  for (const moduleName of UI_PROXY_MODULES) {
-    aliasLines.push(
-      "      '@nextblock-cms/ui/" +
-        moduleName +
-        "': path.join(process.cwd(), 'lib/ui/" +
-        moduleName +
-        "'),",
-    );
-  }
-
-  for (const moduleName of editorUtilNames) {
-    aliasLines.push(
-      "      '@nextblock-cms/editor/utils/" +
-        moduleName +
-        "': path.join(process.cwd(), 'lib/editor/utils/" +
-        moduleName +
-        "'),",
-    );
-  }
-
-  const lines = [
-    '//@ts-check',
-    '',
-    "const path = require('path');",
-    "const webpack = require('webpack');",
-    '',
-    '/**',
-    " * @type {import('next').NextConfig}",
-    ' **/',
-    // Self-hosted Docker builds emit a standalone server (`node server.js`); gated on
-    // DOCKER_BUILD so a normal `next build` / Vercel deploy is unaffected.
-    "const isDockerStandalone = process.env.DOCKER_BUILD === 'true';",
-    'const nextConfig = {',
-    "  ...(isDockerStandalone ? { output: 'standalone' } : {}),",
-    '  outputFileTracingRoot: path.join(__dirname),',
-    '  env: {',
-    '    NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,',
-    '    NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,',
-    '  },',
-    '  images: {',
-    "    formats: ['image/avif', 'image/webp'],",
-    '    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384, 512],',
-    '    deviceSizes: [320, 480, 640, 750, 828, 1080, 1200, 1440, 1920, 2048, 2560],',
-    // Next 16 requires every next/image `quality` value to be whitelisted here; the app uses
-    // both 60 and 75, so without this the quality="60" images warn on every render.
-    '    qualities: [60, 75],',
-    '    minimumCacheTTL: 31536000,',
-    '    dangerouslyAllowSVG: false,',
-    "    contentSecurityPolicy: \"default-src 'self'; script-src 'none'; sandbox;\",",
-    '    remotePatterns: getRemotePatterns(),',
-    '  },',
-    '  experimental: {',
-    // NOTE: optimizeCss is intentionally omitted — Next implements it via require("critters"),
-    // which the generated project does not install (it ships beasties). Leaving it on caused
-    // "Cannot find module 'critters'" at dev/build time.
-    "    cssChunking: 'strict',",
-    '  },',
-    // Transpile ALL @nextblock-cms packages so Next applies React Server Component layer
-    // semantics to them (the react-server condition for 'server-only', 'use client'/'use
-    // server' directives). Without db/sdk/ecommerce here, db/server's `import 'server-only'`
-    // throws even from a Server Component, because Next treats the prebuilt package as an
-    // external and skips the server-layer processing the monorepo gets for free from source.
-    "  transpilePackages: ['@nextblock-cms/utils', '@nextblock-cms/ui', '@nextblock-cms/editor', '@nextblock-cms/db', '@nextblock-cms/sdk', '@nextblock-cms/ecommerce', '@nextblock-cms/cortex'],",
-    '  webpack: (config, { isServer }) => {',
-    '    config.resolve = config.resolve || {};',
-    '    config.resolve.alias = {',
-    '      ...(config.resolve.alias ?? {}),',
-  ];
-
-  if (aliasLines.length > 0) {
-    lines.push(...aliasLines);
-  }
-
-  lines.push('    };', '');
-
-  if (editorUtilNames.length > 0) {
-    lines.push(
-      '    const editorUtilsShims = ' + JSON.stringify(editorUtilNames) + ';',
-      '    config.plugins = config.plugins || [];',
-      '    for (const utilName of editorUtilsShims) {',
-      "      const shimPath = path.join(process.cwd(), 'lib/editor/utils', utilName);",
-      '      config.plugins.push(',
-      "        new webpack.NormalModuleReplacementPlugin(new RegExp('^@nextblock-cms/editor/utils/' + utilName + '$'), shimPath),",
-      '      );',
-      '      config.plugins.push(',
-      "        new webpack.NormalModuleReplacementPlugin(new RegExp('^./utils/' + utilName + '$'), shimPath),",
-      '      );',
-      '    }',
-      '',
-    );
-  }
-
-  lines.push(
-    '    if (!isServer) {',
-    '      config.module = config.module || {};',
-    '      config.module.rules = config.module.rules || [];',
-    '      config.module.rules.push({',
-    '        test: /\\.svg$/i,',
-    '        issuer: /\\.[jt]sx?$/,',
-    "        use: ['@svgr/webpack'],",
-    '      });',
-    '',
-    '      config.optimization = {',
-    '        ...(config.optimization ?? {}),',
-    '        splitChunks: {',
-    '          ...((config.optimization ?? {}).splitChunks ?? {}),',
-    '          cacheGroups: {',
-    '            ...(((config.optimization ?? {}).splitChunks ?? {}).cacheGroups ?? {}),',
-    '            tiptap: {',
-    '              test: /[\\\\/]node_modules[\\\\/](@tiptap|prosemirror)[\\\\/]/,',
-    "              name: 'tiptap',",
-    "              chunks: 'async',",
-    '              priority: 30,',
-    '              reuseExistingChunk: true,',
-    '            },',
-    '            tiptapExtensions: {',
-    '              test: /[\\\\/](tiptap-extensions|RichTextEditor|MenuBar|MediaLibraryModal)[\\\\/]/,',
-    "              name: 'tiptap-extensions',",
-    "              chunks: 'async',",
-    '              priority: 25,',
-    '              reuseExistingChunk: true,',
-    '            },',
-    '          },',
-    '        },',
-    '      };',
-    '    }',
-    '',
-    '    return config;',
-    '  },',
-    '  turbopack: {',
-    '    // Turbopack-specific options can be configured here if needed.',
-    '  },',
-    '  compiler: {',
-    "    removeConsole: process.env.NODE_ENV === 'production',",
-    '  },',
-    '  // The published @nextblock-cms/* libs are pre-built and fully type-checked in the upstream',
-    '  // monorepo, but their consumer-side type declarations can be incomplete — so making',
-    '  // `next build` re-type-check them would fail on imports the app uses correctly at runtime.',
-    '  // Skip build-time type-checking of the pre-built deps; your own code is still checked in',
-    '  // your editor (and you can run `tsc` directly if you want a gate). NOTE: Next 16 removed the',
-    "  // `eslint` next.config key (built-in lint-on-build is gone), so it's intentionally absent.",
-    '  typescript: { ignoreBuildErrors: true },',
-    '};',
-    '',
-    'module.exports = nextConfig;',
-    '',
-    'function getRemotePatterns() {',
-    '  /** @type {Array<{ protocol: "http" | "https", hostname: string, pathname: string }>} */',
-    '  const patterns = [];',
-    '  // Storage providers allowlisted by wildcard so next/image works on a fresh install',
-    '  // WITHOUT a dev-server restart: next.config.js is read once at startup, before the',
-    '  // /setup wizard writes the R2 env, so the exact env-derived hosts below would be',
-    '  // missing until a restart. Custom domains are still picked up from env below.',
-    '  patterns.push(',
-    "    { protocol: 'https', hostname: '**.r2.dev', pathname: '/**' },",
-    "    { protocol: 'https', hostname: '**.r2.cloudflarestorage.com', pathname: '/**' },",
-    "    { protocol: 'https', hostname: '**.supabase.co', pathname: '/**' },",
-    '  );',
-    '  // Whitelist this project R2 public/base URLs and the site URL for next/image.',
-    '  const sources = [',
-    '    process.env.NEXT_PUBLIC_R2_PUBLIC_URL,',
-    '    process.env.NEXT_PUBLIC_R2_BASE_URL,',
-    '    process.env.NEXT_PUBLIC_URL,',
-    '  ];',
-    '  for (const value of sources) {',
-    '    if (!value) continue;',
-    '    try {',
-    '      const parsed = new URL(value);',
-    "      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;",
-    '      const hostname = parsed.hostname;',
-    '      if (patterns.some((pattern) => pattern.hostname === hostname)) continue;',
-    '      patterns.push({',
-    "        protocol: parsed.protocol === 'https:' ? 'https' : 'http',",
-    '        hostname,',
-    "        pathname: '/**',",
-    '      });',
-    '    } catch {',
-    '      // ignore malformed value',
-    '    }',
-    '  }',
-    '  return patterns;',
-    '}',
-  );
-
-  return lines.join('\n');
-}

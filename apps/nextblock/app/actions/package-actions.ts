@@ -1,15 +1,22 @@
 'use server';
 
 import { createClient } from '@supabase/supabase-js';
-import { NEXTBLOCK_PACKAGES, getPackageById, type PackageDef } from '@nextblock-cms/utils';
-import { PACKAGE_ACTIVATION_CACHE_TAG, createClient as createCookieClient } from '@nextblock-cms/db/server';
+import { getPackageById } from '@nextblock-cms/utils';
+import { createClient as createCookieClient } from '@nextblock-cms/db/server';
 import { headers } from 'next/headers';
-import { revalidatePath, updateTag } from 'next/cache';
 import {
   resolveSupabaseAnonKey,
   resolveSupabaseServiceKey,
   resolveSupabaseUrl,
 } from '../../lib/setup/env-status';
+import {
+  activateLicenseKeyWithFreemius,
+  buildPackageActivationInstance,
+  revalidatePackageSurfaces,
+  type PackageActivationProvenance,
+} from '../../lib/packages/activate-license';
+
+export type { PackageActivationProvenance } from '../../lib/packages/activate-license';
 
 // Freemius handles both Sandbox and Production keys on the same API domain.
 // The key itself determines the environment.
@@ -75,43 +82,21 @@ const getServiceRoleClient = () => {
 };
 
 /**
- * Every surface that shows package state reads through `verifyPackageOnline`, which is
- * cached for 60 s. Purge that cache and the CMS routes so the dashboard, the CMS
- * layout (which mounts the Cortex chat) and the packages page reflect the change on
- * the very next request.
+ * The install identity Freemius sees, derived from the request host (a server action
+ * always runs inside a request). Headless callers derive the same shape from
+ * NEXT_PUBLIC_URL instead — see lib/packages/env-license.ts.
  */
-function revalidatePackageSurfaces() {
-  updateTag(PACKAGE_ACTIVATION_CACHE_TAG);
-  revalidatePath('/cms', 'layout');
-  revalidatePath('/cms/settings/packages');
-  revalidatePath('/cms/dashboard');
-}
-
 async function resolveInstanceIdentity() {
   const headerList = await headers();
   // instance_name is usually the domain, for local dev use 'localhost' or actual host
   const instanceName = headerList.get('host') || 'nextblock-instance';
   const forwardedProto = headerList.get('x-forwarded-proto')?.split(',')[0]?.trim();
-  const isLocal = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(instanceName);
-  const protocol = forwardedProto === 'http' || forwardedProto === 'https' ? forwardedProto : isLocal ? 'http' : 'https';
 
-  // Freemius requires a 32-char unique identifier for the install.
-  // We hash the instance (domain) to ensure reactivations on the same domain use the same UID.
-  const crypto = require('crypto');
-  const uid = crypto.createHash('md5').update(instanceName).digest('hex');
-
-  return { instanceName, siteUrl: `${protocol}://${instanceName}`, uid };
+  return buildPackageActivationInstance({
+    host: instanceName,
+    protocol: forwardedProto === 'http' || forwardedProto === 'https' ? forwardedProto : undefined,
+  });
 }
-
-/** What the activation records about where the key came from, for the packages page. */
-export type PackageActivationProvenance = {
-  activated_at: string;
-  expiration?: string | null;
-  is_trial?: boolean;
-  plan_id?: string | null;
-  source: 'checkout' | 'manual';
-  trial_ends_at?: string | null;
-};
 
 type ActivatePackageOptions = {
   /** Try this package's Freemius product first (the key is known to belong to it). */
@@ -144,118 +129,21 @@ async function activateLicenseKey(key: string, options?: ActivatePackageOptions)
     return { error: 'License activation is disabled in Sandbox mode. To purchase a real license, visit nextblock.dev' };
   }
 
-  const licenseKey = (key ?? '').trim();
+  // The Freemius call, the activation row and the cache purge live in
+  // lib/packages/activate-license.ts, shared with the headless (env-seeded) path.
+  const result = await activateLicenseKeyWithFreemius({
+    instance: await resolveInstanceIdentity(),
+    licenseKey: key,
+    packageId: options?.packageId,
+    provenance: options?.provenance,
+    supabase: getServiceRoleClient(),
+  });
 
-  if (!licenseKey) {
-    return { error: 'License key is required.' };
+  if ('success' in result) {
+    return { success: true, package: result.package, packageId: result.packageId };
   }
 
-  const { instanceName, siteUrl, uid } = await resolveInstanceIdentity();
-
-  try {
-    let data: Record<string, any> | null = null;
-    let pkg: PackageDef | null = null;
-    let hasLicenseError = false;
-    let specificErrorMsg: string | null = null;
-
-    // We don't know the exact package just from the license key, so we try activating
-    // against our known Freemius Product IDs from the NEXTBLOCK_PACKAGES registry —
-    // the hinted package first.
-    const hinted = options?.packageId ? getPackageById(options.packageId) : undefined;
-    const packages = [
-      ...(hinted ? [hinted] : []),
-      ...Object.values(NEXTBLOCK_PACKAGES).filter((p) => p.id !== hinted?.id),
-    ];
-
-    for (const p of packages) {
-      if (!p.fm_product_id) continue;
-
-      const response = await fetch(`${FM_API_URL}/products/${p.fm_product_id}/licenses/activate.json?uid=${uid}&license_key=${encodeURIComponent(licenseKey)}&url=${encodeURIComponent(siteUrl)}`, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-        }
-      });
-
-      const responseData = await response.json();
-
-      // Freemius returns the license object directly if successful, or an error/api_response
-      if (response.ok && responseData.install_id) {
-          data = responseData;
-          pkg = p;
-          break;
-      }
-
-      const errorCode = responseData?.error?.code;
-      if (errorCode === 'not_found' || errorCode === 'invalid_license_key') {
-          hasLicenseError = true;
-      } else if (responseData?.error?.message) {
-          specificErrorMsg = responseData.error.message;
-      }
-    }
-
-    if (!data || !pkg) {
-        if (hasLicenseError && !specificErrorMsg) {
-            return { error: 'Sorry, this is a sandbox key. Please purchase the real key at nextblock.dev' };
-        }
-        return { error: specificErrorMsg || 'Activation failed. Invalid key, wrong product, or limit reached.' };
-    }
-
-    // 3. Store in DB - USE SERVICE ROLE
-    const supabase = getServiceRoleClient();
-
-    const provenance: PackageActivationProvenance = {
-      activated_at: new Date().toISOString(),
-      source: 'manual',
-      ...(options?.provenance ?? {}),
-      ...(options?.provenance?.plan_id === undefined && data.license_plan_id !== undefined
-        ? { plan_id: String(data.license_plan_id) }
-        : {}),
-    };
-
-    const { error: dbError } = await supabase
-        .from('package_activations')
-        .upsert({
-            license_key: licenseKey,
-            instance_name: instanceName,
-            package_id: pkg.id,
-            status: 'active',
-            meta: {
-              ...data,
-              fm_product_id: pkg.fm_product_id,
-              fm_install_id: data.install_id,
-              fm_uid: uid,
-              nextblock: provenance,
-            },
-            last_validated_at: new Date().toISOString(),
-        }, { onConflict: 'license_key, package_id' });
-
-    if (dbError) {
-        console.error('DB Error activating package:', dbError);
-        return { error: 'Activation successful, but local saving failed: ' + dbError.message };
-    }
-
-    // One row per package: a re-purchase or a trial-to-paid conversion replaces the
-    // previous key. Done AFTER the new row is saved so a failed save never leaves the
-    // package with no row at all.
-    const { error: cleanupError } = await supabase
-        .from('package_activations')
-        .delete()
-        .eq('package_id', pkg.id)
-        .neq('license_key', licenseKey);
-
-    if (cleanupError) {
-        console.warn('Could not remove the previous activation row:', cleanupError.message);
-    }
-
-    revalidatePackageSurfaces();
-    return { success: true, package: pkg.name, packageId: pkg.id };
-
-  } catch (err: any) {
-    console.error('Activation Action Error:', err);
-    return { error: err.message || 'An unexpected error occurred.' };
-  }
+  return { error: result.error };
 }
 
 /* -------------------------------------------------------------------------- */

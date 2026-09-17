@@ -88,6 +88,15 @@ async function main() {
     console.log(chalk.blue('✓ Found existing .env — reusing previously generated secrets where present.'));
   }
 
+  // Older installs wrote NEXT_PUBLIC_IS_SANDBOX=true, a leftover from the first Docker builds.
+  // A self-hosted install is not the shared demo sandbox — that flag disables license activation
+  // (the Cortex AI trial), MCP token minting, saving AI keys and the post-setup welcome flow —
+  // so a stale line is dropped rather than carried forward. Unset means "not a sandbox".
+  existing = existing
+    .split(/\r?\n/)
+    .filter((line) => !line.startsWith('NEXT_PUBLIC_IS_SANDBOX='))
+    .join('\n');
+
   // Integrations (Cloudflare Turnstile, SMTP) and the first admin are configured later in the
   // browser /setup wizard, not here. Default to Turnstile test keys (always pass) and no SMTP so
   // the stack boots cleanly and the first admin can be created without an email round-trip
@@ -130,6 +139,14 @@ async function main() {
   const minioPassword = reuse('MINIO_ROOT_PASSWORD', generateSecret);
   const bucket = readEnvValue(existing, 'STORAGE_BUCKET') || 'nextblock';
 
+  // Headless install parity with the standalone template's docker-setup: an MCP bearer token
+  // and a package key handed over through the process environment land in the same .env
+  // compose reads. A value already in .env wins so re-runs never rotate a token.
+  const fromEnv = (key) => (process.env[key] || '').trim();
+  const mcpBearerToken = readEnvValue(existing, 'MCP_BEARER_TOKEN') || fromEnv('MCP_BEARER_TOKEN');
+  const licenseKey = readEnvValue(existing, 'NEXTBLOCK_LICENSE_KEY') || fromEnv('NEXTBLOCK_LICENSE_KEY');
+  const licenseKind = readEnvValue(existing, 'NEXTBLOCK_LICENSE_KIND') || fromEnv('NEXTBLOCK_LICENSE_KIND');
+
   const replacements = {
     POSTGRES_PASSWORD: `POSTGRES_PASSWORD=${postgresPassword}`,
     POSTGRES_DB: 'POSTGRES_DB=postgres',
@@ -143,7 +160,6 @@ async function main() {
     API_EXTERNAL_URL: 'API_EXTERNAL_URL=http://localhost:8000',
     SITE_URL: 'SITE_URL=http://localhost:3000',
     NEXT_PUBLIC_URL: 'NEXT_PUBLIC_URL=http://localhost:3000',
-    NEXT_PUBLIC_IS_SANDBOX: 'NEXT_PUBLIC_IS_SANDBOX=true',
     NEXTBLOCK_BUILD_MIGRATE: 'NEXTBLOCK_BUILD_MIGRATE=1',
     CRON_SECRET: `CRON_SECRET=${cronSecret}`,
     DRAFT_MODE_SECRET: `DRAFT_MODE_SECRET=${draftSecret}`,
@@ -171,6 +187,9 @@ async function main() {
     SMTP_PASS: `SMTP_PASS=${smtp.pass}`,
     SMTP_FROM_EMAIL: `SMTP_FROM_EMAIL=${smtp.fromEmail}`,
     SMTP_FROM_NAME: `SMTP_FROM_NAME=${smtp.fromName}`,
+    MCP_BEARER_TOKEN: `MCP_BEARER_TOKEN=${mcpBearerToken}`,
+    NEXTBLOCK_LICENSE_KEY: `NEXTBLOCK_LICENSE_KEY=${licenseKey}`,
+    NEXTBLOCK_LICENSE_KIND: `NEXTBLOCK_LICENSE_KIND=${licenseKind}`,
   };
 
   const seed =

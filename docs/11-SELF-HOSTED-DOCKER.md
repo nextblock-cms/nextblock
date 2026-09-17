@@ -60,6 +60,34 @@ When it finishes:
 With no SMTP configured, accounts are **auto-confirmed** and the first sign-up lands
 straight in `/cms/dashboard` — no confirmation email step.
 
+## Headless (agent-driven) install
+
+Docker is the default profile of `npm create nextblock -- --non-interactive --name … --email …`
+(docs/06 → "Headless mode"). The CLI runs the same `docker-setup.mjs`, with three
+differences:
+
+- It hands `MCP_BEARER_TOKEN`, `NEXTBLOCK_LICENSE_KEY` and `NEXTBLOCK_LICENSE_KIND` to the
+  script through the process environment; the script persists them into `.env` (a value
+  already in `.env` wins, so re-runs never rotate a token the agent configs were written
+  with) and `docker-compose.yml` passes them to the `nextblock-cms` container.
+- It polls `GET /api/setup/status` on the app URL read back from `.env` (the port may have
+  been remapped) until the migrate container has finished, then creates the first
+  administrator through `POST /api/setup/bootstrap` instead of the browser wizard. The
+  generated password is stored as `NEXTBLOCK_ADMIN_PASSWORD` in `.env` — the file the agent
+  guardrails deny — and never printed.
+- It writes `.mcp.json` / `.cursor/mcp.json` pointing at `http://localhost:<APP_PORT>/api/mcp`
+  with the bearer token, so the agent's next session can operate the site over MCP.
+
+By default (attended) the user then opens `/setup`, creates their account, and starts the
+free Cortex AI trial on the welcome screen — the same Freemius overlay flow as any install.
+That is why the Docker profile now runs as a **normal self-hosted install**: `docker:setup`
+no longer writes `NEXT_PUBLIC_IS_SANDBOX` (unset means "not a sandbox") and drops a stale
+`NEXT_PUBLIC_IS_SANDBOX=true` from an older `.env` on re-run. That flag, a leftover from the
+first Docker experiments, made `/cms/welcome` redirect away and disabled license activation,
+MCP token minting, and saving AI keys. Only the hosted demo at nextblock.dev sets it. In unattended
+mode the Cortex AI license is activated inside the container from `NEXTBLOCK_LICENSE_KEY`
+(docs/08 → "Headless bootstrap").
+
 ## The two optional prompts
 
 | Prompt | If you skip it |
@@ -81,7 +109,7 @@ the app. Every image tag is pinned and overridable via an env var (e.g. `SUPABAS
 | `auth` | `supabase/gotrue` | Auth: sessions, JWTs, the `auth.users` table. |
 | `rest` | `postgrest/postgrest` | Instant REST API over the `public` / `graphql_public` schemas. |
 | `kong` | `kong` | Edge gateway — maps `/auth/v1`, `/rest/v1`, `/graphql/v1` to port **8000**. |
-| `minio` + `minio-init` | `minio/minio`, `minio/mc` | S3-compatible media storage + a public `nextblock` bucket. Named volume `nextblock_media`. |
+| `minio` + `minio-init` | `quay.io/minio/minio`, `quay.io/minio/mc` (Docker Hub stopped serving `minio/*` in 2025) | S3-compatible media storage + a public `nextblock` bucket. Named volume `nextblock_media`. |
 | `migrate` | `postgres:alpine` | Applies `libs/db/src/supabase/migrations` in order, **once**, then exits. |
 | `nextblock-cms` | built locally | The Next.js standalone app on **3000**. Boots **only after `migrate` succeeds**. |
 

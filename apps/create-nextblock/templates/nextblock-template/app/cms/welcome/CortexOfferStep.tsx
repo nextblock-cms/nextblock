@@ -44,7 +44,14 @@ const DASHBOARD_HREF = '/cms/dashboard';
  * active") is the confirmation. The "activated" stage below only shows for as long
  * as the reload takes, with a manual "Continue" in case it is slow.
  */
-export function CortexOfferStep({ pkg }: { pkg: PackageDef }) {
+export function CortexOfferStep({
+  agentInitiated = false,
+  pkg,
+}: {
+  /** A coding agent installed this site and is waiting for Cortex AI to unlock its MCP access. */
+  agentInitiated?: boolean;
+  pkg: PackageDef;
+}) {
   const { activateManualKey, busy, manualKey, monthlyPrice, offer, openCheckout, resendEmail, setManualKey, setStage, stage, trialEndsAt } =
     usePackageCheckout({
       onActivated: () => window.location.assign(CMS_WELCOME_PATH),
@@ -64,8 +71,9 @@ export function CortexOfferStep({ pkg }: { pkg: PackageDef }) {
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold leading-tight">Welcome to NextBlock</h1>
             <p className="text-sm text-muted-foreground">
-              Your site is live with sample content. One choice before your dashboard: let Cortex AI
-              replace that sample content with your own site, or do it by hand.
+              {agentInitiated
+                ? 'Your coding agent set this site up and is waiting for one thing only: Cortex AI, which powers the MCP server it will use to build your pages. Start the free trial below and you can go straight back to your terminal.'
+                : 'Your site is live with sample content. One choice before your dashboard: let Cortex AI replace that sample content with your own site, or do it by hand.'}
             </p>
           </div>
         </div>
@@ -213,6 +221,9 @@ export function CortexOfferStep({ pkg }: { pkg: PackageDef }) {
                 {stage.result.isTrial
                   ? `Your free trial has started${trialEndsAt ? ` and runs until ${formatPackageDate(trialEndsAt)}` : ''}. Your license key was also emailed to you.`
                   : 'Your license is activated on this site. The key was also emailed to you for safekeeping.'}
+                {agentInitiated
+                  ? ' Your coding agent picks this up on its next status check — you can return to your terminal.'
+                  : ''}
               </p>
             </div>
           </div>
