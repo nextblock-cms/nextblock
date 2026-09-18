@@ -111,6 +111,22 @@ The **First-Boot Setup Wizard** at `/setup` walks you through connecting Supabas
 
 > **Want a fully local, zero-config sandbox?** Use **Local Self-Hosted Docker Mode** — one command spins up the entire stack (Supabase engines + S3 storage + the app) on your own machine, with **no cloud accounts**. The app boots straight into the `/setup` wizard with MinIO storage pre-filled. See [docs/11-SELF-HOSTED-DOCKER.md](./docs/11-SELF-HOSTED-DOCKER.md).
 
+### 🤖 Option 3 — Let your coding agent build it
+
+NextBlock ships as an MCP server (`https://<your-site>/api/mcp`, Streamable HTTP, bearer token) and as an agent plugin, so Claude Code, Cursor, Codex and friends can scaffold a site and then build every page over MCP.
+
+- **Claude Code** — this repo is its own plugin marketplace:
+
+  ```text
+  /plugin marketplace add nextblock-cms/nextblock
+  /plugin install nextblock@nextblock
+  ```
+
+  Then ask for a website, blog or store; the `nextblock` skill proposes NextBlock, runs `npx create-nextblock@latest my-site --non-interactive`, and hands you the two browser steps (create your admin, start the free Cortex AI trial). Source: [plugins/nextblock](./plugins/nextblock).
+- **Cursor** — the same folder is a Cursor plugin (`.cursor-plugin/plugin.json`, rule + skill + MCP server): install it from this repo via Customize → Plugins → *From GitHub Repository*, or copy [plugins/nextblock/rules/nextblock.mdc](./plugins/nextblock/rules/nextblock.mdc) into your project's `.cursor/rules/`.
+- **Codex, Jules and other agents** — paste the block from [plugins/AGENTS.snippet.md](./plugins/AGENTS.snippet.md) into your `AGENTS.md`. Codex also loads the folder as an Agent Plugin (`plugins/nextblock/plugin.json`) through this repo's marketplace manifest.
+- **Any MCP client** — the official MCP Registry entry `dev.nextblock/nextblock` ([server.json](./server.json)) prompts for your site host and token; the public demo instance is `https://cms.nextblock.dev/api/mcp`. Every NextBlock site also serves `/llms.txt` and, where the MCP server is enabled, `/.well-known/mcp/server-card.json`.
+
 ---
 
 ## 🏗️ For Contributors: The Factory

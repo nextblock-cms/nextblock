@@ -106,11 +106,9 @@ export async function GET(): Promise<Response> {
     sections.push(
       section(
         'Pages',
-        pages.map((page) => line(page, base, page.slug === 'home' ? '' : '/')).map((entry) =>
-          entry?.replace(`${base}/home)`, `${base}/)`) ?? null
-        )
+        pages.map((page) => line(page, base, '/')).map((entry) => entry?.replace(`${base}/home)`, `${base}/)`) ?? null)
       ),
-      section('Posts', posts.map((post) => line(post, base, '/blog/')))
+      section('Posts', posts.map((post) => line(post, base, '/article/')))
     );
   } catch {
     sections.push('## Status\n\n- This NextBlock site is not set up yet.');

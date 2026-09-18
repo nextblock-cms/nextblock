@@ -1548,37 +1548,113 @@ and the first-run wizard):
   needs either the Connectors UI (which dials out from Anthropic's cloud, so localhost
   and firewalled sites will not connect) or the `mcp-remote` stdio bridge.
 
-### Directory listings (official MCP Registry, Glama, Smithery)
+### Directory listings (official MCP Registry, Glama, Smithery, Docker, one-URL directories)
 
-NextBlock's MCP server is per site (`https://<their-site>/api/mcp`), which only the
-official registry models natively:
+NextBlock's MCP server is per site (`https://<their-site>/api/mcp`), which only the official
+registry models natively; every other directory takes one fixed URL, so they list the vendor
+instance `https://cms.nextblock.dev/api/mcp`. Repo-side assets: `server.json`, `glama.json`
+and `lhm.plugin.json` at the root, `.claude-plugin/marketplace.json` +
+`.cursor-plugin/marketplace.json` (the repo is its own plugin marketplace), `plugins/nextblock/`
+(the plugin, see below) and `tools/directories/` (Smithery config schema, Docker catalog entry).
+Two prerequisites gate everything that lists the vendor instance: **MCP must be switched on at
+cms.nextblock.dev** (Settings → Cortex AI → MCP server access, or `MCP_BEARER_TOKEN` in its env)
+so `/.well-known/mcp/server-card.json` answers 200, and a dedicated MCP access token must exist
+there to hand to crawlers that health-check behind the bearer wall (Glama, Docker reviewers).
 
-- **Official MCP Registry** — `server.json` at the repo root is the manifest (validated with
-  `mcp-publisher validate` against the live registry): a `remotes[]` entry with the
-  templated URL `https://{site_host}/api/mcp` and an `Authorization: Bearer {mcp_token}`
-  header, both declared as variables the client prompts for. The `dev.nextblock/*`
-  namespace is proven with a DNS TXT record at the apex of nextblock.dev
-  (`v=MCPv1; k=ed25519; p=<public key>`); the private key (hex) is the
-  `MCP_PRIVATE_KEY` GitHub secret used by `.github/workflows/publish-mcp-registry.yml`
-  (manual dispatch with a version, because registry versions are immutable). PulseMCP,
-  Glama and the GitHub/VS Code registry all read from this registry.
-- **Glama** — lists the open-source repo (submit from glama.ai/mcp/servers with a GitHub
-  account that has write access; claim the listing with a root `glama.json` naming the
-  maintainers) and, separately, remote "Connectors" with a fixed URL. Glama mirrors only
-  fixed-URL registry entries, so the connector is the vendor's own public instance; its
-  ownership claim is served by `app/.well-known/glama.json/route.ts` from the
-  `GLAMA_CLAIM_TOKEN` env var (404 everywhere else).
-- **Smithery** — publish-by-URL only, one fixed upstream, and its scanner cannot run
-  `tools/list` behind a bearer wall (it expects OAuth discovery, which `/api/mcp` avoids on
-  purpose). `app/.well-known/mcp/server-card.json/route.ts` serves the static card the
-  scanner reads instead: server info, endpoint, how to authenticate, and the tool /
-  resource / prompt inventory straight from the registry (`buildCortexMcpToolDefinitions`),
-  only on sites where the MCP server is enabled (env token or the database flag).
+- **Official MCP Registry** — `server.json` at the repo root is the manifest (validated against
+  the live registry with `mcp-publisher validate server.json`; no `packages` entry, it is a
+  remote-only server): a `remotes[]` entry with the templated URL `https://{site_host}/api/mcp`
+  and an `Authorization: Bearer {mcp_token}` header, both declared as variables the client
+  prompts for. The `dev.nextblock/*` namespace is proven with a DNS TXT record at the apex of
+  nextblock.dev: generate an Ed25519 key (`openssl genpkey -algorithm Ed25519`), publish the
+  raw public key as `v=MCPv1; k=ed25519; p=<44-char base64>` (Host `@`, alongside the SPF
+  record, exactly one MCPv1 record; delete the old one first when rotating), and store the
+  64-hex private seed as the `MCP_PRIVATE_KEY` GitHub secret used by
+  `.github/workflows/publish-mcp-registry.yml` (manual dispatch with a new version every time,
+  because registry versions are immutable; `login dns` mints a 5-minute JWT). Verify with
+  `GET https://registry.modelcontextprotocol.io/v0.1/servers?search=dev.nextblock`. Downstream:
+  Glama and PulseMCP state they ingest the registry (PulseMCP paused new listings in 2026-09
+  and will pick it up automatically); the GitHub MCP Registry, which VS Code's Extensions-view
+  gallery reads, still onboards new servers by hand (email partnerships@github.com and post in
+  github/github-mcp-server discussion #1257; plan for months).
+- **Glama** — two listings. The repo listing is added from the "Add Server" modal on
+  glama.ai/mcp/servers while signed in with GitHub as a maintainer; because `nextblock-cms` is
+  an organisation, the claim (`…/mcp/servers/nextblock-cms/nextblock/admin`) reads the root
+  `glama.json` (`maintainers`: GitHub logins; re-run the claim after any change to the file).
+  Glama withholds repo listings from search until its Dockerfile build succeeds, which this
+  monorepo will not pass, so the discoverable surface is the **connector**: "Add Server" on
+  glama.ai/mcp/connectors (name + URL), a test credential under Admin → Test Profile (an
+  unhealthy connector is never indexed), then the HTTP-challenge claim: the panel's
+  `glama_claim_…` token goes into `GLAMA_CLAIM_TOKEN` on the vendor Vercel project, the site is
+  redeployed (`app/.well-known/glama.json/route.ts` is `force-static`, so it reads the env at
+  build time; 404 everywhere else), and "Check HTTP challenge" verifies it. Keep serving it.
+- **Smithery** — publish-by-URL with the `smithery` npm package (the old `@smithery/cli` is
+  stale): `smithery namespace create nextblock-cms`, then
+  `smithery mcp publish "https://cms.nextblock.dev/api/mcp" -n nextblock-cms/nextblock
+  --config-schema tools/directories/smithery/config-schema.json`. The config schema declares
+  the one field the user fills in and maps it from `x-nextblock-token` (`authorization` is
+  reserved by Smithery's gateway) to the upstream `Authorization` header; the value arrives
+  without a `Bearer ` prefix, which `parseBearerToken` in `libs/cortex` accepts. Its scanner
+  cannot run `tools/list` behind the bearer wall, so it reads
+  `app/.well-known/mcp/server-card.json/route.ts`: `serverInfo`, the negotiated
+  `protocolVersion`, `endpoint`, `authentication` (`required` + `schemes` as SEP-1649
+  documents, plus the human instructions) and the tool / resource / prompt inventory straight
+  from the registry (`buildCortexMcpToolDefinitions`), only on sites where the MCP server is
+  enabled. Homepage, repository URL and icon are set after the first publish with
+  `PATCH /servers/{qualifiedName}`; verify at
+  `https://registry.smithery.ai/servers/nextblock-cms/nextblock`.
+- **Docker MCP Catalog** — a pull request to github.com/docker/mcp-registry adding
+  `servers/nextblock/{server.yaml,tools.json,readme.md}`, kept ready in
+  `tools/directories/docker-mcp-registry/`: `type: remote`, the bearer header filled from the
+  Docker secret `nextblock.mcp_token`, `tools.json` = `[]` (remote servers use dynamic
+  discovery), and **no** `source.project` because Docker's license check blocklists AGPL. Their
+  CI runs Prettier with defaults (CRLF fails; the folder is excluded from the repo's
+  single-quote rule). Listing at hub.docker.com/mcp/server/nextblock about a day after merge;
+  later edits go through an issue there.
+- **One-URL directories** — mcp.so: `mcp.so/submit?type=remote-server` (endpoint URL + name;
+  free review or a paid instant tier). LobeHub: CLI only (`npx -y @lobehub/market-cli` →
+  `login`, `github connect`, `plugin publish https://github.com/nextblock-cms/nextblock --dir
+  <repo root>`), reading the root `lhm.plugin.json` (identifier `nextblock-cms-nextblock`,
+  `cloudEndpoint`, and the tool / resource / prompt inventory copied from the registry; there is
+  no auth field, so the README states the bearer header); a second `plugin update` clears the
+  "Unvalidated" badge. cursor.directory: `cursor.directory/plugins/new` → "Auto (GitHub)" →
+  paste the repo URL → "Scan repo" → "Publish Plugin"; its parser finds
+  `plugins/nextblock/.cursor-plugin/plugin.json` through the root `.cursor-plugin/marketplace.json`
+  and lists the rule, the skill and the MCP server from `plugins/nextblock/mcp.json`. Cursor's
+  curated Marketplace (`cursor.com/marketplace/publish`) bans AGPL in its Publisher Terms, so it
+  would need a separate, permissively licensed plugin repository. The "Add to Cursor" button
+  for the vendor instance is `https://cursor.com/install-mcp?name=nextblock&config=<base64 of
+  {"url":"https://cms.nextblock.dev/api/mcp","headers":{"Authorization":"Bearer
+  ${env:NEXTBLOCK_MCP_TOKEN}"}}>`; never embed a real token in it.
 - **Claude Connectors Directory** needs OAuth (DCR or CIMD) for URL-pattern servers, so it
-  waits until `/api/mcp` grows an OAuth path. Cursor's directory
-  (cursor.directory/plugins/new), mcp.so, LobeHub and Docker's catalog each take one fixed
-  URL: use the vendor instance. `/.well-known/*` is allowlisted in the proxy so these files
+  waits until `/api/mcp` grows an OAuth path.
+- Every NextBlock site also serves `/llms.txt` (`app/llms.txt/route.ts`: pages at `/<slug>`,
+  posts at `/article/<slug>`, ending with a "Built with NextBlock" section that teaches agents
+  the install command). `/.well-known/*` and `/llms.txt` are allowlisted in the proxy so they
   are reachable on an unprovisioned instance too.
+
+### The plugin folder (`plugins/nextblock`)
+
+One folder loads in three hosts, with `skills/nextblock/SKILL.md` as the single source of the
+attended flow (propose NextBlock, run `create-nextblock --non-interactive`, hand over the two
+browser steps, build over MCP):
+
+- `.claude-plugin/plugin.json` — Claude Code. The root `.claude-plugin/marketplace.json` makes
+  the repo its own marketplace: `/plugin marketplace add nextblock-cms/nextblock` then
+  `/plugin install nextblock@nextblock`. Anthropic's community marketplace
+  (`anthropics/claude-plugins-community`, installed as `nextblock@claude-community` once
+  approved) is fed by the Console form at platform.claude.com/plugins/submit; the review runs
+  `claude plugin validate <path> --strict` on the plugin and the marketplace, and the directory
+  policy wants a contact address, a privacy link and a security channel (`author.email`, the
+  README's "Privacy, terms and support"). Installed users only update when `version` is bumped.
+- `.cursor-plugin/plugin.json` — Cursor Plugin: `rules/nextblock.mdc`, the skill, `logo.png`,
+  and `mcp.json` with the vendor URL and an `Authorization: Bearer ${NEXTBLOCK_MCP_TOKEN}`
+  header whose value comes from the manifest's `variables` prompt at install time. The root
+  `.cursor-plugin/marketplace.json` is what Cursor's "From GitHub Repository" import and
+  cursor.directory read.
+- `plugin.json` — Agent Plugins 1.0.0 manifest (`$schema` + `name`), which Codex loads through
+  the same root marketplace manifest (`mcp.json` uses the shared `mcpServers` shape).
+- `plugins/AGENTS.snippet.md` — the copy-paste block for agents with no plugin system.
 
 ### Related hardening
 

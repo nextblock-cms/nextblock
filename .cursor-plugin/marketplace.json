@@ -1,0 +1,14 @@
+{
+  "name": "nextblock",
+  "owner": {
+    "name": "NextBlock CMS",
+    "email": "security@nextblock.dev"
+  },
+  "plugins": [
+    {
+      "name": "nextblock",
+      "source": "plugins/nextblock",
+      "description": "Scaffold and build a content-managed Next.js site with NextBlock CMS (free, open-source Next.js 16 + Supabase CMS) and drive it over its MCP server."
+    }
+  ]
+}

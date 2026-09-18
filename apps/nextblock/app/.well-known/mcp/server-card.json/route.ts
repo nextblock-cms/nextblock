@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 
 import {
+  CORTEX_MCP_MODERN_PROTOCOL_VERSION,
   CORTEX_MCP_PROMPTS,
   CORTEX_MCP_RESOURCES,
   buildCortexMcpToolDefinitions,
@@ -49,6 +50,9 @@ export async function GET(): Promise<Response> {
 
   return NextResponse.json(
     {
+      // SEP-1649 (the server-card draft Smithery and other crawlers follow) wants the
+      // protocol version the endpoint negotiates next to `serverInfo`.
+      protocolVersion: CORTEX_MCP_MODERN_PROTOCOL_VERSION,
       serverInfo: {
         name: 'nextblock',
         title: 'NextBlock CMS',
@@ -57,6 +61,10 @@ export async function GET(): Promise<Response> {
       },
       endpoint: { transport: 'streamable-http', url: `${siteUrl}/api/mcp` },
       authentication: {
+        // `required` + `schemes` is the shape Smithery's scanner documents (SEP-1649 draft);
+        // the rest is what a human or agent needs to actually obtain the token.
+        required: true,
+        schemes: ['bearer'],
         type: 'bearer',
         header: 'Authorization',
         instructions:

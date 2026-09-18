@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "properties": {
+    "token": {
+      "type": "string",
+      "title": "NextBlock MCP access token",
+      "description": "Create it in your NextBlock CMS: Settings > Cortex AI > MCP server access. Sent to the site as the Authorization header.",
+      "x-from": { "header": "x-nextblock-token" },
+      "x-to": { "header": "Authorization" }
+    }
+  },
+  "required": ["token"]
+}
