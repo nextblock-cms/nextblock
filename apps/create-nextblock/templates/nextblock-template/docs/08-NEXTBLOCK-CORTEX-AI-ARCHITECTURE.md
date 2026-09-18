@@ -1589,8 +1589,8 @@ there to hand to crawlers that health-check behind the bearer wall (Glama, Docke
   redeployed (`app/.well-known/glama.json/route.ts` is `force-static`, so it reads the env at
   build time; 404 everywhere else), and "Check HTTP challenge" verifies it. Keep serving it.
 - **Smithery** — publish-by-URL with the `smithery` npm package (the old `@smithery/cli` is
-  stale): `smithery namespace create nextblock-cms`, then
-  `smithery mcp publish "https://cms.nextblock.dev/api/mcp" -n nextblock-cms/nextblock
+  stale): `smithery namespace create nextblock` (`nextblock-cms` is taken by another account), then
+  `smithery mcp publish "https://cms.nextblock.dev/api/mcp" -n nextblock/nextblock
   --config-schema tools/directories/smithery/config-schema.json`. The config schema declares
   the one field the user fills in and maps it from `x-nextblock-token` (`authorization` is
   reserved by Smithery's gateway) to the upstream `Authorization` header; the value arrives
@@ -1602,7 +1602,7 @@ there to hand to crawlers that health-check behind the bearer wall (Glama, Docke
   from the registry (`buildCortexMcpToolDefinitions`), only on sites where the MCP server is
   enabled. Homepage, repository URL and icon are set after the first publish with
   `PATCH /servers/{qualifiedName}`; verify at
-  `https://registry.smithery.ai/servers/nextblock-cms/nextblock`.
+  `https://registry.smithery.ai/servers/nextblock/nextblock`.
 - **Docker MCP Catalog** — a pull request to github.com/docker/mcp-registry adding
   `servers/nextblock/{server.yaml,tools.json,readme.md}`, kept ready in
   `tools/directories/docker-mcp-registry/`: `type: remote`, the bearer header filled from the
