@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Button } from '@nextblock-cms/ui/button';
 import { Input } from '@nextblock-cms/ui/input';
 import { Label } from '@nextblock-cms/ui/label';
@@ -10,7 +10,7 @@ import { getShippingEstimates } from '../server-actions/shipping-actions';
 import { ResolvedShippingMethod } from '../shipping/resolver';
 import { useTranslations } from '@nextblock-cms/utils';
 import { usePriceFormatter } from '../use-price-formatter';
-import { countryUsesStructuredStates, getStatesForCountry } from '../states';
+import { countryUsesStructuredStates, getStatesForCountry, getSubdivisionLabel } from '../states';
 import { useCurrency } from '../CurrencyProvider';
 
 interface ShippingEstimatorProps {
@@ -34,6 +34,15 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
   };
   const availableStates = getStatesForCountry(country);
   const usesStructuredStates = countryUsesStructuredStates(country);
+  // Country names in the visitor's language. The estimator only renders inside the cart,
+  // after the store hydrates in the browser, so there is no server HTML to mismatch.
+  const regionNames = useMemo(() => {
+    try {
+      return new Intl.DisplayNames([lang], { type: 'region' });
+    } catch {
+      return null;
+    }
+  }, [lang]);
   const selectOptionLabel = translateOrFallback('select_an_option', 'Select an option');
   const statePlaceholder = translateOrFallback('state_province', 'State / Province');
 
@@ -110,7 +119,7 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
           >
             {countries.map((c: { code: string; name: string }) => (
               <option key={c.code} value={c.code}>
-                {c.name}
+                {regionNames?.of(c.code) ?? c.name}
               </option>
             ))}
           </select>
@@ -132,7 +141,7 @@ export const ShippingEstimator = ({ physicalSubtotal }: ShippingEstimatorProps) 
               <option value="">{`${selectOptionLabel}: ${statePlaceholder}`}</option>
               {availableStates.map((entry) => (
                 <option key={entry.code} value={entry.code}>
-                  {entry.name}
+                  {getSubdivisionLabel(country, entry, lang)}
                 </option>
               ))}
             </select>

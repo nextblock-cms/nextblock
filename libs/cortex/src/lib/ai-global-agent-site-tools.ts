@@ -373,7 +373,12 @@ export const getSiteOverviewInputSchema = z.strictObject({
 
 export type GetSiteOverviewInput = z.input<typeof getSiteOverviewInputSchema>;
 
-type NavigationNode = {
+// Exported because it is recursive: TypeScript can inline an anonymous object type into the
+// declaration of `createCortexGlobalAgentTools` (another module), but a type that refers to
+// itself has to be NAMED, and a module-private name cannot be. The build logged TS4058 and
+// wrote no `ai-global-agent-tools.d.ts` at all, so the published package typed the whole
+// tools factory as `any`.
+export type NavigationNode = {
   children: NavigationNode[];
   id: number;
   label: string;

@@ -7,6 +7,7 @@ import type { Metadata } from 'next';
 import PageClientContent from "./PageClientContent";
 import { getCachedPublishedPageTranslatedSlugs, getPageDataBySlug } from "./page.utils";
 import BlockRenderer from "../../components/BlockRenderer";
+import { parsePageParam, setRequestedPage } from "../../lib/blocks/requested-page";
 import { cookies, draftMode, headers } from "next/headers";
 import {
   resolveMetaTitle,
@@ -33,6 +34,7 @@ interface ResolvedPageParams {
 
 interface PageProps {
   params: Promise<ResolvedPageParams>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
 }
 
 export async function generateStaticParams(): Promise<ResolvedPageParams[]> {
@@ -132,8 +134,12 @@ export async function generateMetadata(
   };
 }
 
-export default async function DynamicPage({ params: paramsPromise }: PageProps) {
+export default async function DynamicPage({ params: paramsPromise, searchParams: searchParamsPromise }: PageProps) {
   const params = await paramsPromise;
+  // Paginated grids on this page render the requested page on the server (no JavaScript
+  // needed). The route is already per-request because of the locale cookie, so reading the
+  // query string changes nothing about how it is rendered.
+  setRequestedPage(parsePageParam((await searchParamsPromise).page));
   let preferredLocale: string | undefined;
   try {
     const store = await cookies();

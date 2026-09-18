@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/sdk",
-  "version": "0.19.2",
+  "version": "0.19.3",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "main": "./index.js",

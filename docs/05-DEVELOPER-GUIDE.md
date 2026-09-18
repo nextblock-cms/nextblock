@@ -418,8 +418,30 @@ accident:
 - The honeypot field name lives in `lib/botProtection/fields.ts` and is deliberately not
   email-like: browser autofill filled the old `verification_secondary_email`, and the server
   then discarded a real visitor's sign-up or message with a fake success.
-- Grid pagination keeps its page in the URL through `hooks/usePageParam.ts` without reading
-  `searchParams` on the server, which would make every CMS page dynamic.
+- Grid pagination is real links (`?page=N`, `components/blocks/GridPagination.tsx`). The page
+  routes read the parameter and put it in a request-scoped store
+  (`lib/blocks/requested-page.ts`, React `cache`), and the posts and product grid server
+  components render that page, so page 2 works with JavaScript off and has its own URL. The
+  routes were already per-request (locale cookie), so this did not change how they render.
+  With JavaScript the client cancels the link and swaps the items in place
+  (`hooks/usePageParam.ts` keeps Back/Forward working). A page past the end falls back to 1.
+- Button hover and pressed states (`libs/ui/src/lib/button.tsx`) move the surface away from
+  its own text colour: `color-mix` (12 % on hover, 20 % pressed) toward the button text with
+  its lightness inverted, `oklch(from hsl(var(--surface-foreground)) calc(1 - l) 0 0)`. Light
+  text darkens the surface, dark text lightens it, so contrast rises in every theme; the old
+  `/90` fade lowered it in whichever theme had the darker page (dark theme: 4.9 → 4.1).
+  Measured in Chrome on the seeded palettes: dark 4.9 → 5.4, vibrant 4.9 → 6.5; light
+  computes to 6.4 → 7.6. Browsers without relative colour syntax keep the rest colour on
+  hover. Spell such class names out in full: Tailwind only generates a utility it finds
+  verbatim in a source file, never one assembled from two strings. `02016` deepens the four
+  seeded tokens that failed AA at rest (dark focus ring, vibrant primary and destructive, light
+  destructive), guarded by the seeded values so a recoloured theme is left alone;
+  `libs/ui/src/styles/theme.css` carries the same values.
+- The header logo's `alt` is the site title on purpose: the logo is the home link, and
+  `media` has no alt column (`description` defaults to the upload's file name).
+- `products.short_description` renders through `ShortDescription`
+  (`libs/ecommerce/src/lib/components/ShortDescription.tsx`) everywhere: HTML when the row
+  contains markup (older rows carry embeds), otherwise escaped text with line breaks.
 
 ## Current Repo Notes
 

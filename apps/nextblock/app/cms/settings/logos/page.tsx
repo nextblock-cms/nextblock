@@ -105,7 +105,7 @@ export default async function CmsLogosListPage() {
                     {logo.media ? (
                       <MediaImage
                           src={resolveLogoSrc(logo.media.object_key) || ''}
-                          alt={logo.media.alt_text || logo.name}
+                          alt={logo.name}
                           width={logo.media.width || 100}
                           height={logo.media.height || 100}
                           className="max-w-16 max-h-16 object-contain"

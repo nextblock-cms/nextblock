@@ -58,7 +58,19 @@ export const Cart = () => {
     [activeCurrencyCode, currencies, items]
   );
 
-  if (!store) return null;
+  // Same reason as Checkout: the cart is only known after the store hydrates in the browser.
+  if (!store) {
+    return (
+      <div role="status" aria-busy="true" className="container mx-auto py-12">
+        <span className="sr-only">{t('loading') === 'loading' ? 'Loading…' : t('loading')}</span>
+        <div className="mb-8 h-9 w-56 rounded-md bg-muted" />
+        <div className="grid gap-12 lg:grid-cols-12 lg:items-start">
+          <div className="h-64 rounded-lg border bg-muted/40 lg:col-span-8" />
+          <div className="h-64 rounded-lg border bg-muted/40 lg:col-span-4" />
+        </div>
+      </div>
+    );
+  }
 
   const { updateQuantity, removeItem } = store;
   const getAllocatedSkuQuantity = (sku: string) =>

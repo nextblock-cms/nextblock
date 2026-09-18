@@ -113,6 +113,12 @@ async function fetchPublishedPostsPage(languageId: number, page: number, limit: 
     .range(offset, offset + limit - 1);
 
   if (error) {
+    // PostgREST answers an offset past the last row with 416 "Requested range not
+    // satisfiable" (PGRST103). For a paginated grid that is an empty page, not a failure:
+    // `?page=99` and a stale page count both land here.
+    if (error.code === 'PGRST103') {
+      return { posts: [], totalCount: 0, error: undefined };
+    }
     console.error('Error fetching published posts:', error);
     return { posts: [], totalCount: 0, error: error.message };
   }
@@ -137,8 +143,8 @@ export async function fetchPaginatedPublishedPosts(languageId: number, page: num
   return fetchPublishedPostsPage(languageId, page, limit);
 }
 
-export const fetchInitialPublishedPosts = cache(async (languageId: number, limit: number): Promise<{ posts: PostWithMediaDimensions[], totalCount: number, error?: string | null }> => {
-  const result = await fetchPublishedPostsPage(languageId, 1, limit);
+export const fetchInitialPublishedPosts = cache(async (languageId: number, limit: number, page = 1): Promise<{ posts: PostWithMediaDimensions[], totalCount: number, error?: string | null }> => {
+  const result = await fetchPublishedPostsPage(languageId, page, limit);
   return {
     posts: result.posts,
     totalCount: result.totalCount,

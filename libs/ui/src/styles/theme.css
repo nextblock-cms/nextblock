@@ -24,7 +24,7 @@
   --accent: 210 40% 96.1%; /* Slate 100 */
   --accent-foreground: 222 47% 11%;
 
-  --destructive: 0 84.2% 60.2%;
+  --destructive: 0 72.2% 50.6%; /* Red 600: 4.6:1 on the light text, the seeded 60% shade was 3.6:1 */
   --destructive-foreground: 210 40% 98%;
 
   --warning: 38 92% 50%; /* Amber 500 */
@@ -74,7 +74,7 @@
 
   --border: 217.2 32.6% 17.5%; /* Slate 800 - Subtle borders */
   --input: 217.2 32.6% 17.5%;
-  --ring: 224 76% 48%; /* Blue 600 */
+  --ring: 213 94% 68%; /* Blue 400: 8:1 on the page, 7:1 on a card; Blue 600 was 2.7:1 on a card */
 
   --chart-1: 220 70% 50%;
   --chart-2: 160 60% 45%;
@@ -94,7 +94,7 @@
   --popover: 260 50% 8%;
   --popover-foreground: 180 100% 90%;
 
-  --primary: 320 100% 55%;       /* Neon Pink */
+  --primary: 320 100% 42%;       /* Neon Pink, deepened: 4.9:1 under white text (55% was 3.5:1) */
   --primary-foreground: 0 0% 100%;
 
   --secondary: 180 100% 50%;     /* Neon Cyan */
@@ -106,7 +106,7 @@
   --accent: 280 100% 50%;        /* Electric Purple */
   --accent-foreground: 0 0% 100%;
 
-  --destructive: 0 100% 50%;     /* Neon Red */
+  --destructive: 0 100% 42%;     /* Neon Red, deepened: 5.4:1 under white text */
   --destructive-foreground: 0 0% 100%;
 
   --warning: 60 100% 50%;        /* Neon Yellow */

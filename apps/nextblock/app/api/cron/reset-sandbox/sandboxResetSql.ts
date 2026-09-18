@@ -12861,6 +12861,41 @@ VALUES
 ON CONFLICT (key) DO NOTHING;
 
 
+-- >>> FROM: 02016_theme_contrast_tokens.sql <<<
+-- Theme tokens that failed WCAG AA on the seeded palettes (measured against the seeded pairs):
+--   dark    ring        224 76% 48%  -> 213 94% 68%   focus ring 2.7:1 on a card -> 7.1:1 (8.1:1 on the page)
+--   vibrant primary     320 100% 55% -> 320 100% 42%  white button text 3.5:1 -> 4.9:1
+--   vibrant destructive 0 100% 50%   -> 0 100% 42%    white button text 4.0:1 -> 5.4:1
+--   light   destructive 0 84.2% 60.2% -> 0 72.2% 50.6% light button text 3.6:1 -> 4.6:1
+-- Each update is guarded by the seeded value, so a theme an operator has already recoloured in
+-- the CMS theme editor is left exactly as they set it. libs/ui/src/styles/theme.css carries the
+-- same values for standalone consumers of the UI package.
+
+UPDATE public.site_themes
+   SET tokens = tokens || '{"ring": "213 94% 68%"}'::jsonb,
+       updated_at = now()
+ WHERE slug = 'dark'
+   AND tokens->>'ring' = '224 76% 48%';
+
+UPDATE public.site_themes
+   SET tokens = tokens || '{"primary": "320 100% 42%"}'::jsonb,
+       updated_at = now()
+ WHERE slug = 'vibrant'
+   AND tokens->>'primary' = '320 100% 55%';
+
+UPDATE public.site_themes
+   SET tokens = tokens || '{"destructive": "0 100% 42%"}'::jsonb,
+       updated_at = now()
+ WHERE slug = 'vibrant'
+   AND tokens->>'destructive' = '0 100% 50%';
+
+UPDATE public.site_themes
+   SET tokens = tokens || '{"destructive": "0 72.2% 50.6%"}'::jsonb,
+       updated_at = now()
+ WHERE slug = 'light'
+   AND tokens->>'destructive' = '0 84.2% 60.2%';
+
+
   -- Step D: Record the applied migrations in history (truncated in Step B) so
   -- \`npm run db:migrate:check\` reports up to date instead of listing every file as pending.
   INSERT INTO supabase_migrations.schema_migrations (version, name) VALUES
@@ -12879,7 +12914,8 @@ ON CONFLICT (key) DO NOTHING;
     ('02012', 'drop_variant_backdrop_blur'),
     ('02013', 'advisor_rls_and_trigger_grants'),
     ('02014', 'package_activations_staff_read'),
-    ('02015', 'public_copy_typography_and_a11y_keys')
+    ('02015', 'public_copy_typography_and_a11y_keys'),
+    ('02016', 'theme_contrast_tokens')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles

@@ -108,6 +108,10 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - Renaming a custom block `slug` orphans every block instance that references it.
 - A new `libs/utils` directory barrel needs its own build entry + `exports` key in
   `vite.config.mts` (see `./seo`); the published `./*` wildcard only maps files.
+- Lib declarations fail silently (the build exits 0, scaffolds use `skipLibCheck`, the type
+  becomes `any`): a recursive type in an exported function's inferred return type must be
+  exported (else TS4058 and NO `.d.ts` for that module), and every lib's dts plugin keeps
+  `aliasesExclude` for `@nextblock-cms/*`. `tools/scripts/verify-lib-dist.js` checks both.
 - Publish order utils → ui → sdk → db → editor → ecommerce → cortex → CLI; npm 2FA needs
   an OTP per publish and piping output breaks the prompt (`EOTP`).
 - Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`

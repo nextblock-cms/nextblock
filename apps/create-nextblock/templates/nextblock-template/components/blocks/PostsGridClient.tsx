@@ -6,8 +6,8 @@ import Link from 'next/link';
 import { useLanguage } from '../../context/LanguageContext';
 import type { PostWithMediaDimensions } from './types';
 import Image from 'next/image';
-import { Button } from '@nextblock-cms/ui';
 import PostCardSkeleton from './PostCardSkeleton'; // Added import
+import GridPagination from './GridPagination';
 import { usePageParam } from '../../hooks/usePageParam';
 import { useLabel } from '../../lib/i18n/use-label';
 
@@ -176,31 +176,13 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
       </div>
 
       {showPagination && totalPages > 1 && (
-        <nav
-          aria-label={label('pagination.label', 'Pagination', 'Pagination')}
-          className="flex justify-center items-center mt-8 space-x-2"
-        >
-          <Button
-            onClick={() => handlePageChange(currentPage - 1)}
-            disabled={currentPage === 1 || isLoading}
-            variant="outline"
-          >
-            {label('pagination.previous', 'Previous', 'Précédent')}
-          </Button>
-          <span aria-live="polite" className="text-sm tabular-nums">
-            {label('pagination.page_of', 'Page {current} of {total}', 'Page {current} sur {total}', {
-              current: currentPage,
-              total: totalPages,
-            })}
-          </span>
-          <Button
-            onClick={() => handlePageChange(currentPage + 1)}
-            disabled={currentPage === totalPages || isLoading}
-            variant="outline"
-          >
-            {label('pagination.next', 'Next', 'Suivant')}
-          </Button>
-        </nav>
+        <GridPagination
+          className="mt-8"
+          currentPage={currentPage}
+          totalPages={totalPages}
+          isLoading={isLoading}
+          onNavigate={(page) => void handlePageChange(page)}
+        />
       )}
       {/* {isLoading && <p className="text-center mt-4 text-sm text-muted-foreground">Fetching posts...</p>} */}
     </div>

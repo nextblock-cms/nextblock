@@ -13,7 +13,8 @@ import { useProduct } from '../product-context';
 import { ProductGallery } from './ProductGallery';
 import { AddToCartButton } from './AddToCartButton';
 import { SubscriptionSelector } from './SubscriptionSelector';
-import { SimpleTiptapRenderer, toNoCookieEmbedSrc } from './SimpleTiptapRenderer';
+import { SimpleTiptapRenderer } from './SimpleTiptapRenderer';
+import { ShortDescription } from './ShortDescription';
 import {
   chooseInitialVariantSelections,
   findMatchingVariant,
@@ -438,13 +439,9 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
                   {...shortDescriptionVisualEditAttributes}
                 >
                   {product.short_description ? (
-                    <div
+                    <ShortDescription
+                      value={product.short_description}
                       className="text-lg mb-4 leading-relaxed"
-                      dangerouslySetInnerHTML={{
-                        __html:
-                          toNoCookieEmbedSrc(product.short_description) ??
-                          product.short_description,
-                      }}
                     />
                   ) : visualEditingEnabled ? (
                     <p className="text-lg mb-4 italic text-muted-foreground">

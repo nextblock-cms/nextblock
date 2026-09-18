@@ -2,6 +2,7 @@
 
 import { Product } from '../types';
 import { AddToCartButton } from './AddToCartButton';
+import { ShortDescription } from './ShortDescription';
 import { cn } from '@nextblock-cms/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import Link from 'next/link';
@@ -111,11 +112,10 @@ export const FeaturedProduct = ({ product, className, imagePosition = 'left' }: 
                 </div>
             )}
 
-            {product.short_description && (
-                <p className="mb-8 text-lg text-muted-foreground">
-                    {product.short_description}
-                </p>
-            )}
+            <ShortDescription
+                value={product.short_description}
+                className="mb-8 text-lg text-muted-foreground"
+            />
 
             <div className="flex flex-col gap-4 sm:flex-row">
                 <AddToCartButton 

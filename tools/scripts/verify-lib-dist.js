@@ -21,6 +21,12 @@
 //   3. Exports the TypeScript source has but the build lost. `libs/db` and `libs/utils` track
 //      stale compiled twins (`foo.js` beside `foo.ts`); Vite's default extension order picked
 //      the `.js`, so the package was assembled from months-old code.
+//   4. Declaration files that were never written. vite-plugin-dts only LOGS TypeScript's
+//      declaration-emit errors (TS4058 "... cannot be named", TS2742, ...) and carries on: the
+//      build exits 0, the JavaScript is fine, and the module whose types could not be written
+//      gets no `.d.ts` at all. cortex shipped that way through 0.19.2: `index.d.ts` re-exported
+//      `./lib/ai-global-agent-tools`, the file did not exist, and because scaffolds compile
+//      with `skipLibCheck` nothing failed. `createCortexGlobalAgentTools` was just `any`.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -86,6 +92,8 @@ function collectConsumedSubpaths(importName) {
     walk(root, (file) => {
       if (!/\.(ts|tsx|mts|js|mjs)$/.test(file)) return;
       if (/\.(test|spec)\.[a-z]+$/.test(file)) return;
+      // Build configs talk ABOUT specifiers (comments, export maps); they do not import them.
+      if (/^vite\.config\.[a-z]+$/.test(path.basename(file))) return;
 
       const text = fs.readFileSync(file, 'utf8');
 
@@ -119,10 +127,27 @@ function pickTarget(entry) {
   return pickTarget(entry.default ?? entry.import ?? entry.require ?? null);
 }
 
-function resolveThroughExports(exportsMap, subpath) {
-  const key = `./${subpath}`;
+/** The declaration file TypeScript would load for an `exports` entry, as it resolves it. */
+function pickTypesTarget(entry) {
+  if (typeof entry === 'string') {
+    // No `types` condition: TypeScript looks for the `.d.ts` beside the JavaScript file.
+    return /\.d\.(c|m)?ts$/.test(entry) ? entry : entry.replace(/\.(c|m)?js$/i, '.d.ts');
+  }
+  if (!entry || typeof entry !== 'object') return null;
+  if (typeof entry.types === 'string') return entry.types;
 
-  if (exportsMap[key] !== undefined) return pickTarget(exportsMap[key]);
+  for (const condition of ['import', 'default', 'require']) {
+    const nested = pickTypesTarget(entry[condition]);
+    if (nested) return nested;
+  }
+
+  return null;
+}
+
+function resolveThroughExports(exportsMap, subpath, pick = pickTarget) {
+  const key = subpath ? `./${subpath}` : '.';
+
+  if (exportsMap[key] !== undefined) return pick(exportsMap[key]);
 
   // Longest wildcard prefix wins, as in Node's resolution.
   const wildcards = Object.keys(exportsMap)
@@ -134,7 +159,7 @@ function resolveThroughExports(exportsMap, subpath) {
 
     if (key.startsWith(prefix) && key.endsWith(suffix) && key.length >= prefix.length + suffix.length) {
       const middle = key.slice(prefix.length, key.length - suffix.length);
-      const target = pickTarget(exportsMap[candidate]);
+      const target = pick(exportsMap[candidate]);
 
       return target ? target.replace('*', middle) : null;
     }
@@ -237,6 +262,80 @@ function findLostExports(library, distDir) {
   return problems;
 }
 
+/* ------------------------------ 4. declaration files ------------------------------ */
+
+const NON_CODE_SPECIFIER = /\.(css|scss|json|svg|png|jpe?g|webp|gif|woff2?)$/i;
+
+function declarationExists(base) {
+  const withoutJsExtension = base.replace(/\.(c|m)?js$/i, '');
+
+  return [
+    `${withoutJsExtension}.d.ts`,
+    `${withoutJsExtension}.d.mts`,
+    `${withoutJsExtension}.d.cts`,
+    path.join(withoutJsExtension, 'index.d.ts'),
+  ].some((candidate) => fs.existsSync(candidate));
+}
+
+/** Relative imports inside emitted `.d.ts` files that resolve to no declaration file. */
+function findDanglingDeclarationImports(distDir) {
+  const problems = [];
+  const seen = new Set();
+
+  walk(distDir, (file) => {
+    if (!/\.d\.(c|m)?ts$/.test(file)) return;
+
+    const text = fs.readFileSync(file, 'utf8');
+
+    // `from './x'`, `import './x'` and `import('./x')`.
+    for (const match of text.matchAll(/(?:from|import)\s*\(?\s*['"](\.{1,2}\/[^'"]+)['"]/g)) {
+      const specifier = match[1];
+
+      if (NON_CODE_SPECIFIER.test(specifier)) continue;
+
+      const target = path.resolve(path.dirname(file), specifier);
+      const key = `${file}|${specifier}`;
+
+      if (seen.has(key) || declarationExists(target)) continue;
+      seen.add(key);
+
+      problems.push(
+        `${path.relative(distDir, file)} imports "${specifier}" but no declaration file was emitted for it — ` +
+          (specifier.includes('/src/')
+            ? 'a workspace alias was rewritten to a monorepo source path; the dts plugin needs aliasesExclude'
+            : 'look for "error TS" in the build log (usually TS4058: export the type it cannot name)')
+      );
+    }
+
+    // Sibling libraries, by package name. They must resolve through the sibling's OWN
+    // published `exports` to a declaration file, or the type is `any` for every consumer
+    // (`@nextblock-cms/db/types` resolved through a tsconfig path here and nowhere else).
+    for (const match of text.matchAll(/(?:from|import)\s*\(?\s*['"]@nextblock-cms\/([^'"/]+)(?:\/([^'"]+))?['"]/g)) {
+      const [, packageName, subpath = ''] = match;
+      const siblingDir = distDirFor(packageName);
+      const siblingManifest = path.join(siblingDir, 'package.json');
+      const key = `bare|${packageName}|${subpath}`;
+
+      // Not built in this run: nothing to check it against.
+      if (seen.has(key) || !fs.existsSync(siblingManifest)) continue;
+      seen.add(key);
+
+      const manifest = JSON.parse(fs.readFileSync(siblingManifest, 'utf8'));
+      const exportsMap = manifest.exports ?? publishExportsFor(packageName) ?? { '.': manifest.types ?? './index.d.ts' };
+      const target = resolveThroughExports(exportsMap, subpath, pickTypesTarget);
+      const specifier = `@nextblock-cms/${packageName}${subpath ? `/${subpath}` : ''}`;
+
+      if (!target) {
+        problems.push(`${path.relative(distDir, file)} imports "${specifier}" but that package has no "exports" key for it`);
+      } else if (!fs.existsSync(path.join(siblingDir, target))) {
+        problems.push(`${path.relative(distDir, file)} imports "${specifier}" but ${target} does not exist in that package`);
+      }
+    }
+  });
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
 function verifyLibDist(library) {
@@ -250,6 +349,7 @@ function verifyLibDist(library) {
     ...findDevelopmentArtifacts(distDir).map((entry) => `development build artifact: ${entry}`),
     ...findUnresolvableSubpaths(library, distDir).map((entry) => `unresolvable subpath: ${entry}`),
     ...findLostExports(library, distDir).map((entry) => `lost export: ${entry}`),
+    ...findDanglingDeclarationImports(distDir).map((entry) => `missing declaration: ${entry}`),
   ];
 
   if (problems.length > 0) {

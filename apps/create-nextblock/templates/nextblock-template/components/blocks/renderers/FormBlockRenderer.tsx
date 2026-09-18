@@ -522,6 +522,12 @@ const renderField = (
              );
         case 'email':
             return <Input type="email" autoComplete="email" spellCheck={false} {...commonProps} defaultValue={previous} />;
+        case 'tel':
+            return <Input type="tel" inputMode="tel" autoComplete="tel" {...commonProps} defaultValue={previous} />;
+        case 'url':
+            return <Input type="url" inputMode="url" autoComplete="url" spellCheck={false} {...commonProps} defaultValue={previous} />;
+        case 'number':
+            return <Input type="number" inputMode="decimal" {...commonProps} defaultValue={previous} />;
         case 'text':
         default:
             return <Input type="text" {...commonProps} defaultValue={previous} />;

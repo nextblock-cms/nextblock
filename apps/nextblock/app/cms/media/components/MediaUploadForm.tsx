@@ -209,6 +209,9 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
         };
 
         // 3. Process image variants
+        // A local flag, not the `processingStatus` state: `handleSuccess` below runs in this
+        // same closure and would read the value from before this upload started.
+        let variantsFailed = false;
         setProcessingStatus("processing");
         const processResponse = await fetch('/api/process-image', {
           method: 'POST',
@@ -223,6 +226,7 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
 
         if (!processResponse.ok) {
           console.error("Error processing image:", processData.error || "Failed to process image variants.");
+          variantsFailed = true;
           setProcessingStatus("processed_error");
           setErrorMessage(`Original uploaded, but variants failed: ${processData.error || "Unknown error"}`);
         } else {
@@ -257,7 +261,7 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
           if (newMedia) onUploadSuccess?.(newMedia);
           // Reset form state
           resetFileSelection();
-          if (processingStatus !== "processed_error") {
+          if (!variantsFailed) {
             setProcessingStatus("idle");
           }
           if (!returnJustData) {
@@ -361,7 +365,14 @@ export default function MediaUploadForm({ onUploadSuccess, returnJustData, defau
              <Spinner className="mr-2 h-4 w-4" /> Processing image variants...
           </div>
         )}
-        {/* Message for when original uploads but variants fail, errorMessage will be set */}
+        {/* The original uploaded but its resized variants did not. This used to be set and never
+            shown: the upload counts as a success, and the alert above only renders on error. */}
+        {processingStatus === "processed_error" && uploadStatus !== "error" && errorMessage && (
+          <Alert variant="warning" className="mb-4">
+            <XCircle className="h-4 w-4" />
+            <AlertDescription>{errorMessage}</AlertDescription>
+          </Alert>
+        )}
 
 
         <Button

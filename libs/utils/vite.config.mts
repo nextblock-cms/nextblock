@@ -29,6 +29,9 @@ export default defineConfig({
       // publish fine. Restoring out-tsc reliably needs a non-incremental composite build, which
       // isn't worth the complexity for cosmetic build-log noise.
       tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
+      // of monorepo-relative source paths that do not exist in the published package.
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDir: '../../dist/libs/utils',
       afterBuild: () => {
         const packageJson = {

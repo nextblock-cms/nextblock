@@ -35,7 +35,7 @@ import { getShippingEstimates } from '../server-actions/shipping-actions';
 import { getTaxEstimate } from '../server-actions/tax-actions';
 import { ResolvedShippingMethod } from '../shipping/resolver';
 import { type CartItem, isDigitalItem } from '../types';
-import { countryUsesStructuredStates, getStatesForCountry } from '../states';
+import { countryUsesStructuredStates, getStatesForCountry, getSubdivisionLabel } from '../states';
 import {
   addressesMatch,
   CheckoutCustomerDefaults,
@@ -250,7 +250,7 @@ function AddressForm({
                 <option value="">{`${selectOptionLabel}: ${statePlaceholder}`}</option>
                 {availableStates.map((state) => (
                   <option key={state.code} value={state.code}>
-                    {state.name}
+                    {getSubdivisionLabel(value.country_code, state, lang)}
                   </option>
                 ))}
               </select>
@@ -677,8 +677,27 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
     return () => window.removeEventListener('pageshow', handlePageShow);
   }, []);
 
+  // The cart lives in localStorage, so the first render cannot know it. Returning nothing
+  // left a blank page that then jumped to the full form; a skeleton of the same shape holds
+  // the layout and tells assistive tech something is loading.
   if (!store) {
-    return null;
+    return (
+      <div role="status" aria-busy="true" className="container mx-auto px-4 py-12 md:px-6">
+        <span className="sr-only">{t('loading') === 'loading' ? 'Loading…' : t('loading')}</span>
+        <div className="mx-auto max-w-6xl">
+          <div className="mb-8 h-9 w-48 rounded-md bg-muted" />
+          <div className="grid gap-8 lg:grid-cols-12 lg:items-start">
+            <div className="space-y-6 lg:col-span-8">
+              <div className="h-56 rounded-xl border bg-muted/40" />
+              <div className="h-96 rounded-xl border bg-muted/40" />
+            </div>
+            <div className="lg:col-span-4">
+              <div className="h-72 rounded-xl border bg-muted/40" />
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   const closeSandboxModal = () => {

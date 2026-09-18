@@ -67,6 +67,12 @@ export default defineConfig({
     dts({
       entryRoot: 'src',
       tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations. By
+      // default the plugin rewrites tsconfig path aliases into relative paths, which for a
+      // sibling library means `../../../db/src/index.ts`: a file that exists in this
+      // monorepo and nowhere else (58 such imports shipped in 0.19.2). Consumers compile
+      // with skipLibCheck, so nothing failed; every `Database`-typed signature was `any`.
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDir: '../../dist/libs/ecommerce',
       afterBuild: reapplyDirectives,
     }),

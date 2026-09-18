@@ -17,8 +17,31 @@
 
 ## Status
 
-Sections 1 to 4 are the audit as found. Sections 5 and 6 list what was fixed (two passes,
-same day), section 7 covers the shop audit that followed, and section 8 is what is still open.
+**Read this first.** Sections 1 to 4 are the audit *as found*: every line there describes the
+code before any fix, so they still read like open problems. They are kept as the record of
+what was wrong. What is actually open is section 10, and only section 10.
+
+| Group from the first open list | Status |
+| :-- | :-- |
+| Mobile navigation: `aria-expanded` on desktop parent links, English-only submenu label | Done (section 6) |
+| Slider: arrow keys, photo credit on slide backgrounds | Done (section 6), swipe added (section 8) |
+| Form block: `fieldset`/`legend`, label gaps, values kept after a server error, silent reCAPTCHA failure, autofillable honeypot, Turnstile theme | Done (section 6) |
+| Form block: `tel` / `url` / `number` field types | Done (section 8) |
+| Form block: per-field `aria-invalid` | Not applicable: the server only returns form-level errors, and the browser's own validation covers required and email fields |
+| Search: links for results, combobox semantics, `aria-pressed` chips, guarded `localStorage`, focus while the chunk loads | Done (section 6) |
+| Reviews and comments: star radio group, focus ring, rating text, `h3`, textarea `name`, `aria-pressed` | Done (section 6) |
+| Remaining S12 sites (`ContactSellerSection`, `view-live-button`) | Done (sections 6 and 7) |
+| Orders page date | Done (section 7, fixed time zone in `formatInvoiceDate`) |
+| `DynamicLayoutEngine`: currency, developer warnings, image dimensions | Done (section 6); plain string image values still have no dimensions to use |
+| Images and LCP: text block first image, image block `fetchPriority`, article preload | Done (section 6) |
+| Pagination state in the URL | Done (section 6); pages 2+ without JavaScript done (section 9) |
+| Logo alt text, button hover contrast (S14), dark focus ring (S15), `short_description` | Done (section 9) |
+| Design system: unlabeled controls | Done (section 6) |
+| Manifest, `backdrop-blur`, hardcoded English | Done (section 6) |
+| Shop UI (`libs/ecommerce`) not audited | Audited and fixed (section 7) |
+
+Sections 5 and 6 list what was fixed in the first two passes, section 7 covers the shop audit,
+sections 8 and 9 the third and fourth passes, and section 10 is what is still open.
 
 ## 1. Systemic (fix once, fixes every page)
 
@@ -323,25 +346,65 @@ announced values, a labelled cart icon that includes the count, real links inste
 estimator field, section headings, announced errors, image dimensions and lazy loading,
 translated trial and cart error copy, localized country names.
 
-## 8. Still open
+## 8. Third pass (after the 0.19.2 release)
 
-- **Logo alt text.** `media.description` is the alt field but is auto-filled from the file
-  name, so reading it would swap the site title for text like "Img 4821". Needs a product
-  decision (a dedicated alt column, or cleaning the auto-fill).
-- **S14 / S15** (button hover contrast, dark focus-ring contrast). Themes are database
-  rows, so this is a palette decision to make in the theme editor, then seed.
-- **Form block field types** `tel` / `url` / `number`: a feature touching the block schema,
-  the CMS form editor and the Cortex tool schemas, not a defect.
-- **Product `short_description`** is rendered as HTML on the product page on purpose
-  (embeds are rewritten to the no-cookie host), while `FeaturedProduct` renders it as text.
-  Pick one; staff-authored either way.
-- **Slider** has no swipe gesture.
-- **Pagination** pages 2+ still need JavaScript (the first page is in the static HTML;
-  older items are in the sitemap).
-- **Image block** external images without stored dimensions still shift layout; the Cortex
-  stock-photo tool should store the width and height the provider returns.
-- State and province names are English only (`states.ts`).
-- Checkout returns nothing until the cart store hydrates (blank, then a jump). A skeleton
-  would fix it.
-- CMS-only: the media picker fetches on every keystroke; `MediaUploadForm` never shows its
-  "variants failed" message.
+- **Declaration files.** The cortex build logged `TS4058 ... 'NavigationNode' ... cannot be
+  named` on every build. It was not a cosmetic warning: no `ai-global-agent-tools.d.ts` was
+  written at all, and `index.d.ts` still re-exported it. The same family of defect was in
+  `ecom` and `editor`: types imported from a sibling library were emitted as
+  `../../../db/src/index.ts`, a path that exists only in this monorepo (58 imports in
+  `ecom`). Scaffolds compile with `skipLibCheck`, so nothing failed; the types were `any`.
+  Fixed (exported type, `aliasesExclude` in every lib config, a types-only `./types` export
+  on `db`) and `verify-lib-dist.js` gained a fourth check that would have caught both.
+- **Form block** gained `tel`, `url` and `number` field types (schema, CMS editor, renderer,
+  Cortex schema and its field-type normalizer).
+- **Slider** swipes on touch screens (`touch-pan-y`, horizontal gestures only).
+- **Cart and checkout** render a skeleton with `role="status"` while the cart store
+  hydrates, instead of nothing followed by a jump.
+- **French province and state names** on the checkout and the shipping estimator, and
+  localized country names in the estimator.
+- **Stock photos:** the Cortex tool now tells agents to copy `width` and `height` into the
+  image content, so new AI-built pages reserve the space.
+- **CMS:** the media library search is debounced and labelled; the uploader finally shows
+  its "original uploaded, but variants failed" warning (it was set and never rendered).
+
+## 9. Fourth pass: the four decision items
+
+- **Pagination without JavaScript.** Previous / Next are now links to `?page=N`
+  (`components/blocks/GridPagination.tsx`), so page 2 can be opened in a new tab, bookmarked,
+  crawled and reached with scripts off. The page routes read the parameter into a
+  request-scoped store (`lib/blocks/requested-page.ts`) and the posts and product grid server
+  components render that page. The earlier objection (reading `searchParams` makes a page
+  dynamic) turned out to be moot: both routes already render per request for the locale
+  cookie. With JavaScript the link is cancelled and the grid swaps in place as before.
+- **Button hover contrast (S14).** Measured on the seeded themes, `hover:bg-primary/90` took
+  the dark theme's primary button from 4.93:1 to 4.12:1 (below AA). Hover and pressed states
+  now mix the surface toward the button's own text colour with its lightness inverted
+  (`color-mix` + relative `oklch`), so the surface always moves away from the text: measured
+  in Chrome, dark 4.9 → 5.4 and vibrant 4.9 → 6.5; light computes to 6.4 → 7.6. A first attempt
+  that mixed toward the page `--foreground` was rejected by the same measurement: it lifted the
+  vibrant theme's magenta toward its light cyan text and dropped that button to 4.0. The rule
+  covers `destructive` and `secondary` too.
+- **Seeded palette (S15 and rest-state failures).** Four seeded tokens failed AA before any
+  hover: the dark focus ring (2.7:1 on a card), the vibrant primary (3.5:1 under white text),
+  the vibrant destructive (4.0:1) and the light destructive (3.6:1). `02016` deepens them
+  (7.1, 4.9, 5.4 and 4.6), guarded by the seeded values so an operator's recoloured theme is
+  untouched. nextblock.dev serves these exact seeded tokens, so the fix applies there once the
+  migration runs. `libs/ui/src/styles/theme.css` mirrors the values.
+- **Logo alt text.** Every header typed a `media.alt_text` column that does not exist, so the
+  code always fell through to the site title. That fallback is the right alt for a logo that
+  is the home link, so it is now explicit and the phantom column is gone (site header, CMS
+  shell, CMS logo settings).
+- **Product `short_description`.** One renderer (`ShortDescription`) for the product page and
+  the featured-product block: HTML when the text contains markup (older rows carry embeds,
+  which are still rewritten to the no-cookie host), otherwise escaped text with line breaks.
+  The field is plain text in every authoring surface, so this is what the seed and the visual
+  editor already produce.
+
+## 10. Still open
+
+- **Images with no stored size.** An external image block or a custom-block string value
+  that carries no `width`/`height` still shifts layout: there is nothing to reserve. New
+  stock photos now carry their size (section 8); existing content does not.
+- Not applicable, listed for completeness: per-field `aria-invalid` on the form block (the
+  server returns form-level errors only).

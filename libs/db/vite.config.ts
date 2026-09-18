@@ -24,6 +24,9 @@ export default defineConfig({
       // referenced composite project and emits to ../../dist/out-tsc instead of outDir below,
       // shipping a package with no index.d.ts. (Matches libs/ui, libs/utils, etc.)
       tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
+      // of monorepo-relative source paths that do not exist in the published package.
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDir: '../../dist/libs/db',
       exclude: ['vite.config.ts'],
       afterBuild: () => {
@@ -59,6 +62,12 @@ export default defineConfig({
               types: './secrets.d.ts',
               require: './secrets.cjs.js',
               default: './secrets.es.js',
+            },
+            // Types only. ecommerce and cortex type their signatures with `Database` imported
+            // from this package's `types` subpath; without this key that specifier resolves in
+            // the monorepo (through a tsconfig path) and nowhere else.
+            './types': {
+              types: './lib/supabase/types.d.ts',
             },
             './package.json': './package.json',
           },

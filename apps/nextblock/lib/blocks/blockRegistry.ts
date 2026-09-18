@@ -186,7 +186,10 @@ export type FormFieldOption = z.infer<typeof FormFieldOptionSchema>;
 
 export const FormFieldSchema = z.object({
   temp_id: z.string(),
-  field_type: z.enum(['text', 'email', 'textarea', 'select', 'radio', 'checkbox']),
+  // `tel`, `url` and `number` exist so the browser can offer the right keyboard, autofill and
+  // validation; they used to be plain text fields. Keep in sync with
+  // libs/cortex/src/lib/block-content-schemas.ts (the MCP side validates the same shape).
+  field_type: z.enum(['text', 'email', 'tel', 'url', 'number', 'textarea', 'select', 'radio', 'checkbox']),
   label: z.string(),
   placeholder: z.string().optional(),
   is_required: z.boolean(),

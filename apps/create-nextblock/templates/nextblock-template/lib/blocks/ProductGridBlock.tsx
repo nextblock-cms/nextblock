@@ -9,6 +9,7 @@ import {
   type ProductGridBlockContent,
 } from './ecommerce-block-schemas';
 import { loadProductGridPage, type ProductGridQuery } from './product-grid-data';
+import { getRequestedPage } from './requested-page';
 
 interface ProductGridBlockProps {
   content: ProductGridBlockContent;
@@ -50,7 +51,15 @@ export const ProductGridBlock = async ({
     excludeTranslationGroupId,
   };
 
-  const { products, totalCount } = await loadProductGridPage(query);
+  // `?page=N` renders that page on the server, so later pages work without JavaScript and
+  // have a URL of their own. A page past the end falls back to the first one.
+  let initialPage = paginate ? getRequestedPage() : 1;
+  let { products, totalCount } = await loadProductGridPage({ ...query, page: initialPage });
+
+  if (initialPage > 1 && products.length === 0) {
+    initialPage = 1;
+    ({ products, totalCount } = await loadProductGridPage(query));
+  }
 
   if (products.length === 0) {
     return null; // Silent fail if no products
@@ -68,6 +77,7 @@ export const ProductGridBlock = async ({
       <div className="container">
         <ProductGridClient
           initialProducts={products}
+          initialPage={initialPage}
           totalCount={totalCount}
           query={query}
           showPagination={showPagination}

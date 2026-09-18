@@ -226,7 +226,8 @@ export default function CmsClientLayout({
     return "bg-sky-500"; // Default color
   }
   const cmsLogoSrc = resolveMediaUrl(logo?.media?.object_key) || FALLBACK_LOGO_PATH;
-  const cmsLogoAlt = logo?.media?.alt_text || siteTitle || "Nextblock";
+  // The logo links home, so its alt is the site name (media rows have no alt column).
+  const cmsLogoAlt = siteTitle || "Nextblock";
 
   // pageTitle logic should now work reliably with usePathname
   let pageTitle = "CMS"; // Default title

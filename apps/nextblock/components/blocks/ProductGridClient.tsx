@@ -1,8 +1,6 @@
 'use client';
 
 import React from 'react';
-import { ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
-import { Button } from '@nextblock-cms/ui/button';
 import { ProductGrid } from '@nextblock-cms/ecommerce/components/ProductGrid';
 import type { Product } from '@nextblock-cms/ecommerce/types';
 import { cn } from '@nextblock-cms/utils';
@@ -11,9 +9,12 @@ import { fetchProductGridPage } from '../../app/actions/productGridActions';
 import { usePageParam } from '../../hooks/usePageParam';
 import { useLabel } from '../../lib/i18n/use-label';
 import type { ProductGridQuery } from '../../lib/blocks/product-grid-data';
+import GridPagination from './GridPagination';
 
 interface ProductGridClientProps {
   initialProducts: Product[];
+  /** The page the server rendered: 1, or the `?page=N` the visitor asked for. */
+  initialPage: number;
   totalCount: number;
   /** The block's resolved query, replayed by the server action for later pages. */
   query: ProductGridQuery;
@@ -22,12 +23,13 @@ interface ProductGridClientProps {
 
 export default function ProductGridClient({
   initialProducts,
+  initialPage,
   totalCount,
   query,
   showPagination,
 }: ProductGridClientProps) {
   const [products, setProducts] = React.useState(initialProducts);
-  const [currentPage, setCurrentPage] = React.useState(1);
+  const [currentPage, setCurrentPage] = React.useState(initialPage);
   const [isLoading, setIsLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const gridRef = React.useRef<HTMLDivElement>(null);
@@ -36,8 +38,8 @@ export default function ProductGridClient({
   // Re-sync when the server sends a new first page (e.g. a live draft edit).
   React.useEffect(() => {
     setProducts(initialProducts);
-    setCurrentPage(1);
-  }, [initialProducts]);
+    setCurrentPage(initialPage);
+  }, [initialProducts, initialPage]);
 
   const perPage = query.limit > 0 ? query.limit : products.length || 1;
   const totalPages = showPagination ? Math.max(1, Math.ceil(totalCount / perPage)) : 1;
@@ -87,39 +89,14 @@ export default function ProductGridClient({
       )}
 
       {showPagination && totalPages > 1 && (
-        <nav
-          aria-label={label('pagination.label', 'Pagination', 'Pagination')}
-          className="mt-10 flex items-center justify-center gap-3"
-        >
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => goToPage(currentPage - 1)}
-            disabled={currentPage === 1 || isLoading}
-          >
-            <ChevronLeft className="h-4 w-4" />
-            {label('pagination.previous', 'Previous', 'Précédent')}
-          </Button>
-          <span
-            aria-live="polite"
-            className="flex min-w-[7rem] items-center justify-center gap-1.5 text-sm text-muted-foreground"
-          >
-            {isLoading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            {label('pagination.page_of', 'Page {current} of {total}', 'Page {current} sur {total}', {
-              current: currentPage,
-              total: totalPages,
-            })}
-          </span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => goToPage(currentPage + 1)}
-            disabled={currentPage === totalPages || isLoading}
-          >
-            {label('pagination.next', 'Next', 'Suivant')}
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        </nav>
+        <GridPagination
+          className="mt-10"
+          size="sm"
+          currentPage={currentPage}
+          totalPages={totalPages}
+          isLoading={isLoading}
+          onNavigate={(page) => void goToPage(page)}
+        />
       )}
     </div>
   );

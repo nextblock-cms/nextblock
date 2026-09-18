@@ -86,7 +86,7 @@ type StoreCurrency = Database['public']['Tables']['currencies']['Row'];
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 type MenuLocation = Database['public']['Enums']['menu_location'];
 type HeaderLogo = Database['public']['Tables']['logos']['Row'] & {
-  media: (Database['public']['Tables']['media']['Row'] & { alt_text: string | null }) | null;
+  media: Database['public']['Tables']['media']['Row'] | null;
 };
 
 const getCachedLanguages = unstable_cache(

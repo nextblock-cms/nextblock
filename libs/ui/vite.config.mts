@@ -16,6 +16,9 @@ export default defineConfig({
     dts({
       entryRoot: 'src',
       tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
+      // of monorepo-relative source paths that do not exist in the published package.
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDir: '../../dist/libs/ui',
       afterBuild: () => {
         const packageJson = {

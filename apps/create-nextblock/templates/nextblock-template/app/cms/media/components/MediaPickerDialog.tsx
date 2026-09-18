@@ -61,10 +61,18 @@ export default function MediaPickerDialog({
     onOpenChange?.(v);
   };
   const [searchTerm, setSearchTerm] = useState("");
+  // What the request uses. Typing "mountain" used to fire eight requests, one per keystroke
+  // (stale answers were already discarded, but the server still did the work eight times).
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [items, setItems] = useState<Media[]>([]);
   const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearchTerm(searchTerm), 300);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
 
   const fetchLibrary = useCallback(async () => {
     const requestId = ++requestIdRef.current;
@@ -83,8 +91,8 @@ export default function MediaPickerDialog({
         limit: MEDIA_LIBRARY_LIMIT.toString(),
       });
 
-      if (searchTerm.trim()) {
-        params.set("q", searchTerm.trim());
+      if (debouncedSearchTerm.trim()) {
+        params.set("q", debouncedSearchTerm.trim());
       }
 
       const response = await fetch(`/api/media/library?${params.toString()}`, {
@@ -129,7 +137,7 @@ export default function MediaPickerDialog({
         setIsLoading(false);
       }
     }
-  }, [searchTerm]);
+  }, [debouncedSearchTerm]);
 
   useEffect(() => {
     if (isOpen) fetchLibrary();
@@ -181,7 +189,8 @@ export default function MediaPickerDialog({
               <div className="relative">
                 <Input
                   type="search"
-                  placeholder="Search library..."
+                  aria-label="Search the media library"
+                  placeholder="Search library…"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="pl-10"

@@ -2565,12 +2565,33 @@ function normalizeFormFieldType(field: Record<string, unknown>) {
     .replace(/\s+/g, '_');
   const label = stringifyContentValue(field.label ?? field.name ?? field.placeholder).toLowerCase();
 
-  if (['email', 'textarea', 'select', 'radio', 'checkbox', 'text'].includes(rawType)) {
+  if (['email', 'tel', 'url', 'number', 'textarea', 'select', 'radio', 'checkbox', 'text'].includes(rawType)) {
     return rawType;
   }
 
-  if (label.includes('email')) {
+  // What an agent is likely to write for the same thing.
+  if (['phone', 'telephone', 'phone_number', 'mobile'].includes(rawType)) {
+    return 'tel';
+  }
+
+  if (['website', 'link', 'uri'].includes(rawType)) {
+    return 'url';
+  }
+
+  if (['numeric', 'integer', 'quantity'].includes(rawType)) {
+    return 'number';
+  }
+
+  if (label.includes('email') || label.includes('courriel')) {
     return 'email';
+  }
+
+  if (label.includes('phone') || label.includes('téléphone') || label.includes('telephone')) {
+    return 'tel';
+  }
+
+  if (label.includes('website') || label.includes('site web')) {
+    return 'url';
   }
 
   if (label.includes('message') || label.includes('comment') || label.includes('details')) {
@@ -6742,8 +6763,8 @@ export async function executeSearchStockPhotos(
           success: true,
           usageGuidance:
             provider.provider === 'unsplash'
-              ? 'Unsplash photos: keep them hotlinked (use `url` as external_url; never save an Unsplash photo to the media library) and attribute each one — copy the photo\'s attribution fields into the image content\'s `attribution` (photographer, photographerUrl, sourceUrl, downloadLocation, utmSource, provider "unsplash"). The site renders the "Photo by … on Unsplash" credit from `attribution` automatically, so do NOT also copy the credit into `caption` (leave caption empty unless you have a genuine descriptive caption).'
-              : 'Set the image content\'s `attribution` (photographer, photographerUrl, sourceUrl, provider "pexels"). The site renders the "Photo by … on Pexels" credit from `attribution` automatically, so do NOT also copy the credit into `caption` (leave caption empty unless you have a genuine descriptive caption). Pexels attribution is appreciated but optional.',
+              ? 'Unsplash photos: keep them hotlinked (use `url` as external_url; never save an Unsplash photo to the media library) and attribute each one — copy the photo\'s attribution fields into the image content\'s `attribution` (photographer, photographerUrl, sourceUrl, downloadLocation, utmSource, provider "unsplash"). The site renders the "Photo by … on Unsplash" credit from `attribution` automatically, so do NOT also copy the credit into `caption` (leave caption empty unless you have a genuine descriptive caption). Also copy the photo\'s `width` and `height` into the image content: the page then reserves the right space before the file loads instead of shifting.'
+              : 'Set the image content\'s `attribution` (photographer, photographerUrl, sourceUrl, provider "pexels"). The site renders the "Photo by … on Pexels" credit from `attribution` automatically, so do NOT also copy the credit into `caption` (leave caption empty unless you have a genuine descriptive caption). Pexels attribution is appreciated but optional. Also copy each photo `width` and `height` into the image content: the page then reserves the right space before the file loads instead of shifting.',
         };
       }
     } catch (error) {
@@ -8074,7 +8095,7 @@ export function createCortexGlobalAgentTools(context?: ToolExecutionContext) {
     }),
     search_stock_photos: tool({
       description:
-        'Find relevant, free, high-quality stock photos (Unsplash/Pexels) for page imagery. Returns a list of photos each with a direct image `url`, `width`, `height`, `alt`, and `photographer`. Read-only, zero cost. Use the returned `url` directly as an image block\'s external_url or a section image background\'s image.external_url when building or revamping pages, so layouts show real photos instantly. Set orientation "landscape" for hero/section backgrounds.',
+        'Find relevant, free, high-quality stock photos (Unsplash/Pexels) for page imagery. Returns a list of photos each with a direct image `url`, `width`, `height`, `alt`, and `photographer`. Read-only, zero cost. Use the returned `url` directly as an image block\'s external_url (copy `width` and `height` into the same image content, so the page does not shift while the photo loads) or a section image background\'s image.external_url when building or revamping pages, so layouts show real photos instantly. Set orientation "landscape" for hero/section backgrounds.',
       execute: (input) => executeSearchStockPhotos(input, context),
       inputSchema: searchStockPhotosInputSchema,
       strict: true,

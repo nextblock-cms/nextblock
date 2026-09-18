@@ -71,6 +71,12 @@ export default defineConfig({
     dts({
       entryRoot: 'src',
       tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations. By
+      // default the plugin rewrites tsconfig path aliases into relative paths, which for a
+      // sibling library means `../../../db/src/index.ts`: a file that exists in this
+      // monorepo and nowhere else. Consumers compile with skipLibCheck, so nothing failed;
+      // every type that mentioned a sibling library was silently `any`.
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDir: '../../dist/libs/cortex',
       afterBuild: reapplyDirectives,
     }),

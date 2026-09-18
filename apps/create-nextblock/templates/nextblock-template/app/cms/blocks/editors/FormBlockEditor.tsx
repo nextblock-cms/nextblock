@@ -66,6 +66,9 @@ const SortableFormField = ({ field, index, onUpdate, onDelete }: { field: FormFi
                 <SelectContent>
                   <SelectItem value="text">Text</SelectItem>
                   <SelectItem value="email">Email</SelectItem>
+                  <SelectItem value="tel">Phone</SelectItem>
+                  <SelectItem value="url">Website (URL)</SelectItem>
+                  <SelectItem value="number">Number</SelectItem>
                   <SelectItem value="textarea">Text Area</SelectItem>
                   <SelectItem value="select">Select</SelectItem>
                   <SelectItem value="radio">Radio Buttons</SelectItem>

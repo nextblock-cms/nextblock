@@ -9,7 +9,7 @@ import { CurrencySwitcher } from '@nextblock-cms/ecommerce/components/CurrencySw
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 type Logo =
   Database['public']['Tables']['logos']['Row'] & {
-    media: (Database['public']['Tables']['media']['Row'] & { alt_text: string | null }) | null;
+    media: Database['public']['Tables']['media']['Row'] | null;
   };
 
 interface HeaderProps {

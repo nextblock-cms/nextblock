@@ -9,6 +9,7 @@ import {
   getPageDataBySlug,
 } from './[slug]/page.utils';
 import BlockRenderer from '../components/BlockRenderer';
+import { parsePageParam, setRequestedPage } from '../lib/blocks/requested-page';
 import {
   resolveMetaTitle,
   resolvePageMetaDescription,
@@ -157,7 +158,14 @@ export async function generateMetadata(): Promise<Metadata> {
   };
 }
 
-export default async function RootPage() {
+interface RootPageProps {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}
+
+export default async function RootPage({ searchParams }: RootPageProps) {
+  // Paginated grids on the home page render the requested `?page=N` on the server. The
+  // route is already per-request (locale cookie), so this costs nothing extra.
+  setRequestedPage(parsePageParam((await searchParams).page));
   const preferredLocale = await getPreferredLocale();
   const pageData = await resolveHomepageData(preferredLocale);
 

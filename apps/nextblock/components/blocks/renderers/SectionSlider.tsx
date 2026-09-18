@@ -42,6 +42,7 @@ export default function SectionSlider({
   const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
   const totalSlides = children.length;
   const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const label = (key: string, values: Record<string, number> = {}) => {
     const translated = t(key);
@@ -125,13 +126,35 @@ export default function SectionSlider({
     }
   };
 
+  // Swipe left / right on touch screens. `touch-pan-y` on the container leaves vertical
+  // scrolling to the browser, so only a mostly-horizontal gesture of some length counts.
+  const handleTouchStart = (event: React.TouchEvent) => {
+    const touch = event.touches[0];
+    touchStartRef.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+  };
+
+  const handleTouchEnd = (event: React.TouchEvent) => {
+    const start = touchStartRef.current;
+    const touch = event.changedTouches[0];
+    touchStartRef.current = null;
+
+    if (!start || !touch || totalSlides <= 1) return;
+
+    const deltaX = touch.clientX - start.x;
+    const deltaY = touch.clientY - start.y;
+
+    if (Math.abs(deltaX) < 48 || Math.abs(deltaX) < Math.abs(deltaY) * 1.5) return;
+
+    setCurrentIndex((prev) => (deltaX < 0 ? (prev + 1) % totalSlides : (prev - 1 + totalSlides) % totalSlides));
+  };
+
   if (totalSlides === 0) {
     return null;
   }
 
   return (
     <div
-      className="relative w-full overflow-hidden group"
+      className="relative w-full overflow-hidden group touch-pan-y"
       role="region"
       aria-roledescription="carousel"
       aria-label={label("slider.label")}
@@ -142,6 +165,8 @@ export default function SectionSlider({
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setIsPaused(false);
       }}
       onKeyDown={handleKeyDown}
+      onTouchStart={handleTouchStart}
+      onTouchEnd={handleTouchEnd}
       style={{ minHeight }}
     >
       {/* Slides Container */}

@@ -146,7 +146,8 @@ export const fallbackBlockSchemas: Record<BlockType, z.ZodTypeAny> = {
   form: z.object({
     fields: z.array(
       z.object({
-        field_type: z.enum(['text', 'email', 'textarea', 'select', 'radio', 'checkbox']),
+        // Mirrors FormFieldSchema in apps/nextblock/lib/blocks/blockRegistry.ts.
+        field_type: z.enum(['text', 'email', 'tel', 'url', 'number', 'textarea', 'select', 'radio', 'checkbox']),
         is_required: z.boolean(),
         label: z.string(),
         options: z.array(z.object({ label: z.string(), value: z.string() })).optional(),

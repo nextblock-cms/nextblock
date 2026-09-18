@@ -10,7 +10,7 @@ import { useLabel } from '../lib/i18n/use-label';
 import { DeferredGlobalSearch } from './DeferredGlobalSearch';
 import { resolveMediaUrl } from '../lib/media/resolveMediaUrl';
 
-type Logo = Database['public']['Tables']['logos']['Row'] & { media: (Database['public']['Tables']['media']['Row'] & { alt_text: string | null }) | null };
+type Logo = Database['public']['Tables']['logos']['Row'] & { media: Database['public']['Tables']['media']['Row'] | null };
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 import Image from 'next/image'
 import { EyeOff, FilePenLine, Pencil } from 'lucide-react';
@@ -414,7 +414,10 @@ export default function ResponsiveNav({
             {logo && logo.media ? (
               <Image
                 src={resolveMediaUrl(logo.media.object_key) || FALLBACK_LOGO_PATH}
-                alt={logo.media.alt_text || siteTitle || 'Nextblock'}
+                // The logo is the home link, so its text is the site name: that is what a
+                // screen reader should announce, not the file's own description (a media
+                // row has no alt column; `description` defaults to the upload's file name).
+                alt={siteTitle || 'Nextblock'}
                 width={logo.media.width || 100}
                 height={logo.media.height || 32}
                 className="h-14 w-auto object-contain" style={{ width: 'auto', height: '56px' }}

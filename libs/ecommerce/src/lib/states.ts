@@ -80,6 +80,54 @@ export const STATES_BY_COUNTRY: Record<string, CountrySubdivision[]> = {
   CA: CA_PROVINCES,
 };
 
+/**
+ * French names, only where they differ from the English ones. `Intl.DisplayNames` covers
+ * countries but has no subdivision data, so a French checkout listed "British Columbia" and
+ * "Quebec".
+ */
+const FRENCH_SUBDIVISION_NAMES: Record<string, Record<string, string>> = {
+  CA: {
+    BC: 'Colombie-Britannique',
+    NB: 'Nouveau-Brunswick',
+    NL: 'Terre-Neuve-et-Labrador',
+    NS: 'Nouvelle-Écosse',
+    NT: 'Territoires du Nord-Ouest',
+    PE: 'Île-du-Prince-Édouard',
+    QC: 'Québec',
+  },
+  US: {
+    CA: 'Californie',
+    DC: 'District de Columbia',
+    FL: 'Floride',
+    GA: 'Géorgie',
+    HI: 'Hawaï',
+    LA: 'Louisiane',
+    NC: 'Caroline du Nord',
+    ND: 'Dakota du Nord',
+    NM: 'Nouveau-Mexique',
+    PA: 'Pennsylvanie',
+    SC: 'Caroline du Sud',
+    SD: 'Dakota du Sud',
+    VA: 'Virginie',
+    WV: 'Virginie-Occidentale',
+  },
+};
+
+/** The subdivision's name in the visitor's language. The stored value stays the code. */
+export function getSubdivisionLabel(
+  countryCode: string | null | undefined,
+  subdivision: CountrySubdivision,
+  lang?: string | null
+) {
+  if (!lang || !lang.toLowerCase().startsWith('fr')) {
+    return subdivision.name;
+  }
+
+  const normalizedCountry = normalizeCountryCode(countryCode);
+
+  return (normalizedCountry && FRENCH_SUBDIVISION_NAMES[normalizedCountry]?.[subdivision.code]) || subdivision.name;
+}
+
 const SUBDIVISION_ALIAS_MAP: Record<string, Record<string, string>> = {
   US: {
     CALIFORNIA: 'CA',
