@@ -69,6 +69,31 @@ async function generateSandboxReset() {
     'e3a2c121-70a4-4239-a9df-f70ce717f5a1'::uuid
   );
 
+  -- Step B0: Refuse to cascade into an extension that is registered in schema public.
+  -- DROP SCHEMA public CASCADE drops every extension whose extnamespace is public, and for
+  -- pg_net that deadlocks the reset: the pg_net worker holds a lock on net.http_request_queue
+  -- for as long as the HTTP request that triggered this very reset is outstanding, so the
+  -- DROP waits on the worker, the worker waits on the route, and Vercel kills the function
+  -- at maxDuration (a 504 on every run). Relocatable extensions are moved to "extensions";
+  -- anything else fails loudly here instead of hanging (npm run sandbox:schedule reinstalls
+  -- pg_net WITH SCHEMA extensions).
+  DO $nb_ext_guard$
+  DECLARE r record;
+  BEGIN
+    FOR r IN
+      SELECT extname, extrelocatable
+        FROM pg_extension
+       WHERE extnamespace = 'public'::regnamespace
+    LOOP
+      IF r.extrelocatable AND to_regnamespace('extensions') IS NOT NULL THEN
+        RAISE NOTICE 'sandbox reset: moving extension % out of schema public', r.extname;
+        EXECUTE format('ALTER EXTENSION %I SET SCHEMA extensions', r.extname);
+      ELSE
+        RAISE EXCEPTION 'sandbox reset aborted: extension % is installed in schema public and DROP SCHEMA public CASCADE would drop it. Reinstall it WITH SCHEMA extensions (for pg_net: npm run sandbox:schedule -- https://cms.nextblock.dev).', r.extname;
+      END IF;
+    END LOOP;
+  END $nb_ext_guard$;
+
   -- Step B: Wipe public schema and truncate migrations
   DROP SCHEMA public CASCADE;
   CREATE SCHEMA public;
@@ -86,6 +111,24 @@ async function generateSandboxReset() {
 
   -- Step C: Execute full schema & seed from production migrations
 ${concatenatedSql}
+
+  -- Step C2: Take the API roles' EXECUTE back off every trigger function. Step B's
+  -- DEFAULT PRIVILEGES hand anon/authenticated EXECUTE on each function the migrations
+  -- create; trigger functions never need it (EXECUTE is only checked at CREATE TRIGGER
+  -- time and PostgREST cannot call them), and the Security Advisor flags the SECURITY
+  -- DEFINER ones. Same pass as lib/setup/schema-apply.ts runs after a build-time apply.
+  do $nb_trg$
+  declare r record;
+  begin
+    for r in
+      select p.oid::regprocedure as sig
+        from pg_proc p
+        join pg_type t on t.oid = p.prorettype
+       where p.pronamespace = 'public'::regnamespace and t.typname = 'trigger'
+    loop
+      execute format('revoke execute on function %s from public, anon, authenticated', r.sig);
+    end loop;
+  end $nb_trg$;
 
   -- Step D: Record the applied migrations in history (truncated in Step B) so
   -- \`npm run db:migrate:check\` reports up to date instead of listing every file as pending.

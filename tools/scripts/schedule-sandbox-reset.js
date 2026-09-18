@@ -10,7 +10,12 @@
  *
  * The job calls `GET /api/cron/reset-sandbox` through pg_net with the CRON_SECRET read
  * from Supabase Vault. It survives the reset itself, which drops only the `public`
- * schema (`cron`, `net` and `vault` are untouched).
+ * schema (`cron`, `net` and `vault` are untouched) — PROVIDED pg_net is registered in
+ * the `extensions` schema. A bare `create extension pg_net` lands it in `public` (the
+ * postgres role's first search_path entry), and then `DROP SCHEMA public CASCADE` tries to
+ * drop pg_net itself while the pg_net worker still holds the request that triggered the
+ * reset: the two wait on each other until Vercel times the route out (504 every run).
+ * This script installs pg_net WITH SCHEMA extensions and moves an existing public copy.
  *
  * Run it ONCE from any machine whose `.env.local` points at the sandbox database (or
  * paste the `--print-sql` output into the Supabase SQL editor). The job then lives in
@@ -37,6 +42,23 @@ const SECRET_NAME = 'sandbox_cron_secret';
 const DEFAULT_SCHEDULE = '*/15 * * * *';
 // The reset takes up to a minute; pg_net's default 5 s would abandon the request.
 const REQUEST_TIMEOUT_MS = 90_000;
+
+// pg_net is not relocatable, so a copy that landed in `public` has to be dropped and
+// re-created in `extensions` (its own objects live in the `net` schema either way; only the
+// request/response log is lost). Blocks for up to a request timeout if the worker is
+// mid-request, so run it between reset ticks.
+const ENSURE_PG_NET_SQL = `
+      do $nb_pg_net$
+      begin
+        if exists (
+          select 1 from pg_extension
+           where extname = 'pg_net' and extnamespace = 'public'::regnamespace
+        ) then
+          raise notice 'pg_net is installed in schema public; reinstalling it in extensions';
+          drop extension pg_net;
+        end if;
+        create extension if not exists pg_net with schema extensions;
+      end $nb_pg_net$`;
 
 const envPath = path.resolve(__dirname, '../../.env.local');
 if (fs.existsSync(envPath)) {
@@ -111,7 +133,7 @@ function printSql() {
     [
       "-- Paste into the sandbox project's SQL editor (Supabase dashboard -> SQL). Safe to re-run.",
       'create extension if not exists pg_cron;',
-      'create extension if not exists pg_net;',
+      `${ENSURE_PG_NET_SQL};`,
       `delete from vault.secrets where name = ${sqlLiteral(SECRET_NAME)};`,
       `select vault.create_secret(${sqlLiteral(cronSecret)}, ${sqlLiteral(SECRET_NAME)}, 'Bearer token for /api/cron/reset-sandbox');`,
       `select cron.schedule(${sqlLiteral(JOB_NAME)}, ${sqlLiteral(schedule)}, $cmd$${command}\n$cmd$);`,
@@ -168,7 +190,7 @@ async function main() {
     const { cronSecret, resetUrl, schedule, command } = scheduleInputs();
 
     await sql.unsafe('create extension if not exists pg_cron');
-    await sql.unsafe('create extension if not exists pg_net');
+    await sql.unsafe(ENSURE_PG_NET_SQL);
 
     // Vault has no upsert by name; replace so a rotated CRON_SECRET takes effect.
     await sql.unsafe(`delete from vault.secrets where name = ${sqlLiteral(SECRET_NAME)}`);

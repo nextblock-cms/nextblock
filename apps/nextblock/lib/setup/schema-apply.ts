@@ -159,12 +159,33 @@ const TRACKING_DDL =
 // which a `DROP SCHEMA public CASCADE` reset wipes. This final, idempotent pass mirrors
 // migration 06's grants over the FINAL table set, so no table is left ungranted
 // ("permission denied"). RLS still governs row access on top of these base grants.
+//
+// The blanket EXECUTE grant is then taken back from every trigger function: Postgres only
+// checks EXECUTE on a trigger function at CREATE TRIGGER time, never when it fires, and
+// PostgREST cannot call a `RETURNS trigger` function via /rpc, so the API roles never
+// need it. Without this pass every apply re-granted anon/authenticated on the SECURITY
+// DEFINER triggers (handle_new_user, update_product_ratings) that migration 02013 revokes,
+// and the Supabase Security Advisor flagged them again after each deploy.
+const TRIGGER_FUNCTION_REVOKE_SQL = `do $nb_trg$
+declare r record;
+begin
+  for r in
+    select p.oid::regprocedure as sig
+      from pg_proc p
+      join pg_type t on t.oid = p.prorettype
+     where p.pronamespace = 'public'::regnamespace and t.typname = 'trigger'
+  loop
+    execute format('revoke execute on function %s from public, anon, authenticated', r.sig);
+  end loop;
+end $nb_trg$;`;
+
 const GRANTS_SQL =
   'grant usage on schema public to anon, authenticated, service_role;' +
   'grant select on all tables in schema public to anon;' +
   'grant all on all tables in schema public to authenticated, service_role;' +
   'grant all on all sequences in schema public to anon, authenticated, service_role;' +
-  'grant execute on all functions in schema public to anon, authenticated, service_role;';
+  'grant execute on all functions in schema public to anon, authenticated, service_role;' +
+  TRIGGER_FUNCTION_REVOKE_SQL;
 
 function recordSql(version: string, file: string): string {
   return (

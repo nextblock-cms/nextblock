@@ -201,7 +201,16 @@ The two jobs that used to be crons are handled like this:
   `-- remove` unschedules, and `-- https://cms.nextblock.dev print-sql` prints the same
   statements for the Supabase SQL editor instead (bare words, because npm on PowerShell
   drops `--flags` even after `--`).
-  Nothing runs on Vercel. The job survives the reset itself (which drops only `public`). A branch
+  Nothing runs on Vercel. The job survives the reset itself (which drops only `public`)
+  **as long as `pg_net` is registered in the `extensions` schema**, which the script enforces
+  (`create extension pg_net with schema extensions`, moving an existing `public` copy).
+  A bare `create extension pg_net` lands in `public`, and then the reset's
+  `DROP SCHEMA public CASCADE` tries to drop pg_net itself while the pg_net worker still
+  holds the request that triggered the reset: each waits on the other until Vercel kills
+  the route at 60 s (a 504 on every run, and the "Extension in Public" advisor warning).
+  The generated reset SQL now refuses to run while any extension lives in `public`.
+  Debugging a silent reset: `npm run sandbox:schedule -- status` (504 = the route timed
+  out), then the project's Postgres logs for `still waiting for AccessExclusiveLock`. A branch
   carrying the cron was tried first and rejected: every Vercel project on the repo builds
   every branch, so each release produced a second, useless build in the other project.
   On a normal install the route returns 404 anyway.
