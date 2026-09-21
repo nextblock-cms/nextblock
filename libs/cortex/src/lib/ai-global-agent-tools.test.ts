@@ -3757,7 +3757,11 @@ describe('block-level edits over MCP (skipConfirmation + cmsTarget)', () => {
     },
   ];
 
-  const mcpContext = (supabase: unknown) => ({
+  // Typed from the mock factory, not `unknown`: the executors take
+  // `SupabaseLike | undefined`, so an `unknown` here fails the app's type-check (the
+  // app tsconfig's exclude is anchored at the app dir, so it DOES check libs tests).
+  // Deriving it also proves the mock still structurally satisfies the real interface.
+  const mcpContext = (supabase: ReturnType<typeof createMockSupabase>['supabase']) => ({
     revalidatePath: () => undefined,
     skipConfirmation: true,
     supabase,
