@@ -1,3 +1,9 @@
+// Imported statically, not with a lazy require(): Vite 8 (Rolldown) emits a lazy
+// require('next/cache') in the published ESM as a __require shim that bundlers cannot
+// analyse, so it never resolved in scaffolds and revalidation silently did nothing.
+// Importing next/cache is safe outside a request scope; only calling it needs one. Every
+// caller runs inside a route handler, and tests inject their own revalidatePath.
+import { revalidatePath as nextRevalidatePath, revalidateTag as nextRevalidateTag } from 'next/cache';
 import { tool } from 'ai';
 
 import { z } from './zod-config';
@@ -135,8 +141,8 @@ function buildWidgetGenerationParams(input: { prompt: string; context?: string }
 
 function revalidateCustomBlockCaches(definition?: { id?: string; slug?: string } | null) {
   try {
-    // Lazily required so the module stays import-safe outside a request scope.
-    const { revalidatePath, revalidateTag } = require('next/cache') as typeof import('next/cache');
+    const revalidatePath = nextRevalidatePath;
+    const revalidateTag = nextRevalidateTag;
     revalidateTag('custom-block-definitions', 'max');
     if (definition?.id) revalidateTag(`custom-block-definitions:${definition.id}`, 'max');
     if (definition?.slug) revalidateTag(`custom-block-definitions:${definition.slug}`, 'max');

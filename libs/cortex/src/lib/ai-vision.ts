@@ -446,12 +446,12 @@ function isRecoverableAltTextError(error: unknown) {
 /**
  * Generate an `alt` attribute for an image by actually looking at it.
  *
- * The image is attached as an AI SDK v6 image content part inside a user message.
- * Two consequences of that are worth knowing at the call site: the URL must be
- * publicly fetchable from the server (the SDK downloads it and inlines base64
- * rather than forwarding the link, because the provider is created without
- * `supportedUrls`), and a very large source image inflates the request body on
- * every attempt in the fallback chain. Passing a resized or CDN-transformed URL is
+ * The image is downloaded once by `downloadCortexVisionImage` (DNS-pinned, private
+ * addresses refused, capped at CORTEX_AI_VISION_MAX_IMAGE_BYTES) and attached as an AI SDK
+ * file part with its bytes inside a user message. Two consequences are worth knowing at the
+ * call site: the URL must be publicly fetchable from the server, and a very large source
+ * image inflates the request body on every attempt in the fallback chain, because the
+ * provider receives it inline as base64. Passing a resized or CDN-transformed URL is
  * therefore materially cheaper than passing the original upload.
  */
 export async function generateCortexAiAltText(
@@ -483,6 +483,13 @@ export async function generateCortexAiAltText(
     selectedModel: client.modelSelection,
   });
 
+  // Downloaded here, once, rather than by the SDK on every attempt in the fallback chain.
+  // AI SDK 7's own downloader loads undici at runtime in a way deployments do not ship; see
+  // vision-image-download.ts. Lazily imported, like the client above, so this module's pure
+  // helpers stay importable without Node's http stack.
+  const { downloadCortexVisionImage } = await import('./vision-image-download');
+  const image = await downloadCortexVisionImage(imageUrl, { abortSignal: params.abortSignal });
+
   const messages: ModelMessage[] = [
     {
       content: [
@@ -491,14 +498,14 @@ export async function generateCortexAiAltText(
           type: 'text',
         },
         {
-          // `mediaType` is intentionally omitted. The SDK downloads the image and
-          // derives the media type from the response, whereas guessing it from the
-          // URL is unreliable for the CDN and signed-URL shapes this CMS produces —
-          // query strings, no extension, or an extension that disagrees with what
-          // the storage bucket actually serves. A wrong media type is worse than a
-          // missing one, because the provider will reject the part outright.
-          image: imageUrl,
-          type: 'image',
+          // The bytes, with the media type the server declared or the file signature
+          // showed. It is never guessed from the URL, which is unreliable for the CDN and
+          // signed-URL shapes this CMS produces (query strings, no extension, or one that
+          // disagrees with what the bucket serves); a wrong type makes the provider
+          // reject the part outright.
+          data: image.data,
+          mediaType: image.mediaType,
+          type: 'file',
         },
       ],
       role: 'user',
@@ -534,7 +541,7 @@ export async function generateCortexAiAltText(
             maxOutputTokens: 400,
             maxRetries: 0,
             messages,
-            system: buildAltTextSystemPrompt(maxLength),
+            instructions: buildAltTextSystemPrompt(maxLength),
             temperature: 0.2,
           } as Record<string, unknown>,
           {

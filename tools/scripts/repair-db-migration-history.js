@@ -750,10 +750,24 @@ async function readBaselineGeneration() {
   }
 }
 
-/** One read of the remote history, shared by the router and the reconcile. Null when unreadable. */
+/**
+ * One read of the remote history, shared by the router and the reconcile. Null when unreadable.
+ * `--output-format json` matches push-db-migrations.js: the same form in a terminal and in an
+ * agent session (CLI 2.109+ switches to JSON when it detects an agent).
+ */
 function readRemoteStatus(dbPassword) {
   const { parseMigrationList } = require('./push-db-migrations.js');
-  const listing = runCapture(npxBin, ['supabase', 'migration', 'list', '--workdir', workdir, '--password', dbPassword]);
+  const listing = runCapture(npxBin, [
+    'supabase',
+    'migration',
+    'list',
+    '--workdir',
+    workdir,
+    '--password',
+    dbPassword,
+    '--output-format',
+    'json',
+  ]);
   return listing ? parseMigrationList(listing) : null;
 }
 

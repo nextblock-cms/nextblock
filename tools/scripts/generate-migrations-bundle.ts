@@ -51,7 +51,9 @@ if (naming.errors.length > 0) {
 const entries = files.map((name) => ({
   version: name.split('_')[0],
   name,
-  sql: readFileSync(path.join(MIGRATIONS_DIR, name), 'utf8'),
+  // Normalise to LF: a migration's endings depend on the checkout (core.autocrlf), so copying
+  // them verbatim made every regeneration rewrite unrelated entries. Postgres does not care.
+  sql: readFileSync(path.join(MIGRATIONS_DIR, name), 'utf8').replace(/\r\n/g, '\n'),
 }));
 
 const banner =

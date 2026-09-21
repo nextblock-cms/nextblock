@@ -1,5 +1,6 @@
 import nx from '@nx/eslint-plugin';
-import jsoncParser from 'jsonc-eslint-parser';
+// jsonc-eslint-parser 3 is ESM-only with no default export; the namespace is the parser.
+import * as jsoncParser from 'jsonc-eslint-parser';
 
 export default [
   ...nx.configs['flat/base'],

@@ -61,7 +61,7 @@ import {
   enableMcpForSetupAction,
   saveStockPhotoKeysForSetupAction,
   selectModelForSetupAction,
-  useExistingMcpTokenForSetupAction,
+  reuseExistingMcpTokenForSetupAction,
   type StockProviderId,
 } from './actions';
 import { SiteBriefForm } from './SiteBriefForm';
@@ -455,7 +455,7 @@ export function CortexSetupWizard({
         // Re-running the guide against a connection that already exists: switch the
         // server on if needed and carry the token's name to the last step. Its secret
         // was shown once, when it was created, so the snippets keep the placeholder.
-        const reused = await useExistingMcpTokenForSetupAction({ allowLocalhostWithoutToken, tokenId: existing.id });
+        const reused = await reuseExistingMcpTokenForSetupAction({ allowLocalhostWithoutToken, tokenId: existing.id });
 
         if (!reused.success) {
           setMcpState({ message: reused.message, status: 'error' });

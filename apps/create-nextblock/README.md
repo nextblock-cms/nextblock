@@ -107,7 +107,7 @@ no-card trial you can start from the dashboard or headlessly as above.
 
 ## Requirements
 
-Node.js 20+ (22 recommended). Docker Desktop for the local Docker profile. A Supabase
+Node.js 22.12 or newer. Docker Desktop for the local Docker profile. A Supabase
 project (free tier works) for the cloud profile.
 
 License: AGPL-3.0-or-later.

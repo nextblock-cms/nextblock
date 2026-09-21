@@ -39,7 +39,9 @@ async function generateSandboxReset() {
   let concatenatedSql = '';
   for (const file of files) {
     console.log(` - Reading ${file}`);
-    let content = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf-8');
+    // Normalise to LF so the output does not depend on the checkout's line endings
+    // (core.autocrlf), and so the BEGIN/COMMIT stripping below sees consistent input.
+    let content = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf-8').replace(/\r\n/g, '\n');
     // Strip BEGIN; and COMMIT; because they cause errors inside an EXECUTE block
     content = content.replace(/(?:^|\n)\s*BEGIN\s*;/ig, '\n');
     content = content.replace(/(?:^|\n)\s*COMMIT\s*;/ig, '\n');

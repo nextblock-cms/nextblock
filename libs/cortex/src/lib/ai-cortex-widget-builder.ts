@@ -95,7 +95,7 @@ export async function generateCortexWidgetDefinition(
             // schema below, which works across every OpenRouter model.
             output: 'no-schema',
             prompt: buildCortexWidgetBuilderPrompt(request),
-            system: buildCortexWidgetBuilderSystemPrompt(),
+            instructions: buildCortexWidgetBuilderSystemPrompt(),
             temperature: 0.15,
           } as Record<string, unknown>,
           {

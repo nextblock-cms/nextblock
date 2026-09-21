@@ -306,7 +306,7 @@ export async function generateEditorHtmlFragment(
             maxOutputTokens: 5000,
             maxRetries: 0,
             prompt: buildHtmlGenerationPrompt(request),
-            system: buildInlineHtmlAssistantSystemPrompt(),
+            instructions: buildInlineHtmlAssistantSystemPrompt(),
             temperature: 0.2,
           } as Record<string, unknown>,
           {

@@ -169,6 +169,23 @@ When the CLI creates a project it currently:
    the seven published packages to transpile, no build-time type-check of pre-built
    deps; a required anchor that disappears throws at scaffold time and fails
    `next-config.test.js`, which runs the patches against `apps/nextblock/next.config.js`)
+   and `eslint.config.mjs` is replaced by the standalone config in
+   `bin/lib/eslint-config.js`. The app's own config only loads inside the monorepo (it
+   imports `@nx/eslint-plugin` and a `../../` root config), so before this every scaffold's
+   `npm run lint` was dead. The standalone one is built on `eslint-config-next` and reports
+   every rule the monorepo does not enforce as a warning, chiefly the React Compiler checks
+   in `eslint-plugin-react-hooks` 7 (`rules-of-hooks` stays an error on both sides), so a
+   fresh project lints green whenever `nx lint nextblock` does. `eslint-config.test.js` is
+   the drift guard: it lints the real `apps/nextblock` code with exactly that config and
+   fails on any error (about 2 minutes cold, under 20 s warm via an ESLint cache in the OS
+   temp dir). The app's `lint` script is `eslint .`; Next 16 removed `next lint`.
+   `sync-template.js` also writes the same standalone config into the template, because
+   `npm run update` copies and 3-way-merges framework files from the template. Otherwise every
+   update would put the unloadable monorepo config back. `tsconfig.json` no longer gets
+   `baseUrl` (TypeScript 6 deprecates it, error TS5101); the `paths` entries are `./`-relative
+   and need none. For projects scaffolded earlier, `npm run update` adds
+   `"ignoreDeprecations": "6.0"` when their tsconfig still sets `baseUrl`, and keeps `baseUrl`,
+   since their own code may import paths rooted at it.
 9. rewrites `package.json` away from workspace dependencies and toward published
    packages
 10. writes a project-level `.npmrc` for public package resolution
@@ -306,6 +323,16 @@ through 0.19.2, and neither breaks a scaffold build because scaffolds compile wi
 | Missing declarations | vite-plugin-dts only LOGS TypeScript's declaration-emit errors and the build still exits 0. cortex logged `TS4058 ... 'NavigationNode' ... cannot be named` and wrote **no** `ai-global-agent-tools.d.ts`, while `index.d.ts` still re-exported it. Rule: a recursive type that appears in an exported function's inferred return type must itself be exported. |
 | Sibling imports | By default the plugin rewrites tsconfig path aliases to relative paths, so a type imported from a sibling library was emitted as `../../../db/src/index.ts`, a path that exists only in this monorepo (58 such imports in `ecom`). Every lib config now sets `aliasesExclude: [new RegExp('^@nextblock-cms/')]`, and the check resolves each `@nextblock-cms/*` specifier found in a `.d.ts` through the sibling's own `exports` to a declaration file (that is why `db` now exports a types-only `./types`). |
 
+A fifth check (added with the Vite 8 upgrade) reads what `npm publish` would really ship. It
+runs `npm pack --dry-run --json` in the dist folder, parses every shipped `.js`/`.mjs`/`.cjs`/
+`.d.ts` file with TypeScript (a regex flagged `import("./html_renderer")` inside a highlight.js
+comment in the editor bundle), and fails when a relative import or an `exports` target is not
+in the tarball. With no argument, `verify-lib-dist.js` now checks every built lib.
+
+| Check | What went wrong |
+| :-- | :-- |
+| Tarball contents | Rolldown renamed `ui`'s lazy chunks from `index-[hash]` to `dist-*`, `es-*` and `rolldown-runtime-*`, and `index.mjs` imports the runtime chunk directly. The `files` whitelist still globbed `index-*.mjs`, so every consumer of `@nextblock-cms/ui` would have failed to import it, and every earlier check passed. It also catches a lib whose declarations silently disappear (next section). |
+
 ### Library build gotchas (dts / tsconfig)
 
 Each lib emits its `.d.ts` via `vite-plugin-dts` running tsc on `tsconfig.lib.json`. When a
@@ -323,6 +350,39 @@ tsconfig decides whether the build log is clean:
 - A **strict** lib (`db`/`sdk` set `noPropertyAccessFromIndexSignature`) compiles the
   sibling's *source* under its strict rules, so `libs/utils` must stay strict-clean
   (bracket-access undeclared keys, e.g. `process.env['R2_BUCKET_NAME']`).
+
+Vite 8 (Rolldown) and vite-plugin-dts 5 added these rules:
+
+- **`build.lib.entry` paths must be relative** (`'./src/index.ts'`), never
+  `path.resolve(__dirname, …)`. `nx run <lib>:build` starts the Vite step from a lowercase
+  `d:\` working directory, vite-plugin-dts 5 compares paths case-sensitively, and an absolute
+  `D:\…` entry was silently skipped: `db` emitted 3 declaration files instead of 14, with no
+  error. Check 5 above catches it.
+- vite-plugin-dts 5 (a re-export of `unplugin-dts`) renamed the option `outDir` to
+  `outDirs`. A leftover `outDir` is a TS2561 error and is ignored at runtime.
+- Use `build.rolldownOptions`; `build.rollupOptions` is a deprecated alias. `external`,
+  `output.preserveModules` and `preserveModulesRoot` behave exactly as before.
+- Rolldown names shared chunks `dist-*`, `es-*` and `rolldown-runtime-*`, and adds a
+  `_virtual/_rolldown/runtime` module, so a manifest `files` list must glob `*.mjs`/`*.js`
+  rather than a chunk-name prefix.
+- `[unplugin:dts] Outside emitted: dist/libs/<sibling>/src/...` log lines are expected. They
+  are the sibling sources listed in `include`, reported and not written.
+- **A bundled CommonJS module must never `require()` an external.** Rolldown keeps such a
+  call as a `__require("react")` shim, where Vite 7's commonjs plugin rewrote it into an
+  import. The shim throws "Calling `require` for "react" in an environment that doesn't expose
+  the `require` function" in the browser and in any ESM consumer. It shipped in the first Vite 8
+  builds of `editor` (`use-sync-external-store`, via `@tiptap/react`), `ui` (`react-color`'s
+  `reactcss`, in the lazy SketchPicker chunk) and `cortex` (a lazy `require('next/cache')`).
+  The fix is to keep the CommonJS package external and declare it in the lib's `package.json`
+  `dependencies`: the editor and ui `afterBuild` hooks copy that field into the published
+  manifest. Keep every React subpath external too (`/^react(\/|$)/`), which also stops
+  `react/jsx-runtime` being bundled. For your own code, import statically instead (`cortex`
+  now imports `next/cache` at module scope). Rolldown's `esmExternalRequirePlugin` does NOT work
+  here: in library mode it left React bundled instead of external, in every placement tried.
+  `verify-lib-dist.js` check 6 fails on the shim in any shipped ESM file.
+- The root `vitest.config.ts` sets `oxc: { jsx: { runtime: 'automatic' } }`. Without it,
+  Vite 8's Oxc honours `apps/nextblock/tsconfig.json` `"jsx": "preserve"` and every app test
+  containing JSX fails to parse.
 
 `vite-plugin-dts` `entryRoot: 'src'` keeps emission to the lib's own `src`, so listing
 sibling sources does **not** leak their `.d.ts` into the tarball. The published `bin` path

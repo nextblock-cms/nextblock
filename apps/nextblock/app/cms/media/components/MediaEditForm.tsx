@@ -134,15 +134,18 @@ export default function MediaEditForm({ mediaItem, formAction }: MediaEditFormPr
     });
   };
 
+  // Hooks must run on every render, so they sit above the early returns below: calling
+  // them only after `authLoading` settles changes the hook count between renders, which
+  // React rejects ("Rendered more hooks than during the previous render").
+  const formRef = React.useRef<HTMLFormElement>(null);
+  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
+
   if (authLoading) {
     return <div>Loading form...</div>;
   }
   if (!user || (!isAdmin && !isWriter)) {
     return <div>Access Denied. You do not have permission to edit media.</div>;
   }
-
-  const formRef = React.useRef<HTMLFormElement>(null);
-  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
   const previewUrl = resolveMediaUrl(mediaItem.file_path || mediaItem.object_key);
   const isImage = Boolean(mediaItem.file_type?.startsWith("image/"));
 

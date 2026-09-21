@@ -180,7 +180,7 @@ The wizard is four screens, one decision each, every one skippable:
    left as it was) — or, when active tokens already exist (a re-run of the guide, or a token
    minted on the settings page before it), lists them first (`existingMcpTokens`, loaded by
    `loadCortexSetupWizardProps` through `getMcpSettingsStatus`, newest preselected) next to
-   "Create a new connection": picking one calls `useExistingMcpTokenForSetupAction`, which
+   "Create a new connection": picking one calls `reuseExistingMcpTokenForSetupAction`, which
    only switches the server on, and the Build step then names the connection and asks for
    the token value saved at creation (a secret is shown once; only its hash is stored).
    "I'll decide later" moves on with neither — and then step 3 offers no
@@ -545,7 +545,18 @@ It uses:
 createOpenAICompatible
 ```
 
-from `@ai-sdk/openai-compatible`, with:
+from `@ai-sdk/openai-compatible` (v3, paired with `ai` v7 — the Vercel AI SDK 7 line, which is
+ESM-only and needs Node.js >= 22). Cortex never lets SDK 7 download a URL itself. The SDK
+fetches URL file parts through a DNS-pinned `undici` Agent that `@ai-sdk/provider-utils` loads
+at runtime with `createRequire(...)("undici")`, with no `fetch` fallback. The output file tracer
+cannot see that require, so the package is missing from Vercel functions and standalone
+builds, and tracing it from `next.config.js` breaks a scaffold's Turbopack build and never
+reaches an existing project through `npm run update`. Alt text is the only place a URL reaches
+the model, so `generateCortexAiAltText` downloads the image itself with
+`downloadCortexVisionImage` (`libs/cortex/src/lib/vision-image-download.ts`): Node http(s)
+with a pinned DNS lookup that refuses private addresses, redirects re-checked per hop, a
+20 MiB cap, and the media type from Content-Type or the file signature. It downloads once
+instead of once per model in the fallback chain. The client is created with:
 
 ```txt
 baseURL = https://openrouter.ai/api/v1
@@ -816,7 +827,7 @@ Vercel AI SDK usage:
 ```ts
 generateText({
   prompt,
-  system,
+  instructions, // AI SDK 7 name for the former `system` option
   maxRetries: 0,
 })
 ```
@@ -883,7 +894,9 @@ Tool factory:
 createCortexGlobalAgentTools(context)
 ```
 
-Tools are passed to Vercel AI SDK `streamText`.
+Tools are passed to Vercel AI SDK `streamText`. The factory is annotated `: ToolSet`: under
+`ai` v7 its inferred literal return type exceeds what TypeScript will serialize (TS7056), which
+left the published package with no `ai-global-agent-tools.d.ts`.
 
 The new CMS editing tools require a current `pageContext` supplied by the chat request. They are admin-only for this rollout because the global-agent route requires `ADMIN`.
 
@@ -1148,7 +1161,7 @@ Request schema:
 ```ts
 {
   messages: Array<{
-    role: 'system' | 'user' | 'assistant';
+    role: 'user' | 'assistant';
     content: string;
   }>;
   pageContext?: {
@@ -1172,12 +1185,15 @@ Limits:
 
 - Max 40 messages.
 - Max 8000 chars per message.
+- No `system` role: the system prompt is built server-side and passed as `instructions`, and
+  AI SDK 7 rejects system messages inside `messages` (`InvalidPromptError`), so a request that
+  carries one fails validation with a 400.
 
 Model orchestration:
 
-- Uses `streamText`.
+- Uses `streamText` and iterates `result.stream` (AI SDK 7's name for `fullStream`).
 - Uses `buildCortexAiRoutingPolicy`.
-- Uses `stepCountIs(8)` (raised from 6 to allow read -> plan -> build/confirm multi-tool sequences such as rewriting a full page).
+- Uses `isStepCount(8)` (AI SDK 7's name for `stepCountIs`; raised from 6 to allow read -> plan -> build/confirm multi-tool sequences such as rewriting a full page).
 - Temperature is `0.1`.
 - Max output tokens is `4000` (raised from 2000; this is a per-step cap that also counts reasoning/tool-argument tokens, so a low value could starve the post-tool summary step and produce empty text).
 - Per-attempt timeout is **idle-based** (`GLOBAL_AGENT_MODEL_IDLE_TIMEOUT_MS = 60000`): the attempt aborts only after 60s with no stream activity, and the timer resets on every stream part. A slow-but-progressing generation is not killed mid-answer.
@@ -1748,7 +1764,7 @@ of those change, the product page and the guide are the two places that go stale
 The global agent's model limits are admin-tunable from `/cms/settings/cortex-ai` (collapsible "Advanced settings"), stored as a non-secret JSON `site_settings` row `cortex_ai_agent_settings` and read by the route via `resolveCortexAiAgentSettings(supabase)` (defaults + clamping in `normalizeCortexAiAgentSettings`, `libs/cortex/src/lib/ai-config.ts`):
 
 - `maxOutputTokens` — per-step output cap. **`null` = Unlimited** (the route omits the cap so the model uses its own full budget). Default 16000. This is the main lever when a large `rewrite_page_draft` gets truncated.
-- `maxSteps` — `stepCountIs(n)` tool-call rounds. Default 8.
+- `maxSteps` — `isStepCount(n)` tool-call rounds. Default 8.
 - `temperature` — default 0.1.
 - `responseTimeoutMs` — the per-attempt idle abort. Default 120000.
 

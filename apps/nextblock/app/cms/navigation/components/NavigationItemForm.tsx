@@ -131,15 +131,17 @@ export default function NavigationItemForm({
     });
   };
 
+  // Hooks must run on every render, so they sit above the early returns below (see
+  // MediaEditForm): otherwise the hook count changes once auth or data finish loading.
+  const formRef = React.useRef<HTMLFormElement>(null);
+  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
+
   if (authLoading || !isAdmin) {
     return <div>Access Denied. Admin role required.</div>;
   }
   if (dataLoading && !item) return <div>Loading form data...</div>; // Show loading only if not editing an existing item with data
 
   const menuLocations: MenuLocation[] = ['HEADER', 'FOOTER', 'SIDEBAR'];
-
-  const formRef = React.useRef<HTMLFormElement>(null);
-  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
 
   return (
     <form ref={formRef} onSubmit={handleSubmit} className="space-y-6">

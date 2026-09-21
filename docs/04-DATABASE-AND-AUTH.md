@@ -362,6 +362,14 @@ by diffing local files against remote history. Consequences worth keeping:
 - The apply path derives its baseline-replay guard from the same read instead of
   regex-scraping `db push --dry-run` output, and returns early when nothing is
   pending, so `db push` is never invoked without work to do.
+- The read is `supabase migration list --output-format json`, and `parseMigrationList`
+  reads the JSON line first, then falls back to the text table. Supabase CLI 2.109
+  changed that command's output twice over: the text table wraps every cell in
+  backticks, and a detected coding agent (`CLAUDECODE`/`AI_AGENT`) gets JSON by
+  default. The old parser read the first as "0 pending" (so `db:migrate` said
+  "Nothing to apply" with migrations outstanding) and failed the second as "never been
+  linked". Output the parser cannot recognise returns `null`, never an empty history.
+  `repair-db-migration-history.js` reuses the same parser and flag.
 - `parseMigrationList` is unit-tested in `tools/scripts/push-db-migrations.test.ts`.
 
 If a future CLI upgrade tempts you back toward `db push --dry-run` for previewing:

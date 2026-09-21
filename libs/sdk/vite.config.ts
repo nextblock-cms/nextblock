@@ -52,9 +52,6 @@ export default defineConfig(() => ({
     outDir: '../../dist/libs/sdk',
     emptyOutDir: true,
     reportCompressedSize: true,
-    commonjsOptions: {
-      transformMixedEsModules: true,
-    },
     lib: {
       entry: 'src/index.ts',
       name: 'sdk',
@@ -63,7 +60,7 @@ export default defineConfig(() => ({
       // Don't forget to update your package.json as well.
       formats: ['es' as const],
     },
-    rollupOptions: {
+    rolldownOptions: {
       // External packages that should not be bundled into your library.
       external: [],
     },

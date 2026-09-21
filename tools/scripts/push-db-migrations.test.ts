@@ -144,6 +144,87 @@ describe('parseMigrationList', () => {
   });
 });
 
+// The same history in both CLI 2.109+ shapes: one retired remote-only version, one applied
+// migration, one pending file.
+const EXPECTED_MIXED = {
+  applied: ['02000'],
+  pending: ['02006'],
+  remoteOnly: ['01999'],
+};
+
+describe('parseMigrationList with CLI 2.109+ output', () => {
+  // From 2.109 the text table wraps every cell in backticks and draws a blank cell as a
+  // backticked space. The old parser found the header, rejected every cell as a version, and
+  // reported "Pending migrations: 0" while migrations were pending.
+  const BACKTICK_TABLE = [
+    '',
+    '  ',
+    '   Local   | Remote  | Time (UTC) ',
+    '  ---------|---------|------------',
+    '   ` `     | `01999` | `01999`    ',
+    '   `02000` | `02000` | `02000`    ',
+    '   `02006` | ` `     | `02006`    ',
+    '',
+    'Connecting to remote database...',
+  ];
+
+  // `--output-format json`, and the default when the CLI detects an agent (CLAUDECODE /
+  // AI_AGENT): one JSON line on stdout, then the stderr chatter the scripts append to it.
+  const JSON_OUTPUT = [
+    JSON.stringify({
+      migrations: [
+        { local: '', remote: '01999', time: '01999' },
+        { local: '02000', remote: '02000', time: '02000' },
+        { local: '02006', remote: '', time: '02006' },
+      ],
+      message: 'Migrations listed',
+    }),
+    'Connecting to remote database...',
+    'A new version of Supabase CLI is available: v2.118.0 | currently v2.117.0',
+  ];
+
+  it('strips backticks from table cells', () => {
+    expect(parseMigrationList(BACKTICK_TABLE.join('\n'))).toEqual(EXPECTED_MIXED);
+  });
+
+  it('reads a backtick table captured with CRLF line endings', () => {
+    expect(parseMigrationList(BACKTICK_TABLE.join('\r\n'))).toEqual(EXPECTED_MIXED);
+  });
+
+  it('reads the JSON line and ignores the stderr lines appended after it', () => {
+    expect(parseMigrationList(JSON_OUTPUT.join('\n'))).toEqual(EXPECTED_MIXED);
+  });
+
+  it('reads the JSON line when stderr chatter comes first and lines end in CRLF', () => {
+    const output = ['Using workdir C:\\repo\\libs\\db\\src', ...JSON_OUTPUT].join('\r\n');
+    expect(parseMigrationList(output)).toEqual(EXPECTED_MIXED);
+  });
+
+  it('treats an empty JSON migrations list as a real, empty history', () => {
+    // Unlike unrecognised output, this is a structured answer: no files and no history.
+    expect(parseMigrationList('{"migrations":[],"message":"Migrations listed"}')).toEqual({
+      applied: [],
+      pending: [],
+      remoteOnly: [],
+    });
+  });
+
+  it('returns null for garbage, including JSON without a migrations array', () => {
+    expect(parseMigrationList('')).toBeNull();
+    expect(
+      parseMigrationList(
+        [
+          '{not json at all',
+          '{"message":"Migrations listed"}',
+          '{"migrations":"02000"}',
+          'Connecting to remote database...',
+          'error: failed to connect to postgres | timeout',
+        ].join('\n')
+      )
+    ).toBeNull();
+  });
+});
+
 describe('baseline guard', () => {
   it('extracts the version from a migration filename', () => {
     expect(getMigrationVersion('00000000000017_cortex_ai_mcp_server.sql')).toBe('00000000000017');

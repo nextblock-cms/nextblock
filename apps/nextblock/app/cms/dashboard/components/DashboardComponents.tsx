@@ -198,10 +198,10 @@ export function PremiumCTA({ hasCommerce, hasAi, isAdmin = false }: PremiumCTAPr
 
         {isAdmin ? (
           <Button className="w-full shadow-lg shadow-primary/20 group" asChild>
-            <a href="/cms/settings/packages">
+            <Link href="/cms/settings/packages">
               {label}
               <ArrowRight className="ml-2 h-4 w-4 transition-transform group-hover:translate-x-1" />
-            </a>
+            </Link>
           </Button>
         ) : (
           <div className="space-y-2">

@@ -1,9 +1,12 @@
 {
   "name": "@nextblock-cms/editor",
-  "version": "0.20.3",
+  "version": "0.21.0",
   "license": "AGPL-3.0-or-later",
   "main": "./index.js",
   "typings": "./index.d.ts",
+  "dependencies": {
+    "use-sync-external-store": "^1.6.0"
+  },
   "exports": {
     ".": {
       "import": "./index.mjs",

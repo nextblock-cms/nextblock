@@ -1,4 +1,13 @@
-import { tool } from 'ai';
+// Imported statically, not with a lazy require(): Vite 8 (Rolldown) emits a lazy
+// require('next/cache') in the published ESM as a __require shim that bundlers cannot
+// analyse, so it never resolved in scaffolds and revalidation silently did nothing.
+// Importing next/cache is safe outside a request scope; only calling it needs one. Every
+// caller runs inside a route handler, and tests inject their own revalidatePath.
+import { revalidatePath as nextRevalidatePath } from 'next/cache';
+import { isBlockedFetchHost } from './fetch-host-guard';
+
+export { isBlockedFetchHost };
+import { tool, type ToolSet } from 'ai';
 import { createCortexDatabaseAgentTools } from './ai-global-agent-db-tools';
 import { createCortexCustomBlockTools } from './ai-global-agent-custom-block-tools';
 import { createCortexContentOpsTools } from './ai-global-agent-content-ops-tools';
@@ -874,7 +883,6 @@ type DocumentationSnippet = {
   url: string;
 };
 
-
 function getEditorBlockDocumentSchema() {
   return z.object({
     content: z.array(z.any()).optional(),
@@ -883,12 +891,7 @@ function getEditorBlockDocumentSchema() {
 }
 
 function getDefaultRevalidatePath(): RevalidateFn | null {
-  try {
-    const { revalidatePath } = require('next/cache') as typeof import('next/cache');
-    return revalidatePath;
-  } catch {
-    return null;
-  }
+  return nextRevalidatePath;
 }
 
 function getSupabase(context?: ToolExecutionContext) {
@@ -3888,8 +3891,6 @@ function buildCurrentCmsFieldUpdate(
       assertValidStatusForContentType(pageContext.contentType, rawValue);
     }
 
-
-
     updatePayload[fieldName] = normalizeCmsFieldValue(fieldName, rawValue);
   }
 
@@ -5857,94 +5858,6 @@ export type FetchUrlContentInput = z.input<typeof fetchUrlContentInputSchema>;
 
 const FETCH_URL_CONTENT_TIMEOUT_MS = 12000;
 const FETCH_URL_CONTENT_MAX_BYTES = 2_000_000;
-
-/**
- * Unwrap an IPv4-mapped IPv6 address to its dotted-quad form.
- *
- * `http://[::ffff:127.0.0.1]/` reaches loopback just as `http://127.0.0.1/` does,
- * but the WHATWG URL parser normalises it to `::ffff:7f00:1` — which matches none of
- * the IPv4 private-range checks below. Without this, the mapped form is a working
- * bypass of the entire SSRF blocklist. Decimal and hex hosts (`http://2130706433/`)
- * need no special handling: the URL parser already normalises those to dotted-quad.
- */
-function unwrapMappedIpv4(host: string): string | null {
-  const mapped = host.match(/^::ffff:(.+)$/i);
-
-  if (!mapped) {
-    return null;
-  }
-
-  const rest = mapped[1] as string;
-
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) {
-    return rest;
-  }
-
-  const hextets = rest.match(/^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-
-  if (!hextets) {
-    return null;
-  }
-
-  const high = Number.parseInt(hextets[1] as string, 16);
-  const low = Number.parseInt(hextets[2] as string, 16);
-
-  return [(high >> 8) & 255, high & 255, (low >> 8) & 255, low & 255].join('.');
-}
-
-/** Exported for the SSRF regression tests in ai-global-agent-ssrf.test.ts. */
-export function isBlockedFetchHost(hostname: string): boolean {
-  const host = hostname.trim().toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
-
-  if (
-    !host ||
-    host === 'localhost' ||
-    host.endsWith('.localhost') ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal') ||
-    host === 'metadata.google.internal'
-  ) {
-    return true;
-  }
-
-  // `::` is the unspecified address and reaches loopback on most stacks.
-  if (
-    host === '0.0.0.0' ||
-    host === '::' ||
-    host === '::1' ||
-    host.startsWith('fe80:') ||
-    host.startsWith('fc') ||
-    host.startsWith('fd')
-  ) {
-    return true;
-  }
-
-  const mappedIpv4 = unwrapMappedIpv4(host);
-
-  if (mappedIpv4) {
-    return isBlockedFetchHost(mappedIpv4);
-  }
-
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-
-  if (ipv4) {
-    const a = Number(ipv4[1]);
-    const b = Number(ipv4[2]);
-
-    if (
-      a === 10 ||
-      a === 127 ||
-      a === 0 ||
-      (a === 192 && b === 168) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31)
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 function decodeHtmlEntitiesToText(value: string) {
   return value
@@ -8058,7 +7971,10 @@ export async function executeSetContentImages(
   };
 }
 
-export function createCortexGlobalAgentTools(context?: ToolExecutionContext) {
+// Annotated as `ToolSet`: under ai 7 the inferred literal type of this registry exceeds what
+// TypeScript will serialize (TS7056), so no `ai-global-agent-tools.d.ts` was emitted and
+// tools/scripts/verify-lib-dist.js refused to publish the package.
+export function createCortexGlobalAgentTools(context?: ToolExecutionContext): ToolSet {
   return {
     ...createCortexDatabaseAgentTools(context),
     ...createCortexCustomBlockTools(context),

@@ -20,8 +20,13 @@ interface ColorPickerProps {
 
 const SketchPicker = React.lazy(async () => {
   const module = await import("react-color");
+  // react-color is external to the published ui bundle. Bundlers read its ESM build and
+  // expose SketchPicker as a named export; Node's own ESM loader (e.g. a test runner that
+  // leaves node_modules to Node) gets its CommonJS build, whose getters it cannot see, so
+  // the component is only on `default` there.
+  const Sketch = module.SketchPicker ?? module.default?.SketchPicker;
   return {
-    default: module.SketchPicker as React.ComponentType<SketchPickerProps>,
+    default: Sketch as React.ComponentType<SketchPickerProps>,
   };
 });
 

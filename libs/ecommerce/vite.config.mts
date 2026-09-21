@@ -73,7 +73,7 @@ export default defineConfig({
       // monorepo and nowhere else (58 such imports shipped in 0.19.2). Consumers compile
       // with skipLibCheck, so nothing failed; every `Database`-typed signature was `any`.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
-      outDir: '../../dist/libs/ecommerce',
+      outDirs: '../../dist/libs/ecommerce',
       afterBuild: reapplyDirectives,
     }),
     react(),
@@ -118,7 +118,7 @@ export default defineConfig({
       fileName: (format, entryName) => `${entryName}.${format}.js`,
       formats: ['es', 'cjs'],
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         // One file per source module (mirroring src/) so 'use client'/'use server' modules
         // stay separate and the consuming RSC bundler can split them — no cross-boundary

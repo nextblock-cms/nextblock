@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/cortex",
-  "version": "0.20.3",
+  "version": "0.21.0",
   "license": "AGPL-3.0-or-later",
   "publishConfig": {
     "access": "public"
@@ -32,14 +32,14 @@
     ]
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^2.0.42",
+    "@ai-sdk/openai-compatible": "^3.0.53",
     "@nextblock-cms/db": "workspace:*",
     "@nextblock-cms/ecommerce": "workspace:*",
     "@nextblock-cms/utils": "workspace:*",
-    "ai": "^6.0.170",
-    "zod": "^4.3.6"
+    "ai": "^7.0.107",
+    "zod": "^4.6.5"
   },
   "peerDependencies": {
-    "next": "^16.2.7"
+    "next": "^16.3.5"
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "create-nextblock",
-  "version": "0.20.3",
+  "version": "0.21.0",
   "description": "Scaffold a production-ready NextBlock CMS project — the open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "main": "index.js",
   "bin": {
@@ -52,11 +52,14 @@
   "homepage": "https://nextblock.dev",
   "type": "module",
   "dependencies": {
-    "@clack/prompts": "^0.8.1",
+    "@clack/prompts": "^1.8.1",
     "@nextblock-cms/db": "latest",
-    "chalk": "^5.6.2",
-    "commander": "^14.0.1",
-    "execa": "^9.3.0",
-    "fs-extra": "^11.3.2"
+    "chalk": "^6.0.0",
+    "commander": "^15.0.0",
+    "execa": "^10.0.1",
+    "fs-extra": "^11.4.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

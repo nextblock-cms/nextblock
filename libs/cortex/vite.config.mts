@@ -77,7 +77,7 @@ export default defineConfig({
       // monorepo and nowhere else. Consumers compile with skipLibCheck, so nothing failed;
       // every type that mentioned a sibling library was silently `any`.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
-      outDir: '../../dist/libs/cortex',
+      outDirs: '../../dist/libs/cortex',
       afterBuild: reapplyDirectives,
     }),
     react(),
@@ -93,7 +93,7 @@ export default defineConfig({
       fileName: (format, entryName) => `${entryName}.${format}.js`,
       formats: ['es', 'cjs'],
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         preserveModules: true,
         preserveModulesRoot: 'src',

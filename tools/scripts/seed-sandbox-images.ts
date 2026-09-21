@@ -3,8 +3,9 @@ import { S3Client, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s
 import fs from 'fs';
 import path from 'path';
 
-// Force reading from .env.local if not already loaded (though dotenv-cli usually handles this)
-// We rely on process.env being populated by the caller (dotenv-cli)
+// Environment comes from the caller: the root db:push:sandbox script runs this file
+// through dotenv 18's CLI (`dotenv run -q -f .env.local -- npx tsx ...`), which
+// populates process.env from .env.local.
 
 async function seedImages() {
   const r2AccountId = process.env.R2_ACCOUNT_ID;

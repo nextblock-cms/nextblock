@@ -187,16 +187,81 @@ const VERSION_PATTERN = /^\d+$/;
 /** Column delimiters the CLI has shipped: ASCII pipe, and box-drawing verticals. */
 const COLUMN_SPLIT = /[|│┃]/;
 
+/**
+ * CLI 2.109+ wraps every text-table cell in backticks (`02005`) and renders a blank cell as
+ * a backticked space, so the backticks are stripped before a cell is compared.
+ */
 function splitRow(line) {
-  return line.split(COLUMN_SPLIT).map((cell) => cell.trim());
+  return line.split(COLUMN_SPLIT).map((cell) => cell.trim().replace(/^`+|`+$/g, '').trim());
+}
+
+function classifyVersions(rows) {
+  const pending = [];
+  const applied = [];
+  const remoteOnly = [];
+
+  for (const { local, remote } of rows) {
+    const hasLocal = VERSION_PATTERN.test(local);
+    const hasRemote = VERSION_PATTERN.test(remote);
+
+    if (hasLocal && hasRemote) {
+      applied.push(local);
+    } else if (hasLocal) {
+      pending.push(local);
+    } else if (hasRemote) {
+      remoteOnly.push(remote);
+    }
+  }
+
+  return { applied, pending, remoteOnly };
+}
+
+/**
+ * The JSON form of `supabase migration list`: one line on stdout,
+ * `{"migrations":[{"local":"02000","remote":"02000","time":"02000"}, ...],"message":"..."}`,
+ * printed for `--output-format json` and, from CLI 2.109, by default whenever the CLI detects
+ * an AI agent (CLAUDECODE / AI_AGENT). Stderr lines such as "Connecting to remote database..."
+ * are appended to the captured output, so each line is parsed on its own. An empty local or
+ * remote value marks a pending file or a remote-only version, as in the table.
+ *
+ * Returns null when no line holds a `migrations` array.
+ */
+function parseMigrationListJson(lines) {
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) {
+      continue;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    if (!parsed || !Array.isArray(parsed.migrations)) {
+      continue;
+    }
+
+    return classifyVersions(
+      parsed.migrations.map((entry) => ({
+        local: entry && entry.local != null ? String(entry.local).trim() : '',
+        remote: entry && entry.remote != null ? String(entry.remote).trim() : '',
+      })),
+    );
+  }
+
+  return null;
 }
 
 /**
  * Parse `supabase migration list` into local/remote sets.
  *
- * Output is a three-column table (Local | Remote | Time). A row with only a Local
- * value is a migration file that has never been applied; a row with only a Remote
- * value is a history entry with no file behind it.
+ * The JSON form (see parseMigrationListJson) is tried first. Otherwise the output is a
+ * three-column table (Local | Remote | Time). A row with only a Local value is a migration
+ * file that has never been applied; a row with only a Remote value is a history entry with
+ * no file behind it. CLI 2.109+ wraps each table cell in backticks; splitRow strips them.
  *
  * Column positions come from the header row rather than from fixed indices 0 and 1. A table
  * rendered with an outer delimiter ("| 02005 | | |") shifts every cell by one, which would
@@ -204,13 +269,18 @@ function splitRow(line) {
  * is what `--reconcile-squash` reverts. Reading the header keeps the two columns identified
  * however the table is drawn.
  *
- * Returns NULL when no header row is recognised. Callers must treat that as a failed read and
- * never as an empty history: "nothing parsed" and "the database has no migrations" call for
- * opposite actions, and conflating them makes this command affirmatively lie about the
- * database when the CLI changes its output.
+ * Returns NULL when neither a JSON `migrations` list nor a table header row is recognised.
+ * Callers must treat that as a failed read and never as an empty history: "nothing parsed" and
+ * "the database has no migrations" call for opposite actions, and conflating them makes this
+ * command affirmatively lie about the database when the CLI changes its output.
  */
 function parseMigrationList(output) {
   const lines = output.split('\n');
+
+  const fromJson = parseMigrationListJson(lines);
+  if (fromJson) {
+    return fromJson;
+  }
 
   let localIndex = -1;
   let remoteIndex = -1;
@@ -235,9 +305,7 @@ function parseMigrationList(output) {
     return null;
   }
 
-  const pending = [];
-  const applied = [];
-  const remoteOnly = [];
+  const rows = [];
 
   for (let i = headerLine + 1; i < lines.length; i += 1) {
     if (!COLUMN_SPLIT.test(lines[i])) {
@@ -245,22 +313,10 @@ function parseMigrationList(output) {
     }
 
     const cells = splitRow(lines[i]);
-    const local = cells[localIndex] || '';
-    const remote = cells[remoteIndex] || '';
-
-    const hasLocal = VERSION_PATTERN.test(local);
-    const hasRemote = VERSION_PATTERN.test(remote);
-
-    if (hasLocal && hasRemote) {
-      applied.push(local);
-    } else if (hasLocal) {
-      pending.push(local);
-    } else if (hasRemote) {
-      remoteOnly.push(remote);
-    }
+    rows.push({ local: cells[localIndex] || '', remote: cells[remoteIndex] || '' });
   }
 
-  return { applied, pending, remoteOnly };
+  return classifyVersions(rows);
 }
 
 /**
@@ -271,10 +327,14 @@ function parseMigrationList(output) {
  * that probe applied migration 00000000000017 to production while printing
  * "DRY RUN: migrations will *not* be pushed". A command named `check` must not be
  * able to change anything, so the check path now runs only this.
+ *
+ * `--output-format json` (a global flag) pins the JSON form so a human terminal and an agent
+ * session read the same thing. CLI 2.107 and 2.108 accept the flag but still print the text
+ * table for this command, which parseMigrationList also reads.
  */
 function readMigrationStatus(dbPassword, { allowFailure = false } = {}) {
   const result = supabase(
-    ['migration', 'list', '--workdir', workdir, '--password', dbPassword],
+    ['migration', 'list', '--workdir', workdir, '--password', dbPassword, '--output-format', 'json'],
     { allowFailure, capture: true, echoStdout: false },
   );
 
@@ -287,11 +347,15 @@ function readMigrationStatus(dbPassword, { allowFailure = false } = {}) {
   const status = parseMigrationList(output);
 
   if (!status) {
+    // Printed on both paths: the command itself succeeded, so a missing link is not the cause.
+    log('Could not recognise the output of `supabase migration list`.', colors.red);
+    log(
+      'Neither a JSON "migrations" list nor a "Local | Remote" header row was found, so the remote history was not read.',
+      colors.yellow,
+    );
     if (allowFailure) {
       return null;
     }
-    log('Could not recognise the output of `supabase migration list`.', colors.red);
-    log('No "Local | Remote" header row was found, so the remote history was not read.', colors.yellow);
     log('Refusing to continue: an unreadable history must not be mistaken for an empty one.', colors.yellow);
     process.exit(1);
   }

@@ -2349,7 +2349,7 @@ The `libs/ecommerce` premium library uses the `@nx/js:tsc` executor to produce o
 | Tool | Role |
 | :-- | :-- |
 | `dotenv` | `.env` file loader |
-| `dotenv-cli` | CLI wrapper for dotenv |
+| `dotenv run` | dotenv 18 built-in CLI: `dotenv run -q -f .env.local -- <cmd>` loads `.env.local` for root scripts (`db:*`, `configure:supabase-auth`) |
 | `cross-env` | Cross-platform env-var setter |
 
 #### 3.6.2.5 Key Build Targets
@@ -9261,7 +9261,7 @@ The test environment is **the developer's local machine only**. No dedicated tes
 ```mermaid
 graph TB
     subgraph DevMachine["Developer Machine - Local Test Environment"]
-        Node[Node.js Runtime<br/>v20 or later]
+        Node[Node.js Runtime<br/>v22.12 or later]
         Pnpm[npm / Nx CLI]
         Nx[Nx<br/>with @nx/vitest plugin]
         VitestRunner[Vitest Runner]
@@ -10920,8 +10920,7 @@ The workspace operates two build pipelines in parallel:
 | `@swc/core` |
 | `@babel/core` |
 | `typescript` |
-| `dotenv` |
-| `dotenv-cli` |
+| `dotenv` (library + `dotenv run` CLI) |
 | `cross-env` |
 
 #### 8.6.2.5 Dependency Management
@@ -11507,7 +11506,7 @@ Documented gaps (per §6.4 and §6.5):
 
 | Resource | Minimum | Recommended |
 |:--|:--|:--|
-| Node.js | Per Vitest + Nx compatibility (Node 20 LTS) | Node 20 LTS |
+| Node.js | Node.js 22.12 (Vitest 5, Vite 8 and the create-nextblock CLI; supabase-js and AI SDK 7 need 22) | Node.js 22 LTS (the Docker image uses `node:22-alpine`) |
 | npm | | |
 | Disk | ~10 GB for `node_modules` + `dist` + `.next` + Supabase local | SSD recommended |
 | Memory | 8 GB | 16 GB+ |

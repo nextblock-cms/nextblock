@@ -175,6 +175,59 @@ becomes the root of a standalone `create-nextblock` project. `npm install-script
 `npm approve-scripts --allow-scripts-pending`) lists anything still unreviewed. The
 `.npmrc` also sets `fund=false` so the funding notice stays out of build logs.
 
+## Dependency versions: what is held back, and why
+
+Policy: every dependency sits at its npm `latest` unless the packages it has to work with
+cannot take that version. The last full sweep (2026-09-21) moved 149 of 155 outdated
+packages to latest and took `npm audit` from 104 findings (1 critical) to 0. Held
+packages and temporary overrides are listed here because `package.json` cannot carry
+comments. Re-check each row on the next sweep.
+
+**Held below latest**
+
+| Package | Held at | Latest | Why | Move when |
+| :-- | :-- | :-- | :-- | :-- |
+| `eslint`, `@eslint/js` | 9.39.5 (final 9.x) | 10.x | `eslint-plugin-react` 7.37.5, `eslint-plugin-import` 2.32.0 and `eslint-plugin-jsx-a11y` 6.10.2 (all at latest, loaded by Nx's `flat/react` and by `eslint-config-next`) exclude ESLint 10, and `eslint-plugin-react` crashes on it (it calls the removed `context.getFilename()`). Its maintainer asks users not to force it (jsx-eslint/eslint-plugin-react#3977). A peer-override plus `@eslint/compat` shim path works but was rejected for that reason. | All three plugins publish an ESLint 10 peer range. Then fix the ~34 findings from `@eslint/js` 10's new recommended rules (`no-useless-assignment`, `preserve-caught-error`). |
+| `typescript` | `~6.0.3` | 7.0.x | TypeScript 7.0 is the native compiler and ships no JS compiler API (`require('typescript')` exports only the version), which typescript-eslint, vite-plugin-dts, Nx and `@swc-node/register` all need. typescript-eslint also caps its peer at `<6.1.0`, hence the tilde. | TypeScript 7.1 ships its API and typescript-eslint, `@nx/js` and `unplugin-dts` adopt it. |
+| `@types/node` | `^22.20.4` | 26.x | Policy, not a block: the types must describe the oldest runtime we deploy (Docker `node:22-alpine`, Vercel 22/24). Newer types would type-check APIs that crash in production. | Docker and Vercel move to a newer Node major. |
+
+**Temporary overrides in the root `package.json`**
+
+| Override | Why | Remove when |
+| :-- | :-- | :-- |
+| `"@nx/vitest": { "vitest": "$vitest" }` | `@nx/vitest` 23.2.1 peers `vitest ^3 \|\| ^4`. Nx has merged the `^5` range (nrwl/nx#37055) but not published it. We use the plugin only to infer the `test` target, and the suite passes on Vitest 5. | `npm view @nx/vitest peerDependencies.vitest` includes `^5`. |
+| `"smol-toml": "^1.8.0"` | Nx 23.2.1 pins 1.6.1, which has a high advisory (GHSA-7w5x-hrqm-74c2). | Nx pins 1.7.1 or later (the 23.3 line). |
+| `esbuild`, `postcss` | Must equal the direct devDependency spec, or npm fails with `EOVERRIDE`. `next` still pins `postcss` 8.5.23 exactly. | Bump together with the devDependency. |
+| `qs`, `fast-uri`, `js-yaml`, `body-parser`, `svgo@3`, `svgo@4`, `brace-expansion@*`, `glob`, `form-data`, `tmp`, `undici`, `@noble/hashes` | Security floors for transitive packages, each kept inside the major its consumers expect (`fast-uri` 3 and `js-yaml` 4, not their newer majors). | When `npm audit` stays clean without them. |
+
+These overrides match nothing since Nx 23 dropped its webpack tree, and are kept as
+guards against a vulnerable version coming back: `node-domexception`, `keygrip`,
+`http-proxy-middleware`, `adm-zip`, `immutable`, `shell-quote`, `webpack-dev-server`. (`uuid`
+is now a declared root dependency, and its override equals that spec.) For
+the same reason the `@parcel/watcher` and `less` entries in `allowScripts` are currently
+inert.
+
+**Node.js floor.** 22.12. `supabase-js` 2.110+, AI SDK 7 and `@ai-sdk/*` need Node 22;
+Vite 8, Vitest 5 and the `create-nextblock` CLI (`commander` 15, `execa` 10, `chalk` 6)
+need 22.12, which the CLI declares in `engines`.
+
+**How to run the next sweep.** `npm outdated`, then check each major's peer ranges and
+migration guide before bumping. A plain `npm install` deadlocks on tightly pinned families
+(`nx`/`@nx/*`, `@tiptap/*`, `typescript-eslint`/`@typescript-eslint/*`, `vitest`/`@vitest/*`,
+`eslint`/`@eslint/*`): delete their `node_modules/...` entries from `package-lock.json`,
+set the specs, and run `npm install`. No `--legacy-peer-deps` is needed. Validate the lock
+against Docker's npm in a temp copy with `npx -y npm@10.9.8 ci --dry-run`. Then realign
+`apps/nextblock/package.json` and the published libs' ranges (`libs/cortex`,
+`libs/ecommerce`, and the hard-coded deps in `libs/utils/vite.config.mts`'s `afterBuild`) to
+the root specs. Scaffolds install exactly what those manifests declare.
+
+Finish with `npx nx build nextblock`, not just the type-check. The monorepo installs from the
+ROOT `package.json`, so a package the app imports but only the app manifest declares resolves
+solely as some other package's hoisted transitive. The app imported `uuid` that way, through
+Nx 22's webpack tree. Nx 23 dropped that tree, and only Turbopack noticed ("Module not found:
+Can't resolve 'uuid'"); the `@types/uuid` stub kept `tsc` green. `uuid` is now declared at the
+root.
+
 ## Running the Main App
 
 The canonical application is `apps/nextblock`.

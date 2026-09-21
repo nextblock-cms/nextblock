@@ -110,8 +110,17 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   `vite.config.mts` (see `./seo`); the published `./*` wildcard only maps files.
 - Lib declarations fail silently (the build exits 0, scaffolds use `skipLibCheck`, the type
   becomes `any`): a recursive type in an exported function's inferred return type must be
-  exported (else TS4058 and NO `.d.ts` for that module), and every lib's dts plugin keeps
-  `aliasesExclude` for `@nextblock-cms/*`. `tools/scripts/verify-lib-dist.js` checks both.
+  exported (else TS4058 and NO `.d.ts` for that module), every lib's dts plugin keeps
+  `aliasesExclude` for `@nextblock-cms/*`, and `build.lib.entry` paths stay relative
+  (an absolute `path.resolve` entry built from a lowercase `d:` cwd emitted no `.d.ts` under
+  vite-plugin-dts 5). `tools/scripts/verify-lib-dist.js` checks all three plus the real
+  `npm pack` file list.
+- Vite 8 (Rolldown) keeps a bundled CommonJS module's `require()` of an external as a
+  `__require` shim that throws in browsers and ESM consumers (i.e. every scaffold), and the
+  monorepo never runs `dist/`, so nothing else notices. Keep such CommonJS packages external
+  and declare them in the lib's `dependencies` (editor: `use-sync-external-store`; ui:
+  `react-color`); `esmExternalRequirePlugin` bundles React in library mode, don't use it.
+  `verify-lib-dist.js` check 6 fails on the shim.
 - Publish order utils → ui → sdk → db → editor → ecommerce → cortex → CLI; npm 2FA needs
   an OTP per publish and piping output breaks the prompt (`EOTP`).
 - Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`

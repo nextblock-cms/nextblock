@@ -4,6 +4,7 @@ import { resolve, relative, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'fs-extra';
 import chalk from 'chalk';
+import { STANDALONE_ESLINT_CONFIG } from '../bin/lib/eslint-config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -100,6 +101,7 @@ async function ensureTemplateSync() {
   await ensureUiProxies();
   await removeBackups();
   await syncPackageVersions();
+  await ensureStandaloneEslintConfig();
   await ensureDockerAssets();
   await removeTemplateProjectJson();
   await removeBuildArtifacts();
@@ -107,6 +109,17 @@ async function ensureTemplateSync() {
   await ensureTemplateReadme();
 
   console.log(chalk.green('Template sync complete.'));
+}
+
+/**
+ * The app's eslint.config.mjs only loads inside the monorepo (it imports @nx/eslint-plugin and a
+ * ../../ root config). The CLI replaces it at scaffold time, but `npm run update` copies and
+ * 3-way-merges framework files from THIS template, so the template must carry the same standalone
+ * config: otherwise every update puts the unloadable monorepo config back, and a release that
+ * edits the app's config conflicts in a file the user never touched.
+ */
+async function ensureStandaloneEslintConfig() {
+  await fs.writeFile(resolve(TARGET_DIR, 'eslint.config.mjs'), STANDALONE_ESLINT_CONFIG);
 }
 
 async function ensureEnvExample() {

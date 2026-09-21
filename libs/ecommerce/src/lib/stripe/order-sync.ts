@@ -112,10 +112,23 @@ export async function syncStripeOrderFromSession(session: Stripe.Checkout.Sessio
     detailedSession.customer_details?.address,
     detailedSession.customer_details?.name ?? existingDetails.name
   );
-  const sessionAny = detailedSession as any;
+  // Stripe moved the collected shipping address from `shipping_details` to
+  // `collected_information.shipping_details` in API version 2025-03-31.basil, so on every
+  // current API version (the SDK pins 2026-08-26.dahlia) the old field is undefined and the
+  // Stripe-collected address was silently dropped. It only went unnoticed because the address
+  // stored at checkout creation wins below. The legacy read stays as a fallback for sessions
+  // retrieved through an account pinned to an older API version.
+  type StripeShippingDetails = NonNullable<
+    NonNullable<typeof detailedSession.collected_information>['shipping_details']
+  >;
+  const legacyShipping = (
+    detailedSession as unknown as { shipping_details?: StripeShippingDetails | null }
+  ).shipping_details;
+  const collectedShipping =
+    detailedSession.collected_information?.shipping_details ?? legacyShipping ?? null;
   const stripeShipping = fromStripeAddress(
-    sessionAny.shipping_details?.address,
-    sessionAny.shipping_details?.name ?? existingDetails.name
+    collectedShipping?.address,
+    collectedShipping?.name ?? existingDetails.name
   );
 
   const mergedCustomerDetails = normalizeOrderCustomerDetails({

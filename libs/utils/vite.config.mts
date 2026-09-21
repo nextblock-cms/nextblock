@@ -21,7 +21,7 @@ export default defineConfig({
     dts({
       entryRoot: 'src',
       // Use tsconfig.lib.json (include: src/**) so vite-plugin-dts reliably emits every
-      // declaration to outDir below and the published package ships index.d.ts. (tsconfig.json
+      // declaration to outDirs below and the published package ships index.d.ts. (tsconfig.json
       // has an empty include + only a composite project reference, which made the plugin emit
       // to ../../dist/out-tsc instead, shipping a package with no index.d.ts — the original bug.)
       // Trade-off: this stops producing the dist/out-tsc reference output, so downstream libs'
@@ -32,7 +32,7 @@ export default defineConfig({
       // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
       // of monorepo-relative source paths that do not exist in the published package.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
-      outDir: '../../dist/libs/utils',
+      outDirs: '../../dist/libs/utils',
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/utils',
@@ -79,13 +79,13 @@ export default defineConfig({
           },
           dependencies: {
             'clsx': '^2.1.1',
-            'tailwind-merge': '^3.0.0',
+            'tailwind-merge': '^3.7.0',
             // Externalized bare deps the published output imports by name — declare them
             // so a consumer that installs @nextblock-cms/utils gets them resolved.
-            'zod': '^4.3.6',
+            'zod': '^4.6.5',
             'zod-to-json-schema': '^3.25.2',
-            '@aws-sdk/client-s3': '^3.1039.0',
-            '@aws-sdk/s3-request-presigner': '^3.1039.0',
+            '@aws-sdk/client-s3': '^3.1136.0',
+            '@aws-sdk/s3-request-presigner': '^3.1136.0',
           },
         };
 
@@ -416,7 +416,7 @@ export declare function hasEnvVars(): Promise<boolean>;
       fileName: (format, entryName) => `${entryName}.${format}.js`,
       formats: ['es', 'cjs'],
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         preserveModules: true,
         preserveModulesRoot: 'src',

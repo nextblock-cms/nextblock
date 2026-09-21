@@ -1,4 +1,4 @@
-import { stepCountIs, streamText } from 'ai';
+import { isStepCount, streamText } from 'ai';
 import { NextResponse } from 'next/server';
 
 import {
@@ -131,7 +131,11 @@ function createCortexRevisionRecorder(authorId: string | null) {
 
 const globalAgentMessageSchema = z.strictObject({
   content: z.string().min(1).max(8000),
-  role: z.enum(['system', 'user', 'assistant']),
+  // No 'system': the body is client-controlled and the system prompt is built
+  // server-side (`instructions`). The AI SDK also rejects system messages in
+  // `messages` (InvalidPromptError), so one fails validation here with a 400
+  // instead of erroring mid-stream.
+  role: z.enum(['user', 'assistant']),
 });
 
 const confirmedToolCallSchema = z.strictObject({
@@ -1315,8 +1319,8 @@ export async function POST(request: Request) {
               maxRetries: 0,
               // Admin-tunable step budget (Advanced settings): room for
               // read -> plan -> build/confirm multi-tool sequences.
-              stopWhen: stepCountIs(maxSteps),
-              system: systemPrompt,
+              stopWhen: isStepCount(maxSteps),
+              instructions: systemPrompt,
               temperature: agentSettings.temperature,
               tools,
             };
@@ -1348,7 +1352,7 @@ export async function POST(request: Request) {
             }, GLOBAL_AGENT_HEARTBEAT_INTERVAL_MS);
 
             try {
-              for await (const rawPart of result.fullStream) {
+              for await (const rawPart of result.stream) {
                 attemptAbort.bump();
                 const part = rawPart as CortexAgentStreamPart;
 

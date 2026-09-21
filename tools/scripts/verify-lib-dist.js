@@ -2,6 +2,7 @@
 // Refuses to let a broken library build reach npm.
 //
 //   node tools/scripts/verify-lib-dist.js <lib>        (utils | ui | sdk | db | editor | ecommerce | cortex)
+//   node tools/scripts/verify-lib-dist.js              (every lib that has a dist/libs/<lib> build)
 //
 // release-lib.js calls `verifyLibDist` right after the Nx build and before `npm publish`.
 // Every check here exists because the failure it catches shipped once and was invisible
@@ -27,7 +28,14 @@
 //      gets no `.d.ts` at all. cortex shipped that way through 0.19.2: `index.d.ts` re-exported
 //      `./lib/ai-global-agent-tools`, the file did not exist, and because scaffolds compile
 //      with `skipLibCheck` nothing failed. `createCortexGlobalAgentTools` was just `any`.
+//   5. Files the tarball leaves out. Checks 1-4 read the dist directory, but `npm publish`
+//      packs only what the manifest's `files` whitelist lets through. libs/ui listed its
+//      code-split chunks as `index-*.mjs`; Vite 8 (Rolldown) names them differently, and
+//      `index.mjs` imports one of them statically, so the tarball would have shipped an entry
+//      point that cannot load. This check asks `npm pack --dry-run` for the real file list
+//      and resolves every relative import in it.
 
+const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const { publishExportsFor } = require('./lib-publish-exports');
@@ -336,6 +344,207 @@ function findDanglingDeclarationImports(distDir) {
   return problems;
 }
 
+/* ------------------------------ 5. packed files ------------------------------ */
+
+/** The paths `npm publish` would put in the tarball, relative to the package root, with `/`. */
+function listPackedFiles(distDir) {
+  let output;
+
+  try {
+    // --ignore-scripts: a copied source manifest may carry lifecycle scripts, and they must
+    // not run from inside dist/. The file list does not depend on them.
+    output = execSync('npm pack --dry-run --json --ignore-scripts', {
+      cwd: distDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = String(error.stderr || error.message || error).trim().split(/\r?\n/).slice(-3).join(' ');
+    throw new Error(`npm pack --dry-run failed in ${path.relative(workspaceRoot, distDir) || distDir}: ${detail}`);
+  }
+
+  let report;
+
+  try {
+    // npm writes notices and warnings to stderr; stdout is the JSON array alone.
+    [report] = JSON.parse(output);
+  } catch {
+    throw new Error(`npm pack --dry-run --json printed no JSON in ${path.relative(workspaceRoot, distDir) || distDir}: ${output.slice(0, 200)}`);
+  }
+
+  return new Set(report.files.map((file) => file.path.replace(/\\/g, '/').replace(/^\.\//, '')));
+}
+
+const CODE_FILE = /\.(c|m)?js$/;
+const DECLARATION_FILE = /\.d\.(c|m)?ts$/;
+
+/**
+ * Relative specifiers a file really imports: `import`/`export … from`, bare `import`,
+ * `import()`, `require()` and, in declarations, `import("./x").T`. Parsed with TypeScript
+ * (a root devDependency) rather than matched with a regex, because bundled dependencies keep
+ * their comments: highlight.js ships `@typedef { import("./html_renderer").Renderer }` inside
+ * the editor bundle, which is not an import.
+ */
+function relativeSpecifiersIn(file, text) {
+  const ts = require('typescript');
+  const scriptKind = DECLARATION_FILE.test(file) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, false, scriptKind);
+  const specifiers = new Set();
+
+  const add = (node) => {
+    if (node && ts.isStringLiteralLike(node) && /^\.{1,2}\//.test(node.text)) specifiers.add(node.text);
+  };
+
+  const visit = (node) => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      add(node.moduleSpecifier);
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === 'require'))
+    ) {
+      add(node.arguments[0]);
+    } else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
+      add(node.argument.literal);
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      add(node.moduleReference.expression);
+    }
+
+    ts.forEachChild(node, visit);
+  };
+
+  visit(source);
+
+  return specifiers;
+}
+
+/** Every string target in an `exports` map (all conditions), e.g. './index.mjs' or './lib/*.es.js'. */
+function collectExportTargets(entry, targets = new Set()) {
+  if (typeof entry === 'string') {
+    targets.add(entry);
+  } else if (entry && typeof entry === 'object') {
+    for (const nested of Object.values(entry)) collectExportTargets(nested, targets);
+  }
+
+  return targets;
+}
+
+/**
+ * Relative imports in the files `npm pack` would publish that point at a file it would not,
+ * plus `exports` targets it would not publish. Exported so the check can be exercised on a
+ * scratch copy of a dist directory.
+ */
+function findUnpackedFiles(library, distDir) {
+  const packed = listPackedFiles(distDir);
+  const problems = [];
+
+  // Extension-less specifiers resolve the way the consumer's bundler does, with the
+  // extensions this package's JavaScript actually uses.
+  const codeExtensions = [
+    ...new Set([...packed].filter((file) => CODE_FILE.test(file)).map((file) => path.posix.extname(file))),
+  ];
+  const codeCandidates = (base) => [
+    base,
+    ...codeExtensions.map((extension) => `${base}${extension}`),
+    ...codeExtensions.map((extension) => `${base}/index${extension}`),
+  ];
+  const declarationCandidates = (base) => {
+    const withoutJsExtension = base.replace(/\.(c|m)?js$/i, '');
+
+    return [
+      base,
+      `${withoutJsExtension}.d.ts`,
+      `${withoutJsExtension}.d.mts`,
+      `${withoutJsExtension}.d.cts`,
+      `${withoutJsExtension}/index.d.ts`,
+    ];
+  };
+
+  for (const file of [...packed].sort()) {
+    const isDeclaration = DECLARATION_FILE.test(file);
+
+    if (!isDeclaration && !CODE_FILE.test(file)) continue;
+
+    const text = fs.readFileSync(path.join(distDir, ...file.split('/')), 'utf8');
+
+    for (const specifier of relativeSpecifiersIn(file, text)) {
+      // A declaration's stylesheet/asset import is a type-level no-op (same rule as check 4).
+      if (isDeclaration && NON_CODE_SPECIFIER.test(specifier)) continue;
+
+      const base = path.posix.normalize(path.posix.join(path.posix.dirname(file), specifier.replace(/[?#].*$/, '')));
+      const outside = base === '..' || base.startsWith('../');
+
+      if (!outside && (isDeclaration ? declarationCandidates(base) : codeCandidates(base)).some((c) => packed.has(c))) {
+        continue;
+      }
+
+      problems.push(
+        outside
+          ? `${file} imports "${specifier}", which points outside the package`
+          : `${file} imports "${specifier}" but the tarball has no ${base} — widen "files" in the package.json the build writes`
+      );
+    }
+  }
+
+  // The entry points themselves: a whitelist that drops `index.mjs` leaves nothing importing
+  // it, so the loop above would pass. Same manifest fallback as check 2.
+  const manifestPath = path.join(distDir, 'package.json');
+  const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
+  const exportsMap = manifest.exports ?? publishExportsFor(library) ?? {};
+
+  for (const target of collectExportTargets(exportsMap)) {
+    const normalized = path.posix.normalize(target).replace(/^\.\//, '');
+
+    if (normalized.includes('*')) {
+      const [prefix, suffix] = normalized.split('*');
+      const matches = [...packed].some(
+        (file) => file.startsWith(prefix) && file.endsWith(suffix) && file.length > prefix.length + suffix.length
+      );
+
+      if (!matches) problems.push(`"exports" maps to ${target} but the tarball has no file matching it`);
+    } else if (!packed.has(normalized)) {
+      problems.push(`"exports" maps to ${target} but the tarball does not contain it`);
+    }
+  }
+
+  return problems;
+}
+
+/* --------------------------- 6. require() shim in ESM --------------------------- */
+
+// Rolldown (Vite 8) keeps a CommonJS `require()` of an EXTERNAL module as a `__require()` shim
+// in ESM output (Vite 7's commonjs plugin rewrote it into an import). The shim throws "Calling
+// `require` for "x" in an environment that doesn't expose the `require` function" in the
+// browser and in any ESM consumer, and a bundler cannot analyse it. It shipped in the Vite 8
+// builds of editor and ui (bundled use-sync-external-store / react-color's reactcss requiring
+// react) and cortex (lazy require('next/cache')). Nothing inside the monorepo runs dist/, so
+// only this check sees it.
+const REQUIRE_SHIM_MESSAGE = "doesn't expose the `require` function";
+
+function isEsmOutput(file, text) {
+  if (file.endsWith('.cjs') || file.endsWith('.cjs.js')) return false;
+  if (file.endsWith('.mjs') || file.endsWith('.es.js')) return true;
+  return file.endsWith('.js') && /^(import|export)\s/m.test(text);
+}
+
+function findRequireShims(distDir) {
+  const problems = [];
+
+  walk(distDir, (file) => {
+    if (!/\.(m?js)$/.test(file)) return;
+    const text = fs.readFileSync(file, 'utf8');
+    if (!isEsmOutput(file, text) || !text.includes(REQUIRE_SHIM_MESSAGE)) return;
+    problems.push(
+      `${path.relative(distDir, file).split(path.sep).join('/')} contains Rolldown's require() shim: a bundled ` +
+        'CommonJS module requires an external. Make that CommonJS package external too (and declare it ' +
+        'in the lib\'s dependencies), or import the external statically.'
+    );
+  });
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
 function verifyLibDist(library) {
@@ -350,6 +559,8 @@ function verifyLibDist(library) {
     ...findUnresolvableSubpaths(library, distDir).map((entry) => `unresolvable subpath: ${entry}`),
     ...findLostExports(library, distDir).map((entry) => `lost export: ${entry}`),
     ...findDanglingDeclarationImports(distDir).map((entry) => `missing declaration: ${entry}`),
+    ...findUnpackedFiles(library, distDir).map((entry) => `not in the npm tarball: ${entry}`),
+    ...findRequireShims(distDir).map((entry) => `require() shim in ESM: ${entry}`),
   ];
 
   if (problems.length > 0) {
@@ -364,21 +575,30 @@ function verifyLibDist(library) {
   return { distDir, ok: true };
 }
 
-module.exports = { verifyLibDist };
+module.exports = { verifyLibDist, findUnpackedFiles, findRequireShims };
 
 if (require.main === module) {
-  const library = process.argv[2];
+  const requested = process.argv[2];
+  const libraries = requested
+    ? [requested]
+    : ['utils', 'ui', 'sdk', 'db', 'editor', 'ecommerce', 'cortex'].filter((library) => fs.existsSync(distDirFor(library)));
 
-  if (!library) {
-    console.error('Usage: node tools/scripts/verify-lib-dist.js <utils|ui|sdk|db|editor|ecommerce|cortex>');
+  if (libraries.length === 0) {
+    console.error('Usage: node tools/scripts/verify-lib-dist.js [utils|ui|sdk|db|editor|ecommerce|cortex] (no dist/libs/* build found)');
     process.exit(1);
   }
 
-  try {
-    verifyLibDist(library);
-    console.log(`✓ dist/libs/${library === 'ecom' ? 'ecommerce' : library} is publishable`);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
+  let failed = false;
+
+  for (const library of libraries) {
+    try {
+      verifyLibDist(library);
+      console.log(`✓ dist/libs/${library === 'ecom' ? 'ecommerce' : library} is publishable`);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      failed = true;
+    }
   }
+
+  if (failed) process.exit(1);
 }

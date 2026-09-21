@@ -72,8 +72,8 @@ lifecycle hooks.
 
 ## Getting set up
 
-**Prerequisites:** Node.js 20.9+ (Next.js 16 requires it), npm 10+, and a
-Supabase project. Git.
+**Prerequisites:** Node.js 22.12 or newer (Vitest 5, Vite 8 and the CLI require it),
+npm 10+, and a Supabase project. Git.
 
 ```bash
 git clone https://github.com/nextblock-cms/nextblock.git

@@ -192,6 +192,28 @@ function writeJson(file, value) {
   writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+/**
+ * TypeScript 6 deprecates `compilerOptions.baseUrl` (error TS5101 unless
+ * `"ignoreDeprecations": "6.0"` is set), and create-nextblock wrote `baseUrl: "."` into every
+ * scaffold's tsconfig.json before 0.21. New scaffolds no longer get it. For an existing project we
+ * keep baseUrl, because the project's own code may import paths rooted at it, and silence the
+ * deprecation exactly as TypeScript's error message suggests. A tsconfig that is not plain JSON
+ * (comments) is left alone.
+ */
+function keepTsconfigCompilingOnTs6(root, projectPkg) {
+  const tsconfigPath = path.join(root, 'tsconfig.json');
+  if (!existsSync(tsconfigPath)) return null;
+  const tsSpec = projectPkg.devDependencies?.typescript ?? projectPkg.dependencies?.typescript ?? '';
+  const major = parseInt(String(tsSpec).replace(/^[^0-9]*/, ''), 10);
+  if (!(major >= 6)) return null;
+  const tsconfig = readJson(tsconfigPath);
+  const options = tsconfig?.compilerOptions;
+  if (!options || options.baseUrl === undefined || options.ignoreDeprecations !== undefined) return null;
+  options.ignoreDeprecations = '6.0';
+  writeJson(tsconfigPath, tsconfig);
+  return 'tsconfig.json: added "ignoreDeprecations": "6.0" (TypeScript 6 deprecates baseUrl)';
+}
+
 function walkUpFor(startDir, predicate, maxDepth = 8) {
   let dir = startDir;
   for (let i = 0; i < maxDepth; i++) {
@@ -854,6 +876,10 @@ async function updateCodeViaNpm(install, flags) {
   info(`installed ${C.bold(current)} · latest ${C.bold(latest)}`);
 
   if (compareSemver(latest, current) <= 0 && !flags.force) {
+    // The update that installed TypeScript 6 ran the PREVIOUS update.mjs, which predates this
+    // step, so check here too or it would never run for that project. Idempotent.
+    const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg);
+    if (tsconfigNote) good(tsconfigNote);
     good('Code is already up to date.');
     return { ok: true, changed: false, version: current };
   }
@@ -981,6 +1007,8 @@ async function updateCodeViaNpm(install, flags) {
     for (const line of merged.bumped) good(line);
     for (const line of merged.realigned) info(C.dim(line));
     if (merged.added.length === 0 && merged.bumped.length === 0) info('No dependency changes.');
+    const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg);
+    if (tsconfigNote) good(tsconfigNote);
 
     return { ok: true, changed: true, version: latest };
   } finally {

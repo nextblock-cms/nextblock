@@ -424,7 +424,7 @@ export async function generateCortexAiSeoMetadata(
               siteTitle: params.siteTitle?.trim() || null,
               title: params.title?.trim() || null,
             }),
-            system: buildSeoMetadataSystemPrompt(),
+            instructions: buildSeoMetadataSystemPrompt(),
             temperature: 0.3,
           } as Record<string, unknown>,
           {

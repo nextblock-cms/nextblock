@@ -21,13 +21,13 @@ export default defineConfig({
       entryRoot: 'src',
       // Use tsconfig.lib.json (include: src/**, no project references), not tsconfig.json
       // (empty include + a reference to lib.json) — otherwise vite-plugin-dts builds the
-      // referenced composite project and emits to ../../dist/out-tsc instead of outDir below,
+      // referenced composite project and emits to ../../dist/out-tsc instead of outDirs below,
       // shipping a package with no index.d.ts. (Matches libs/ui, libs/utils, etc.)
       tsconfigPath: './tsconfig.lib.json',
       // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
       // of monorepo-relative source paths that do not exist in the published package.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
-      outDir: '../../dist/libs/db',
+      outDirs: '../../dist/libs/db',
       exclude: ['vite.config.ts'],
       afterBuild: () => {
         const packageJson = {
@@ -93,12 +93,18 @@ export default defineConfig({
   ],
   build: {
     lib: {
+      // Relative, like every other lib: vite-plugin-dts 5 resolves them against the same root
+      // as the tsconfig file list. As `path.resolve(__dirname, ...)` they kept the drive-letter
+      // case of the cwd, which is `d:` under `nx run db:build` (run-commands), while the
+      // plugin resolved its root and the tsconfig file list as `D:`. Its path filter is
+      // case-sensitive, so every module reachable from these entries (index, server, secrets
+      // and all of lib/) was silently left without a .d.ts.
       entry: {
-        index: path.resolve(__dirname, './src/index.ts'),
-        server: path.resolve(__dirname, './src/server.ts'),
+        index: './src/index.ts',
+        server: './src/server.ts',
         // Dedicated entry so secrets.{es,cjs}.js + secrets.d.ts are emitted at the dist root
         // and the './secrets' export above resolves for published consumers (see @nextblock-cms/cortex).
-        secrets: path.resolve(__dirname, './src/secrets.ts'),
+        secrets: './src/secrets.ts',
       },
       formats: ['es', 'cjs'],
       fileName: (format, entryName) => {
@@ -106,7 +112,7 @@ export default defineConfig({
         return `${entryName}.${extension}.js`;
       },
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         // Emit one file per source module (no merged shared chunks). db mixes a client
         // browser-createClient with server modules that use next/headers + a server guard;

@@ -1,3 +1,9 @@
+// Imported statically, not with a lazy require(): Vite 8 (Rolldown) emits a lazy
+// require('next/cache') in the published ESM as a __require shim that bundlers cannot
+// analyse, so it never resolved in scaffolds and revalidation silently did nothing.
+// Importing next/cache is safe outside a request scope; only calling it needs one. Every
+// caller runs inside a route handler, and tests inject their own revalidatePath.
+import { revalidatePath as nextRevalidatePath } from 'next/cache';
 import { tool } from 'ai';
 import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo';
 import { findOriginalUploadVariant, pickOriginalUploadObjectKey } from '@nextblock-cms/utils/media-variants';
@@ -198,12 +204,7 @@ function revalidateSite(context: SiteToolContext | undefined, paths: string[] = 
   let revalidate = context?.revalidatePath;
 
   if (!revalidate) {
-    try {
-      // Lazily required so the module stays import-safe outside a request scope.
-      revalidate = (require('next/cache') as typeof import('next/cache')).revalidatePath;
-    } catch {
-      return;
-    }
+    revalidate = nextRevalidatePath;
   }
 
   try {

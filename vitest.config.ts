@@ -2,6 +2,11 @@ import { defineConfig } from 'vitest/config';
 import path from 'path';
 
 export default defineConfig({
+  // Vite 8 transforms TS/JSX with Oxc, which takes `jsx` from the nearest tsconfig.json.
+  // apps/nextblock/tsconfig.json sets "jsx": "preserve" (Next compiles JSX itself), so
+  // without this every app test that loads a .tsx file fails to parse ("Unexpected JSX
+  // expression").
+  oxc: { jsx: { runtime: 'automatic' } },
   test: {
     globals: true,
     alias: [

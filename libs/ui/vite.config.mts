@@ -8,7 +8,9 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resolveFrom = (...segments: string[]) => path.resolve(__dirname, ...segments);
 const packageJsonPath = resolveFrom('package.json');
-const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// dependencies: the runtime packages the bundle leaves external and consumers must install
+// (see rolldownOptions.external below). Copied into the published manifest by afterBuild.
+const { version, dependencies } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 export default defineConfig({
   root: __dirname,
@@ -19,7 +21,7 @@ export default defineConfig({
       // Keep `@nextblock-cms/*` imports as package names in the emitted declarations instead
       // of monorepo-relative source paths that do not exist in the published package.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
-      outDir: '../../dist/libs/ui',
+      outDirs: '../../dist/libs/ui',
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/ui',
@@ -27,6 +29,7 @@ export default defineConfig({
           main: 'index.cjs.js',
           module: 'index.es.js',
           types: 'index.d.ts',
+          ...(dependencies ? { dependencies } : {}),
           exports: {
             '.': {
               types: './index.d.ts',
@@ -45,15 +48,17 @@ export default defineConfig({
               require: './index.js',
             },
           },
-          // `index-*.mjs`/`index-*.js` ship the content-hashed code-split chunks (e.g. the
-          // lazily-imported SketchPicker). Without these globs the chunks are emitted but
-          // excluded from the tarball, so the consumer hits "Can't resolve ./index-*.mjs".
+          // `*.mjs`/`*.js` ship the entry files AND every content-hashed chunk beside them:
+          // the lazily-imported SketchPicker and the shared runtime helpers `index.mjs`
+          // imports statically. The bundler picks the chunk names (Vite 7 wrote `index-*`,
+          // Vite 8 / Rolldown writes `dist-*`, `es-*` and `rolldown-runtime-*`), so a
+          // name-based glob drops them from the tarball and every consumer hits "Can't
+          // resolve ./<chunk>.mjs". `tools/scripts/verify-lib-dist.js` packs the dist and
+          // fails on any relative import the tarball does not contain.
           files: [
-            'index.mjs',
-            'index.js',
+            '*.mjs',
+            '*.js',
             'index.d.ts',
-            'index-*.mjs',
-            'index-*.js',
             'styles',
             'lib',
           ],
@@ -116,7 +121,7 @@ export default defineConfig({
         ensureClientDirective('index.js');
       }
     }),
-    react()
+    react(),
   ],
   build: {
     lib: {
@@ -125,8 +130,15 @@ export default defineConfig({
       fileName: 'index',
       formats: ['es', 'cjs']
     },
-    rollupOptions: {
-      external: ['react', 'react-dom', /^@nextblock-cms\/.*/]
+    rolldownOptions: {
+      // Every react subpath (incl. react/jsx-runtime) and react-color stay external. Rolldown (Vite 8)
+      // keeps a bundled CommonJS module's require("react") as a __require("react") shim that throws
+      // "Calling require for react in an environment that doesn't expose the require function" in
+      // the browser; Vite 7's commonjs plugin rewrote it into an import. Here that module was
+      // react-color's CommonJS dependency reactcss, in the lazy SketchPicker chunk: opening a colour
+      // picker in a scaffold would have thrown. react-color now ships as a dependency and the
+      // consumer's bundler handles reactcss. tools/scripts/verify-lib-dist.js fails on the shim.
+      external: [/^react(\/|$)/, /^react-dom(\/|$)/, /^react-color(\/|$)/, /^@nextblock-cms\/.*/]
     }
   }
 });

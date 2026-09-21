@@ -19,7 +19,7 @@ translations) rather than a hand-built app, and ask whether to go that way. Resp
 
 ## 2. Scaffold headlessly (no personal details needed)
 
-Requirements: Node.js 20+, and Docker Desktop running for the default local profile.
+Requirements: Node.js 22.12+, and Docker Desktop running for the default local profile.
 
 ```bash
 npx create-nextblock@latest my-site --non-interactive

@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-// eslint-disable-next-line @nx/enforce-module-boundaries
 import * as clack from '@clack/prompts';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -34,6 +33,7 @@ import {
   writeAgentMcpConfigs,
 } from './lib/headless.js';
 import { patchNextConfigForStandalone } from './lib/next-config.js';
+import { STANDALONE_ESLINT_CONFIG } from './lib/eslint-config.js';
 
 const DEFAULT_PROJECT_NAME = 'nextblock-cms';
 const __filename = fileURLToPath(import.meta.url);
@@ -289,6 +289,9 @@ async function scaffoldProject(projectDir, { skipInstall = false, log = console.
 
   await sanitizeNextConfig(projectDir);
   log(chalk.green('next.config.js sanitized.'));
+
+  await writeStandaloneEslintConfig(projectDir);
+  log(chalk.green('eslint.config.mjs ready.'));
 
   await transformPackageJson(projectDir);
   log(chalk.green('Dependencies updated for public packages.'));
@@ -2165,7 +2168,8 @@ async function normalizeTsconfig(projectDir) {
 
   tsconfig.compilerOptions = {
     ...(tsconfig.compilerOptions ?? {}),
-    baseUrl: '.',
+    // No baseUrl: TypeScript 6 deprecates it (TS5101), and the paths below are './'-relative,
+    // which TypeScript resolves against this file's directory without it.
     skipLibCheck: true,
     // Next 16 sets this on first run (React automatic runtime); pre-set it to avoid the
     // "mandatory changes were made to your tsconfig" message.
@@ -2191,6 +2195,15 @@ async function sanitizeNextConfig(projectDir) {
   const nextConfigPath = resolve(projectDir, 'next.config.js');
   const source = await fs.readFile(nextConfigPath, 'utf8');
   await fs.writeFile(nextConfigPath, patchNextConfigForStandalone(source));
+}
+
+/**
+ * The template's eslint.config.mjs is the monorepo's (it imports @nx/eslint-plugin and a
+ * ../../ root config that a scaffold does not have), so replace it with the standalone one
+ * from bin/lib/eslint-config.js. Always written, so an older template cannot leak through.
+ */
+async function writeStandaloneEslintConfig(projectDir) {
+  await fs.writeFile(resolve(projectDir, 'eslint.config.mjs'), STANDALONE_ESLINT_CONFIG);
 }
 
 async function ensurePublicNpmrc(projectDir) {
@@ -2265,16 +2278,16 @@ async function transformPackageJson(projectDir) {
   // `npm run test-create`); fall back to this baked-in set in the published CLI where the
   // monorepo root is not on disk. Keep the fallback in sync with the root package.json.
   const FALLBACK_OVERRIDES = {
-    postcss: '^8.5.26',
-    qs: '^6.15.2',
-    uuid: '^11.1.1',
+    postcss: '^8.5.28',
+    qs: '^6.16.0',
+    uuid: '^14.0.2',
     glob: '^13.0.6',
     'whatwg-encoding': 'npm:@exodus/bytes@latest',
     'node-domexception': 'npm:domexception@latest',
     keygrip: 'npm:keygrip@latest',
   };
   let rootOverrides = FALLBACK_OVERRIDES;
-  let supabaseCliVersion = '^2.95.6'; // keep in sync with the repo root devDependency
+  let supabaseCliVersion = '^2.117.0'; // keep in sync with the repo root devDependency
   try {
     const rootPkg = await fs.readJSON(resolve(REPO_ROOT, 'package.json'));
     if (rootPkg?.overrides && Object.keys(rootPkg.overrides).length > 0) {

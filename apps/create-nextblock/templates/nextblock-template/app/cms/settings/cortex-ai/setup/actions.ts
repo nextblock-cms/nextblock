@@ -328,7 +328,7 @@ export type UseExistingMcpTokenForSetupResult =
  *
  * No revalidation, like every action in this file (see the header).
  */
-export async function useExistingMcpTokenForSetupAction(input: {
+export async function reuseExistingMcpTokenForSetupAction(input: {
   allowLocalhostWithoutToken: boolean;
   tokenId: string;
 }): Promise<UseExistingMcpTokenForSetupResult> {

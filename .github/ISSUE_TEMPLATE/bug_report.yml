@@ -62,7 +62,7 @@ body:
       label: Environment
       description: Node version (`node -v`), package manager, OS, browser if relevant, and where the database lives (Supabase cloud, local, Docker).
       placeholder: |
-        Node: 20.11.0
+        Node: 22.14.0
         npm: 10.9.8
         OS: Windows 11
         Database: Supabase cloud

@@ -75,13 +75,15 @@ export default function LanguageForm({
     });
   };
 
+  // Hooks must run on every render, so they sit above the early returns below (see
+  // MediaEditForm): otherwise the hook count changes once auth finishes loading.
+  const formRef = React.useRef<HTMLFormElement>(null);
+  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
+
   if (authLoading) return <div>Loading...</div>;
   if (!isAdmin) return <div>Access Denied. Admin role required.</div>;
 
   const isTheOnlyDefaultLanguage = isEditing && language?.is_default && allLanguages.filter(l => l.is_default).length === 1;
-
-  const formRef = React.useRef<HTMLFormElement>(null);
-  useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
 
   return (
     <form ref={formRef} onSubmit={handleSubmit} className="space-y-6">
