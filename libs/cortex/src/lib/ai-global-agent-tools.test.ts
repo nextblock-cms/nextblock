@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { getCortexMcpToolAnnotations } from './mcp-tool-registry';
+
 vi.mock('@nextblock-cms/utils', async () => {
   const { z } = await import('zod');
 
@@ -3712,6 +3714,138 @@ describe('custom block instances in the typed content tools', () => {
     expect(frBlock).toMatchObject({
       block_type: 'promo-card',
       content: { body: '<p>Du pain frais chaque jour.</p>', headline: 'Vente de printemps', photo: null },
+    });
+  });
+});
+
+describe('block-level edits over MCP (skipConfirmation + cmsTarget)', () => {
+  const homePage = {
+    id: 7,
+    language_id: 1,
+    slug: 'home',
+    title: 'Home',
+    translation_group_id: 'group-home',
+  };
+
+  const threeBlocks = () => [
+    {
+      block_type: 'heading',
+      content: { level: 1, text_content: 'Title' },
+      id: 1,
+      language_id: 1,
+      order: 0,
+      page_id: 7,
+      post_id: null,
+    },
+    {
+      block_type: 'text',
+      content: { html_content: '<p>Middle</p>' },
+      id: 2,
+      language_id: 1,
+      order: 1,
+      page_id: 7,
+      post_id: null,
+    },
+    {
+      block_type: 'button',
+      content: { text: 'Go', url: '/go' },
+      id: 3,
+      language_id: 1,
+      order: 2,
+      page_id: 7,
+      post_id: null,
+    },
+  ];
+
+  const mcpContext = (supabase: unknown) => ({
+    revalidatePath: () => undefined,
+    skipConfirmation: true,
+    supabase,
+  });
+
+  it('updates one block by id and leaves its siblings, their order and their ids untouched', async () => {
+    const { database, supabase } = createMockSupabase({ blocks: threeBlocks(), pages: [homePage] });
+    const before = JSON.parse(JSON.stringify(database.blocks));
+
+    const result = await executeUpdateContentBlock(
+      {
+        blockId: 2,
+        blockType: 'text',
+        cmsTarget: { contentType: 'page', slug: 'home' },
+        content: { html_content: '<p>Edited over MCP</p>' },
+      },
+      mcpContext(supabase)
+    );
+
+    expect(result).toMatchObject({ blockId: 2, mutationExecuted: true, success: true });
+    expect(database.blocks).toHaveLength(3);
+
+    const byId = new Map(database.blocks.map((block: any) => [block.id, block]));
+
+    expect(byId.get(2)?.content).toEqual({ html_content: '<p>Edited over MCP</p>' });
+    // Siblings are byte-for-byte what they were, including their order.
+    expect(byId.get(1)).toEqual(before[0]);
+    expect(byId.get(3)).toEqual(before[2]);
+  });
+
+  it('is idempotent: repeating the identical update leaves the page in the same state', async () => {
+    const { database, supabase } = createMockSupabase({ blocks: threeBlocks(), pages: [homePage] });
+    const input = {
+      blockId: 2,
+      blockType: 'text',
+      cmsTarget: { contentType: 'page' as const, slug: 'home' },
+      content: { html_content: '<p>Same edit</p>' },
+    };
+
+    // Convergence is about content, order and identity; the executor bumps
+    // `updated_at` on every write, which is a timestamp, not state.
+    const snapshot = () =>
+      database.blocks.map((block: any) => {
+        const clone = JSON.parse(JSON.stringify(block));
+        delete clone.updated_at;
+        return clone;
+      });
+
+    await executeUpdateContentBlock(input, mcpContext(supabase));
+    const afterFirst = snapshot();
+
+    await executeUpdateContentBlock(input, mcpContext(supabase));
+
+    expect(database.blocks).toHaveLength(3);
+    expect(snapshot()).toEqual(afterFirst);
+    expect(getCortexMcpToolAnnotations('update_content_block')).toMatchObject({
+      destructiveHint: false,
+      idempotentHint: true,
+    });
+  });
+
+  it('is NOT idempotent for insert_content_block — a retry inserts a second block, which is what its annotation says', async () => {
+    const { database, supabase } = createMockSupabase({ blocks: threeBlocks(), pages: [homePage] });
+    const input = {
+      anchorBlockId: 2,
+      block: { blockType: 'text', content: { html_content: '<p>Appended</p>' } },
+      contentType: 'page' as const,
+      position: 'after' as const,
+      slug: 'home',
+    };
+
+    await executeInsertContentBlock(input, mcpContext(supabase));
+    expect(database.blocks).toHaveLength(4);
+
+    await executeInsertContentBlock(input, mcpContext(supabase));
+    expect(database.blocks).toHaveLength(5);
+
+    // The three original blocks are still there with their ids; the two copies sit
+    // after the anchor and everything below shifted.
+    const ids = database.blocks.map((block: any) => block.id).sort();
+    expect(ids).toEqual(expect.arrayContaining([1, 2, 3]));
+    expect(
+      database.blocks.filter((block: any) => block.content?.html_content === '<p>Appended</p>')
+    ).toHaveLength(2);
+
+    // Change the executor to dedupe and this line is what tells you to flip the hint.
+    expect(getCortexMcpToolAnnotations('insert_content_block')).toMatchObject({
+      idempotentHint: false,
     });
   });
 });

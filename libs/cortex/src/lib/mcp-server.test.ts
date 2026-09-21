@@ -5,17 +5,22 @@ import {
   CORTEX_MCP_MODERN_PROTOCOL_VERSION,
   JSON_RPC_INVALID_PARAMS,
   JSON_RPC_METHOD_NOT_FOUND,
+  buildCortexMcpDiscoveryDocument,
   handleCortexMcpMessage,
   isModernEraMessage,
+  wantsMcpEventStream,
   type CortexMcpHandlerDeps,
 } from './mcp-server';
 import {
   CORTEX_MCP_TOOL_ALIASES,
   CORTEX_MCP_TOOL_KINDS,
+  CORTEX_MCP_WRITE_TOOL_BEHAVIOURS,
   assertCortexMcpToolCoverage,
   buildCortexMcpToolDefinitions,
   callCortexMcpTool,
   cortexMcpScopesAllow,
+  getCortexMcpToolAnnotations,
+  getCortexMcpToolKind,
   resolveCortexMcpToolName,
 } from './mcp-tool-registry';
 import {
@@ -531,5 +536,162 @@ describe('MCP environment bootstrap token', () => {
 
   it('never honours a configured token below the minimum length, even on an exact match', () => {
     expect(matchesCortexAiMcpEnvToken('tooshort', 'tooshort')).toBe(false);
+  });
+});
+
+describe('MCP tool annotations', () => {
+  it('annotates every listed tool with the four spec hints', () => {
+    const definitions = buildCortexMcpToolDefinitions({ scopes: ['read', 'write'] });
+
+    for (const definition of definitions) {
+      expect(definition.annotations).toEqual({
+        destructiveHint: expect.any(Boolean),
+        idempotentHint: expect.any(Boolean),
+        openWorldHint: expect.any(Boolean),
+        readOnlyHint: expect.any(Boolean),
+      });
+
+      // readOnlyHint is derived from the scope table, never declared a second time.
+      expect(definition.annotations.readOnlyHint).toBe(
+        getCortexMcpToolKind(definition.name) === 'read'
+      );
+
+      if (definition.annotations.readOnlyHint) {
+        expect(definition.annotations.destructiveHint).toBe(false);
+        expect(definition.annotations.idempotentHint).toBe(true);
+      }
+    }
+  });
+
+  it('keeps the behaviour table and the scope table on exactly the same write tools', () => {
+    const writeNames = Object.entries(CORTEX_MCP_TOOL_KINDS)
+      .filter(([, kind]) => kind === 'write')
+      .map(([name]) => name)
+      .sort();
+
+    expect(Object.keys(CORTEX_MCP_WRITE_TOOL_BEHAVIOURS).sort()).toEqual(writeNames);
+  });
+
+  it('gives an alias the annotations of the executor it forwards to', () => {
+    for (const [alias, config] of Object.entries(CORTEX_MCP_TOOL_ALIASES)) {
+      expect(getCortexMcpToolAnnotations(alias)).toEqual(
+        getCortexMcpToolAnnotations(config.canonical)
+      );
+    }
+  });
+
+  it('classifies the contract tools the way their executors behave', () => {
+    expect(getCortexMcpToolAnnotations('get_database_schema')).toEqual({
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+      readOnlyHint: true,
+    });
+    // Stock search reaches Pexels/Unsplash: read-only, but open-world.
+    expect(getCortexMcpToolAnnotations('search_stock_media')).toMatchObject({
+      openWorldHint: true,
+      readOnlyHint: true,
+    });
+    // A create is refused on a duplicate slug before anything is written, so a retry
+    // converges; a feature image may be imported from an arbitrary URL.
+    expect(getCortexMcpToolAnnotations('create_page_layout')).toEqual({
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+      readOnlyHint: false,
+    });
+    // Stages a Live Draft (delete-then-insert per parent): nothing live changes.
+    expect(getCortexMcpToolAnnotations('generate_jsonb_layout')).toMatchObject({
+      destructiveHint: false,
+      idempotentHint: true,
+      readOnlyHint: false,
+    });
+    // "replace" mode drops the menu (destructive); "append" skips URLs already present.
+    expect(getCortexMcpToolAnnotations('update_site_navigation')).toMatchObject({
+      destructiveHint: true,
+      idempotentHint: true,
+    });
+    // Deleting what is already gone is a no-op, so a retry is safe.
+    expect(getCortexMcpToolAnnotations('delete_cms_item')).toMatchObject({
+      destructiveHint: true,
+      idempotentHint: true,
+      readOnlyHint: false,
+    });
+    expect(getCortexMcpToolAnnotations('reset_site_content')).toMatchObject({
+      destructiveHint: true,
+    });
+    // A retry inserts a second block, so a host must not blind-retry it.
+    expect(getCortexMcpToolAnnotations('insert_content_block')).toMatchObject({
+      destructiveHint: false,
+      idempotentHint: false,
+    });
+    expect(getCortexMcpToolAnnotations('drop_all_tables')).toBeNull();
+  });
+
+  it('serialises annotations on every tools/list entry', async () => {
+    const response = await handleCortexMcpMessage(
+      { id: 20, jsonrpc: '2.0', method: 'tools/list' },
+      deps()
+    );
+
+    // Through JSON, as a client would see it: no undefined, no functions.
+    const tools = JSON.parse(JSON.stringify(resultOf(response)?.['tools'])) as Array<{
+      annotations?: Record<string, unknown>;
+      name: string;
+    }>;
+
+    expect(tools.length).toBeGreaterThan(20);
+
+    for (const tool of tools) {
+      expect(tool.annotations).toBeDefined();
+    }
+
+    expect(tools.find((tool) => tool.name === 'get_database_schema')?.annotations).toEqual({
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+      readOnlyHint: true,
+    });
+    expect(tools.find((tool) => tool.name === 'delete_cms_item')?.annotations).toMatchObject({
+      destructiveHint: true,
+      readOnlyHint: false,
+    });
+  });
+});
+
+describe('MCP discovery document', () => {
+  it('builds a static document from the endpoint and server-card URLs', () => {
+    const document = buildCortexMcpDiscoveryDocument({
+      endpointUrl: 'https://example.com/api/mcp',
+      serverCardUrl: 'https://example.com/.well-known/mcp/server-card.json',
+      serverVersion: '1.0.0',
+    });
+
+    expect(document).toMatchObject({
+      authentication: { header: 'Authorization', required: true, schemes: ['bearer'] },
+      capabilities: { prompts: {}, resources: {}, tools: {} },
+      endpoint: { transport: 'streamable-http', url: 'https://example.com/api/mcp' },
+      name: 'nextblock-cortex-ai',
+      serverCard: 'https://example.com/.well-known/mcp/server-card.json',
+      status: 'ok',
+      version: '1.0.0',
+    });
+    expect(document.protocolVersions).toContain(CORTEX_MCP_LATEST_LEGACY_PROTOCOL_VERSION);
+    expect(document.protocolVersions).toContain(CORTEX_MCP_MODERN_PROTOCOL_VERSION);
+    // No inventory here: that lives on the server card, which is gated on the operator
+    // switching the MCP server on.
+    expect(document).not.toHaveProperty('tools');
+    expect(JSON.stringify(document)).toBeTypeOf('string');
+  });
+
+  it('tells an SSE-stream request apart from a plain GET', () => {
+    expect(wantsMcpEventStream('text/event-stream')).toBe(true);
+    expect(wantsMcpEventStream('application/json, text/event-stream')).toBe(true);
+    expect(wantsMcpEventStream('Text/Event-Stream')).toBe(true);
+    expect(wantsMcpEventStream('application/json')).toBe(false);
+    expect(wantsMcpEventStream('*/*')).toBe(false);
+    expect(wantsMcpEventStream('')).toBe(false);
+    expect(wantsMcpEventStream(null)).toBe(false);
+    expect(wantsMcpEventStream(undefined)).toBe(false);
   });
 });

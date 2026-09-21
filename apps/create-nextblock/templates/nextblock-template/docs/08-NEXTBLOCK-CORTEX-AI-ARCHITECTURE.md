@@ -1345,7 +1345,7 @@ from inside the editor.
 | `libs/cortex/src/lib/mcp-server.ts` | Transport-agnostic JSON-RPC 2.0 engine. No `next` imports, so it is unit-testable. |
 | `libs/cortex/src/lib/mcp-tool-registry.ts` | Zod→JSON Schema conversion, read/write scope table, MCP-contract aliases, tool dispatch, resources, prompts. |
 | `libs/cortex/src/lib/mcp-tokens.ts` | Token mint/hash/verify, MCP settings resolver, localhost-trust rules. |
-| `libs/cortex/src/lib/mcp-server.test.ts` | 33 tests across tokens, registry, and protocol. |
+| `libs/cortex/src/lib/mcp-server.test.ts` | 43 tests across tokens, registry, annotations, discovery, and protocol; `ai-global-agent-tools.test.ts` adds three MCP-path block-edit tests (sibling isolation, update idempotency, insert non-idempotency). |
 | `apps/nextblock/app/api/mcp/route.ts` | Streamable HTTP shim + hybrid auth + tool-context construction. |
 | `apps/nextblock/app/cms/settings/cortex-ai/mcp-actions.ts` | Admin server actions: settings, mint, revoke. |
 | `apps/nextblock/app/cms/settings/cortex-ai/McpServerSettingsCard.tsx` | Settings UI + copy-paste client config. |
@@ -1371,8 +1371,21 @@ Deliberate behaviours, each of which breaks a real client if changed:
 
 - **Notifications get `202 Accepted` with an empty body.** Returning a JSON-RPC
   envelope for a message with no `id` desyncs strict clients.
-- **GET returns `405`.** The server never initiates requests or pushes unsolicited
-  notifications, so there is no stream to open. The spec explicitly allows 405 here.
+- **GET is content-negotiated.** An MCP client opening the server→client SSE stream
+  sends `Accept: text/event-stream` (a spec MUST) and still gets `405`: the server never
+  initiates requests or pushes notifications, so there is no stream to open, and the spec
+  explicitly allows 405 there. Any other GET or HEAD — a directory's health probe, an
+  uptime monitor, a browser — gets a `200` static discovery document
+  (`buildCortexMcpDiscoveryDocument`: identity, protocol versions, capabilities, how to
+  authenticate, the server-card URL). It reads nothing and checks nothing, so it cannot
+  fail, and it carries no tool inventory (that stays on the server card, which is gated
+  on the operator switching MCP on). Several crawlers scored the old blanket 405 as down.
+- **Never 500 to an unauthenticated caller.** The readiness gate checks
+  `isFullyConfigured()` (service role, not just URL + anon key) because every path below
+  it — token lookup, the tool context — goes through `getServiceRoleSupabaseClient()`,
+  which throws without the secret key; and `authenticateMcpRequest` is wrapped so a
+  database outage answers `503` + `Retry-After` rather than a 500 (dropped as broken) or a
+  401 (dropped as misconfigured).
 - **401 carries a bare `WWW-Authenticate: Bearer`.** Adding a `resource_metadata`
   parameter (or serving `/.well-known/oauth-protected-resource`) advertises RFC 9728
   OAuth discovery, and Claude Code responds by starting an OAuth flow that dead-ends
@@ -1407,8 +1420,10 @@ Four accepted paths, in priority order, all gated behind
    controllable, so localhost trust is a development affordance only.
 
 The proxy allowlists `/api/mcp` alongside `/api/setup/*`, so an unprovisioned instance
-answers MCP calls with its own JSON (503 while Supabase is unconfigured, 401 otherwise)
-instead of a 307 to the HTML wizard.
+answers MCP calls with its own JSON (503 + `Retry-After` while the service role is
+unconfigured or the auth backend is unreachable, 401 otherwise) instead of a 307 to the
+HTML wizard. A plain GET or HEAD is answered with the discovery document on every
+instance, configured or not.
 
 Tokens are stored as **SHA-256 hashes**; the plaintext (`nbmcp_` + 256 bits base64url)
 is shown once at mint time and is unrecoverable. This differs from the OpenRouter BYOK
@@ -1432,6 +1447,47 @@ The table is **exhaustive by construction**: `assertCortexMcpToolCoverage` compa
 keys against the live factory output, and a unit test fails if they diverge. An
 unclassified tool is *withheld*, never defaulted to `read`, so adding a tool to the
 agent without classifying it is a loud failure rather than a silent hole.
+
+### Tool annotations
+
+Every `tools/list` entry carries the spec's `annotations` object (`readOnlyHint`,
+`destructiveHint`, `idempotentHint`, `openWorldHint`), typed in `CortexMcpToolAnnotations`
+to mirror `ToolAnnotations` in `@modelcontextprotocol/sdk` without depending on it. The
+defaults are why this matters: a client that receives no annotations assumes
+`destructiveHint: true`, `idempotentHint: false`, `openWorldHint: true`, so before this
+table an unannotated `get_database_schema` looked, to Claude Code or Cursor, exactly like
+a raw DELETE and prompted accordingly.
+
+`readOnlyHint` is derived from `CORTEX_MCP_TOOL_KINDS`, never declared twice. Read tools
+are `destructive: false, idempotent: true` by definition and only pick `openWorld`
+(`fetch_url_content`, `search_stock_photos`). Write tools get a row in
+`CORTEX_MCP_WRITE_TOOL_BEHAVIOURS`, typed as `Record<CortexMcpWriteToolName, …>` so a tool
+classified `write` without a row fails to compile, and a unit test keeps the two tables
+on exactly the same names. An alias inherits its canonical tool's annotations.
+
+The rules are read off the executor code, not the tool description (the comment above
+the table carries them in full):
+
+- `destructiveHint` — can delete rows or discard content wholesale (a delete action or
+  operation, a reset, a "replace" mode) with no revision snapshot or Live Draft to
+  restore from. Field-level overwrites and revision-recorded page/post/product edits are
+  not destructive; `rewrite_page_draft` only stages a draft. Mode-dependent tools take
+  their worst mode, because the spec defines the hint as "MAY perform destructive
+  updates" — which is why `update_navigation_bar` and `update_global_css` are `true`.
+- `idempotentHint` — a retry with identical arguments converges: creates are refused on
+  a duplicate slug (`assertUniqueSlug`) or an existing translation before anything is
+  written, drafts are delete-then-insert per parent, navigation "append" skips URLs
+  already present, settings and languages are upserts, deletes of something already gone
+  are no-ops. False where a retry adds a second copy: `insert_content_block`, CSS
+  "append", variant "append", raw DB inserts, URL imports (`upload_media`,
+  `set_content_images`) that re-download into the media library, and model-generated
+  custom block definitions. This is the honest answer to "make every mutation
+  idempotent": the tools that already are, say so; the handful that are not tell the
+  host not to blind-retry them, rather than growing an idempotency-key table.
+- `openWorldHint` — an argument may name an arbitrary external host.
+
+Adding a write tool means a row here as well as in the scope table; the compiler and
+`mcp-server.test.ts` both refuse a missing one.
 
 ### Confirmation is skipped over MCP
 
@@ -1955,6 +2011,12 @@ If new warnings appear, inspect for:
 8. Add focused tests in `ai-global-agent-tools.test.ts`.
 9. Update `verify-cortex-ai-global-tools.ts`.
 10. Consider deterministic completion copy in `getToolCompletionMessage`.
+11. Classify it for MCP: `read` or `write` in `CORTEX_MCP_TOOL_KINDS`
+    (`mcp-tool-registry.ts`), and for a write tool a row in
+    `CORTEX_MCP_WRITE_TOOL_BEHAVIOURS` (`destructive` / `idempotent` / `openWorld`, read
+    off what the executor actually does — see "Tool annotations"). The compiler and
+    `mcp-server.test.ts` both refuse a missing one; an unclassified tool is withheld from
+    `tools/list` rather than exposed.
 
 Rules:
 

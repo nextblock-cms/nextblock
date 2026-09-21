@@ -185,6 +185,69 @@ function buildInitializeResult(deps: CortexMcpHandlerDeps, requestedVersion: unk
   };
 }
 
+export type CortexMcpDiscoveryDocument = {
+  authentication: {
+    header: 'Authorization';
+    instructions: string;
+    required: true;
+    schemes: ['bearer'];
+  };
+  capabilities: {
+    prompts: Record<string, never>;
+    resources: Record<string, never>;
+    tools: Record<string, never>;
+  };
+  endpoint: { transport: 'streamable-http'; url: string };
+  name: string;
+  protocolVersions: readonly string[];
+  serverCard: string;
+  status: 'ok';
+  title: string;
+  version: string;
+  websiteUrl: string;
+};
+
+/**
+ * The document a plain `GET /api/mcp` (no `Accept: text/event-stream`) answers with.
+ *
+ * Directory crawlers, uptime monitors and people pasting the URL into a browser all GET
+ * the endpoint before they ever POST `initialize`. A real MCP client opening the
+ * server→client stream sends `Accept: text/event-stream` (a spec MUST), so the route can
+ * tell the two apart and keep answering that one with 405. This one is static on
+ * purpose: nothing here reads the database or checks a token, so it cannot fail, and it
+ * reveals nothing an `initialize` would not — the tool inventory stays on the server
+ * card, which is served only where the operator switched MCP on.
+ */
+export function buildCortexMcpDiscoveryDocument(params: {
+  endpointUrl: string;
+  serverCardUrl: string;
+  serverVersion: string;
+}): CortexMcpDiscoveryDocument {
+  return {
+    authentication: {
+      header: 'Authorization',
+      instructions:
+        'POST JSON-RPC 2.0 messages with `Authorization: Bearer <token>`. Create the token in the NextBlock CMS (Settings → Cortex AI → MCP server access) or set MCP_BEARER_TOKEN in the environment. Cortex AI must be active on the site.',
+      required: true,
+      schemes: ['bearer'],
+    },
+    capabilities: { prompts: {}, resources: {}, tools: {} },
+    endpoint: { transport: 'streamable-http', url: params.endpointUrl },
+    name: CORTEX_MCP_SERVER_NAME,
+    protocolVersions: CORTEX_MCP_SUPPORTED_PROTOCOL_VERSIONS,
+    serverCard: params.serverCardUrl,
+    status: 'ok',
+    title: CORTEX_MCP_SERVER_TITLE,
+    version: params.serverVersion,
+    websiteUrl: 'https://nextblock.dev',
+  };
+}
+
+/** True when the caller is an MCP client opening the optional server→client SSE stream. */
+export function wantsMcpEventStream(acceptHeader: string | null | undefined): boolean {
+  return Boolean(acceptHeader && acceptHeader.toLowerCase().includes('text/event-stream'));
+}
+
 /**
  * Handle one JSON-RPC message.
  *

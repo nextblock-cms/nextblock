@@ -8,6 +8,7 @@ import {
 import { revalidatePublicContent } from '../../../lib/public-content-cache';
 import {
   CORTEX_AI_PACKAGE_ID,
+  buildCortexMcpDiscoveryDocument,
   handleCortexMcpMessage,
   isLocalhostHost,
   matchesCortexAiMcpEnvToken,
@@ -17,6 +18,7 @@ import {
   shouldTrustLocalMcpRequest,
   touchCortexAiMcpToken,
   verifyCortexAiMcpToken,
+  wantsMcpEventStream,
   type CortexAiMcpScope,
   type CortexMcpToolContext,
   type JsonRpcMessage,
@@ -24,7 +26,8 @@ import {
 
 import { validateBlockContent } from '../../../lib/blocks/blockRegistry';
 import { ensureEnvLicenseActivation } from '../../../lib/packages/env-license';
-import { isFullyConfigured, isSupabaseConfigured } from '../../../lib/setup/env-status';
+import { isFullyConfigured } from '../../../lib/setup/env-status';
+import { hasResolvedSiteUrl, resolveSiteUrl } from '../../../lib/site-url';
 import { importExternalImageToMedia } from '../../cms/media/import-external-image';
 import { captureRevisionBaseline, commitRevisionFromBaseline } from '../../cms/revisions/service';
 import type { AnyFullContent } from '../../cms/revisions/utils';
@@ -358,6 +361,35 @@ function unauthorized(message: string): Response {
   });
 }
 
+/** 503 + Retry-After: "not now", never "not ever". */
+function serviceUnavailable(message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    headers: { ...JSON_HEADERS, 'Retry-After': '5' },
+    status: 503,
+  });
+}
+
+const ALLOWED_METHODS = 'GET, HEAD, POST, DELETE, OPTIONS';
+
+/**
+ * The absolute URL of this endpoint and of the server card, for the discovery document.
+ *
+ * Prefers the configured site URL (behind Vercel or a reverse proxy `request.url` is the
+ * internal origin); falls back to the request origin so a fresh install with no
+ * NEXT_PUBLIC_URL still answers with a URL that works for whoever is asking.
+ */
+function resolvePublicOrigin(request: Request): string {
+  if (hasResolvedSiteUrl()) {
+    return resolveSiteUrl().replace(/\/+$/, '');
+  }
+
+  try {
+    return new URL(request.url).origin;
+  } catch {
+    return resolveSiteUrl().replace(/\/+$/, '');
+  }
+}
+
 export async function POST(request: Request): Promise<Response> {
   if (!isOriginAllowed(request)) {
     return new Response(JSON.stringify({ error: 'Origin not allowed.' }), {
@@ -368,21 +400,19 @@ export async function POST(request: Request): Promise<Response> {
 
   // The proxy lets this route through before the instance is set up (so agents get a
   // real answer instead of a redirect to the wizard); say so plainly when nothing can
-  // work yet.
-  if (!isSupabaseConfigured()) {
-    return new Response(
-      JSON.stringify({
-        error: 'This NextBlock instance is not configured yet. Poll GET /api/setup/status until it reports initialized.',
-      }),
-      { headers: { ...JSON_HEADERS, 'Retry-After': '5' }, status: 503 }
+  // work yet. The check is for the *service role*, not just the URL + anon key: every
+  // path below (token lookup, the tool context) goes through
+  // `getServiceRoleSupabaseClient()`, which throws without the secret key — and an
+  // uncaught throw here is a 500 to a client that only needed to hear "not ready".
+  if (!isFullyConfigured()) {
+    return serviceUnavailable(
+      'This NextBlock instance is not configured yet. Poll GET /api/setup/status until it reports initialized.'
     );
   }
 
   // A key seeded through NEXTBLOCK_LICENSE_KEY is activated on first use; a cached
   // no-op read when there is nothing to do.
-  if (isFullyConfigured()) {
-    await ensureEnvLicenseActivation();
-  }
+  await ensureEnvLicenseActivation();
 
   const isCortexAiActive = await verifyPackageOnline(CORTEX_AI_PACKAGE_ID);
 
@@ -393,7 +423,17 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const auth = await authenticateMcpRequest(request);
+  let auth: McpAuth | null;
+
+  try {
+    auth = await authenticateMcpRequest(request);
+  } catch (error) {
+    // The token table or profiles being unreachable is an outage, not a bad credential:
+    // say 503 + Retry-After so a well-behaved client backs off instead of dropping the
+    // server as broken (a 500) or as misconfigured (a 401).
+    console.error('Cortex AI MCP: authentication backend unavailable —', error);
+    return serviceUnavailable('Authentication is temporarily unavailable. Retry shortly.');
+  }
 
   if (!auth) {
     return unauthorized(
@@ -435,20 +475,57 @@ export async function POST(request: Request): Promise<Response> {
 }
 
 /**
- * The optional server→client SSE stream.
+ * GET is two different requests wearing one method.
  *
- * This server never initiates requests or pushes unsolicited notifications — every
- * response is returned inline on the POST — so there is nothing to stream. The spec
- * explicitly permits answering the GET with 405 in that case.
+ * An MCP client opening the optional server→client SSE stream sends
+ * `Accept: text/event-stream` (a spec MUST). This server never initiates requests or
+ * pushes unsolicited notifications — every response is returned inline on the POST — so
+ * there is nothing to stream, and the spec explicitly permits answering that GET with
+ * 405. Unchanged.
+ *
+ * Everything else that GETs this URL — a directory's health probe, an uptime monitor, a
+ * person pasting the endpoint into a browser — is asking "is there an MCP server here?"
+ * and used to be told 405 too, which several crawlers score as down. They now get a
+ * small static discovery document: identity, protocol versions, capabilities, how to
+ * authenticate, and where the full server card lives. It reads nothing and checks
+ * nothing, so it cannot fail, and it discloses nothing an `initialize` would not.
  */
-export function GET(): Response {
+export function GET(request: Request): Response {
+  if (wantsMcpEventStream(request.headers.get('accept'))) {
+    return new Response(
+      JSON.stringify({
+        error:
+          'This MCP endpoint does not offer a server-initiated SSE stream. Send JSON-RPC messages via POST.',
+      }),
+      { headers: { ...JSON_HEADERS, Allow: ALLOWED_METHODS }, status: 405 }
+    );
+  }
+
+  const origin = resolvePublicOrigin(request);
+
   return new Response(
-    JSON.stringify({
-      error:
-        'This MCP endpoint does not offer a server-initiated SSE stream. Send JSON-RPC messages via POST.',
-    }),
-    { headers: { ...JSON_HEADERS, Allow: 'POST, DELETE, OPTIONS' }, status: 405 }
+    JSON.stringify(
+      buildCortexMcpDiscoveryDocument({
+        endpointUrl: `${origin}/api/mcp`,
+        serverCardUrl: `${origin}/.well-known/mcp/server-card.json`,
+        serverVersion: SERVER_VERSION,
+      })
+    ),
+    {
+      headers: {
+        'Cache-Control': 'public, max-age=300',
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      status: 200,
+    }
   );
+}
+
+/** Same negotiation as GET, no body: what most health checkers actually send. */
+export function HEAD(request: Request): Response {
+  const full = GET(request);
+
+  return new Response(null, { headers: full.headers, status: full.status });
 }
 
 /** Session termination. The server is stateless, so there is no session to tear down. */
@@ -461,8 +538,8 @@ export function OPTIONS(): Response {
     headers: {
       'Access-Control-Allow-Headers':
         'Authorization, Content-Type, MCP-Protocol-Version, Mcp-Session-Id, Mcp-Method, Mcp-Name',
-      'Access-Control-Allow-Methods': 'POST, DELETE, OPTIONS',
-      Allow: 'POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': ALLOWED_METHODS,
+      Allow: ALLOWED_METHODS,
     },
     status: 204,
   });
