@@ -96,9 +96,12 @@ the one-click deploy needs **no manual dashboard configuration**:
 
 - **`buildCommand`** runs the Nx target from the repo root, which resolves the
   workspace libraries (`@nextblock-cms/*` via the TS path aliases) and builds the app.
-- **`outputDirectory`** points at the app's `.next`. This `@nx/next` version emits it
-  to `apps/nextblock/.next` — **not** `dist/apps/nextblock/.next` (which only receives
-  the deploy wrapper: `package.json`, `next.config.js`, `public/`). Verify with
+- **`outputDirectory`** points at the app's `.next`. The build target runs `next build`
+  inside `apps/nextblock` (a plain `nx:run-commands` target, see docs/05), so the output is
+  `apps/nextblock/.next`. Nothing is written to `dist/apps/nextblock` any more; the retired
+  `@nx/next:build` executor only copied `package.json`, `next.config.js` and `public/` there.
+  Nx reads `--prod` as `--configuration=production`, which the build targets do not define,
+  so it does nothing and is kept only to match `npm run build`. Verify with
   `npx nx build nextblock --prod` then check `apps/nextblock/.next/BUILD_ID`.
 - **`framework: nextjs`** keeps Vercel's first-class Next.js runtime (SSR/ISR
   functions, image optimization, the `proxy.ts` middleware).

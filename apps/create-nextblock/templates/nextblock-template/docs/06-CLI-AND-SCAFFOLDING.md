@@ -310,9 +310,9 @@ in 0.19.0 and broke `next build` in every generated project:
 
 | Check | What went wrong |
 | :-- | :-- |
-| Development build | Without `NODE_ENV=production` the Nx Vite executor builds in development mode. plugin-react then emits `jsxDEV(..., this)` with the builder's absolute paths, and `this` is illegal in a file with inline server actions ("Server Actions cannot use `this`"). |
+| Development build | Without `NODE_ENV=production` a release build can run in development mode: `@nx/vite/plugin` resolves every Vite config in development mode while Nx computes the project graph, Vite then sets `NODE_ENV=development` in that process, and with plugin isolation off (as in `release-lib.js`) the build task inherits it. plugin-react then emits `jsxDEV(..., this)` with the builder's absolute paths, and `this` is illegal in a file with inline server actions ("Server Actions cannot use `this`"). |
 | Consumed subpaths | With `preserveModules`, only modules reachable from a build entry are emitted. A module imported **only** through its subpath (`@nextblock-cms/utils/script-safety`) shipped a `.d.ts` and no JavaScript. Give it its own `build.lib.entry`. |
-| Lost exports | `libs/db` and `libs/utils` track stale compiled twins (`foo.js` beside `foo.ts`). Vite resolves `.js` before `.ts` by default, so the package was assembled from months-old code. Both configs now set `resolve.extensions` with TypeScript first. |
+| Lost exports | `libs/db` and `libs/utils` track stale compiled twins (`foo.js` beside `foo.ts`). Vite resolves `.js` before `.ts` by default, so the package was assembled from months-old code. Both configs now set `resolve.extensions` with TypeScript first, and so does the root `vitest.config.ts`: until 0.21 the tests ran the twins too. |
 
 A fourth check covers the declaration files, which fail silently in two ways (both shipped
 through 0.19.2, and neither breaks a scaffold build because scaffolds compile with
@@ -332,6 +332,64 @@ in the tarball. With no argument, `verify-lib-dist.js` now checks every built li
 | Check | What went wrong |
 | :-- | :-- |
 | Tarball contents | Rolldown renamed `ui`'s lazy chunks from `index-[hash]` to `dist-*`, `es-*` and `rolldown-runtime-*`, and `index.mjs` imports the runtime chunk directly. The `files` whitelist still globbed `index-*.mjs`, so every consumer of `@nextblock-cms/ui` would have failed to import it, and every earlier check passed. It also catches a lib whose declarations silently disappear (next section). |
+
+Check 6, Rolldown's `require()` shim, is described with the Vite 8 rules below. A seventh
+check covers the CommonJS side of each package. Nothing in the monorepo or in a scaffold's
+Next.js build loads it, so all three of these shipped through 0.20:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Module formats | `cortex` and `ecom` are `"type": "module"` and published their `require` entries as `index.cjs.js`, which Node parses as ESM ("exports is not defined in ES module scope"). `ui` and `editor` put `'use client'` back on `index.mjs` only, so their CommonJS `index.js` was a Server Component. `ui`'s `main`/`module` named `index.cjs.js`/`index.es.js`, files the build never wrote. The check requires `.cjs` for every CommonJS file and `require` target in a `"type": "module"` package, the same `'use client'`/`'use server'` directive at the top of both files of every export, and existing `main`/`module`/`types` files. |
+
+An eighth check covers the npm package page, which nothing else looks at:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Package page | Through 0.20 only `sdk` published a README. The first fix published Nx's generated "This library was generated with Nx" stubs, `editor` and `sdk` linked to `../../docs/…` (a 404 on npmjs.com), the five manifests the builds write had no `license`, and `cortex` and `ecom` pointed `repository` at `nextblock-cms/packages`, which does not exist. The check requires a README in the tarball that is not the Nx stub and uses only absolute links, plus `license` and `repository` in the manifest. Every lib now has a real README, and every manifest points at `nextblock-cms/nextblock` with its `directory`. |
+
+### How the libraries build
+
+`npx nx build <lib>` runs the `vite build` target that `@nx/vite/plugin` infers from the lib's
+Vite config, after the lib's `typecheck` target (`tsc --noEmit -p tsconfig.lib.json`, which the
+old `@nx/vite:build` executor also ran first). Each `project.json` only sets
+`"build": { "dependsOn": ["typecheck"] }`. That replaces the plugin's default `^build`: a lib
+externalizes its siblings and reads their types from source, so it never needs them built.
+`db`'s `build` is still `vite-build` (plain `vite build`) plus the step that copies
+`src/supabase` into the dist. What the configs must now do themselves:
+
+- Set `build.outDir: '../../dist/libs/<lib>'`, relative and with `/`. The plugin derives the
+  target's cache outputs from it, and an absolute path came out with Windows backslashes.
+  Set `emptyOutDir: true` too: Vite will not empty a folder outside the lib otherwise, and old
+  chunks would stay in the tarball.
+- Copy files the build does not write with `copyIntoDist()` from
+  `tools/vite/lib-build-plugins.mjs`: `README.md`, and the raw `package.json` for `cortex` and
+  `ecommerce`, which `release-lib.js` finalizes. `sdk` and `db` copy their README in
+  `afterBuild` instead: their configs are `.ts`, which the root lint config checks with
+  `@nx/enforce-module-boundaries`, and `tools/` belongs to the root project. The executor's
+  `assets` option was not in its schema and never copied anything, so only `sdk` (through
+  `nxCopyAssetsPlugin`) shipped a README before.
+- A lib whose `afterBuild` writes its own manifest (`utils`, `ui`, `sdk`, `db`, `editor`)
+  copies `license` and `repository` from its `package.json` into it. The README is the npm
+  page, so link to docs with absolute GitHub URLs; check 8 rejects relative links.
+- A lib that bundles into one chunk (`ui`, `editor`) adds `'use client'` with
+  `clientDirectiveOnEntries()`. Rolldown drops module directives when it merges modules, and
+  vite-plugin-dts's `afterBuild` runs after the ESM output is written but before the CommonJS
+  one, so a file patch there never reaches the CommonJS entry. `preserveModules` libs keep
+  their directives.
+- A `"type": "module"` lib (`cortex`, `ecommerce`) names its CommonJS files `.cjs` through
+  `build.lib.fileName`. The other libs have no `type` field, so their `.cjs.js` files are
+  CommonJS already.
+- Do not write build output from `afterBuild` that the CommonJS pass also writes. Through 0.20
+  `utils` overwrote `server.es.js` and `server.d.ts` with a hand-written copy there, while the
+  CommonJS pass shipped the compiled source. The copy had drifted (its `hasEnvVars()` ignored
+  the Vercel integration's key aliases). Both formats are compiled from `src/server.ts` now.
+- Keep `libs/utils/src/lib/server-utils.ts` free of `"use server"`. The directive would turn
+  every export into a Server Action as soon as a client component imports one, and
+  `getEmailServerConfig()` returns the SMTP password. The module throws when loaded in a
+  browser instead, and a test checks both.
+
+Nothing imports `nxViteTsPaths` or `nxCopyAssetsPlugin` any more: Nx 24 removes both, and
+`sdk` was the only user.
 
 ### Library build gotchas (dts / tsconfig)
 

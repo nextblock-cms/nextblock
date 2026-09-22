@@ -8,18 +8,9 @@
   ],
   "targets": {
     "build": {
-      "executor": "@nx/vite:build",
-      "outputs": [
-        "{options.outputPath}"
-      ],
-      "options": {
-        "outputPath": "dist/libs/cortex",
-        "configFile": "libs/cortex/vite.config.mts",
-        "assets": [
-          "libs/cortex/*.md",
-          "libs/cortex/package.json"
-        ]
-      }
+      "dependsOn": [
+        "typecheck"
+      ]
     }
   }
 }

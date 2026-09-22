@@ -32,7 +32,7 @@ const config = [
       // Its rule OPTION is a *pages* directory: passing 'apps/nextblock/app' there made it
       // derive pages-router URLs (`/cms/settings/packages/page`) that never match a real
       // link, so internal <a> links were silently never checked. Paths are relative to the
-      // workspace root, which is where the @nx/eslint:lint executor runs ESLint.
+      // workspace root, which is where `nx lint nextblock` runs ESLint (project.json).
       next: { rootDir: 'apps/nextblock/' },
     },
     rules: {

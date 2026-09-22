@@ -4,6 +4,7 @@ import dts from 'vite-plugin-dts';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
+import { copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = path.resolve(__dirname, '../../dist/libs/cortex');
@@ -33,7 +34,7 @@ function reapplyDirectives() {
         continue;
       }
 
-      const match = entry.name.match(/^(.*)\.(es|cjs)\.js$/);
+      const match = entry.name.match(/^(.*)\.(?:es\.js|cjs)$/);
       if (!match) continue;
 
       const relNoExt = path
@@ -81,8 +82,14 @@ export default defineConfig({
       afterBuild: reapplyDirectives,
     }),
     react(),
+    // The raw manifest; tools/scripts/release-lib.js finalizes it (entry points, exports,
+    // resolved sibling versions) right before publishing.
+    copyIntoDist(__dirname, OUT_DIR, ['package.json', 'README.md']),
   ],
   build: {
+    // Relative, '/'-separated: @nx/vite/plugin derives the build target's cache outputs from
+    // this, and an absolute path came out with Windows backslashes.
+    outDir: '../../dist/libs/cortex',
     emptyOutDir: true,
     lib: {
       entry: {
@@ -90,7 +97,10 @@ export default defineConfig({
         index: './src/index.ts',
       },
       name: 'cortex',
-      fileName: (format, entryName) => `${entryName}.${format}.js`,
+      // CommonJS as `.cjs`: this package is "type": "module", so Node and bundlers read any
+      // `.js` file in it as ESM. Through 0.20 the `require` entry was index.cjs.js, which
+      // failed to load ("exports is not defined in ES module scope").
+      fileName: (format, entryName) => (format === 'cjs' ? `${entryName}.cjs` : `${entryName}.${format}.js`),
       formats: ['es', 'cjs'],
     },
     rolldownOptions: {

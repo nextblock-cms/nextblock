@@ -4,7 +4,9 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 const packageJsonPath = path.resolve(__dirname, 'package.json');
-const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// license and repository go into the published manifest too: npm shows them on the package page,
+// and through 0.20 every package this hook writes shipped without either.
+const { version, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 export default defineConfig({
   root: __dirname,
@@ -33,6 +35,8 @@ export default defineConfig({
         const packageJson = {
           name: '@nextblock-cms/db',
           version,
+          license,
+          repository,
           main: 'index.cjs.js',
           module: 'index.es.js',
           types: 'index.d.ts',
@@ -88,10 +92,17 @@ export default defineConfig({
           path.resolve(__dirname, '../../dist/libs/db', 'package.json'),
           JSON.stringify(packageJson, null, 2)
         );
+
+        // The README ships with the package (tools/scripts/verify-lib-dist.js check 8 requires one).
+        fs.copyFileSync(path.join(__dirname, 'README.md'), path.resolve(__dirname, '../../dist/libs/db', 'README.md'));
       },
     }),
   ],
   build: {
+    // Must match the `outputs` of `build` / `vite-build` and the supabase copy destination in
+    // project.json: db's explicit targets replace the one @nx/vite/plugin would infer from it.
+    outDir: '../../dist/libs/db',
+    emptyOutDir: true,
     lib: {
       // Relative, like every other lib: vite-plugin-dts 5 resolves them against the same root
       // as the tsconfig file list. As `path.resolve(__dirname, ...)` they kept the drive-letter

@@ -17,23 +17,19 @@
           "node tools/scripts/copy-db-supabase.cjs libs/db/src/supabase dist/libs/db/supabase"
         ],
         "parallel": false
-      }
+      },
+      "dependsOn": [
+        "typecheck"
+      ]
     },
     "vite-build": {
-      "executor": "@nx/vite:build",
+      "executor": "nx:run-commands",
       "outputs": [
-        "{options.outputPath}"
+        "{workspaceRoot}/dist/libs/db"
       ],
       "options": {
-        "outputPath": "dist/libs/db",
-        "assets": [
-          "libs/db/package.json",
-          {
-            "input": "libs/db",
-            "glob": "*.md",
-            "output": "."
-          }
-        ]
+        "command": "vite build",
+        "cwd": "libs/db"
       }
     },
     "gen-types": {

@@ -10,11 +10,12 @@
 // TypeScript source; it only broke `next build` in scaffolded projects, which install the
 // published packages:
 //
-//   1. Development JSX. The Nx Vite executor builds in development mode unless NODE_ENV is
-//      `production`, so plugin-react emitted `jsxDEV(..., this)` with the builder's absolute
-//      source paths. Besides leaking `C:/Users/...` and shipping the dev runtime, the `this`
-//      argument is illegal inside a file with inline server actions ("Server Actions cannot
-//      use `this`"), which failed every scaffold build once ecommerce gained such files.
+//   1. Development JSX. Unless NODE_ENV is `production`, a release build can inherit
+//      NODE_ENV=development from Nx's project-graph step (see release-lib.js), so plugin-react
+//      emitted `jsxDEV(..., this)` with the builder's absolute source paths. Besides leaking
+//      `C:/Users/...` and shipping the dev runtime, the `this` argument is illegal inside a file
+//      with inline server actions ("Server Actions cannot use `this`"), which failed every
+//      scaffold build once ecommerce gained such files.
 //   2. Subpaths consumers import that the package does not actually contain. With
 //      preserveModules only modules reachable from a build entry are emitted, so a module
 //      that is imported ONLY through its subpath (`@nextblock-cms/utils/script-safety`) ships
@@ -34,6 +35,18 @@
 //      `index.mjs` imports one of them statically, so the tarball would have shipped an entry
 //      point that cannot load. This check asks `npm pack --dry-run` for the real file list
 //      and resolves every relative import in it.
+//   6. Rolldown's require() shim in ESM output (see the check for details).
+//   7. A CommonJS side that cannot load, or loads as the wrong kind of module. Only the ESM
+//      files run in scaffolds, so these shipped unnoticed: cortex and ecom are
+//      `"type": "module"` and published their `require` entries as `index.cjs.js`, which
+//      Node parses as ESM; ui and editor put 'use client' back on `index.mjs` only; utils
+//      published a hand-written ESM server entry with a 'use server' its compiled CommonJS
+//      twin lacked; and ui's `main` / `module` named files that were never built.
+//   8. The npm package page. Through 0.20 no package but sdk shipped a README (the old
+//      executor's `assets` option copied nothing), the first fix published Nx's generated
+//      "This library was generated with Nx" stubs, the READMEs that did exist linked to
+//      `../../docs/...` (a 404 on npmjs.com), five manifests dropped `license`, and cortex and
+//      ecom pointed `repository` at a GitHub repo that does not exist.
 
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -545,6 +558,171 @@ function findRequireShims(distDir) {
   return problems;
 }
 
+/* ------------------------------ 7. module formats ------------------------------ */
+
+const RSC_DIRECTIVES = new Set(['use client', 'use server']);
+
+/** The 'use client' / 'use server' directives in a file's directive prologue. */
+function rscDirectivesOf(text) {
+  const found = [];
+  let rest = text.replace(/^\uFEFF/, '');
+  for (;;) {
+    rest = rest.replace(/^(?:\s+|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/, '');
+    const match = rest.match(/^(['"])([^'"\n]*)\1\s*;?/);
+    if (!match) break;
+    if (RSC_DIRECTIVES.has(match[2])) found.push(match[2]);
+    rest = rest.slice(match[0].length);
+  }
+  return found.sort().join(', ') || 'none';
+}
+
+/** CommonJS output as Rolldown writes it (minified or not). */
+const COMMONJS_MARKER = /\bObject\.definePropert(?:y|ies)\(exports\b|\bmodule\.exports\s*=|(?:^|[;,{}\s])exports\.[\w$]+\s*=/;
+
+/** The file a condition's value resolves to: a string, or an object's `default` / `node`. */
+function conditionTarget(value) {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') return conditionTarget(value.default ?? value.node);
+  return undefined;
+}
+
+/**
+ * Every ESM/CommonJS pair of targets in an exports map, keyed by subpath. The CommonJS side is
+ * `require`; the ESM side is `import`, else `module`, else `default` (utils and db publish
+ * `{ types, require, default }`).
+ */
+function collectFormatPairs(exportsMap) {
+  const pairs = [];
+  const visit = (key, entry) => {
+    if (!entry || typeof entry !== 'object') return;
+    const cjs = conditionTarget(entry.require);
+    const esm = conditionTarget(entry.import ?? entry.module ?? entry.default);
+    if (cjs && esm) {
+      if (cjs !== esm) pairs.push({ key, esm, cjs });
+      return;
+    }
+    for (const value of Object.values(entry)) visit(key, value);
+  };
+  for (const [key, entry] of Object.entries(exportsMap)) visit(key, entry);
+  return pairs;
+}
+
+/** Every `require` target in an exports map, with the subpath it belongs to. */
+function collectRequireTargets(exportsMap) {
+  const targets = [];
+  const visit = (key, entry) => {
+    if (!entry || typeof entry !== 'object') return;
+    for (const [condition, value] of Object.entries(entry)) {
+      if (condition === 'require' && conditionTarget(value)) targets.push({ key, target: conditionTarget(value) });
+      else visit(key, value);
+    }
+  };
+  for (const [key, entry] of Object.entries(exportsMap)) visit(key, entry);
+  return targets;
+}
+
+/** A wildcard pair (`./lib/*.es.js` / `./lib/*.cjs`) as one concrete pair per built ESM file. */
+function expandFormatPair(distDir, pair) {
+  if (!pair.esm.includes('*') || !pair.cjs.includes('*')) return [pair];
+  const [prefix, suffix] = pair.esm.replace(/^\.\//, '').split('*');
+  const expanded = [];
+  walk(distDir, (file) => {
+    const relative = path.relative(distDir, file).split(path.sep).join('/');
+    if (!relative.startsWith(prefix) || !relative.endsWith(suffix)) return;
+    if (relative.length <= prefix.length + suffix.length) return;
+    const star = relative.slice(prefix.length, relative.length - suffix.length);
+    expanded.push({ key: pair.key.replace('*', star), esm: `./${relative}`, cjs: pair.cjs.replace('*', star) });
+  });
+  return expanded;
+}
+
+function findModuleFormatProblems(library, distDir) {
+  const manifestPath = path.join(distDir, 'package.json');
+  const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
+  const exportsMap = manifest.exports ?? publishExportsFor(library) ?? {};
+  const isModulePackage = manifest.type === 'module';
+  const problems = [];
+  const rel = (file) => path.relative(distDir, file).split(path.sep).join('/');
+
+  for (const field of ['main', 'module', 'types']) {
+    const target = manifest[field];
+    if (typeof target === 'string' && !fs.existsSync(path.join(distDir, target))) {
+      problems.push(`"${field}" is ${target}, which the build did not write`);
+    }
+  }
+
+  if (isModulePackage) {
+    const requireTargets = [
+      ...(typeof manifest.main === 'string' ? [['"main"', manifest.main]] : []),
+      ...collectRequireTargets(exportsMap).map(({ key, target }) => [`"exports" ${key} require`, target]),
+    ];
+    for (const [where, target] of requireTargets) {
+      if (!target.endsWith('.cjs')) {
+        problems.push(`${where} is ${target}: this package is "type": "module", so a CommonJS file needs the .cjs extension`);
+      }
+    }
+    walk(distDir, (file) => {
+      // `.es.js` is the ESM output by name; only an unmarked `.js` can be CommonJS in disguise.
+      if (!file.endsWith('.js') || file.endsWith('.es.js')) return;
+      if (COMMONJS_MARKER.test(fs.readFileSync(file, 'utf8'))) {
+        problems.push(`${rel(file)} is CommonJS in a "type": "module" package, so Node loads it as ESM; emit it as .cjs`);
+      }
+    });
+  }
+
+  const pairs = collectFormatPairs(exportsMap).flatMap((pair) => expandFormatPair(distDir, pair));
+  for (const { key, esm, cjs } of pairs) {
+    const esmFile = path.join(distDir, esm);
+    const cjsFile = path.join(distDir, cjs);
+    if (!fs.existsSync(esmFile) || !fs.existsSync(cjsFile)) continue; // check 5 reports it
+    const esmDirectives = rscDirectivesOf(fs.readFileSync(esmFile, 'utf8'));
+    const cjsDirectives = rscDirectivesOf(fs.readFileSync(cjsFile, 'utf8'));
+    if (esmDirectives !== cjsDirectives) {
+      problems.push(
+        `"exports" ${key}: ${esm} starts with ${esmDirectives} but ${cjs} starts with ${cjsDirectives}; ` +
+          'a require() consumer would get a different kind of module'
+      );
+    }
+  }
+
+  return problems;
+}
+
+/* ------------------------------ 8. package page ------------------------------ */
+
+const NX_README_STUB = /This library was generated with \[Nx\]/;
+/** A Markdown link or image whose target is not absolute: it resolves only inside the monorepo. */
+const RELATIVE_MARKDOWN_LINK = /\]\((?!https?:\/\/|#|mailto:)([^)\s]+)\)/g;
+
+function findPackagePageProblems(library, distDir, packed = listPackedFiles(distDir)) {
+  const problems = [];
+  const readme = [...packed].find((file) => /^readme(\.md)?$/i.test(file));
+
+  if (!readme) {
+    problems.push('the tarball has no README.md: copy the lib\'s README into the dist folder');
+  } else {
+    const text = fs.readFileSync(path.join(distDir, readme), 'utf8');
+    if (NX_README_STUB.test(text)) {
+      problems.push(`${readme} is Nx's generated stub ("This library was generated with Nx"); write a real one`);
+    }
+    for (const [, target] of text.matchAll(RELATIVE_MARKDOWN_LINK)) {
+      problems.push(`${readme} links to "${target}", which only resolves inside the monorepo; use an absolute URL`);
+    }
+  }
+
+  const manifestPath = path.join(distDir, 'package.json');
+  const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : {};
+  if (typeof manifest.license !== 'string' || manifest.license.length === 0) {
+    problems.push('package.json has no "license"');
+  }
+  const repositoryUrl = typeof manifest.repository === 'string' ? manifest.repository : manifest.repository?.url;
+  if (typeof repositoryUrl !== 'string' || repositoryUrl.length === 0) {
+    problems.push('package.json has no "repository"');
+  }
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
 function verifyLibDist(library) {
@@ -561,6 +739,8 @@ function verifyLibDist(library) {
     ...findDanglingDeclarationImports(distDir).map((entry) => `missing declaration: ${entry}`),
     ...findUnpackedFiles(library, distDir).map((entry) => `not in the npm tarball: ${entry}`),
     ...findRequireShims(distDir).map((entry) => `require() shim in ESM: ${entry}`),
+    ...findModuleFormatProblems(library, distDir).map((entry) => `module format: ${entry}`),
+    ...findPackagePageProblems(library, distDir).map((entry) => `package page: ${entry}`),
   ];
 
   if (problems.length > 0) {
@@ -575,7 +755,13 @@ function verifyLibDist(library) {
   return { distDir, ok: true };
 }
 
-module.exports = { verifyLibDist, findUnpackedFiles, findRequireShims };
+module.exports = {
+  verifyLibDist,
+  findUnpackedFiles,
+  findRequireShims,
+  findModuleFormatProblems,
+  findPackagePageProblems,
+};
 
 if (require.main === module) {
   const requested = process.argv[2];

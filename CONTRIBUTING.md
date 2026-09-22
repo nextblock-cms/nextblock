@@ -47,8 +47,9 @@ The root scripts delegate to Nx, so the usual commands do the obvious thing:
 `npm run build` deliberately mirrors `vercel.json`'s `buildCommand` **character
 for character**, so a local build reproduces the deploy build. If a deploy fails
 and a local build passes, the difference is environment, not command. (`--prod`
-is redundant — the `build-base` target already defaults to the production
-configuration — but it is kept so the two stay literally identical.)
+does nothing — Nx reads it as `--configuration=production`, which the build
+targets do not define, and `next build` always builds for production — but it is
+kept so the two stay literally identical.)
 
 > **⚠️ `npm run build` can write to your database.** The Nx build target runs
 > `tools/build-migrate.mjs` first, and that hook loads `.env.local` **before** it

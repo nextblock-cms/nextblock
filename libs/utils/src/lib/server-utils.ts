@@ -1,4 +1,12 @@
-"use server";
+// Server-only, and deliberately NOT a "use server" module. That directive turns every export
+// into a Server Action the moment a client component imports it, and getEmailServerConfig()
+// returns the SMTP password. The callers are server actions and route handlers, which call these
+// as plain functions. A client import fails loudly here instead, like ../server.ts.
+if (typeof window !== 'undefined') {
+  throw new Error(
+    '@nextblock-cms/utils server helpers cannot be imported from a Client Component. Import them from server code.',
+  );
+}
 
 /**
  * Redirects to a specified path with an encoded message as a query parameter.

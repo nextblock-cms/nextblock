@@ -4,10 +4,14 @@ import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
+import { copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = path.resolve(__dirname, 'package.json');
-const { version } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// license and repository go into the published manifest too: npm shows them on the package page,
+// and through 0.20 every package this hook writes shipped without either.
+const { version, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+const OUT_DIR = path.resolve(__dirname, '../../dist/libs/utils');
 
 export default defineConfig({
   root: __dirname,
@@ -37,6 +41,8 @@ export default defineConfig({
         const packageJson = {
           name: '@nextblock-cms/utils',
           version,
+          license,
+          repository,
           main: 'index.cjs.js',
           module: 'index.es.js',
           types: 'index.d.ts',
@@ -146,249 +152,24 @@ export default defineConfig({
         };
         reapplyDirectives(outputDir);
 
-        const serverSharedHelper = `
-const missingEnvMessage = 'R2 client environment variables are missing. File uploads will not work. Needed: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_S3_ENDPOINT (or construct from R2_ACCOUNT_ID)';
-
-let cachedClient = null;
-let warnedMissingEnv = false;
-
-function buildS3Client(factory) {
-  if (cachedClient) {
-    return cachedClient;
-  }
-
-  const accountId = process.env.R2_ACCOUNT_ID;
-  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-  const endpoint =
-    process.env.R2_S3_ENDPOINT ||
-    (accountId ? \`https://\${accountId}.r2.cloudflarestorage.com\` : undefined);
-
-  if (!accountId || !accessKeyId || !secretAccessKey || !endpoint) {
-    if (!warnedMissingEnv) {
-      console.warn(missingEnvMessage);
-      warnedMissingEnv = true;
-    }
-    cachedClient = null;
-    return cachedClient;
-  }
-
-  cachedClient = factory({
-    region: process.env.R2_REGION || 'auto',
-    endpoint,
-    forcePathStyle: process.env.R2_FORCE_PATH_STYLE === 'true',
-    credentials: {
-      accessKeyId,
-      secretAccessKey,
-    },
-  });
-
-  return cachedClient;
-}
-
-async function hasEnvVars() {
-  return Boolean(
-    process.env.NEXT_PUBLIC_SUPABASE_URL &&
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-  );
-}
-
-async function getEmailServerConfig() {
-  const SMTP_HOST = process.env.SMTP_HOST;
-  const SMTP_PORT = process.env.SMTP_PORT;
-  const SMTP_USER = process.env.SMTP_USER;
-  const SMTP_PASS = process.env.SMTP_PASS;
-  const SMTP_FROM_EMAIL = process.env.SMTP_FROM_EMAIL;
-  const SMTP_FROM_NAME = process.env.SMTP_FROM_NAME;
-
-  if (
-    !SMTP_HOST ||
-    !SMTP_PORT ||
-    !SMTP_USER ||
-    !SMTP_PASS ||
-    !SMTP_FROM_EMAIL
-  ) {
-    console.warn(
-      'Email server environment variables are missing. Email will not be sent.',
-    );
-    return null;
-  }
-
-  const from = SMTP_FROM_NAME
-    ? \`"\${SMTP_FROM_NAME}" <\${SMTP_FROM_EMAIL}>\`
-    : SMTP_FROM_EMAIL;
-
-  return {
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT),
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-    from,
-  };
-}
-
-async function encodedRedirect(type, path, message) {
-  const { redirect } = await import('next/navigation');
-  return redirect(\`\${path}?\${type}=\${encodeURIComponent(message)}\`);
-}
-`.trimStart();
-
-        const serverOnlyGuard = `
-const SERVER_ONLY_ERROR_MESSAGE = 'This module cannot be imported from a Client Component module. It should only be used from a Server Component.';
-
-if (typeof window !== 'undefined') {
-  throw new Error(SERVER_ONLY_ERROR_MESSAGE);
-}
-`.trimStart();
-
-        const serverEsm = `'use server';
-${serverOnlyGuard}
-import { S3Client, DeleteObjectsCommand } from '@aws-sdk/client-s3';
-
-${serverSharedHelper}
-
-async function getS3Client() {
-  const client = buildS3Client((config) => new S3Client(config));
-  return client;
-}
-
-async function deleteMediaFiles(keys) {
-  const s3 = await getS3Client();
-  if (!s3 || !process.env.R2_BUCKET_NAME) {
-      console.warn("deleteMediaFiles: S3 client or Bucket not configured.");
-      return;
-  }
-
-  if (keys.length === 0) return;
-
-  try {
-    const output = await s3.send(
-      new DeleteObjectsCommand({
-        Bucket: process.env.R2_BUCKET_NAME,
-        Delete: {
-          Objects: keys.map((key) => ({ Key: key })),
-        },
-      })
-    );
-
-    if (output.Errors && output.Errors.length > 0) {
-        console.error("[deleteMediaFiles] Errors reported by R2:", output.Errors);
-    }
-  } catch (error) {
-    console.error("[deleteMediaFiles] Exception failed to delete files from R2:", error);
-  }
-}
-
-async function getS3PresignClient() {
-  if (!process.env.R2_S3_PUBLIC_ENDPOINT) {
-    return getS3Client();
-  }
-  const accountId = process.env.R2_ACCOUNT_ID;
-  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-  if (!accountId || !accessKeyId || !secretAccessKey) {
-    return getS3Client();
-  }
-  return new S3Client({
-    region: process.env.R2_REGION || 'auto',
-    endpoint: process.env.R2_S3_PUBLIC_ENDPOINT,
-    forcePathStyle: process.env.R2_FORCE_PATH_STYLE === 'true',
-    credentials: { accessKeyId, secretAccessKey },
-  });
-}
-
-export { getS3Client, getS3PresignClient, deleteMediaFiles, encodedRedirect, getEmailServerConfig, hasEnvVars };
-`;
-
-        const serverCjs = `'use server';
-${serverOnlyGuard}
-const { S3Client, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
-
-${serverSharedHelper}
-
-async function getS3Client() {
-  const client = buildS3Client((config) => new S3Client(config));
-  return client;
-}
-
-async function deleteMediaFiles(keys) {
-  const s3 = await getS3Client();
-  if (!s3 || !process.env.R2_BUCKET_NAME) {
-      console.warn("deleteMediaFiles: S3 client or Bucket not configured.");
-      return;
-  }
-
-  if (keys.length === 0) return;
-
-  try {
-    const output = await s3.send(
-      new DeleteObjectsCommand({
-        Bucket: process.env.R2_BUCKET_NAME,
-        Delete: {
-          Objects: keys.map((key) => ({ Key: key })),
-        },
-      })
-    );
-
-    if (output.Errors && output.Errors.length > 0) {
-        console.error("[deleteMediaFiles] Errors reported by R2:", output.Errors);
-    }
-  } catch (error) {
-    console.error("[deleteMediaFiles] Exception failed to delete files from R2:", error);
-  }
-}
-
-async function getS3PresignClient() {
-  if (!process.env.R2_S3_PUBLIC_ENDPOINT) {
-    return getS3Client();
-  }
-  const accountId = process.env.R2_ACCOUNT_ID;
-  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-  if (!accountId || !accessKeyId || !secretAccessKey) {
-    return getS3Client();
-  }
-  return new S3Client({
-    region: process.env.R2_REGION || 'auto',
-    endpoint: process.env.R2_S3_PUBLIC_ENDPOINT,
-    forcePathStyle: process.env.R2_FORCE_PATH_STYLE === 'true',
-    credentials: { accessKeyId, secretAccessKey },
-  });
-}
-
-module.exports = { getS3Client, getS3PresignClient, deleteMediaFiles, encodedRedirect, getEmailServerConfig, hasEnvVars };
-`;
-
-        const serverDts = `import { S3Client } from '@aws-sdk/client-s3';
-
-export declare function deleteMediaFiles(keys: string[]): Promise<void>;
-
-export declare function getS3Client(): Promise<S3Client | null>;
-export declare function getS3PresignClient(): Promise<S3Client | null>;
-export declare function encodedRedirect(type: 'error' | 'success', path: string, message: string): Promise<never>;
-export declare function getEmailServerConfig(): Promise<{
-  host: string;
-  port: number;
-  auth: {
-    user: string;
-    pass: string;
-  };
-  from: string;
-} | null>;
-export declare function hasEnvVars(): Promise<boolean>;
-`;
-
-        fs.writeFileSync(path.join(outputDir, 'server.es.js'), serverEsm);
-        fs.writeFileSync(path.join(outputDir, 'server.cjs.js'), serverCjs);
-        fs.writeFileSync(path.join(outputDir, 'server.d.ts'), serverDts);
-
+        // server.es.js / server.cjs.js / server.d.ts are the compiled src/server.ts, like every
+        // other module. Through 0.20 this hook overwrote server.es.js and server.d.ts with a
+        // hand-written copy from 2025-10 (it ran after the ESM output and before the CommonJS
+        // one, so only the CommonJS file was real). The copy had drifted: its hasEnvVars()
+        // ignored the SUPABASE_URL / publishable-key aliases the Vercel integration injects,
+        // and it carried a top-level 'use server' the source does not have, which turns every
+        // export (deleteMediaFiles, getS3Client) into a Server Action once a client module
+        // imports it, instead of the source's loud client-import error.
       },
     }),
     react(),
+    copyIntoDist(__dirname, OUT_DIR, ['README.md']),
   ],
   build: {
+    // Relative, '/'-separated: @nx/vite/plugin derives the build target's cache outputs from
+    // this, and an absolute path came out with Windows backslashes.
+    outDir: '../../dist/libs/utils',
+    emptyOutDir: true,
     lib: {
       entry: {
         index: './src/index.ts',

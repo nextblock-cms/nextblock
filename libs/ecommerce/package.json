@@ -1,13 +1,14 @@
 {
   "name": "@nextblock-cms/ecom",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "license": "AGPL-3.0-or-later",
   "publishConfig": {
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nextblock-cms/packages.git"
+    "url": "git+https://github.com/nextblock-cms/nextblock.git",
+    "directory": "libs/ecommerce"
   },
   "type": "module",
   "nx": {

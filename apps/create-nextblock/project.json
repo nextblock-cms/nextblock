@@ -5,13 +5,9 @@
   "sourceRoot": "apps/create-nextblock",
   "targets": {
     "lint": {
-      "executor": "@nx/eslint:lint",
-      "outputs": ["{options.outputFile}"],
+      "executor": "nx:run-commands",
       "options": {
-        "lintFilePatterns": [
-          "apps/create-nextblock/bin/**/*.js",
-          "apps/create-nextblock/scripts/**/*.js"
-        ]
+        "command": "eslint \"apps/create-nextblock/bin/**/*.js\" \"apps/create-nextblock/scripts/**/*.js\""
       }
     }
   },

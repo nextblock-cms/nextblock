@@ -10,12 +10,12 @@ const ECOM_EXPORTS = {
   '.': {
     types: './index.d.ts',
     import: './index.es.js',
-    require: './index.cjs.js',
+    require: './index.cjs',
   },
   './server': {
     types: './server.d.ts',
     import: './server.es.js',
-    require: './server.cjs.js',
+    require: './server.cjs',
   },
   './package.json': './package.json',
   // preserveModules emits one file per source module under dist/lib/* (JS) with the .d.ts
@@ -26,7 +26,7 @@ const ECOM_EXPORTS = {
   './*': {
     types: './lib/*.d.ts',
     import: './lib/*.es.js',
-    require: './lib/*.cjs.js',
+    require: './lib/*.cjs',
   },
 };
 
@@ -34,12 +34,12 @@ const CORTEX_EXPORTS = {
   '.': {
     types: './index.d.ts',
     import: './index.es.js',
-    require: './index.cjs.js',
+    require: './index.cjs',
   },
   './client': {
     types: './client.d.ts',
     import: './client.es.js',
-    require: './client.cjs.js',
+    require: './client.cjs',
   },
   './package.json': './package.json',
 };

@@ -7,13 +7,15 @@
   "// targets": "to see all targets run: nx show project nextblock --web",
   "targets": {
     "lint": {
-      "executor": "@nx/eslint:lint",
-      "options": {}
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "eslint apps/nextblock --config apps/nextblock/eslint.config.mjs"
+      }
     },
     "build": {
       "executor": "nx:run-commands",
       "outputs": [
-        "{options.outputPath}"
+        "{projectRoot}/.next"
       ],
       "options": {
         "commands": [
@@ -21,49 +23,38 @@
           "nx run nextblock:build-base"
         ],
         "parallel": false,
-        "forwardAllArgs": true,
-        "outputPath": "dist/apps/nextblock"
+        "forwardAllArgs": true
       }
     },
     "build-base": {
-      "executor": "@nx/next:build",
+      "executor": "nx:run-commands",
       "outputs": [
-        "{options.outputPath}"
+        "{projectRoot}/.next"
       ],
-      "defaultConfiguration": "production",
       "options": {
-        "outputPath": "dist/apps/nextblock"
-      },
-      "configurations": {
-        "development": {
-          "outputPath": "apps/nextblock"
-        },
-        "production": {}
+        "command": "next build",
+        "cwd": "apps/nextblock"
       }
     },
     "serve": {
-      "executor": "@nx/next:server",
-      "defaultConfiguration": "development",
+      "executor": "nx:run-commands",
+      "continuous": true,
       "options": {
-          "buildTarget": "nextblock:build-base",
-        "dev": true
+        "command": "next dev --port 4200",
+        "cwd": "apps/nextblock"
       },
       "configurations": {
-        "development": {
-          "buildTarget": "nextblock:build-base:development",
-          "dev": true
-        },
         "production": {
-          "buildTarget": "nextblock:build-base:production",
-          "dev": false
+          "command": "next start --port 4200"
         }
       }
     },
     "start": {
-      "executor": "@nx/next:server",
+      "executor": "nx:run-commands",
+      "continuous": true,
       "options": {
-        "buildTarget": "nextblock:build-base:production",
-        "dev": false
+        "command": "next start --port 4200",
+        "cwd": "apps/nextblock"
       }
     }
   }

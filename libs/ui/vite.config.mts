@@ -4,13 +4,17 @@ import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
+import { clientDirectiveOnEntries, copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resolveFrom = (...segments: string[]) => path.resolve(__dirname, ...segments);
+const OUT_DIR = resolveFrom('../../dist/libs/ui');
 const packageJsonPath = resolveFrom('package.json');
 // dependencies: the runtime packages the bundle leaves external and consumers must install
 // (see rolldownOptions.external below). Copied into the published manifest by afterBuild.
-const { version, dependencies } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// license and repository go into the published manifest too: npm shows them on the package page,
+// and through 0.20 every package this hook writes shipped without either.
+const { version, dependencies, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 
 export default defineConfig({
   root: __dirname,
@@ -26,8 +30,13 @@ export default defineConfig({
         const packageJson = {
           name: '@nextblock-cms/ui',
           version,
-          main: 'index.cjs.js',
-          module: 'index.es.js',
+          license,
+          repository,
+          // The files this build actually writes (Vite's `fileName: 'index'` gives index.mjs
+          // and index.js). Through 0.20 these named index.cjs.js / index.es.js, which never
+          // existed; resolvers that honour `exports` never noticed.
+          main: 'index.js',
+          module: 'index.mjs',
           types: 'index.d.ts',
           ...(dependencies ? { dependencies } : {}),
           exports: {
@@ -83,47 +92,18 @@ export default defineConfig({
             }
           }
         }
-
-        const ensureClientDirective = (fileName: string) => {
-          const filePath = resolveFrom('../../dist/libs/ui', fileName);
-          if (!fs.existsSync(filePath)) {
-            return;
-          }
-
-          const contents = fs.readFileSync(filePath, 'utf8');
-          if (contents.startsWith("'use client'") || contents.startsWith('"use client"')) {
-            return;
-          }
-
-          const directive = "'use client';\n";
-          const strictPatterns = [
-            "'use strict';\r\n",
-            "'use strict';\n",
-            "'use strict';",
-            '"use strict";\r\n',
-            '"use strict";\n',
-            '"use strict";',
-          ];
-
-          for (const pattern of strictPatterns) {
-            if (contents.startsWith(pattern)) {
-              const suffix = contents.slice(pattern.length);
-              const lineBreak = pattern.endsWith('\n') || pattern.endsWith('\r\n') ? '' : '\n';
-              fs.writeFileSync(filePath, `${pattern}${lineBreak}${directive}${suffix}`);
-              return;
-            }
-          }
-
-          fs.writeFileSync(filePath, `${directive}${contents}`);
-        };
-
-        ensureClientDirective('index.mjs');
-        ensureClientDirective('index.js');
       }
     }),
     react(),
+    // 'use client' on index.mjs AND index.js (see the plugin for why afterBuild could not).
+    clientDirectiveOnEntries(),
+    copyIntoDist(__dirname, OUT_DIR, ['README.md']),
   ],
   build: {
+    // Relative, '/'-separated: @nx/vite/plugin derives the build target's cache outputs from
+    // this, and an absolute path came out with Windows backslashes.
+    outDir: '../../dist/libs/ui',
+    emptyOutDir: true,
     lib: {
       entry: './src/index.ts',
       name: 'ui',

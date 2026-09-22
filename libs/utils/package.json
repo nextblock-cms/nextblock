@@ -1,7 +1,12 @@
 {
   "name": "@nextblock-cms/utils",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextblock-cms/nextblock.git",
+    "directory": "libs/utils"
+  },
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

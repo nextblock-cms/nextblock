@@ -6,13 +6,9 @@
   "tags": ["scope:premium"],
   "targets": {
     "build": {
-      "executor": "@nx/vite:build",
-      "outputs": ["{options.outputPath}"],
-      "options": {
-        "outputPath": "dist/libs/ecommerce",
-        "configFile": "libs/ecommerce/vite.config.mts",
-        "assets": ["libs/ecommerce/*.md", "libs/ecommerce/package.json"]
-      }
+      "dependsOn": [
+        "typecheck"
+      ]
     }
   }
 }

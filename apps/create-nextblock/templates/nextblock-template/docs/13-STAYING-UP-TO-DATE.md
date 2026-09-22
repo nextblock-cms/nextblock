@@ -142,6 +142,16 @@ picks up new libs on its own); new ones are added as `latest`. Your `name`, `ver
 dependencies are re-aligned to their `overrides` spec afterwards so `npm install` cannot
 fail with `EOVERRIDE`.
 
+The exception is an override NextBlock wrote itself. `create-nextblock` gives every project
+a few `overrides` (`postcss`, `qs`, `uuid`, `glob`, …), and a later release may raise them. An
+override still set to one of NextBlock's earlier values moves to the current one, together with
+the direct dependency the scaffolder aligned to it; the log prints each move. Any other value is
+yours and wins over the template, and the log says so ("uuid stays at ^11.0.0: your
+overrides.uuid pins it").
+The known values live in `tools/lib/managed-overrides.mjs`. An update runs the updater that
+was already on disk, so the update that brings a project to 0.21 still uses the old rules. Run
+`npm run update` once more afterwards: it moves the overrides and reinstalls.
+
 ### The version stamp
 
 `package.json` carries `nextblock.version` — the NextBlock release the project is on,

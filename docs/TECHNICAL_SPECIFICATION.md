@@ -1880,7 +1880,7 @@ The following Nx plugins are registered in `nx.json` and installed as devDepende
 | `@nx/eslint` + `@nx/eslint-plugin` | Linting integration |
 | `@nx/js` | TypeScript library builder |
 | `@nx/key` | Nx Powerpack license key |
-| `@nx/next` | Next.js app executor |
+| `@nx/next` | Next.js project plugin (the app targets themselves are `nx:run-commands`) |
 | `@nx/node` | Node application support |
 | `@nx/powerpack-license` | Powerpack license enforcement |
 | `@nx/react` | React support |
@@ -2311,7 +2311,7 @@ The `eslint.config.mjs` file enforces the `@nx/enforce-module-boundaries` rule w
 
 ### 3.6.2 Build System
 
-The workspace operates a dual build strategy: Next.js's native build pipeline for applications and Vite (with `@nx/vite:build` executor) for library packages.
+The workspace operates a dual build strategy: Next.js's native build pipeline for applications and Vite (the `vite build` target inferred by `@nx/vite/plugin`) for library packages.
 
 #### 3.6.2.1 Library Bundling — Vite
 
@@ -10383,7 +10383,7 @@ graph TB
 
     subgraph VercelTier["Vercel Managed Platform"]
         Proxy[proxy.ts<br/>Edge Runtime<br/>Session · RBAC · CSP · Locale]
-        NextApp[Next.js 16 App Router<br/>apps/nextblock - dist/apps/nextblock]
+        NextApp[Next.js 16 App Router<br/>apps/nextblock - apps/nextblock/.next]
         ServerlessFns[Serverless Functions<br/>API Route Handlers]
         CronDispatcher[Vercel Cron<br/>vercel.json declarations]
         ImageOpt[Image Optimization<br/>AVIF + WebP pipeline]
@@ -10825,7 +10825,7 @@ The concerns that containerization would address are handled through alternative
 | Factor | Implication |
 |:--|:--|
 | No container artifact to orchestrate | See §8.4.1 |
-| Single serverless deployment unit | Vercel deploys `dist/apps/nextblock` as one logical application |
+| Single serverless deployment unit | Vercel deploys `apps/nextblock/.next` as one logical application |
 | No inter-service RPC (§6.1.1) | No service discovery, load balancing, or mesh routing required |
 | Auto-scaling delegated to Vercel platform | No cluster-level scaling rules needed |
 | Cron jobs declared in `vercel.json` | No orchestrator-managed scheduled workloads |
@@ -10901,12 +10901,12 @@ The workspace operates two build pipelines in parallel:
 
 | Target | Executor | Produces |
 |:--|:--|:--|
-| `apps/nextblock:build-base` | `@nx/next:build` | `dist/apps/nextblock/.next/` |
-| `apps/nextblock:build` | `nx:run-commands` (delegates to `build-base` + `copy-next-build.js`) | Split-step build with artifact copy |
-| `apps/nextblock:serve` | `@nx/next:server` (dev mode) | Local dev server |
-| `apps/nextblock:start` | `@nx/next:server` (production) | Local production server |
-| `libs/ui`, `libs/db`, `libs/editor`, `libs/sdk`, `libs/utils` | `@nx/vite:build` | Library bundles with `vite-plugin-dts` declarations |
-| `libs/ecommerce` | `@nx/js:tsc` | `dist/libs/ecommerce` (known issue: target not green) |
+| `apps/nextblock:build-base` | `nx:run-commands` (`next build` in `apps/nextblock`) | `apps/nextblock/.next/` |
+| `apps/nextblock:build` | `nx:run-commands` (`tools/build-migrate.mjs`, then `build-base`) | Build-time migrations, then the Next.js build |
+| `apps/nextblock:serve` | `nx:run-commands` (`next dev --port 4200`) | Local dev server |
+| `apps/nextblock:start` | `nx:run-commands` (`next start --port 4200`) | Local production server |
+| `libs/ui`, `libs/editor`, `libs/sdk`, `libs/utils`, `libs/ecommerce`, `libs/cortex` | `vite build` inferred by `@nx/vite/plugin`, after `typecheck` | Library bundles with `vite-plugin-dts` declarations in `dist/libs/<lib>` |
+| `libs/db` | `nx:run-commands` (`vite build`, then the `src/supabase` copy), after `typecheck` | `dist/libs/db` |
 
 **Key build tool versions** (from `package.json`):
 
@@ -10960,7 +10960,7 @@ publish:
 
 | Artifact Type | Output Location | Destination |
 |:--|:--|:--|
-| Next.js build | `dist/apps/nextblock/.next/` | Consumed by Vercel at deploy time |
+| Next.js build | `apps/nextblock/.next/` | Consumed by Vercel at deploy time |
 | Library bundles | `dist/libs/{ui,db,editor,sdk,utils}` | Published to npm registry |
 | Ecommerce stub | `dist/libs/ecommerce-stub` (conceptual) | Published to `registry.npmjs.org` (public) |
 | Ecommerce real | `dist/libs/ecommerce` | Published to `npm.pkg.github.com` (private) |
@@ -11078,7 +11078,7 @@ flowchart TB
 
     subgraph AppPipeline["Application Deployment - Vercel"]
         VercelDetect[Vercel Git Webhook<br/>auto-detects Nx]
-        VercelBuild[nx build nextblock<br/>→ dist/apps/nextblock/.next/]
+        VercelBuild[nx build nextblock<br/>→ apps/nextblock/.next/]
         PreviewDeploy[Preview Deployment<br/>unique URL per commit]
         ProdDeploy[Production Deployment<br/>atomic swap to NEXT_PUBLIC_URL]
         ConfigureVars[Read Env Vars from<br/>Vercel Environment section]

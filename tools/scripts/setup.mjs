@@ -5,7 +5,7 @@ import chalk from 'chalk';
 // points you at the right place. (Self-hosted Docker still has a one-command,
 // non-interactive bootstrap: `npm run docker:setup`.)
 
-// `npx nx serve nextblock` uses the @nx/next:server default port (4200).
+// `npx nx serve nextblock` runs `next dev --port 4200` (apps/nextblock/project.json).
 const DEFAULT_LOCAL_URL = 'http://localhost:4200';
 
 console.log(chalk.bold.green('🚀 NextBlock™ CMS Setup'));

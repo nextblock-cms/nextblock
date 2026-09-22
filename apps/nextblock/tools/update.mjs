@@ -46,6 +46,16 @@ import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
 
+// Loaded defensively, like ./lib/migrate-core.mjs: an updater that cannot start cannot repair
+// itself, so a project missing this file (a partial sync, a trimmed tools/) still updates and
+// only skips the override refresh.
+let refreshManagedOverrides = () => [];
+try {
+  ({ refreshManagedOverrides } = await import('./lib/managed-overrides.mjs'));
+} catch {
+  /* tools/lib/managed-overrides.mjs is missing */
+}
+
 const UPSTREAM_URL = 'https://github.com/nextblock-cms/nextblock.git';
 const UPSTREAM_SLUG = 'nextblock-cms/nextblock';
 const UPSTREAM_BRANCH = 'master';
@@ -200,7 +210,7 @@ function writeJson(file, value) {
  * deprecation exactly as TypeScript's error message suggests. A tsconfig that is not plain JSON
  * (comments) is left alone.
  */
-function keepTsconfigCompilingOnTs6(root, projectPkg) {
+function keepTsconfigCompilingOnTs6(root, projectPkg, { dryRun = false } = {}) {
   const tsconfigPath = path.join(root, 'tsconfig.json');
   if (!existsSync(tsconfigPath)) return null;
   const tsSpec = projectPkg.devDependencies?.typescript ?? projectPkg.dependencies?.typescript ?? '';
@@ -209,6 +219,7 @@ function keepTsconfigCompilingOnTs6(root, projectPkg) {
   const tsconfig = readJson(tsconfigPath);
   const options = tsconfig?.compilerOptions;
   if (!options || options.baseUrl === undefined || options.ignoreDeprecations !== undefined) return null;
+  if (dryRun) return 'tsconfig.json: would add "ignoreDeprecations": "6.0" (TypeScript 6 deprecates baseUrl)';
   options.ignoreDeprecations = '6.0';
   writeJson(tsconfigPath, tsconfig);
   return 'tsconfig.json: added "ignoreDeprecations": "6.0" (TypeScript 6 deprecates baseUrl)';
@@ -705,11 +716,16 @@ function applyFileSync(templateDir, projectRoot, plan) {
  * project already has them: the scaffolder writes floating ranges there, so `npm
  * install` picks up new libs without this script guessing published versions. New
  * NextBlock packages are added as `latest`, matching what the scaffolder writes.
+ *
+ * An override NextBlock wrote in an earlier release moves to the current default first
+ * (see ./lib/managed-overrides.mjs); an override the owner set still wins over the template.
  */
 function mergePackageJson(templatePkg, projectPkg, newVersion) {
-  const added = [];
-  const bumped = [];
+  // Keyed by package name so the override pass below can correct a line it contradicts.
+  const added = new Map();
+  const bumped = new Map();
   const realigned = [];
+  const overrides = refreshManagedOverrides(projectPkg);
 
   for (const section of ['dependencies', 'devDependencies']) {
     const fromTemplate = templatePkg[section] ?? {};
@@ -727,8 +743,8 @@ function mergePackageJson(templatePkg, projectPkg, newVersion) {
         next = String(range).startsWith('npm:') ? range : 'latest';
       }
       if (current === next) continue;
-      if (current == null) added.push(`${name}@${next}`);
-      else bumped.push(`${name} ${current} → ${next}`);
+      if (current == null) added.set(name, `${name}@${next}`);
+      else bumped.set(name, `${name} ${current} → ${next}`);
       projectPkg[section][name] = next;
     }
   }
@@ -737,14 +753,22 @@ function mergePackageJson(templatePkg, projectPkg, newVersion) {
   // override with a different spec. The scaffolder aligns them; taking the template's
   // range verbatim above can knock them back out of alignment (e.g. overrides.uuid
   // ^11.1.1 vs the template's dependencies.uuid ^11.0.4), which fails `npm install`.
-  // Re-assert the alignment — the override always wins, exactly as at scaffold time.
+  // Re-assert the alignment — the override always wins, exactly as at scaffold time. The log
+  // says what the project ends up with: a range this merge just raised is reported as held
+  // by the override, not as a bump followed by a revert.
   for (const [name, spec] of Object.entries(projectPkg.overrides ?? {})) {
     if (typeof spec !== 'string') continue;
     for (const section of ['dependencies', 'devDependencies']) {
-      if (projectPkg[section]?.[name] === undefined) continue;
-      if (projectPkg[section][name] === spec) continue;
+      const range = projectPkg[section]?.[name];
+      if (range === undefined || range === spec) continue;
       projectPkg[section][name] = spec;
-      realigned.push(`${name} → ${spec} (matches overrides)`);
+      if (added.has(name)) {
+        added.set(name, `${name}@${spec} (your overrides.${name})`);
+      } else if (bumped.delete(name)) {
+        realigned.push(`${name} stays at ${spec}: your overrides.${name} pins it (this release ships ${range})`);
+      } else {
+        realigned.push(`${name} → ${spec} (matches your overrides.${name})`);
+      }
     }
   }
 
@@ -759,7 +783,7 @@ function mergePackageJson(templatePkg, projectPkg, newVersion) {
   // leave the manifest claiming the new version, and the next `npm run update` would say
   // "already up to date" and never finish the job.
 
-  return { added, bumped, realigned };
+  return { added: [...added.values()], bumped: [...bumped.values()], realigned, overrides };
 }
 
 /** Record the NextBlock version this project is now on. Call only after a successful install. */
@@ -878,8 +902,28 @@ async function updateCodeViaNpm(install, flags) {
   if (compareSemver(latest, current) <= 0 && !flags.force) {
     // The update that installed TypeScript 6 ran the PREVIOUS update.mjs, which predates this
     // step, so check here too or it would never run for that project. Idempotent.
-    const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg);
+    const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg, { dryRun: flags.check });
     if (tsconfigNote) good(tsconfigNote);
+    // Same for the overrides NextBlock wrote in earlier releases: the update that brought this
+    // script ran the previous one, which kept them. Moving one needs an `npm install`, so the
+    // run then counts as a change and main() installs.
+    const overrideNotes = refreshManagedOverrides(flags.check ? structuredClone(projectPkg) : projectPkg);
+    if (overrideNotes.length > 0 && flags.check) {
+      for (const line of overrideNotes) info(C.dim(`would move ${line}`));
+    } else if (overrideNotes.length > 0) {
+      const original = readFileSync(pkgPath, 'utf8');
+      writeJson(pkgPath, projectPkg);
+      for (const line of overrideNotes) good(line);
+      good('Code is already up to date.');
+      // Nothing else records this move, so a failed install has to undo it: otherwise the next
+      // run finds the overrides already current, reports nothing to do, and never installs.
+      return {
+        ok: true,
+        changed: true,
+        version: current,
+        restoreOnInstallFailure: { path: pkgPath, text: original },
+      };
+    }
     good('Code is already up to date.');
     return { ok: true, changed: false, version: current };
   }
@@ -1003,10 +1047,13 @@ async function updateCodeViaNpm(install, flags) {
     step('Updating package.json');
     const merged = mergePackageJson(templatePkg, projectPkg, latest);
     writeJson(pkgPath, projectPkg);
+    for (const line of merged.overrides) good(line);
     for (const line of merged.added) good(`added ${line}`);
     for (const line of merged.bumped) good(line);
     for (const line of merged.realigned) info(C.dim(line));
-    if (merged.added.length === 0 && merged.bumped.length === 0) info('No dependency changes.');
+    if (merged.added.length + merged.bumped.length + merged.overrides.length === 0) {
+      info('No dependency changes.');
+    }
     const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg);
     if (tsconfigNote) good(tsconfigNote);
 
@@ -1226,6 +1273,7 @@ async function main() {
   await core.loadEnvFiles(install.root);
 
   let codeChanged = false;
+  let restoreOnInstallFailure = null;
   let newVersion = null;
 
   if (!flags.dbOnly) {
@@ -1258,6 +1306,7 @@ async function main() {
       }
       codeChanged = res.changed;
       newVersion = res.version ?? null;
+      restoreOnInstallFailure = res.restoreOnInstallFailure ?? null;
     }
   }
 
@@ -1265,6 +1314,10 @@ async function main() {
     step('Installing dependencies');
     const installed = run(NPM, ['install'], { cwd: install.root });
     if (!installed.ok) {
+      if (restoreOnInstallFailure) {
+        writeFileSync(restoreOnInstallFailure.path, restoreOnInstallFailure.text, 'utf8');
+        info('package.json is back as it was, so the next run moves the overrides again.');
+      }
       fail('npm install failed — fix the error above, then re-run "npm run update".');
       process.exitCode = 1;
       return;

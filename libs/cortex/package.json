@@ -1,28 +1,29 @@
 {
   "name": "@nextblock-cms/cortex",
-  "version": "0.21.0",
+  "version": "0.21.1",
   "license": "AGPL-3.0-or-later",
   "publishConfig": {
     "access": "public"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nextblock-cms/packages.git"
+    "url": "git+https://github.com/nextblock-cms/nextblock.git",
+    "directory": "libs/cortex"
   },
   "type": "module",
-  "main": "./index.cjs.js",
+  "main": "./index.cjs",
   "module": "./index.es.js",
   "types": "./index.d.ts",
   "exports": {
     ".": {
       "types": "./index.d.ts",
       "import": "./index.es.js",
-      "require": "./index.cjs.js"
+      "require": "./index.cjs"
     },
     "./client": {
       "types": "./client.d.ts",
       "import": "./client.es.js",
-      "require": "./client.cjs.js"
+      "require": "./client.cjs"
     },
     "./package.json": "./package.json"
   },

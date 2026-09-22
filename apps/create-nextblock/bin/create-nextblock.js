@@ -34,6 +34,7 @@ import {
 } from './lib/headless.js';
 import { patchNextConfigForStandalone } from './lib/next-config.js';
 import { STANDALONE_ESLINT_CONFIG } from './lib/eslint-config.js';
+import { FALLBACK_OVERRIDES } from './lib/fallback-overrides.js';
 
 const DEFAULT_PROJECT_NAME = 'nextblock-cms';
 const __filename = fileURLToPath(import.meta.url);
@@ -2275,17 +2276,8 @@ async function transformPackageJson(projectDir) {
   // Mirror the monorepo's defensive dependency overrides into the generated project so a
   // fresh `npm install` reproduces the "0 vulnerabilities" posture and silences deprecated
   // transitive deps (e.g. uuid@10). Read live from the repo root when available (local dev /
-  // `npm run test-create`); fall back to this baked-in set in the published CLI where the
-  // monorepo root is not on disk. Keep the fallback in sync with the root package.json.
-  const FALLBACK_OVERRIDES = {
-    postcss: '^8.5.28',
-    qs: '^6.16.0',
-    uuid: '^14.0.2',
-    glob: '^13.0.6',
-    'whatwg-encoding': 'npm:@exodus/bytes@latest',
-    'node-domexception': 'npm:domexception@latest',
-    keygrip: 'npm:keygrip@latest',
-  };
+  // `npm run test-create`); fall back to FALLBACK_OVERRIDES (./lib/fallback-overrides.js)
+  // in the published CLI, where the monorepo root is not on disk.
   let rootOverrides = FALLBACK_OVERRIDES;
   let supabaseCliVersion = '^2.117.0'; // keep in sync with the repo root devDependency
   try {

@@ -590,6 +590,11 @@ export default async function RootLayout({
   const visualEditingEnabled =
     draft.isEnabled || process.env.NEXTBLOCK_VISUAL_EDITING_ENABLED === 'true';
   const isVercelDeployment = process.env.VERCEL === '1';
+  // Speed Insights works only in a production build on Vercel. Anywhere else it fails loudly:
+  // in development it loads a debug script from va.vercel-scripts.com, which the CSP blocks, and
+  // a self-hosted production build asks for /_vercel/speed-insights/script.js, which only
+  // Vercel serves (a 404). Both log "[Vercel Speed Insights] Failed to load script".
+  const speedInsightsEnabled = isVercelDeployment && process.env.NODE_ENV === 'production';
   const toolbarEnabled =
     process.env.NEXTBLOCK_VERCEL_TOOLBAR_ENABLED === 'true' ||
     (isVercelDeployment && visualEditingEnabled);
@@ -674,7 +679,7 @@ export default async function RootLayout({
           {Toolbar && <Toolbar nonce={nonce} />}
           {privacySettings.banner_enabled && <ConsentBanner />}
         </Providers>
-        <DeferredSpeedInsights />
+        {speedInsightsEnabled && <DeferredSpeedInsights />}
         <ConsentGatedAnalytics
           gtmId={resolvedGtmId}
           gaMeasurementId={privacySettings.ga_measurement_id || ''}

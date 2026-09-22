@@ -52,8 +52,8 @@ reference template for a manual `.env.local`.
 
 ### First login
 
-`npx nx serve nextblock` serves the app at **http://localhost:4200** (the
-`@nx/next:server` default port). Open `/sign-up` and register: the **first**
+`npx nx serve nextblock` serves the app at **http://localhost:4200** (the target
+runs `next dev --port 4200`). Open `/sign-up` and register: the **first**
 account to sign up is automatically promoted to **ADMIN** by a database trigger
 (`handle_new_user`). Email confirmation is enabled by default, so click the
 confirmation link (delivered through the SMTP you configured) — or confirm the
@@ -221,6 +221,14 @@ against Docker's npm in a temp copy with `npx -y npm@10.9.8 ci --dry-run`. Then 
 `libs/ecommerce`, and the hard-coded deps in `libs/utils/vite.config.mts`'s `afterBuild`) to
 the root specs. Scaffolds install exactly what those manifests declare.
 
+Raising a root override that scaffolds also get (`postcss`, `qs`, `uuid`, `glob`) takes two
+more edits. Set the same value in `FALLBACK_OVERRIDES`
+(`apps/create-nextblock/bin/lib/fallback-overrides.js`), which the published CLI writes into new
+projects. Then, in `MANAGED_OVERRIDES` (`apps/nextblock/tools/lib/managed-overrides.mjs`), set
+`current` to it and add the old value to `previous`, so `npm run update` moves existing projects
+(docs/13). Append the new value to `SHIPPED` in `fallback-overrides.test.js`, which fails until
+all four agree.
+
 Finish with `npx nx build nextblock`, not just the type-check. The monorepo installs from the
 ROOT `package.json`, so a package the app imports but only the app manifest declares resolves
 solely as some other package's hoisted transitive. The app imported `uuid` that way, through
@@ -232,11 +240,21 @@ root.
 
 The canonical application is `apps/nextblock`.
 
-Useful targets:
+Useful targets, all plain `nx:run-commands` in `apps/nextblock/project.json`:
 
-- `nx serve nextblock`
-- `nx build nextblock`
-- `nx lint nextblock`
+| Target | Runs | Notes |
+| :-- | :-- | :-- |
+| `nx serve nextblock` | `next dev --port 4200` in `apps/nextblock` | `--configuration=production` runs `next start --port 4200` instead. |
+| `nx build nextblock` | `tools/build-migrate.mjs`, then `nx run nextblock:build-base` (`next build` in `apps/nextblock`) | Output is `apps/nextblock/.next`. Other arguments reach both commands, so `nx build nextblock --debug` or `--webpack` reaches `next build`; the hook ignores them. Nx reads Vercel's `--prod` as `--configuration=production`, which the build targets do not define, so it does nothing. |
+| `nx start nextblock` | `next start --port 4200` in `apps/nextblock` | Serves the last build. |
+| `nx lint nextblock` | `eslint apps/nextblock --config apps/nextblock/eslint.config.mjs` from the repo root | The app config's paths are relative to the repo root. |
+
+Nothing in the workspace uses an Nx executor that Nx 24 removes (`@nx/next:build`,
+`@nx/next:server`, `@nx/vite:build`, `@nx/eslint:lint`) or the deprecated `nxViteTsPaths` /
+`nxCopyAssetsPlugin` Vite plugins. The libraries build with the `vite build` target that
+`@nx/vite/plugin` infers (docs/06 → "How the libraries build"). `nx build nextblock` no longer
+writes `dist/apps/nextblock`: nothing read it, and the old `nx start nextblock` failed because
+it ran `next start` there, where no `.next` exists.
 
 The CMS and public site share the same Next.js app, so one dev server covers:
 

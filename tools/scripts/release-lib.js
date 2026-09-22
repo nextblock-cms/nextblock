@@ -94,7 +94,7 @@ function resolveWorkspaceDeps(pkg) {
 function finalizeEcomDistPackageJson(distPkgPath) {
   const pkg = JSON.parse(fs.readFileSync(distPkgPath, 'utf8'));
 
-  pkg.main = './index.cjs.js';
+  pkg.main = './index.cjs';
   pkg.module = './index.es.js';
   pkg.types = './index.d.ts';
   // Defined in lib-publish-exports.js (shared with the publish check).
@@ -114,7 +114,7 @@ function finalizeEcomDistPackageJson(distPkgPath) {
 function finalizeCortexDistPackageJson(distPkgPath) {
   const pkg = JSON.parse(fs.readFileSync(distPkgPath, 'utf8'));
 
-  pkg.main = './index.cjs.js';
+  pkg.main = './index.cjs';
   pkg.module = './index.es.js';
   pkg.types = './index.d.ts';
   pkg.exports = CORTEX_EXPORTS;
@@ -152,7 +152,9 @@ try {
   console.log(`✓ Version bumped to ${version}`);
 
   console.log('\n→ Building with Nx');
-  const buildCommand = `npx nx run ${nxProject}:build --skip-nx-cache --with-deps`;
+  // The build target is plain `vite build` (inferred by @nx/vite/plugin) after the lib's `typecheck`.
+  // It never built sibling libs: each lib externalizes them and reads their types from source.
+  const buildCommand = `npx nx run ${nxProject}:build --skip-nx-cache`;
   // Run with the nx daemon OFF: the persistent daemon accumulates memory across the
   // sequential per-lib builds in `release:all` and was OOM-killing the bundler ("cannot
   // allocate memory"). Daemon-off recomputes the graph per invocation and frees it on exit.
@@ -164,8 +166,11 @@ try {
   // dies with "Plugin worker ... exited unexpectedly" / "Failed to load 1 default Nx
   // plugin(s)". Loading plugins in-process removes the fork, the socket, and the timeout.
   //
-  // NODE_ENV is forced to production. Left unset, the Nx Vite executor builds in development
-  // mode, so plugin-react emits `jsxDEV(..., this)` with this machine's absolute source
+  // NODE_ENV is forced to production. Left unset, the build can run in development mode:
+  // @nx/vite/plugin resolves every Vite config in development mode while Nx computes the
+  // project graph, and Vite then sets NODE_ENV=development in that process. With plugin
+  // isolation off (above) that process is this nx run, and the `vite build` task inherits it,
+  // so plugin-react emits `jsxDEV(..., this)` with this machine's absolute source
   // paths. That shipped in 0.19.0: the `this` argument is illegal inside files with inline
   // server actions, so every scaffolded project failed `next build` with "Server Actions
   // cannot use `this`" (85 times, all from @nextblock-cms/ecom).

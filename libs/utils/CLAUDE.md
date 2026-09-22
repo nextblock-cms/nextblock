@@ -17,9 +17,15 @@ Entry points: `.` (curated barrel incl. all of `./seo`); `./server`; `./seo` (pu
 - Published deps and the exports map are written in `vite.config.mts` afterBuild, not `package.json`.
 
 ## Gotchas
-- `dist/libs/utils/server.{es,cjs}.js` + `server.d.ts` are hand-written templates in
-  `vite.config.mts` afterBuild; mirror changes to `src/lib/server-utils.ts` there.
-- The stale tracked twin `src/lib/server-utils.js` is what Vite bundles (`src/server.js` is
-  unused); `.ts` edits do not ship until the twin is regenerated.
+- `server.{es,cjs}.js` + `server.d.ts` are compiled from `src/server.ts` like every other module.
+  Never write JS output from `afterBuild`: it runs after the ESM files are written and before the
+  CommonJS ones, so it overwrites real ESM output and its CommonJS files get overwritten (the
+  hand-written server entry did both through 0.20).
+- The stale tracked twins (`src/lib/server-utils.js`, `src/server.js`) are ignored:
+  `resolve.extensions` puts `.ts` first here and in the root `vitest.config.ts`, so the `.ts`
+  sources are what ships and what the tests run.
+- `src/lib/server-utils.ts` is server-only but must never be a `"use server"` module: that would
+  make `getEmailServerConfig()` (it returns the SMTP password) callable from the browser once a
+  client component imports it. It throws in a browser instead; `server-utils.test.ts` guards it.
 
 Commands: `npx vitest run libs/utils`, `npx nx typecheck utils`, `npx nx build utils`.

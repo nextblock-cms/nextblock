@@ -121,6 +121,18 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   and declare them in the lib's `dependencies` (editor: `use-sync-external-store`; ui:
   `react-color`); `esmExternalRequirePlugin` bundles React in library mode, don't use it.
   `verify-lib-dist.js` check 6 fails on the shim.
+- No Nx executors: `nx build <lib>` is the inferred `vite build` after `typecheck`, and the app
+  targets are `nx:run-commands` (`next build`/`dev`/`start`, port 4200). So a lib config sets
+  `build.outDir` itself (relative, `/`), `emptyOutDir: true`, and copies extra files with
+  `tools/vite/lib-build-plugins.mjs`. A `"type": "module"` lib (cortex, ecom) emits CommonJS as
+  `.cjs`; `verify-lib-dist.js` check 7 enforces that and matching directives in both formats.
+  Each lib's README is its npm page: absolute links only, and check 8 also requires `license`
+  and `repository` (github.com/nextblock-cms/nextblock plus `directory`) in every manifest.
+- A scaffold override (`postcss`, `qs`, `uuid`, `glob`) lives in three places: root `overrides`,
+  `apps/create-nextblock/bin/lib/fallback-overrides.js`, and `MANAGED_OVERRIDES` in
+  `apps/nextblock/tools/lib/managed-overrides.mjs` (old value into `previous`, so `npm run
+  update` moves existing projects) plus `SHIPPED` in `fallback-overrides.test.js`, which fails
+  until all of them agree.
 - Publish order utils → ui → sdk → db → editor → ecommerce → cortex → CLI; npm 2FA needs
   an OTP per publish and piping output breaks the prompt (`EOTP`).
 - Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`

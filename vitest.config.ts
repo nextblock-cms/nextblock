@@ -7,6 +7,12 @@ export default defineConfig({
   // without this every app test that loads a .tsx file fails to parse ("Unexpected JSX
   // expression").
   oxc: { jsx: { runtime: 'automatic' } },
+  // TypeScript first, as in libs/db and libs/utils' Vite configs. Both libs track stale compiled
+  // twins (`server.js` beside `server.ts`, `lib/server-utils.js`, ...), and Vite's default order
+  // resolves an extension-less relative import to the `.js`, so tests ran months-old code.
+  resolve: {
+    extensions: ['.mts', '.ts', '.tsx', '.mjs', '.js', '.jsx', '.json'],
+  },
   test: {
     globals: true,
     alias: [
