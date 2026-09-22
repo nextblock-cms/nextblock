@@ -1377,7 +1377,7 @@ async function main() {
   } else if (install.isDocker) {
     info(`Rebuild the stack: ${C.cyan('npm run docker:up')}`);
   } else if (install.layout === 'monorepo') {
-    info(`Restart the dev server: ${C.cyan('npx nx serve nextblock')}`);
+    info(`Restart the dev server: ${C.cyan('npm run dev')}`);
   } else {
     info(`Rebuild and restart: ${C.cyan('npm run build')} then ${C.cyan('npm start')}`);
   }

@@ -115,6 +115,17 @@ export function McpClientConfigPanel({
           </p>
         </div>
       )}
+
+      {activeClient === 'codex' && (
+        <div className="space-y-3">
+          <Snippet code={snippets.codex} title="~/.codex/config.toml" />
+          <p className="text-[11px] text-muted-foreground">
+            Codex (the ChatGPT desktop app&rsquo;s Codex mode, the Codex CLI and its IDE extension) reads
+            this file with any ChatGPT plan. ChatGPT&rsquo;s regular chat, on the web or in the desktop app,
+            cannot use it: its connectors only sign in with OAuth, which this server does not offer.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

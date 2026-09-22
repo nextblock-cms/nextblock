@@ -58,7 +58,7 @@ We combined the **flexibility of a Block Editor** with the **raw power of Next.j
 - **🤖 Built for AI Agents**: Our codebase is documented and structured specifically to be easily read and extended by AI coding assistants.
 - **🛍️ E-Commerce Ready**: Premium commerce package for digital products, checkout providers, currency, tax, and shipping management.
 - **🧱 Visual Block Editor**: A reusable Tiptap-powered Notion-style editor that your clients will actually enjoy using.
-- **🔓 Open-Core Model**: The core is 100% Free & Open Source (AGPL). Premium features are activated via License Keys.
+- **🔓 Open-Core Model**: The core is 100% Free & Open Source (AGPL). Premium modules (today Cortex AI and Commerce Pro, with more to come) ship in every install and switch on in the CMS with a free 30-day trial (no credit card) or a license key.
 
 ## 🆚 The NextBlock™ Advantage
 
@@ -104,7 +104,8 @@ npm create nextblock@latest
 This runs the `create-nextblock` CLI, which scaffolds the canonical application. The CLI no longer asks for credentials in the terminal — once the project is created, start it and finish setup in your browser:
 
 ```bash
-npm run dev   # then open http://localhost:4200/setup
+cd <your-project>
+npm run dev   # then open http://localhost:3000/setup
 ```
 
 The **First-Boot Setup Wizard** at `/setup` walks you through connecting Supabase, configuring storage / email, and creating the first administrator. Every fresh instance redirects there automatically until an admin exists.
@@ -150,8 +151,8 @@ NextBlock ships as an MCP server (`https://<your-site>/api/mcp`, Streamable HTTP
 **Prerequisites** — configuration happens in the browser, but the `/setup` wizard asks for these, so create them first:
 
 1. **Supabase project** ([dashboard](https://supabase.com/dashboard)) — you'll need the **Reference ID** (Project Settings → General), the **connection string** (Connect → Direct connection → URI), the **anon** + **service_role** keys (Project Settings → API Keys), and a **Personal Access Token** (Account → Access Tokens → Generate new token).
-2. **Cloudflare R2 bucket** ([dashboard](https://dash.cloudflare.com) → R2) — create a bucket, enable its **Public Development URL** (Bucket → Settings → General), then create an **Account API token** (R2 → Manage API Tokens) with _Object Read & Write_. Copy the **Access Key ID** and **Secret Access Key** — the secret is shown only once.
-3. **SMTP credentials** ([SMTP2GO](https://www.smtp2go.com) works very well) — required so Supabase can email the confirmation link your first admin needs to sign in.
+2. **Cloudflare R2 bucket** (optional — without one, media goes to the Supabase project's own Storage) ([dashboard](https://dash.cloudflare.com) → R2) — create a bucket, enable its **Public Development URL** (Bucket → Settings → General), then create an **Account API token** (R2 → Manage API Tokens) with _Object Read & Write_. Copy the **Access Key ID** and **Secret Access Key** — the secret is shown only once.
+3. **SMTP credentials** (optional, configurable later in the CMS; [SMTP2GO](https://www.smtp2go.com) works very well) — needed for password resets and invitations. The first administrator is confirmed instantly and needs no email.
 
 Then run:
 
@@ -160,12 +161,12 @@ git clone https://github.com/nextblock-cms/nextblock.git
 cd nextblock
 npm install
 npm run setup
-npx nx serve nextblock
+npm run dev
 ```
 
-`npm run setup` is informational only — it prompts for nothing and writes no files. Open **http://localhost:4200/setup** and the browser wizard connects Supabase, applies the schema, configures storage / email, and creates your first administrator.
+`npm run setup` is informational only — it prompts for nothing and writes no files. `npm run dev` is the root alias for `npx nx serve nextblock`. Open **http://localhost:4200/setup** and the browser wizard connects Supabase, applies the schema, configures storage, and creates your first administrator.
 
-**First login:** the dev server runs at **http://localhost:4200**. Open `/sign-up` and create your account — the **first** account to register automatically becomes the **ADMIN**. Click the confirmation email (or confirm the user in Supabase → Authentication → Users), then sign in to reach the CMS at `/cms/dashboard`.
+**First login:** the dev server runs at **http://localhost:4200**. The wizard creates your administrator (confirmed instantly, no email needed) and signs you in. You land on the Cortex AI welcome offer, one click away from the CMS at `/cms/dashboard`.
 
 #### 🐳 Or: one-click local stack (no cloud accounts)
 
@@ -204,7 +205,7 @@ is hosted. See **[docs/13](./docs/13-STAYING-UP-TO-DATE.md)** for the full pictu
 
 - `npm run update` - Update code, dependencies and database schema (any install type)
 - `npm run update -- --check` - Preview an update without changing anything
-- `npx nx serve nextblock` - Start the local development server for the CMS
+- `npm run dev` - Start the local development server for the CMS on http://localhost:4200 (runs `npx nx serve nextblock`)
 - `npm run lint` - Lint the monorepo
 - `npm run db:types` - Generate Supabase types
 - `npm run db:migrate:check` - Preview pending Supabase migrations safely

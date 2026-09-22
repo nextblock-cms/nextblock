@@ -18,8 +18,9 @@ In workspace code, the developer-facing import paths are:
 - `@nextblock-cms/ecommerce/actions`
 
 One packaging discrepancy exists today: `libs/ecommerce/package.json` is still
-named `@nextblock-cms/ecom`, while the workspace and CLI activation flow expose
-the package through the `@nextblock-cms/ecommerce` alias.
+named `@nextblock-cms/ecom`, while the workspace (tsconfig paths) and every scaffold's
+`package.json` (`"@nextblock-cms/ecommerce": "npm:@nextblock-cms/ecom@latest"`) expose it as
+`@nextblock-cms/ecommerce`.
 
 ## Commerce Data Model
 

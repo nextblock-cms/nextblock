@@ -81,7 +81,7 @@ git clone https://github.com/nextblock-cms/nextblock.git
 cd nextblock
 npm install
 npm run setup          # prints the next steps — it asks nothing
-npx nx serve nextblock # then open http://localhost:4200/setup
+npm run dev            # then open http://localhost:4200/setup
 ```
 
 Configuration happens in the browser, not the terminal: the **First-Boot Setup Wizard**
@@ -98,7 +98,7 @@ migrations automatically. See
 ## Everyday commands
 
 ```bash
-npx nx serve nextblock          # dev server
+npm run dev                     # dev server (= npx nx serve nextblock)
 npx nx build nextblock          # production build
 npm run lint                    # lint the workspace
 npm run nx:lint:nextblock       # lint just the app

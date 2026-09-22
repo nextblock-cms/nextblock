@@ -23,18 +23,21 @@ import SiteSeoSettingsForm from './components/SiteSeoSettingsForm'
 import MediaImage from '../../media/components/MediaImage'
 import DeleteLogoButton from './components/DeleteLogoButton'
 import SetActiveLogoButton from './components/SetActiveLogoButton'
+import AppIconPreview from './components/AppIconPreview'
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl'
+import { loadAppIconContext } from '../../../../lib/branding/app-icon-context'
 
 function resolveLogoSrc(objectKey?: string | null) {
   return resolveMediaUrl(objectKey)
 }
 
 export default async function CmsLogosListPage() {
-  const [logos, branding, seoSettings, pinnedActiveLogoId] = await Promise.all([
+  const [logos, branding, seoSettings, pinnedActiveLogoId, appIcon] = await Promise.all([
     getLogos(),
     getInvoiceBrandingData(),
     getSiteSeoSettings(),
     getActiveLogoId(),
+    loadAppIconContext(),
   ])
 
   // The effective active logo: the admin-pinned one, else the most recent (logos come back
@@ -159,6 +162,8 @@ export default async function CmsLogosListPage() {
           </div>
         )}
       </section>
+
+      <AppIconPreview source={appIcon.source} />
     </div>
   )
 }

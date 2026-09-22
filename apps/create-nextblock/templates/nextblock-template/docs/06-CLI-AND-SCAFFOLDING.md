@@ -5,10 +5,9 @@
 `apps/create-nextblock` is the onboarding surface for developers who want a
 standalone NextBlock project without cloning the full monorepo.
 
-The CLI does two main jobs:
-
-- scaffold a package-based project from the current app template
-- activate premium ecommerce routes and dependencies in generated projects
+The CLI scaffolds a package-based project from the current app template (interactively,
+or headless for coding agents). It never installs premium packages: their code ships in
+every scaffold and a license switches it on in the running site (see "Premium Packages").
 
 ## Source Application vs Template Output
 
@@ -27,10 +26,9 @@ That means contributor workflow should be:
 
 ## CLI Entry Points
 
-`apps/create-nextblock/bin/create-nextblock.js` currently defines:
-
-- `create [project-directory]`
-- `activate [module]`
+`apps/create-nextblock/bin/create-nextblock.js` defines one command,
+`create [project-directory]` (the default), plus a hidden `activate [package]` that only
+prints how to activate a premium package (see "Premium Packages").
 
 The default create flow is what powers:
 
@@ -207,14 +205,11 @@ metadata for:
 - `@nextblock-cms/db`
 - `@nextblock-cms/editor`
 - `@nextblock-cms/sdk`
+- `@nextblock-cms/cortex`
 
-The ecommerce module is special because activation installs the alias:
-
-```bash
-@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest
-```
-
-That alias matches the current package-name discrepancy documented elsewhere.
+The ecommerce module's npm name differs from its import name, so
+`apps/nextblock/package.json` (and therefore every scaffold) declares the alias
+`"@nextblock-cms/ecommerce": "npm:@nextblock-cms/ecom@latest"`.
 
 ## Template Sync Workflow
 
@@ -235,22 +230,42 @@ It currently:
 This is why the root docs and root/app README surfaces matter first: the
 template inherits from them later through the sync step.
 
-## Premium Ecommerce Activation
+## Premium Packages
 
-The `activate ecommerce` command does more than add a dependency. It also
-injects route wrappers and supporting files into the generated project so the
-premium module appears as a coherent extension rather than a bare npm install.
+NextBlock CMS is free and open source (AGPL-3.0). Premium packages add to it, today
+**Cortex AI** and **Commerce Pro**, with more to come. There is nothing to install: every
+scaffold already depends on `@nextblock-cms/ecommerce` and `@nextblock-cms/cortex`, and
+the premium routes and UI ship in the template, gated by `verifyPackageOnline()` (the
+commerce CMS pages redirect to `/cms/settings/packages` while Commerce Pro is inactive). A
+license switches that code on at runtime:
 
-The injected surfaces include wrappers for routes such as:
+- **In the CMS.** Administration → Packages (`/cms/settings/packages`): start the free
+  30-day trial of Cortex AI or Commerce Pro (no credit card), buy a license, or paste a
+  key. See docs/08 → "Package Activation".
+- **Headless.** Set `NEXTBLOCK_LICENSE_KEY` in the env file. `--non-interactive` writes it
+  for you: the key given with `--license-key`, or, in unattended mode (`--name` /
+  `--email`), the Cortex AI trial key the vendor mints. The app activates it on the next
+  `GET /api/setup/status`, `POST /api/setup/bootstrap` or `/api/mcp` request
+  (`lib/packages/env-license.ts`), never on a page view. The variable holds one key and
+  defaults to Cortex AI; a Commerce Pro key also needs `NEXTBLOCK_LICENSE_PACKAGE=ecommerce`.
+  Details: docs/08 → "Headless bootstrap" (Environment-seeded license).
 
-- `/cms/orders`
-- `/cms/products`
-- `/cms/payments`
-- `/checkout/success`
-- `/api/checkout`
+`create-nextblock activate [package]` is a hidden signpost that prints these steps
+(`bin/lib/activate.js`). It installs nothing, writes no file, and exits 1 only for an
+unknown package name; it stays registered because commander would otherwise hand
+`activate` to the default `create` command and scaffold a project named "activate". It
+also names premium dependencies an older project's `package.json` lacks (update the
+project instead of installing them one by one, docs/13) and any files an older `activate`
+overwrote.
 
-Those wrappers use `verifyPackageOnline()` so premium routes stay aligned with
-package activation state.
+Up to create-nextblock 0.21.1 the command ran
+`npm install @nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest` (already a
+dependency) and overwrote ten routes (`/cms/orders`, `/cms/orders/[id]`, `/cms/products`,
+`/cms/products/new`, `/cms/products/[id]/edit`, `/cms/payments`, `/cms/coupons`,
+`/cms/coupons/[id]/edit`, `/checkout/success`, `/api/checkout`) with wrappers that
+imported page components from the package root, which only
+`@nextblock-cms/ecommerce/server` exports, so the project stopped building. Restore such
+files from git history or from a fresh scaffold of the same version.
 
 ## Publishing and Release Notes
 

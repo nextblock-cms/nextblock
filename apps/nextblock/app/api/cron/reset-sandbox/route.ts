@@ -16,6 +16,7 @@ import postgres from 'postgres';
 
 import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
 import { SANDBOX_RESET_SQL } from './sandboxResetSql';
+import { CORTEX_PRODUCT_COPY } from './cortex-product-copy';
 import { activateSandboxPackage } from './activate-package';
 
 export const dynamic = 'force-dynamic';
@@ -1423,317 +1424,18 @@ async function enrichCortexAiProducts(params: {
     );
   }
 
-  const shortDescEn =
-    'NextBlock™ Cortex AI is the AI layer for your free CMS. Route any model through your own OpenRouter key inside the editor, or register /api/mcp and let Claude Code, Cursor, and ChatGPT build layouts, inspect your schema, and manage content on the AI subscription you already pay for. Free for 30 days, no credit card.';
-
-  // Copy is mirrored by the seeded product blocks in libs/db/src/supabase/migrations/02004_baseline_seed.sql
-  // (originally migration 00000000000041_marketing_review_free_cms_trial, folded into the generation-2
-  // baseline; the seed populates fresh installs, this function re-seeds the sandbox after every reset).
-  // Keep the two in step.
-  // ── Section 0: Hero (MCP-native positioning, 30-day trial, two columns) ──
-  const cortexS0En = {
-    "container_type": "container",
-    "background": {
-      "type": "gradient",
-      "gradient": {
-        "type": "linear",
-        "direction": "135deg",
-        "stops": [
-          {
-            "color": "#1e1b4b",
-            "position": 0
-          },
-          {
-            "color": "#312e81",
-            "position": 35
-          },
-          {
-            "color": "#0f172a",
-            "position": 100
-          }
-        ]
-      }
-    },
-    "responsive_columns": {
-      "mobile": 1,
-      "tablet": 1,
-      "desktop": 2
-    },
-    "column_gap": "xl",
-    "vertical_alignment": "center",
-    "padding": {
-      "top": "xl",
-      "bottom": "xl"
-    },
-    "column_blocks": [
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-xs uppercase tracking-[0.3em] text-violet-400 font-semibold mb-4'>MCP-Native AI Layer · 30-Day Free Trial</p><h2 class='text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5'>Your CMS as a Cortex AI MCP Server.</h2><p class='text-base md:text-lg text-slate-200 leading-relaxed mb-4'>Cortex AI runs two ways. Inside the editor it routes to any model through your own OpenRouter key. Over MCP it turns NextBlock into a server that Claude Code, Cursor, and ChatGPT operate from their own chat window.</p><p class='text-base text-slate-300 leading-relaxed mb-6'>The CMS is free forever. Cortex AI is the one license we sell, and it starts with 30 days free and no credit card.</p>"
-          }
-        },
-        {
-          "block_type": "button",
-          "content": {
-            "text": "Read the MCP Setup Guide →",
-            "url": "/article/cortex-ai-mcp-connection-guide",
-            "variant": "default",
-            "size": "lg",
-            "position": "left"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='rounded-2xl border border-violet-700 bg-slate-950 p-6 shadow-xl sm:p-8'><h3 class='text-lg font-bold text-white mb-5'>Bring Your Own AI Subscription</h3><ul class='space-y-4 text-sm leading-relaxed text-slate-300'><li class='flex items-start gap-3'><span class='flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Free for 30 days</strong> — start the trial with no credit card. If you do nothing, it simply ends.</span></li><li class='flex items-start gap-3'><span class='flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold'>✓</span><span><strong class='text-white'>No token markup</strong> — use Claude Pro, ChatGPT Plus, Cursor, or Gemini Advanced by registering /api/mcp. You pay your provider, not us.</span></li><li class='flex items-start gap-3'><span class='flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Editor BYOK</strong> — OpenRouter routing with your own key, so you pick the model and keep the bill.</span></li><li class='flex items-start gap-3'><span class='flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Scoped tokens</strong> — mint read-only or write tokens in CMS Settings and revoke them any time.</span></li><li class='flex items-start gap-3'><span class='flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Live Drafts</strong> — generated layouts stage as drafts. Nothing goes live until an editor publishes it.</span></li></ul></div>"
-          }
-        }
-      ]
-    ]
-  };
-
-  // ── Section 1: Trial + contract metrics bar ──
-  const cortexS1En = {
-    "container_type": "container",
-    "background": {
-      "type": "theme",
-      "theme": "muted"
-    },
-    "responsive_columns": {
-      "mobile": 1,
-      "tablet": 2,
-      "desktop": 4
-    },
-    "column_gap": "lg",
-    "padding": {
-      "top": "lg",
-      "bottom": "lg"
-    },
-    "vertical_alignment": "center",
-    "column_blocks": [
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>30</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Days free, no card</span></p>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>0 %</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Token markup</span></p>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>5</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>MCP contract tools</span></p>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>29</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Typed agent tools</span></p>"
-          }
-        }
-      ]
-    ]
-  };
-
-  // ── Section 2: MCP tool cards (5 contract tools + the rest of the registry) ──
-  const cortexS2En = {
-    "container_type": "container",
-    "background": {
-      "type": "none"
-    },
-    "responsive_columns": {
-      "mobile": 1,
-      "tablet": 2,
-      "desktop": 3
-    },
-    "column_gap": "lg",
-    "padding": {
-      "top": "xl",
-      "bottom": "xl"
-    },
-    "vertical_alignment": "stretch",
-    "column_blocks": [
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>get_database_schema</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Returns every table the agent may read or change, with columns, keys, and read-only flags. The model plans against real structure, not guesses.</p></div>"
-          }
-        },
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>query_site_analytics</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Reads revenue, order counts, status breakdowns, and top products over a date range. Read-only, so it is safe on any token.</p></div>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>generate_jsonb_layout</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Turns a prompt into a complete page layout. Blocks are validated against the NextBlock schema and staged as a Live Draft.</p></div>"
-          }
-        },
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>search_stock_media</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Finds free stock photos on Pexels and Unsplash with alt text and credits. Drop a result straight into an image block.</p></div>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>update_site_navigation</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Adds, renames, or reorders header menu items per locale. Append to keep the current menu or replace it in one call.</p></div>"
-          }
-        },
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7'><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'><code class='rounded bg-violet-50 px-2 py-1 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200'>and 24 more</code></h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Create posts and products, translate pages, upload media, manage themes and scripts. Every tool is typed and scoped.</p></div>"
-          }
-        }
-      ]
-    ]
-  };
-
-  // ── Section 3: Deep-dive 2-col (transport, auth, editor BYOK) ──
-  const cortexS3En = {
-    "container_type": "container",
-    "background": {
-      "type": "gradient",
-      "gradient": {
-        "type": "linear",
-        "direction": "180deg",
-        "stops": [
-          {
-            "color": "#020617",
-            "position": 0
-          },
-          {
-            "color": "#0f172a",
-            "position": 100
-          }
-        ]
-      }
-    },
-    "responsive_columns": {
-      "mobile": 1,
-      "tablet": 1,
-      "desktop": 2
-    },
-    "column_gap": "xl",
-    "vertical_alignment": "center",
-    "padding": {
-      "top": "xl",
-      "bottom": "xl"
-    },
-    "column_blocks": [
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-xs uppercase tracking-[0.3em] text-violet-400 font-semibold mb-4'>How It Works</p><h3 class='text-2xl md:text-3xl font-extrabold text-white mb-4'>One Registry, Standard Transport.</h3><p class='text-slate-300 leading-relaxed mb-5'>The MCP server speaks Streamable HTTP at /api/mcp. Your client posts JSON-RPC messages and gets typed results back. There is no SDK to install and no proxy in the middle.</p><ul class='space-y-3 text-sm text-slate-400'><li class='flex items-start gap-2.5'><span class='text-violet-400'>→</span><span>Bearer tokens are stored as SHA-256 hashes and shown once.</span></li><li class='flex items-start gap-2.5'><span class='text-violet-400'>→</span><span>Localhost trust lets a dev server skip the token while you build.</span></li><li class='flex items-start gap-2.5'><span class='text-violet-400'>→</span><span>Read-only tokens never see a mutating tool in the list.</span></li><li class='flex items-start gap-2.5'><span class='text-violet-400'>→</span><span>Copy-paste config for Claude Code, Cursor, VS Code, and Claude Desktop.</span></li></ul>"
-          }
-        }
-      ],
-      [
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<div class='space-y-4'><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Editor BYOK via OpenRouter</h4><p class='text-xs text-slate-400 leading-relaxed'>Pick any model, from Claude to Gemini to open weights, with one key. Costs stay on your OpenRouter bill and switch with a toggle.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>AI Inside the Editor</h4><p class='text-xs text-slate-400 leading-relaxed'>An inline toolbar rewrites copy, refactors columns, and translates whole pages. Output is valid block data, so layouts never break.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Privacy-First Design</h4><p class='text-xs text-slate-400 leading-relaxed'>Requests go straight to your provider with your key. NextBlock never stores, logs, or trains on your content.</p></div></div>"
-          }
-        }
-      ]
-    ]
-  };
-
-  // ── Section 4: CTA (start the free trial) ──
-  const cortexS4En = {
-    "container_type": "container",
-    "background": {
-      "type": "gradient",
-      "gradient": {
-        "type": "linear",
-        "direction": "135deg",
-        "stops": [
-          {
-            "color": "#312e81",
-            "position": 0
-          },
-          {
-            "color": "#1e1b4b",
-            "position": 100
-          }
-        ]
-      }
-    },
-    "responsive_columns": {
-      "mobile": 1,
-      "tablet": 1,
-      "desktop": 1
-    },
-    "column_gap": "none",
-    "padding": {
-      "top": "xl",
-      "bottom": "xl"
-    },
-    "vertical_alignment": "center",
-    "column_blocks": [
-      [
-        {
-          "block_type": "heading",
-          "content": {
-            "level": 2,
-            "text_content": "Ready to connect your AI to your CMS?",
-            "textAlign": "center",
-            "textColor": "background"
-          }
-        },
-        {
-          "block_type": "text",
-          "content": {
-            "html_content": "<p class='text-center text-violet-100 max-w-xl mx-auto mt-2 mb-6'>One license unlocks Cortex AI in the editor and the MCP server. Start with 30 days free and no credit card, bring your own AI subscription, and keep your data yours.</p>"
-          }
-        },
-        {
-          "block_type": "button",
-          "content": {
-            "text": "Start the 30-Day Free Trial",
-            "url": "https://nextblock.dev/product/nextblock-cortex-ai-cortex-ai-license",
-            "variant": "secondary",
-            "size": "lg",
-            "position": "center"
-          }
-        }
-      ]
-    ]
-  };
-
-  const cortexSectionsEn = [cortexS0En, cortexS1En, cortexS2En, cortexS3En, cortexS4En];
+  // Copy (EN + FR) lives in ./cortex-product-copy.ts, shared with migration 02019, which applies the
+  // same sections to nextblock.dev. Keep the two in step.
+  const copyEn = CORTEX_PRODUCT_COPY.en;
+  const copyFr = CORTEX_PRODUCT_COPY.fr;
 
   await params.sql`
     UPDATE public.products
     SET
-      title = 'NextBlock™ Cortex AI MCP Server & AI Editor License',
-      short_description = ${shortDescEn},
-      meta_title = 'Cortex AI MCP Server — Connect Claude & Cursor to Your CMS',
-      meta_description = 'Turn NextBlock into a Cortex AI MCP server. Connect Claude, Cursor, and ChatGPT to create layouts, inspect your schema, and manage content on your AI plan.',
+      title = ${copyEn.title},
+      short_description = ${copyEn.short_description},
+      meta_title = ${copyEn.meta_title},
+      meta_description = ${copyEn.meta_description},
       description_json = NULL,
       product_type = 'digital',
       payment_provider = 'freemius'
@@ -1744,221 +1446,26 @@ async function enrichCortexAiProducts(params: {
 
   // Set description blocks for English Cortex AI product
   await params.sql`DELETE FROM public.blocks WHERE product_id = ${product.id}`;
-  for (let i = 0; i < cortexSectionsEn.length; i++) {
+  for (let i = 0; i < copyEn.sections.length; i++) {
     await params.sql`
       INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
-      VALUES (${product.id}, ${params.enLangId}, 'section', ${params.sql.json(cortexSectionsEn[i] as any)}, ${i})
+      VALUES (${product.id}, ${params.enLangId}, 'section', ${params.sql.json(copyEn.sections[i] as any)}, ${i})
     `;
   }
-
-  // ── French Sections ──
-  const shortDescFr =
-    "La licence NextBlock™ Cortex AI apporte l'intelligence artificielle au niveau des blocs directement dans votre éditeur de contenu Next.js. Génération, refactorisation et traduction de pages en un clic.";
-
-  const cortexS0Fr = {
-    ...cortexS0En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-violet-400 font-semibold mb-4">Couche d'Intelligence IA</p>
-<h2 class="text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5">Boostez votre éditeur<br/>avec l'IA native.</h2>
-<p class="text-base md:text-lg text-slate-200 leading-relaxed mb-6">Cortex AI intègre les LLMs les plus performants directement dans votre surface d'édition de blocs. Rédigez, résumez, restructurez et traduisez — sans quitter l'éditeur.</p>`,
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Obtenir Cortex AI →',
-            url: 'https://nextblock.dev/product/nextblock-cortex-ai-cortex-ai-license',
-            variant: 'default',
-            size: 'lg',
-            position: 'left',
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="rounded-2xl border border-violet-700 bg-slate-950 p-6 shadow-xl sm:p-8">
-<h3 class="text-lg font-bold text-white mb-5">OpenRouter et architecture BYOK</h3>
-<ul class="space-y-4 text-sm leading-relaxed text-slate-300">
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Bring Your Own Key</strong> — contrôle total des coûts avec vos propres jetons API OpenRouter. Aucun frais caché.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Prompts conscients des blocs</strong> — Cortex AI comprend le schéma JSONB, pas seulement le texte brut. Produit des structures de blocs valides.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Respect du design system</strong> — le contenu généré respecte automatiquement votre configuration Tailwind et vos guidelines de marque.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-violet-950 flex items-center justify-center text-violet-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Support multi-modèles</strong> — basculez entre GPT-4o, Claude, Gemini et plus via un simple paramètre.</span>
-  </li>
-</ul>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const cortexS1Fr = {
-    ...cortexS1En,
-    column_blocks: [
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">50+</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Modèles IA disponibles</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">< 2s</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Temps de génération moy.</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">100 %</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Contrôle des coûts BYOK</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">2</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Langues supportées</span></p>' } }],
-    ],
-  };
-
-  const cortexS2Fr = {
-    ...cortexS2En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7">
-<p class="text-2xl mb-3">✍️</p>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Rédaction en un clic</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Rédigez des articles, optimisez vos titres, créez des appels à l'action et rédigez des descriptions produits — le tout avec des prompts contextuels.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7">
-<p class="text-2xl mb-3">🔄</p>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Refactorisation de structure</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Convertissez des colonnes, ajoutez des grilles ou réorganisez vos nœuds de blocs. Cortex AI génère un schéma JSONB valide, pas des suggestions textuelles.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-violet-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-violet-500 sm:p-7">
-<p class="text-2xl mb-3">🌐</p>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Traduction automatique</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Localisez vos pages complètes entre le français et l'anglais en préservant tous les blocs imbriqués, mises en page et styles de section.</p>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const cortexS3Fr = {
-    ...cortexS3En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-violet-400 font-semibold mb-4">Comment ça marche</p>
-<h3 class="text-2xl md:text-3xl font-extrabold text-white mb-4">Une IA qui comprend les blocs</h3>
-<p class="text-slate-300 leading-relaxed mb-5">Contrairement aux outils IA génériques, Cortex AI est profondément intégré à l'éditeur de blocs NextBlock™. Il comprend vos sections, structures de colonnes et hiérarchies de contenu — générant des sorties qui s'insèrent directement dans votre page.</p>
-<ul class="space-y-3 text-sm text-slate-400">
-  <li class="flex items-start gap-2.5">
-    <span class="text-violet-400">→</span>
-    <span>Barre d'outils IA intégrée à la sélection de texte</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-violet-400">→</span>
-    <span>Prompts prédéfinis pour les tâches courantes</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-violet-400">→</span>
-    <span>Génération de pages complètes à partir d'un seul prompt</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-violet-400">→</span>
-    <span>Suivi de la consommation de tokens dans le tableau de bord</span>
-  </li>
-</ul>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="space-y-4">
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Génération de contenu</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Des textes publicitaires aux articles de fond, Cortex AI génère du contenu fidèle à votre marque. Les sorties sont pré-formatées pour votre design system.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Optimisation SEO</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Génération automatique de titres méta, descriptions et hiérarchie de titres. Cortex AI analyse votre structure et suggère des améliorations SEO en temps réel.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Conception axée sur la vie privée</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Votre contenu est envoyé directement à OpenRouter avec VOTRE clé. NextBlock™ ne stocke, ne journalise et ne proxifie jamais vos requêtes IA — souveraineté totale sur vos données.</p>
-</div>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const cortexS4Fr = {
-    ...cortexS4En,
-    column_blocks: [
-      [
-        {
-          block_type: 'heading',
-          content: { level: 2, text_content: "Prêt à ajouter l'IA à votre éditeur ?", textAlign: 'center', textColor: 'background' },
-        },
-        {
-          block_type: 'text',
-          content: {
-            html_content: '<p class="text-center text-violet-100 max-w-xl mx-auto mt-2 mb-6">Libérez la puissance de la création de contenu assistée par IA. BYOK, vie privée d\'abord, et intégration profonde avec votre éditeur de blocs.</p>',
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Acheter Cortex AI',
-            url: 'https://nextblock.dev/product/nextblock-cortex-ai-cortex-ai-license',
-            variant: 'secondary',
-            size: 'lg',
-            position: 'center',
-          },
-        },
-      ],
-    ],
-  };
-
-  const cortexSectionsFr = [cortexS0Fr, cortexS1Fr, cortexS2Fr, cortexS3Fr, cortexS4Fr];
 
   const [frProduct] = await params.sql`
     INSERT INTO public.products (
       sku, title, slug, price, sale_price, stock, status,
-      short_description, description_json,
+      short_description, meta_title, meta_description, description_json,
       product_type, payment_provider,
       language_id, translation_group_id,
       freemius_product_id, freemius_plan_id,
       trial_period_days, trial_requires_payment_method
     )
     VALUES (
-      ${product.sku}, 'Licence NextBlock™ Cortex AI', ${String(product.slug) + '-fr'},
+      ${product.sku}, ${copyFr.title}, ${String(product.slug) + '-fr'},
       ${product.price}, ${product.sale_price}, ${product.stock || 99}, ${product.status},
-      ${shortDescFr}, NULL,
+      ${copyFr.short_description}, ${copyFr.meta_title}, ${copyFr.meta_description}, NULL,
       'digital', 'freemius',
       ${params.frLangId}, ${product.translation_group_id},
       ${product.freemius_product_id}, ${product.freemius_plan_id},
@@ -1968,6 +1475,8 @@ async function enrichCortexAiProducts(params: {
     SET
       title = EXCLUDED.title,
       short_description = EXCLUDED.short_description,
+      meta_title = EXCLUDED.meta_title,
+      meta_description = EXCLUDED.meta_description,
       description_json = NULL,
       product_type = EXCLUDED.product_type,
       payment_provider = EXCLUDED.payment_provider,
@@ -1979,10 +1488,10 @@ async function enrichCortexAiProducts(params: {
   if (frProduct?.id) {
     await attachProductMedia(params.sql, frProduct.id as string, cortexMediaId);
     await params.sql`DELETE FROM public.blocks WHERE product_id = ${frProduct.id}`;
-    for (let i = 0; i < cortexSectionsFr.length; i++) {
+    for (let i = 0; i < copyFr.sections.length; i++) {
       await params.sql`
         INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
-        VALUES (${frProduct.id}, ${params.frLangId}, 'section', ${params.sql.json(cortexSectionsFr[i] as any)}, ${i})
+        VALUES (${frProduct.id}, ${params.frLangId}, 'section', ${params.sql.json(copyFr.sections[i] as any)}, ${i})
       `;
     }
   }

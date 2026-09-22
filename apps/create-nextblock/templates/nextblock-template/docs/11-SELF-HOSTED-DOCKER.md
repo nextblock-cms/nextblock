@@ -183,7 +183,7 @@ configuration:
 | Database / Auth | Supabase Cloud | `supabase/postgres` + `supabase/gotrue` |
 | Object storage | Cloudflare R2 | MinIO (S3-compatible) |
 | Email | Required SMTP | Optional — GoTrue auto-confirms without it |
-| Run command | `npx nx serve nextblock` / Vercel | `npm run docker:setup` |
+| Run command | `npm run dev` (monorepo :4200, scaffold :3000) / Vercel | `npm run docker:setup` |
 | Config | `.env.local` (cloud keys) | `.env` (generated local secrets) |
 
 > The R2 client already speaks S3, so MinIO is pointed at it via `R2_S3_ENDPOINT` /

@@ -3,12 +3,12 @@
  *
  * Shared by the MCP settings card and the first-run setup wizard so the two can
  * never disagree about a field name (Claude Code silently skips a server entry
- * without `type`; VS Code wants `servers`, not `mcpServers`).
+ * without `type`; VS Code wants `servers`, not `mcpServers`; Codex reads TOML).
  */
 
 export const MCP_TOKEN_PLACEHOLDER = 'YOUR_TOKEN';
 
-export type McpClientId = 'claude-code' | 'claude-code-vscode' | 'claude-desktop' | 'cursor' | 'vscode';
+export type McpClientId = 'claude-code' | 'claude-code-vscode' | 'claude-desktop' | 'cursor' | 'vscode' | 'codex';
 
 export const MCP_CLIENTS: ReadonlyArray<readonly [McpClientId, string]> = [
   ['claude-code', 'Claude Code (terminal)'],
@@ -16,6 +16,7 @@ export const MCP_CLIENTS: ReadonlyArray<readonly [McpClientId, string]> = [
   ['claude-desktop', 'Claude Desktop'],
   ['cursor', 'Cursor'],
   ['vscode', 'VS Code (Copilot)'],
+  ['codex', 'Codex (ChatGPT plans)'],
 ];
 
 /**
@@ -36,9 +37,20 @@ export type McpClientSnippets = {
   claudeCodeCli: string;
   claudeCodeExtension: McpClaudeCodeExtensionFields;
   claudeDesktop: string;
+  /**
+   * `~/.codex/config.toml`, shared by the ChatGPT desktop app's Codex mode, the Codex CLI and
+   * its IDE extension. ChatGPT's regular chat (web or desktop) never reads it: its connectors
+   * are OAuth-only.
+   */
+  codex: string;
   cursor: string;
   vscode: string;
 };
+
+/** A TOML basic string: every escape JSON emits (`\"`, `\\`, `\n`, `\u0000`) is valid TOML too. */
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
 
 export function buildMcpClientSnippets(params: {
   /** The bearer token to bake in; the placeholder when none has been minted yet. */
@@ -124,6 +136,12 @@ export function buildMcpClientSnippets(params: {
     2
   );
 
+  const codex = [
+    '[mcp_servers.nextblock]',
+    `url = ${tomlString(url)}`,
+    ...(usesLocalhostTrust ? [] : [`http_headers = { "Authorization" = ${tomlString(`Bearer ${token}`)} }`]),
+  ].join('\n');
+
   const claudeCodeCli = usesLocalhostTrust
     ? `claude mcp add --transport http nextblock ${url}`
     : `claude mcp add --transport http nextblock ${url} --header "Authorization: Bearer ${token}"`;
@@ -135,5 +153,5 @@ export function buildMcpClientSnippets(params: {
     url,
   };
 
-  return { claudeCode, claudeCodeCli, claudeCodeExtension, claudeDesktop, cursor, vscode };
+  return { claudeCode, claudeCodeCli, claudeCodeExtension, claudeDesktop, codex, cursor, vscode };
 }

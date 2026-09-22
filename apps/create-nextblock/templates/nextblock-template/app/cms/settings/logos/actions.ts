@@ -12,9 +12,10 @@ import {
   resolveActiveLogo,
   resolveActiveLogoId,
 } from '../../../../lib/logos/active-logo'
+import { PUBLIC_LAYOUT_LOGO_CACHE_TAG } from '../../../../lib/logos/cached-active-logo'
 
-const PUBLIC_LAYOUT_LOGO_CACHE_TAG = 'public-layout-logo'
-
+// The tag also covers the web app manifest and the app icon version, so a logo change
+// reaches installed-app icons too.
 function revalidateLogoViews() {
   revalidatePath('/cms/settings/logos')
   updateTag(PUBLIC_LAYOUT_LOGO_CACHE_TAG)

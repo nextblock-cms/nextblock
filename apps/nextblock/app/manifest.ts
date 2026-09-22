@@ -1,35 +1,29 @@
 import type { MetadataRoute } from 'next';
 
-import { isSupabaseConfigured } from '../lib/setup/env-status';
-import { themeColorFor } from '../lib/themes/buildThemeCss';
-import { getCachedSiteThemes } from '../lib/themes/cached-site-themes';
+import { buildWebManifest } from '../lib/branding/app-icon';
+import { loadAppIconContext } from '../lib/branding/app-icon-context';
 import { getSiteSettings } from './lib/site-settings';
 
 /**
- * Web app manifest, served at `/manifest.webmanifest`.
+ * Web app manifest, served at `/manifest.webmanifest`: what a browser installs the site
+ * as. Built from the site's own settings, so an operator never edits a JSON file:
  *
- * It replaces `public/favicon/site.webmanifest`, which shipped an empty `name` and
- * `short_name` (an installed site had no title) and icon paths at the public root while the
- * files live in `/favicon/`. The name comes from the Branding settings and the colours from
- * the default theme, so an operator never has to edit a JSON file.
+ * - `name` and `short_name` are the brand part of the Branding site title
+ *   (`brandNameFromTitle`: "Acme Bakery | Fresh bread" installs as "Acme Bakery"),
+ * - the colours are the default theme's page background,
+ * - the icons are rendered from the active logo by app/api/brand/app-icon/[variant]
+ *   (192 and 512 `any`, 512 `maskable`), or are the static NextBlock icons in
+ *   public/favicon/ when the site has no logo of its own.
+ *
+ * Next serves it as an ISR route. Its cached reads tag it with `public-site-settings`,
+ * `public-layout-site-themes` and `public-layout-logo`, so a title, theme or logo save
+ * evicts it. The whole assembly is `buildWebManifest` in lib/branding/app-icon.ts.
  */
 export default async function manifest(): Promise<MetadataRoute.Manifest> {
-  const { siteTitle, siteDescription } = await getSiteSettings();
-  const themes = isSupabaseConfigured() ? await getCachedSiteThemes().catch(() => []) : [];
-  const background = themeColorFor(themes);
+  const [{ siteTitle, siteDescription }, { background, source }] = await Promise.all([
+    getSiteSettings(),
+    loadAppIconContext(),
+  ]);
 
-  return {
-    name: siteTitle,
-    // Home-screen labels truncate around a dozen characters.
-    short_name: siteTitle.length > 12 ? siteTitle.split(/[\s|:–—-]+/)[0].slice(0, 12) || siteTitle.slice(0, 12) : siteTitle,
-    description: siteDescription || undefined,
-    start_url: '/',
-    display: 'standalone',
-    background_color: background,
-    theme_color: background,
-    icons: [
-      { src: '/favicon/android-chrome-192x192.png', sizes: '192x192', type: 'image/png' },
-      { src: '/favicon/android-chrome-512x512.png', sizes: '512x512', type: 'image/png' },
-    ],
-  };
+  return buildWebManifest({ siteTitle, siteDescription, background, source });
 }

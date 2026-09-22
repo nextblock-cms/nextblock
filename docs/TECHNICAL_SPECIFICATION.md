@@ -36,7 +36,7 @@ The system recognizes three database-enforced user roles (defined as the `user_r
 | Registered Customer | `USER` — orders, profile | `/profile`, `/cart`, `/checkout` |
 | Developer / Integrator | Scaffold adopter | `npm create nextblock@latest` |
 | AI Coding Agent | Extension author | `.agent/skills/` playbooks |
-| Store Operator | Premium activator | `activate ecommerce` CLI command |
+| Store Operator | Premium activator | CMS → Administration → Packages (`/cms/settings/packages`) |
 
 A foundational authorization rule encoded in the database trigger `on_auth_user_created` elevates the first registered user to `ADMIN` and assigns all subsequent users the `USER` role, guaranteeing that every deployment has exactly one guaranteed administrator at bootstrap.
 
@@ -66,8 +66,8 @@ The value proposition materializes as (1) a premium commerce package shipping bo
 NextBlock CMS occupies the "sweet spot" between block-editor flexibility (WordPress Gutenberg lineage) and modern server-rendered performance (Next.js React Server Components). Its go-to-market posture is defined by three complementary distribution channels:
 
 1. **Open-Core Core** — All foundational libraries (`libs/ui`, `libs/utils`, `libs/db`, `libs/editor`, `libs/sdk`) are tagged `scope:public` in their Nx project configurations and published under AGPLv3.
-2. **Premium Source-Available Extensions** — The `libs/ecommerce` library is tagged `scope:premium` in `libs/ecommerce/project.json` and activated via a license-key-gated installation path (`@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`).
-3. **CLI-Driven Scaffolding** — The `apps/create-nextblock` package provides the `create` (default) and `activate` commands for respectively bootstrapping a new project and installing premium modules post-scaffold.
+2. **Premium Source-Available Extensions** — The `libs/ecommerce` library is tagged `scope:premium` in `libs/ecommerce/project.json`, ships in every install through the `@nextblock-cms/ecommerce` → `npm:@nextblock-cms/ecom` alias, and is switched on at runtime by a trial or license key (`package_activations`, `verifyPackageOnline('ecommerce')`).
+3. **CLI-Driven Scaffolding** — The `apps/create-nextblock` package provides the `create` command (default; interactive or headless) for bootstrapping a new project; a hidden `activate` only prints how to activate premium packages in the CMS.
 
 #### 1.2.1.2 Current System Limitations Addressed
 
@@ -99,7 +99,7 @@ The system delivers six top-level capability families, each surfaced through ded
 3. **CMS Administration** — The `app/cms/*` route tree provides block editing, media management, product catalog management, order administration, shipping configuration, tax settings, and user administration, gated by role.
 4. **Commerce Surface** — Routes `app/product/*`, `app/cart`, and `app/checkout` implement the customer-facing storefront; `app/api/checkout/route.ts` handles server-side checkout orchestration.
 5. **Operational Endpoints** — Routes `app/api/webhooks/*` (Stripe/Freemius) and `app/api/cron/*` (sandbox reset, currency sync) provide the machine-to-machine surface; `app/api/upload` and `app/api/process-image` handle media ingestion and optimization.
-6. **Developer Scaffolding** — The `apps/create-nextblock` CLI (distributed as the `create-nextblock` npm package) provides project bootstrap and premium-module activation commands.
+6. **Developer Scaffolding** — The `apps/create-nextblock` CLI (distributed as the `create-nextblock` npm package) provides project bootstrap (interactive and headless for coding agents).
 
 #### 1.2.2.2 Major System Components
 
@@ -294,7 +294,7 @@ The following architectural invariants are enforced at workspace level and must 
 | Workflow | Actors | Entry Surface |
 |:--|:--|:--|
 | Register a new project | Developer | `npm create nextblock@latest` |
-| Activate premium module | Developer / Store Operator | `create-nextblock activate ecommerce` |
+| Activate premium module | ADMIN | `/cms/settings/packages` (trial or key); headless: `NEXTBLOCK_LICENSE_KEY` |
 | Sign in to the CMS | ADMIN / WRITER | `app/(auth-pages)/sign-in` |
 | Author a page with blocks | WRITER / ADMIN | `/cms` |
 | Manage product catalog | ADMIN | `/cms/products/*` |
@@ -1061,7 +1061,7 @@ Orders transition through five statuses — `pending`, `paid`, `shipped`, `cance
 
 **Description**
 
-The `package_activations` table (migration `02001_baseline_schema.sql`) contains `license_key`, `instance_name`, `package_id`, `status` (defaulting to `active`), `meta`, `last_validated_at`, and a UNIQUE constraint on `(license_key, package_id)`. The helper `verifyPackageOnline(packageId, customClient?)` in `libs/db/src/lib/package-validation.ts` returns a boolean based on `status === 'active'` and uses `unstable_cache` with a 60-second revalidation window. This function is invoked from four surfaces: the CMS commerce navigation visibility check, the checkout API gate at `apps/nextblock/app/api/checkout/route.ts` line 36, premium route wrappers injected during scaffold activation, and the CLI's module activation flows.
+The `package_activations` table (migration `02001_baseline_schema.sql`) contains `license_key`, `instance_name`, `package_id`, `status` (defaulting to `active`), `meta`, `last_validated_at`, and a UNIQUE constraint on `(license_key, package_id)`. The helper `verifyPackageOnline(packageId, customClient?)` in `libs/db/src/lib/package-validation.ts` returns a boolean based on `status === 'active'` and uses `unstable_cache` with a 60-second revalidation window. This function is invoked from four surfaces: the CMS commerce navigation visibility check, the checkout API gate at `apps/nextblock/app/api/checkout/route.ts` line 36, the premium route wrappers in `app/cms/*` (shipped in every scaffold), and the package activation flow (`activatePackage`).
 
 **Dependencies**
 
@@ -1113,13 +1113,13 @@ Four themes — `light`, `dark`, `vibrant`, and `system` — are provided via `n
 
 **Description**
 
-The CLI package `apps/create-nextblock` is published as `create-nextblock` on npm and invoked via `npm create nextblock@latest`. The CLI entry point at `apps/create-nextblock/bin/create-nextblock.js` exposes two commands. The default `create [project-directory]` command prompts for a project name, copies the `templates/nextblock-template` directory, applies client-component/provider adjustments, normalizes editor/UI imports, generates UI proxy modules, rewrites `package.json` to use published packages, writes `.npmrc`, optionally installs dependencies, optionally runs a setup wizard, and initializes git. The `activate [module]` command presently supports only `ecommerce`, installs it via the npm alias `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`, and injects route wrappers that call `verifyPackageOnline()` for `/cms/orders`, `/cms/products`, `/cms/payments`, `/checkout/success`, and `/api/checkout`. Package versions are resolved from local workspace `package.json` files.
+The CLI package `apps/create-nextblock` is published as `create-nextblock` on npm and invoked via `npm create nextblock@latest`. The CLI entry point at `apps/create-nextblock/bin/create-nextblock.js` exposes one command plus a hidden signpost. The default `create [project-directory]` command prompts for a project name, copies the `templates/nextblock-template` directory, applies client-component/provider adjustments, normalizes editor/UI imports, generates UI proxy modules, rewrites `package.json` to use published packages, writes `.npmrc`, optionally installs dependencies, optionally runs a setup wizard, and initializes git. A hidden `activate [package]` only prints how to activate Cortex AI or Commerce Pro in the CMS; the earlier version (up to 0.21.1), which npm-installed the ecommerce alias and overwrote the commerce routes with imports that did not compile, was retired. Package versions are resolved from local workspace `package.json` files.
 
 **Dependencies**
 
 | Dependency Type | Details |
 |:--|:--|
-| Prerequisite Features | F-022 (for `activate ecommerce`) |
+| Prerequisite Features | F-022 (headless `--license-key` / trial key, activated by the app) |
 | System Dependencies | `templates/nextblock-template` directory |
 | External Dependencies | npm CLI, git |
 | Integration Requirements | Generated projects consume published libraries |
@@ -1422,7 +1422,7 @@ This subsection provides the detailed, testable requirements that operationalize
 |:--|:--|:--|:--|
 | F-010-RQ-001 | Theme options MUST include `light`, `dark`, `vibrant`, `system` | Must-Have | Low |
 | F-023-RQ-001 | `create [project-directory]` MUST scaffold a standalone Next.js app in under 30 seconds (excluding dependency install) | Must-Have | High |
-| F-023-RQ-002 | `activate ecommerce` MUST install the alias `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest` and inject route wrappers with `verifyPackageOnline()` | Must-Have | High |
+| F-023-RQ-002 | `activate [package]` MUST NOT install dependencies or write project files; it prints the CMS activation path (Administration → Packages) and the `NEXTBLOCK_LICENSE_KEY` headless alternative | Must-Have | Low |
 | F-024-RQ-001 | SDK MUST expose `BlockContentSchema`, `BlockData`, `BlockProps`, `BlockEditorProps`, `BlockConfig`, `LucideIcon` | Must-Have | Low |
 | F-024-RQ-002 | External block authoring MUST follow the contract shape documented in `docs/07-BLOCK-SDK-AND-EXTENSIBILITY.md` | Must-Have | Medium |
 | F-025-RQ-001 | `/api/cron/reset-sandbox` MUST run every 15 minutes with `Bearer CRON_SECRET` authorization | Must-Have | Medium |
@@ -1557,7 +1557,7 @@ graph LR
 | Shared Component | Consumers | Location |
 |:--|:--|:--|
 | Supabase clients | All server features | `libs/db/src/lib/supabase/*` |
-| `verifyPackageOnline()` | F-015, F-022, CLI-injected route wrappers | `libs/db/src/lib/package-validation.ts` |
+| `verifyPackageOnline()` | F-015, F-022, premium route wrappers in `app/cms/*` | `libs/db/src/lib/package-validation.ts` |
 | `recordMediaUpload` | F-006 | `libs/db/src/lib/media-actions.ts` |
 | `normalizeCustomerAddress` | F-015 (checkout), F-030 (users admin) | `@nextblock-cms/ecommerce` export |
 | `@nextblock-cms/ui` design system | All UI surfaces | `libs/ui` |
@@ -1664,7 +1664,7 @@ The following matrix links features to the sections of the technical specificati
 | Revalidation abuse | `REVALIDATE_SECRET_TOKEN` shared secret validation | F-027 |
 | Media upload abuse | Role gate (`ADMIN` or `WRITER`) on `recordMediaUpload` | F-006 |
 | Public data exposure | RLS policies restrict writes to authenticated roles; public read only for intended surfaces | All DB-backed features |
-| License fraud | `verifyPackageOnline()` consulted at CMS navigation, checkout API, CLI injection, and premium route wrappers | F-022 |
+| License fraud | `verifyPackageOnline()` consulted at CMS navigation, checkout API, and premium route wrappers | F-022 |
 
 ### 2.4.5 Maintenance Requirements
 
@@ -1726,7 +1726,7 @@ The following matrix links features to the sections of the technical specificati
 - `apps/nextblock/lib/blocks/blockRegistry.ts` — 15-block registry (F-004)
 - `apps/nextblock/components/theme-switcher.tsx` — Theme toggle (F-010)
 - `apps/nextblock/components/SandboxBanner.tsx`, `SandboxCredentialsAlert.tsx` — Sandbox UI (F-026)
-- `apps/create-nextblock/bin/create-nextblock.js` — CLI `create` and `activate` commands (F-023)
+- `apps/create-nextblock/bin/create-nextblock.js` — CLI `create` command (interactive + headless) and hidden `activate` signpost (F-023)
 - `libs/db/src/lib/package-validation.ts` — `verifyPackageOnline()` with 60 s cache (F-022)
 - `libs/db/src/lib/media-actions.ts` — Role-gated media recording (F-006)
 - `libs/db/src/supabase/migrations/02001_baseline_schema.sql` — `user_role`, `page_status`, `menu_location`, `revision_type` enums
@@ -2043,7 +2043,7 @@ Each library publishes an independent version to the public npm registry. The ta
 
 #### 3.3.2.1 Package Alias Convention for Premium Modules
 
-Per the known-issue enumeration in Section 1.3.3.1, `libs/ecommerce/package.json` declares the name `@nextblock-cms/ecom` while the TypeScript path alias in `tsconfig.base.json` is `@nextblock-cms/ecommerce`. This bifurcation is resolved at install time by the npm alias directive `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`, which is injected by the `create-nextblock activate ecommerce` command (F-023). This alias convention is intentional: it preserves a clean `@nextblock-cms/ecommerce` import surface in application code while keeping the published package short and branded.
+Per the known-issue enumeration in Section 1.3.3.1, `libs/ecommerce/package.json` declares the name `@nextblock-cms/ecom` while the TypeScript path alias in `tsconfig.base.json` is `@nextblock-cms/ecommerce`. This bifurcation is resolved at install time by the npm alias directive `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`, which `apps/nextblock/package.json` declares and every scaffold inherits (F-023). This alias convention is intentional: it preserves a clean `@nextblock-cms/ecommerce` import surface in application code while keeping the published package short and branded.
 
 ### 3.3.3 npm Overrides
 
@@ -3784,39 +3784,9 @@ flowchart TB
     AbortEmpty --> End
 ```
 
-### 4.9.2 Activate Command Flow
+### 4.9.2 Activate Command (retired)
 
-The `activate [module]` command currently supports only `ecommerce`. It installs the premium package via the npm alias `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest` and injects eight route wrappers that perform license-gated execution via `verifyPackageOnline('ecommerce')`.
-
-```mermaid
-flowchart TB
-    Start([npm create nextblock<br/>activate ecommerce]) --> Validate{module==<br/>ecommerce?}
-    Validate -->|No| Exit1[Exit 1]
-    Validate -->|Yes| Install[npm install<br/>@nextblock-cms/ecommerce<br/>@npm:@nextblock-cms/ecom@latest]
-    
-    Install --> Inject[Inject Route Wrappers]
-    Inject --> W1[/cms/orders/page.tsx/]
-    Inject --> W2[/cms/orders/[id]/page.tsx/]
-    Inject --> W3[/cms/products/page.tsx/]
-    Inject --> W4[/cms/products/new/page.tsx/]
-    Inject --> W5[/cms/products/[id]/edit/page.tsx/]
-    Inject --> W6[/cms/payments/page.tsx/]
-    Inject --> W7[/checkout/success/page.tsx<br/>uses notFound]
-    Inject --> W8[/api/checkout/route.ts<br/>full checkout handler]
-    
-    W1 --> Pattern
-    W2 --> Pattern
-    W3 --> Pattern
-    W4 --> Pattern
-    W5 --> Pattern
-    W6 --> Pattern
-    W7 --> Pattern
-    W8 --> Pattern
-    
-    Pattern[Each wrapper pattern:<br/>await verifyPackageOnline<br/>if not online redirect to<br/>/cms/settings/packages<br/>else return Component]
-    Pattern --> End([Module Activated])
-    Exit1 --> End
-```
+`activate [package]` is registered with `{ hidden: true }`, so `--help` does not list it. It prints how to switch on Cortex AI or Commerce Pro in the CMS (Administration → Packages, `/cms/settings/packages`: a free 30-day trial with no credit card, or a license key) and the `NEXTBLOCK_LICENSE_KEY` headless path (`apps/nextblock/lib/packages/env-license.ts`; `docs/08-NEXTBLOCK-CORTEX-AI-ARCHITECTURE.md` → "Headless bootstrap"). It runs no install and writes no file, reports premium dependencies an older project lacks and any route files an older `activate` overwrote, and exits 1 only for an unknown package name. It is kept so commander does not hand `activate` to the default `create` command and scaffold a project named `activate`. The helpers live in `apps/create-nextblock/bin/lib/activate.js`; see `docs/06-CLI-AND-SCAFFOLDING.md` → "Premium Packages" for the history of the version up to 0.21.1.
 
 ## 4.10 LICENSE GATE WORKFLOW (F-022)
 
@@ -3845,7 +3815,7 @@ flowchart TB
     End --> Consumers{Consumer Surface}
     Consumers --> C1[CMS Navigation Visibility]
     Consumers --> C2[/api/checkout/route.ts<br/>line 36]
-    Consumers --> C3[CLI-Injected<br/>Route Wrappers]
+    Consumers --> C3[Premium Route<br/>Wrappers in app/cms]
     Consumers --> C4[Package Activation<br/>activatePackage action]
 ```
 
@@ -3999,7 +3969,7 @@ flowchart LR
 - `libs/ecommerce/src/lib/currency-sync.ts` - Frankfurter FX synchronization
 - `libs/db/src/lib/package-validation.ts` - License gate with unstable_cache
 - `libs/db/src/lib/media-actions.ts` - Media upload actions with RBAC
-- `apps/create-nextblock/bin/create-nextblock.js` - CLI create + activate commands
+- `apps/create-nextblock/bin/create-nextblock.js` - CLI `create` command (interactive + headless) and hidden `activate` signpost
 - `apps/nextblock/app/actions/feedback.ts` - Feedback submission server action
 - `vercel.json` - Cron schedule declarations
 
@@ -4046,7 +4016,7 @@ NextBlock CMS is architected as an **Nx-orchestrated monorepo** that composes a 
 
 - **Server-Components-First Rendering.** The application is built on the React Server Components model introduced by the Next.js App Router. The system uses Next.js (App Router) as its application framework, React / react-dom as its UI runtime, and TypeScript under strict mode as the implementation language. Public layouts such as `apps/nextblock/app/layout.tsx` fetch cached data through `unstable_cache` and render on the server, while client islands (cart, editors, switchers) hydrate inside the provider chain declared in `apps/nextblock/app/providers.tsx`.
 
-- **Open-Core Boundary Enforcement.** The workspace is partitioned into two dependency tiers via Nx scope tags. All foundational libraries (`libs/ui`, `libs/utils`, `libs/db`, `libs/editor`, `libs/sdk`) are tagged `scope:public` and published under AGPLv3, while `libs/ecommerce` is tagged `scope:premium` and activated through a license-key-gated installation path (`@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`). The rule that `libs/ui` MUST NOT depend on `apps/nextblock` is enforced via ESLint's `@nx/enforce-module-boundaries` plugin, as documented in `.agent/skills/project-architecture/SKILL.md`, and every Nx project declares a `scope:public` or `scope:premium` tag, enabling dependency-direction enforcement between open and premium tiers.
+- **Open-Core Boundary Enforcement.** The workspace is partitioned into two dependency tiers via Nx scope tags. All foundational libraries (`libs/ui`, `libs/utils`, `libs/db`, `libs/editor`, `libs/sdk`) are tagged `scope:public` and published under AGPLv3, while `libs/ecommerce` is tagged `scope:premium`, ships in every install through the `@nextblock-cms/ecommerce` → `npm:@nextblock-cms/ecom` alias, and is switched on at runtime by a trial or license key. The rule that `libs/ui` MUST NOT depend on `apps/nextblock` is enforced via ESLint's `@nx/enforce-module-boundaries` plugin, as documented in `.agent/skills/project-architecture/SKILL.md`, and every Nx project declares a `scope:public` or `scope:premium` tag, enabling dependency-direction enforcement between open and premium tiers.
 
 - **Request-Proxy-at-the-Edge.** Rather than using the conventional `middleware.ts` convention, the application concentrates all cross-cutting request concerns into `apps/nextblock/proxy.ts`. This file is a deliberate substitute for the conventional Next.js `middleware.ts` file and consolidates six responsibilities traditionally split across middleware, layouts, and handlers.
 
@@ -4129,7 +4099,7 @@ The workspace decomposes into eight first-class components (two applications and
 | Component Name | Primary Responsibility | Key Dependencies |
 |---|---|---|
 | `apps/nextblock` (`@nextblock-cms/template`,) | Public site, CMS admin, checkout, API/cron/webhooks, proxy | All six libraries + Supabase, R2, Stripe, Freemius |
-| `apps/create-nextblock` (`create-nextblock`,) | CLI scaffolder (`create`, `activate`) | `@clack/prompts`, `commander`, `execa`, `fs-extra` |
+| `apps/create-nextblock` (`create-nextblock`,) | CLI scaffolder (`create`; hidden `activate` signpost) | `@clack/prompts`, `commander`, `execa`, `fs-extra` |
 | `libs/db` (`@nextblock-cms/db`,) | Supabase clients, migrations, package-activation gate, media actions | `@supabase/ssr`, `@supabase/supabase-js`, `postgres` |
 | `libs/ui` (`@nextblock-cms/ui`,) | Shared design system, Radix primitives, Tailwind config, styles | Radix UI, `tailwindcss`, `lucide-react` |
 | `libs/editor` (`@nextblock-cms/editor`,) | Tiptap rich-text editor, slash menu, block widgets | Tiptap 3.x, Yjs, lowlight, katex |
@@ -4148,7 +4118,7 @@ The workspace decomposes into eight first-class components (two applications and
 | `libs/editor` | Depends on `libs/ui`, `libs/utils` | Image picker bridges to CMS media pipeline |
 | `libs/sdk` | Public contract for external block authors | Narrow surface; separate from in-app `blockRegistry.ts` |
 | `libs/utils` | R2, SMTP, translation helpers | Dual client/server entrypoints |
-| `libs/ecommerce` | Stripe, Freemius, Frankfurter, Supabase | License-gated; `scope:premium`; activated post-install |
+| `libs/ecommerce` | Stripe, Freemius, Frankfurter, Supabase | License-gated; `scope:premium`; ships in every install, activated at runtime |
 
 ### 5.1.3 Data Flow Description
 
@@ -4361,7 +4331,7 @@ Narrow public contract for external block authors, defined in `README.md`: `Bloc
 
 #### 5.2.7.1 Purpose and Commands
 
-Distributed as the public `create-nextblock` npm package, it bootstraps a new NextBlock project and optionally activates premium modules. The `create [project-directory]` command (default) scaffolds a fresh project; `activate [module]` injects premium ecommerce into an existing project by rewriting route wrappers and adding dependencies. The CLI uses `@clack/prompts`, `commander`, `execa`, `chalk`, `fs-extra`, and `open`.
+Distributed as the public `create-nextblock` npm package, it bootstraps a new NextBlock project (interactive or headless). `create [project-directory]` (default) scaffolds a fresh project; a hidden `activate [package]` only prints how to activate premium packages in the CMS. The CLI uses `@clack/prompts`, `commander`, `execa`, `chalk` and `fs-extra`, and copies the Supabase assets from `@nextblock-cms/db`.
 
 #### 5.2.7.2 Template Synchronization
 
@@ -4612,7 +4582,7 @@ Selected to centralize session, RBAC, locale, CSP, page-type, and security heade
 
 #### 5.3.7.2 ADR-02: Open-core via scope tags
 
-The project publishes open libraries under AGPLv3 (`scope:public`) and ships the commerce module as `scope:premium`, activated by installing `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`. Enforcement is provided by `@nx/enforce-module-boundaries` plus the runtime gate in `verifyPackageOnline`.
+The project publishes open libraries under AGPLv3 (`scope:public`) and ships the commerce module as `scope:premium`, installed in every project through `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest` and activated at runtime by a trial or license key. Enforcement is provided by `@nx/enforce-module-boundaries` plus the runtime gate in `verifyPackageOnline`.
 
 #### 5.3.7.3 ADR-03: Vercel-native deployment (no Docker, no Terraform)
 
@@ -4914,7 +4884,7 @@ The workflow layer is organized across fifteen categories documented in Section 
 - `libs/ecommerce/src/lib/shipping/resolver.ts` — Eight-step shipping resolution algorithm
 - `libs/ecommerce/src/lib/tax-calculation.ts` — Manual + automatic tax mode dispatch
 - `libs/ecommerce/src/lib/currency-sync.ts` — Frankfurter FX synchronization
-- `apps/create-nextblock/bin/create-nextblock.js` — CLI create + activate commands
+- `apps/create-nextblock/bin/create-nextblock.js` — CLI `create` command (interactive + headless) and hidden `activate` signpost
 - `package.json` — Dependency versions
 - `vercel.json` — Cron schedule declarations
 - `nx.json` — Nx orchestration configuration
@@ -8112,7 +8082,7 @@ The security control matrix below enumerates the principal threats, their mitiga
 | Sandbox reset abuse | Dual-guard: `NEXT_PUBLIC_IS_SANDBOX==='true'` + `CRON_SECRET` | `/api/cron/reset-sandbox/route.ts` |
 | Revalidation abuse | `x-revalidate-secret` header equality | `/api/revalidate/route.ts` |
 | Media upload abuse | Role gate (ADMIN/WRITER) + 10MB cap + 300s TTL + path sanitization | `/api/upload/presigned-url/route.ts` |
-| License fraud | `verifyPackageOnline()` at CMS nav, checkout API, CLI injection, premium wrappers (60s cache, fail-closed) | `libs/db/src/lib/package-validation.ts` |
+| License fraud | `verifyPackageOnline()` at CMS nav, checkout API, premium route wrappers (60s cache, fail-closed) | `libs/db/src/lib/package-validation.ts` |
 | Unauthenticated DB access via client | Client uses anon key only; RLS as primary control | `libs/db/src/lib/supabase/client.ts` |
 | Debug log leakage in production | `compiler.removeConsole` strips `console.log`; preserves `warn`/`error` | `apps/nextblock/next.config.js` |
 
@@ -11792,7 +11762,7 @@ The `create-nextblock` CLI offers the primary entry points detailed in Section 4
 | Command | Purpose |
 |:--|:--|
 | `create` (default) | Scaffold a new NextBlock project with interactive prompts |
-| `activate` | Validate and register a premium package activation |
+| `activate` (hidden) | Prints how to activate a premium package in the CMS; changes nothing |
 
 Cross-reference: Section 4.9 (CLI Scaffolding Workflows), Section 4.10 (License Gate Workflow).
 

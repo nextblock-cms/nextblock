@@ -19,6 +19,11 @@ interface GridPaginationProps {
    * `?page=N` and the server renders that page.
    */
   onNavigate: (page: number) => void;
+  /**
+   * The grid's HTML id. Appended as `#anchor` so a page opened in a new tab or without
+   * JavaScript lands on the grid, not the top of the page. Plain clicks never follow the href.
+   */
+  anchor?: string;
   size?: 'default' | 'sm';
   className?: string;
 }
@@ -38,13 +43,15 @@ export default function GridPagination({
   totalPages,
   isLoading,
   onNavigate,
+  anchor,
   size = 'default',
   className,
 }: GridPaginationProps) {
   const label = useLabel();
   const pathname = usePathname() || '/';
 
-  const hrefFor = (page: number) => (page <= 1 ? pathname : `${pathname}?page=${page}`);
+  const hash = anchor ? `#${anchor}` : '';
+  const hrefFor = (page: number) => `${page <= 1 ? pathname : `${pathname}?page=${page}`}${hash}`;
 
   const renderControl = (page: number, rel: 'prev' | 'next', children: React.ReactNode) => {
     const disabled = page < 1 || page > totalPages || isLoading;

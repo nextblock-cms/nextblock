@@ -99,11 +99,20 @@ npm run docker:setup    # one-click local Docker stack
 npm run update          # pull the latest NextBlock framework code as a 3-way merge
 ```
 
-## Premium modules
+## Premium packages
 
-The CMS is free forever. **Cortex AI** (in-editor AI, the site builder, and the MCP server)
-and **Commerce Pro** (Stripe and Freemius storefront) are paid licenses with a 30-day,
-no-card trial you can start from the dashboard or headlessly as above.
+NextBlock CMS is free and open source (AGPL-3.0). Two premium packages exist today, and
+more may follow: **Cortex AI** (in-editor AI, the site builder, and the MCP server) and
+**Commerce Pro** (Stripe and Freemius storefront, orders, coupons, tax, and shipping).
+Every project already contains their code, so there is nothing to install. Each is a paid
+license with a free 30-day trial, no credit card required, which you start (or activate
+with a key you already have) in the CMS under **Administration → Packages**. A headless
+install can request the Cortex AI trial for you (`--name` / `--email`) or activate a
+Cortex AI key you already hold with `--license-key`. Details:
+<https://github.com/nextblock-cms/nextblock/blob/master/docs/06-CLI-AND-SCAFFOLDING.md#premium-packages>
+
+Older instructions mention `npx create-nextblock activate ecommerce`. That command no
+longer installs anything; it only prints these steps.
 
 ## Requirements
 

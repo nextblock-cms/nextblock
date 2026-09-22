@@ -26,7 +26,7 @@ credentials from these services, so have them ready:
 ```bash
 npm install
 npm run setup            # prints the next steps — it asks nothing
-npx nx serve nextblock   # then open http://localhost:4200/setup
+npm run dev              # = npx nx serve nextblock; then open http://localhost:4200/setup
 ```
 
 `npm run setup` (`tools/scripts/setup.mjs`) is **informational only**. It writes
@@ -52,19 +52,21 @@ reference template for a manual `.env.local`.
 
 ### First login
 
-`npx nx serve nextblock` serves the app at **http://localhost:4200** (the target
-runs `next dev --port 4200`). Open `/sign-up` and register: the **first**
-account to sign up is automatically promoted to **ADMIN** by a database trigger
-(`handle_new_user`). Email confirmation is enabled by default, so click the
-confirmation link (delivered through the SMTP you configured) — or confirm the
-user manually in Supabase → Authentication → Users. After signing in you land in
-the CMS at `/cms/dashboard`. Every later sign-up gets the `USER` role.
+`npm run dev` (the root alias for `npx nx serve nextblock`) serves the app at
+**http://localhost:4200** (the target runs `next dev --port 4200`). Run it from the
+repo root: `npm run dev` inside `apps/nextblock` is the standalone scaffold's plain
+`next dev` (port 3000) and does not read the root `.env.local`. The wizard's last
+step creates the first administrator with the email already confirmed
+(`lib/setup/provision-admin.ts`), and the `handle_new_user` database trigger
+promotes that first account to **ADMIN**. You are signed in and land on the
+Cortex AI welcome offer (`/cms/welcome`), one click away from `/cms/dashboard`.
+Every later sign-up gets the `USER` role.
 
 ## Common Commands
 
 ### App and library workflows
 
-- `npx nx serve nextblock`: start the main app in development
+- `npm run dev` (= `npx nx serve nextblock`): start the main app in development
 - `npm run lint`: run Nx lint targets across the workspace
 - `npm run nx:lint:nextblock`: lint the main app only
 - `npm run nx:lint:create-nextblock`: lint the CLI app only

@@ -193,6 +193,9 @@ export const fallbackBlockSchemas: Record<BlockType, z.ZodTypeAny> = {
     width: z.number().nullable().optional(),
   }),
   posts_grid: z.object({
+    // The grid's HTML id (`#anchor` links); empty means 'latest'. Mirrors the app's
+    // POSTS_GRID_ANCHOR_PATTERN (apps/nextblock/lib/blocks/posts-grid-anchor.ts).
+    anchor: z.string().regex(/^([a-z][a-z0-9-]{0,63})?$/).optional(),
     columns: z.number().min(1).max(6),
     postsPerPage: z.number().min(1).max(50),
     showPagination: z.boolean(),

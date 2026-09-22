@@ -3,6 +3,7 @@ import { TestimonialBlockConfig, TestimonialBlockContent } from '../../component
 import { ProductGridBlockSchema, ProductGridBlockContent, FeaturedProductBlockSchema, FeaturedProductBlockContent, CartBlockSchema, CartBlockContent, CheckoutBlockSchema, CheckoutBlockContent, ProductDetailsBlockSchema, ProductDetailsBlockContent } from './ecommerce-block-schemas';
 import { availableBlockTypes, type BlockType } from './blockTypes';
 import { isCustomCssColor, TEXT_COLOR_TOKENS } from './blockColors';
+import { POSTS_GRID_ANCHOR_PATTERN } from './posts-grid-anchor';
 export { availableBlockTypes, type BlockType } from './blockTypes';
 
 /**
@@ -93,6 +94,7 @@ export const PostsGridBlockSchema = z.object({
   columns: z.number().min(1).max(6).describe('Number of columns'),
   showPagination: z.boolean().describe('Whether to show pagination'),
   title: z.string().optional().describe('Optional title'),
+  anchor: z.string().regex(POSTS_GRID_ANCHOR_PATTERN).optional().describe("Optional HTML id (lowercase letters, digits, hyphens; starts with a letter) so buttons can link to the grid with #anchor. Empty means 'latest'. Give each grid on a page its own anchor."),
 });
 export type PostsGridBlockContent = z.infer<typeof PostsGridBlockSchema>;
 
@@ -394,6 +396,7 @@ export const blockRegistry: Record<BlockType, BlockDefinition> = {
         'Grid automatically adapts to smaller screens',
         'Posts are filtered by current language',
         'Pagination improves performance for large post collections',
+        'Renders id="latest" (or its anchor), so /articles#latest scrolls to the grid',
       ],
     },
   },

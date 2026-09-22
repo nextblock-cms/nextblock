@@ -62,7 +62,8 @@ Today that gate is used directly in the app for things like:
 
 - CMS ecommerce navigation visibility.
 - The checkout API.
-- Premium route wrappers and CLI module activation flows.
+- Premium route wrappers (`app/cms/orders`, `products`, `payments`, `coupons`, …), which redirect to
+  `/cms/settings/packages` while the package is inactive.
 
 If a package gate and the actual route behavior disagree, the route file wins.
 

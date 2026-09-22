@@ -19,6 +19,8 @@ interface PostsGridClientProps {
   columns: number;
   languageId: number;
   showPagination: boolean;
+  /** The grid's HTML id (see `lib/blocks/posts-grid-anchor.ts`), appended to `?page=N` links. */
+  anchor?: string;
   fetchAction: (languageId: number, page: number, limit: number) => Promise<{ posts: PostWithMediaDimensions[], totalCount: number, error?: string }>;
 }
 
@@ -33,6 +35,7 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
   columns,
   languageId,
   showPagination,
+  anchor,
   fetchAction,
 }) => {
   const { currentLocale } = useLanguage();
@@ -181,6 +184,7 @@ const PostsGridClient: React.FC<PostsGridClientProps> = ({
           currentPage={currentPage}
           totalPages={totalPages}
           isLoading={isLoading}
+          anchor={anchor}
           onNavigate={(page) => void handlePageChange(page)}
         />
       )}

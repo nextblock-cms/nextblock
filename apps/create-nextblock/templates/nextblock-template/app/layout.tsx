@@ -2,6 +2,7 @@ import '@nextblock-cms/ui/styles/globals.css';
 // app/layout.tsx
 
 import type { Metadata, Viewport } from 'next';
+import { cache } from 'react';
 import Script from 'next/script';
 import { Providers } from './providers';
 import { DeferredCartDrawer } from '../components/DeferredCartDrawer';
@@ -40,7 +41,9 @@ import {
   DEFAULT_OG_IMAGE_WIDTH,
   DEFAULT_OG_IMAGE_HEIGHT,
 } from './lib/seo';
-import { resolveActiveLogo } from '../lib/logos/active-logo';
+import { getCachedActiveLogo, type HeaderLogo } from '../lib/logos/cached-active-logo';
+import { appIconHref, brandNameFromTitle } from '../lib/branding/app-icon';
+import { loadAppIconContext } from '../lib/branding/app-icon-context';
 import { compactTranslationsForLocale } from '../lib/i18n/slim-translations';
 import {
   isSupabaseConfigured,
@@ -63,7 +66,6 @@ const DEFAULT_LOCALE_FOR_LAYOUT = 'en';
 // or path, so the TTL only bounds direct database edits, and a cold entry is a
 // sequential Supabase round trip inside the request on Vercel.
 const PUBLIC_LAYOUT_REVALIDATE_SECONDS = 300;
-const PUBLIC_LAYOUT_LOGO_CACHE_TAG = 'public-layout-logo';
 const TRUSTED_TYPES_SCRIPT_STRATEGY =
   process.env.NODE_ENV === 'production' ? 'beforeInteractive' : 'afterInteractive';
 const TRUSTED_TYPES_BOOTSTRAP = `
@@ -85,9 +87,13 @@ type Language = Database['public']['Tables']['languages']['Row'];
 type StoreCurrency = Database['public']['Tables']['currencies']['Row'];
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 type MenuLocation = Database['public']['Enums']['menu_location'];
-type HeaderLogo = Database['public']['Tables']['logos']['Row'] & {
-  media: Database['public']['Tables']['media']['Row'] | null;
-};
+
+// The site themes, read once per request: generateViewport (theme-color), generateMetadata
+// (the app icon's version hashes the background) and the layout body all need them, and on
+// Vercel every `unstable_cache` read is a Data Cache round trip.
+const getRequestSiteThemes = cache(async (): Promise<SiteTheme[]> =>
+  isSupabaseConfigured() ? getCachedSiteThemes().catch(() => [] as SiteTheme[]) : []
+);
 
 const getCachedLanguages = unstable_cache(
   async (): Promise<Language[]> => {
@@ -294,22 +300,6 @@ const getCachedNavigationMenu = unstable_cache(
   { revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS }
 );
 
-const getCachedActiveLogo = unstable_cache(
-  async (): Promise<HeaderLogo | null> => {
-    try {
-      const supabase = createStaticSupabaseClient();
-      // Honor the admin-pinned active logo (site_settings.active_logo_id), else newest.
-      const logo = await resolveActiveLogo(supabase);
-      return (logo as HeaderLogo | null) ?? null;
-    } catch (error) {
-      console.error('Error fetching cached active logo:', error);
-      return null;
-    }
-  },
-  ['public-layout-logo'],
-  { revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS, tags: [PUBLIC_LAYOUT_LOGO_CACHE_TAG] }
-);
-
 async function loadLayoutData() {
   const headerList = await headers();
   const nonce = headerList.get('x-nonce') || '';
@@ -384,7 +374,7 @@ async function loadLayoutData() {
       en: '(c) {year} Nextblock CMS. All rights reserved.',
     })),
     getCachedGlobalCss().catch(() => ''),
-    getCachedSiteThemes().catch(() => [] as SiteTheme[]),
+    getRequestSiteThemes(),
     getCachedSiteScripts().catch(() => [] as SiteScript[]),
     getCachedTranslations().catch(() => []),
     verifyPackageOnline('ecommerce').catch(() => false),
@@ -395,6 +385,7 @@ async function loadLayoutData() {
     // Locale-independent reads belong in this first wave: on Vercel each cached read
     // is a Data Cache round trip, and these three used to run one after another
     // AFTER the second wave, adding ~3 sequential hops to every public request.
+    // The logo read is shared (React cache) with generateMetadata's app icon.
     getCachedActiveLogo().catch(() => null),
     getSiteSettings(),
     getCachedFooterAttribution().catch(() => true),
@@ -472,9 +463,7 @@ async function loadLayoutData() {
 // own `<meta name="viewport">` as well, so every page shipped the tag twice. The colour is
 // the default theme's background; `ThemeColorSync` follows the visitor's own theme choice.
 export async function generateViewport(): Promise<Viewport> {
-  const themes = isSupabaseConfigured()
-    ? await getCachedSiteThemes().catch(() => [] as SiteTheme[])
-    : ([] as SiteTheme[]);
+  const themes = await getRequestSiteThemes();
 
   return {
     initialScale: 1,
@@ -484,7 +473,10 @@ export async function generateViewport(): Promise<Viewport> {
 }
 
 export async function generateMetadata(): Promise<Metadata> {
-  const { siteTitle, siteDescription, siteKeywords, socialImage } = await getSiteSettings();
+  const [{ siteTitle, siteDescription, siteKeywords, socialImage }, appIcon] = await Promise.all([
+    getSiteSettings(),
+    loadAppIconContext(getRequestSiteThemes()),
+  ]);
   const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
   // The site-wide preview image from the Branding screen, else NextBlock's own banner.
   const defaultSocialImage = socialImage
@@ -525,10 +517,15 @@ export async function generateMetadata(): Promise<Metadata> {
         { url: '/favicon/favicon-16x16.png', sizes: '16x16', type: 'image/png' },
         { url: '/favicon/favicon-32x32.png', sizes: '32x32', type: 'image/png' },
       ],
-      apple: [{ url: '/favicon/apple-touch-icon.png' }],
+      // The iOS home-screen icon: rendered from the active logo on the theme background
+      // (app/api/brand/app-icon), or the static NextBlock icon when there is no custom logo.
+      // The favicons above stay static: a wordmark is illegible at 16 or 32 pixels.
+      apple: [{ url: appIconHref('apple-180', appIcon.source), sizes: '180x180', type: 'image/png' }],
     },
-    // Served by app/manifest.ts: the site's own name and theme colours instead of the static
-    // file, whose `name` was empty and whose icon paths pointed at files that do not exist.
+    // iOS otherwise suggests the page <title> ("Page | Brand") as the home-screen label.
+    // `capable: false` leaves how the app opens to the manifest's `display`.
+    appleWebApp: { capable: false, title: brandNameFromTitle(siteTitle) },
+    // Served by app/manifest.ts: the site's brand name, theme colours and logo icons.
     manifest: '/manifest.webmanifest',
     // Sandbox is a copy of production, so keep it out of the index. Use
     // `noindex, follow` (not nofollow) so Googlebot still follows internal links,

@@ -129,7 +129,7 @@ Known incomplete or future work:
 | `apps/nextblock/app/cms/settings/cortex-ai/actions.ts` | Server actions for reading, saving, and clearing BYOK keys and model selections. |
 | `apps/nextblock/app/cms/settings/cortex-ai/setup/` | The first-run wizard (`page.tsx`, `CortexSetupWizard.tsx`, `actions.ts`, `SiteBriefForm.tsx` + `brief-actions.ts` for the Brief step) — see "First-run setup wizard" below. |
 | `apps/nextblock/lib/cortex-ai/setup-state.ts` + `setup-status.ts` | Pure `deriveCortexSetupState` (when the wizard is owed) and the server loader the settings page, the wizard, and the CMS layout share. |
-| `apps/nextblock/app/cms/settings/cortex-ai/mcp-client-snippets.ts` | The one builder for the Claude Code / Claude Desktop / Cursor / VS Code MCP configs, used by the MCP card and the wizard. |
+| `apps/nextblock/app/cms/settings/cortex-ai/mcp-client-snippets.ts` | The one builder for the Claude Code / Claude Desktop / Codex / Cursor / VS Code MCP configs, used by the MCP card and the wizard. |
 | `libs/cortex/src/lib/ai-key-verification.ts` | Live checks of an OpenRouter, Pexels, or Unsplash key against its provider before it is stored. |
 | `apps/nextblock/app/cms/dashboard/actions.ts` | Dashboard package state; checks `cortex-ai` to hide/show AI premium CTA. |
 | `apps/nextblock/components/Header.tsx` and `apps/nextblock/components/ResponsiveNav.tsx` | Hydration-safe public header controls after Radix ID mismatch fixes. |
@@ -1351,7 +1351,7 @@ Unsplash has strict usage rules; Pexels' license is permissive (attribution opti
 
 Cortex AI is dual-access. Alongside the in-app BYOK path (dashboard chat + inline
 editor), the same tool registry is exposed over the **Model Context Protocol** at
-`/api/mcp`, so Claude Code, Claude Desktop, Cursor, and VS Code can operate the CMS
+`/api/mcp`, so Claude Code, Claude Desktop, Codex, Cursor, and VS Code can operate the CMS
 from inside the editor.
 
 ### Files
@@ -1619,6 +1619,17 @@ and the first-run wizard):
 - **Claude Desktop** — `claude_desktop_config.json` is stdio-only, so a remote server
   needs either the Connectors UI (which dials out from Anthropic's cloud, so localhost
   and firewalled sites will not connect) or the `mcp-remote` stdio bridge.
+- **Codex** (OpenAI's coding agent, included with every ChatGPT plan; the ChatGPT desktop
+  app's Codex mode, the Codex CLI and the IDE extension share `~/.codex/config.toml`) — TOML
+  `[mcp_servers.nextblock]` with `url`, plus `http_headers` (or `bearer_token_env_var`) for the
+  token. It runs on the user's machine, so localhost trust works too.
+
+Clients that cannot connect today, because `/api/mcp` takes a static bearer token and has no
+OAuth path: the **ChatGPT** web and desktop *chat* (developer-mode apps accept OAuth or no auth
+only and cannot send an API key), the consumer **Gemini app** and **Gemini Enterprise** (OAuth
+or no auth only). Gemini CLI (`httpUrl` + `headers`) works technically but, since 2026-06-18,
+only with a paid Gemini API key or a Code Assist Standard/Enterprise license. The public copy
+therefore names Claude Code, Codex, Cursor and VS Code.
 
 ### Directory listings (official MCP Registry, Glama, Smithery, Docker, one-URL directories)
 
@@ -1742,22 +1753,31 @@ tools cannot read token hashes or insert rows.
 
 ### Marketing surfaces that describe the MCP server
 
-Three seeded content rows sell the MCP story and are kept at 100/100 in the built-in SEO
-engine (`libs/utils/src/lib/seo`). Migration `libs/db/src/supabase/migrations/02004_baseline_seed.sql` (originally `00000000000037_reposition_marketing_and_cortex_mcp`, folded in by the generation-2 squash)
-owns them; the sandbox reset route (`enrichCortexAiProducts`) mirrors the product sections
-because it deletes and re-inserts product blocks after the SQL replay, so edit both together.
+These content rows sell the MCP story and are kept at 100/100 in the built-in SEO engine
+(`libs/utils/src/lib/seo`). The pages and posts are seed content (`02004_baseline_seed.sql`, then
+forward copy migrations such as `02018` and `02019`). The Cortex AI license product is vendor-only
+(nextblock.dev and the sandbox; fresh installs have no products): its EN + FR copy lives in
+`apps/nextblock/app/api/cron/reset-sandbox/cortex-product-copy.ts`, which the sandbox reset
+(`enrichCortexAiProducts`) re-inserts after every SQL replay and which `02019` applied to
+nextblock.dev. Edit that module and ship the same sections in a forward migration together.
 
 | Surface | Focus keyphrase (type it into the audit panel; it is not persisted) | Body format |
 | :-- | :-- | :-- |
-| Home page `home` (EN) — hero, "why" (seven-row prototype-tools-vs-NextBlock chart + pricing tiles), "how MCP works", Cortex promo sections | `AI website builder CMS` | styled HTML in `section` → `text` blocks; 040 added the chart, 041 put the pricing message on every section: CMS free forever, Cortex AI (in-editor AI + MCP server) is the one paid license with a 30-day no-card trial, "deploy to Vercel in one click, up in ten minutes" |
-| Product `nextblock-cortex-ai-cortex-ai-license` (EN) | `Cortex AI MCP server` | styled HTML in five `section` blocks; title "NextBlock™ Cortex AI MCP Server & AI Editor License" (041 — never "copilot", the product is Cortex AI) |
+| Home page `home` (EN) — hero, "why" (seven-row prototype-tools-vs-NextBlock chart + pricing tiles), "how MCP works", Cortex promo sections | `AI website builder CMS` | styled HTML in `section` → `text` blocks; 040 added the chart, 041 the pricing message (CMS free forever, deploy to Vercel in one click); since 02019 the licensing is open-handed: Cortex AI and Commerce Pro are optional premium modules, each with a 30-day no-card trial, and more may follow — never "the one paid license" |
+| Product `nextblock-cortex-ai-cortex-ai-license` (EN) / `-fr` (FR) | `Cortex AI MCP server` / `serveur MCP Cortex AI` | styled HTML in five `section` blocks from `cortex-product-copy.ts` (the FR sections translate the EN ones with the same layout); never "copilot", the product is Cortex AI |
 | Post `cortex-ai-mcp-connection-guide` (EN) | `connect Claude to NextBlock CMS` | styled HTML in one `text` block: comparison chart, a CSS/HTML flow diagram (four cards, `not-prose`), terminal panels; 037 seeded a plain Tiptap doc, 038 replaced it with a rasterised diagram, 041 replaced that with the CSS version and retired the media row |
 | Articles page `articles` (EN + FR) | none set (grades 100 without; EN also 100 with `NextBlock Journal`) | short hero + `posts_grid` + a "What the journal covers" section with four topic cards below the grid (041 moved the ~300-word essay out of the hero) |
 | Posts `how-nextblock-works` / `comment-nextblock-fonctionne` | none set (both grade 100) | styled HTML; 042 replaced the `extensibility.webp` figure with a CSS/HTML architecture diagram (core hub with the site logo, four spokes, three panels, stack strip, tagline) built inside the text block — the image file and media row stay because the sandbox reset registers it as a core asset |
 
-The copy names only the five contract tools above plus the real transport and auth rules
-(Streamable HTTP, bearer tokens, localhost trust in development, Live Draft staging). If any
-of those change, the product page and the guide are the two places that go stale.
+The copy names the contract aliases plus the real transport and auth rules (Streamable HTTP,
+bearer tokens, localhost trust in development, Live Draft staging for page rewrites): six aliases
+(`create_page_layout` included) and 50 typed tools; over MCP only `generate_jsonb_layout` stages a
+Live Draft, `create_page_layout` saves drafts unless asked to publish, and other write tools can
+publish or edit live content, so the controls are the token scope and the client's tool approval.
+Clients: `/api/mcp` takes a static bearer token and has no OAuth path, so the copy names Claude
+Code, Codex (included with ChatGPT plans), Cursor and VS Code, and says the ChatGPT web chat and
+the Gemini app cannot connect yet (they only add OAuth or no-auth servers). If any of this
+changes, the product copy module, the guide and the home page are the places that go stale.
 
 ## Advanced Agent Settings
 

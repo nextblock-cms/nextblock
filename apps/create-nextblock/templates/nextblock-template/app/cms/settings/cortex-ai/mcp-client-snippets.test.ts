@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MCP_TOKEN_PLACEHOLDER, buildMcpClientSnippets } from './mcp-client-snippets';
+import { MCP_CLIENTS, MCP_TOKEN_PLACEHOLDER, buildMcpClientSnippets } from './mcp-client-snippets';
 
 const url = 'https://example.com/api/mcp';
 
@@ -28,6 +28,24 @@ describe('buildMcpClientSnippets', () => {
     const vscode = JSON.parse(snippets.vscode);
     expect(vscode.servers.nextblock.headers.Authorization).toBe('Bearer ${input:nextblockToken}');
     expect(vscode.inputs[0].password).toBe(true);
+    // Codex reads TOML (~/.codex/config.toml), not JSON.
+    expect(snippets.codex).toBe(
+      [
+        '[mcp_servers.nextblock]',
+        `url = "${url}"`,
+        'http_headers = { "Authorization" = "Bearer nb_abc" }',
+      ].join('\n')
+    );
+  });
+
+  it('lists Codex as a client', () => {
+    expect(MCP_CLIENTS).toContainEqual(['codex', 'Codex (ChatGPT plans)']);
+  });
+
+  it('escapes the Codex TOML strings', () => {
+    const snippets = buildMcpClientSnippets({ token: 'a"b\\c', url, usesLocalhostTrust: false });
+
+    expect(snippets.codex).toContain('http_headers = { "Authorization" = "Bearer a\\"b\\\\c" }');
   });
 
   it('offers the Claude Code VS Code extension its dialog fields', () => {
@@ -49,6 +67,7 @@ describe('buildMcpClientSnippets', () => {
     const snippets = buildMcpClientSnippets({ token: null, url, usesLocalhostTrust: false });
 
     expect(snippets.claudeCodeCli).toContain(MCP_TOKEN_PLACEHOLDER);
+    expect(snippets.codex).toContain(`"Bearer ${MCP_TOKEN_PLACEHOLDER}"`);
   });
 
   it('sends no Authorization header at all under localhost trust', () => {
@@ -67,5 +86,6 @@ describe('buildMcpClientSnippets', () => {
     });
     expect(JSON.parse(snippets.claudeDesktop).mcpServers.nextblock.args).not.toContain('--header');
     expect(snippets.claudeCodeCli).not.toContain('Authorization');
+    expect(snippets.codex).toBe('[mcp_servers.nextblock]\nurl = "http://localhost:4200/api/mcp"');
   });
 });

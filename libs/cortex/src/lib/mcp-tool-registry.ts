@@ -15,7 +15,7 @@ import type { CortexAiMcpScope } from './mcp-tokens';
  *
  *   1. JSON Schema. MCP `tools/list` transmits raw JSON Schema; the registry stores Zod.
  *   2. Scopes. A read-only token must not even *see* the mutating tools.
- *   3. Aliases. The MCP contract names five tools that already exist here under
+ *   3. Aliases. The MCP contract names six tools that already exist here under
  *      different names (see CORTEX_MCP_TOOL_ALIASES).
  *   4. MCP result envelopes (`content` / `isError` / `structuredContent`).
  */

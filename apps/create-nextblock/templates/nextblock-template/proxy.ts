@@ -90,6 +90,12 @@ function isSetupAllowlisted(pathname: string): boolean {
     // /setup the optimizer would receive a redirect instead of image bytes and the logo
     // would render broken ("isn't a valid image … received null"). Always serve them.
     pathname.startsWith('/images/') ||
+    // The web app manifest and the public brand images (app icons, the auth-email logo).
+    // Browsers fetch the manifest and its icons without cookies, so while no admin exists
+    // the gate would answer them with the wizard's HTML; each route already falls back to
+    // the static NextBlock assets on its own.
+    pathname === '/manifest.webmanifest' ||
+    pathname.startsWith('/api/brand/') ||
     // Crawler-facing static routes: keep them reachable while unprovisioned so a fresh
     // deploy never redirects robots.txt / the sitemap to /setup (which would let crawlers
     // treat the wizard as the canonical entry point).

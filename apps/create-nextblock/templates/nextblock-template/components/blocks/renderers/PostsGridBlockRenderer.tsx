@@ -9,6 +9,7 @@ type PostsGridBlockContent = {
     postsPerPage?: number;
     columns?: number;
     showPagination?: boolean;
+    anchor?: string;
 };
 
 interface PostsGridBlockRendererProps {

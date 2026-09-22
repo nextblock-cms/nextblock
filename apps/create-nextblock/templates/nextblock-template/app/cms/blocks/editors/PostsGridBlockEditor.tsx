@@ -3,12 +3,18 @@ import React from 'react';
 import { BlockEditorProps } from '../components/BlockEditorModal';
 import { Input } from '@nextblock-cms/ui';
 import { Label } from '@nextblock-cms/ui';
+import {
+  DEFAULT_POSTS_GRID_ANCHOR,
+  resolvePostsGridAnchor,
+  sanitizePostsGridAnchorInput,
+} from '../../../../lib/blocks/posts-grid-anchor';
 
 interface PostsGridBlockContent {
   title?: string;
   postsPerPage?: number;
   columns?: number;
   showPagination?: boolean;
+  anchor?: string;
 }
 
 const PostsGridBlockEditor: React.FC<BlockEditorProps<PostsGridBlockContent>> = ({ content, onChange }) => {
@@ -59,6 +65,24 @@ const PostsGridBlockEditor: React.FC<BlockEditorProps<PostsGridBlockContent>> = 
           min="1"
           max="6"
         />
+      </div>
+
+      <div>
+        <Label htmlFor="posts-grid-anchor">Anchor ID</Label>
+        <Input
+          id="posts-grid-anchor"
+          value={content.anchor ?? ''}
+          onChange={(e) => handleChange('anchor', sanitizePostsGridAnchorInput(e.target.value))}
+          placeholder={DEFAULT_POSTS_GRID_ANCHOR}
+          aria-describedby="posts-grid-anchor-hint"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        {/* The resolved id, not the raw value, so the hint always matches what the page renders. */}
+        <p id="posts-grid-anchor-hint" className="mt-1 text-xs text-muted-foreground">
+          Links jump here with <span className="font-mono">#{resolvePostsGridAnchor(content.anchor)}</span>.
+          Give each grid on a page its own ID.
+        </p>
       </div>
       
       <p className="text-sm">

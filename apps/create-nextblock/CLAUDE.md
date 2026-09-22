@@ -1,14 +1,16 @@
 # apps/create-nextblock — scaffolding CLI
 
 Plain-JavaScript ESM CLI published as `create-nextblock` (`npm create nextblock`). No build
-step; `lint` is its only `project.json` target. Tests: `npx vitest run apps/create-nextblock/bin/lib/headless.test.js`.
+step; `lint` is its only `project.json` target. Tests: `npx vitest run apps/create-nextblock/bin/lib`.
 Running from source needs the CLI's own deps: `npm install --prefix apps/create-nextblock`
 (they are not hoisted to the root; without them `npm run test-create` dies on `@clack/prompts`).
 
 - `bin/create-nextblock.js`: `create [dir]` (cloud or Docker profile; `--yes` = cloud + default
   name; `--non-interactive --name --email [--mode docker|cloud]` = the headless agent path, see
-  `docs/06`) and `activate ecommerce`. At scaffold time it derives `next.config.js` from the
-  app's own file with anchored patches (`bin/lib/next-config.js`; `next-config.test.js` runs them
+  `docs/06`); `activate` is a hidden command that only prints how to switch on a premium package
+  in the CMS (`bin/lib/activate.js`): it never runs npm or writes a file, and stays registered so
+  commander does not scaffold a project named "activate". At scaffold time the CLI derives
+  `next.config.js` from the app's own file with anchored patches (`bin/lib/next-config.js`; `next-config.test.js` runs them
   against `apps/nextblock/next.config.js`, so an app change that removes an anchor fails the test
   instead of shipping a stale config) and still writes `tailwind.config.js` from a string
   template (`tsconfig.json` and `package.json` are patched in place), so changes to

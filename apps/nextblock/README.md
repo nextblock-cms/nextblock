@@ -25,7 +25,7 @@ look at generated template output.
 From the repo root:
 
 ```bash
-npx nx serve nextblock
+npm run dev          # = npx nx serve nextblock, http://localhost:4200
 npx nx build nextblock
 npx nx lint nextblock --skip-nx-cache
 ```

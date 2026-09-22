@@ -32,6 +32,12 @@ import {
   writeAgentGuardrails,
   writeAgentMcpConfigs,
 } from './lib/headless.js';
+import {
+  buildActivationGuide,
+  findLegacyActivateWrappers,
+  findMissingPremiumDependencies,
+  resolvePremiumPackages,
+} from './lib/activate.js';
 import { patchNextConfigForStandalone } from './lib/next-config.js';
 import { STANDALONE_ESLINT_CONFIG } from './lib/eslint-config.js';
 import { FALLBACK_OVERRIDES } from './lib/fallback-overrides.js';
@@ -100,9 +106,11 @@ program
   .option('--no-trial', 'Headless: do not request a Cortex AI trial key')
   .action(handleCommand);
 
+// Hidden signpost (bin/lib/activate.js). Without it commander would hand `activate` to the
+// default `create` command and scaffold a project named "activate".
 program
-  .command('activate [module]')
-  .description('Activate a premium NextBlock™ CMS module')
+  .command('activate [package]', { hidden: true })
+  .description('Removed: prints how to activate Cortex AI or Commerce Pro in the CMS (installs nothing)')
   .action(handleActivateCommand);
 
 await program.parseAsync(process.argv).catch((error) => {
@@ -592,287 +600,27 @@ async function handleHeadlessCommand(projectDirectory, options) {
   }
 }
 
-async function handleActivateCommand(moduleName) {
-  if (!moduleName || moduleName !== 'ecommerce') {
-    console.error(
-      chalk.red('Invalid module name. Supported modules: ecommerce'),
-    );
+// Signpost only (see bin/lib/activate.js): never installs, never writes a file. Exits 1 only
+// for a name that is not a premium package.
+async function handleActivateCommand(packageName) {
+  const resolved = resolvePremiumPackages(packageName);
+  if (!resolved.ok) {
+    console.error(chalk.red(resolved.message));
     process.exit(1);
   }
 
-  clack.intro(`🚀 Activating NextBlock™ module: ${moduleName}`);
-
-  const projectPath = process.cwd();
-
-  // 1. Install NPM package
-  clack.note(`Installing @nextblock-cms/${moduleName}...`);
-
-  await execa(
-    'npm',
-    ['install', `@nextblock-cms/ecommerce@npm:@nextblock-cms/ecom@latest`],
-    { cwd: projectPath, stdio: 'inherit' },
-  );
-  clack.note('NPM package installed!');
-
-  // 2. Inject Route Wrappers
-  clack.note('Injecting route wrappers...');
-
-  const routesToInject = {
-    'app/cms/orders/page.tsx': `import { OrdersPage as OrdersPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function OrdersPage() {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <OrdersPageUI />;
-}`,
-    'app/cms/orders/[id]/page.tsx': `import { OrderDetailPage as OrderDetailPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function OrderDetailPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-  const resolvedParams = await params;
-  return <OrderDetailPageUI params={resolvedParams} />;
-}`,
-    'app/cms/products/page.tsx': `import { ProductsPage as ProductsPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function ProductsPage() {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <ProductsPageUI />;
-}`,
-    'app/cms/products/new/page.tsx': `import { NewProductPage as NewProductPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function NewProductPage() {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <NewProductPageUI />;
-}`,
-    'app/cms/products/[id]/edit/page.tsx': `import { EditProductPage as EditProductPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function EditProductPage({ params }: { params: Promise<{ id: string }> }) {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  const resolvedParams = await params;
-  return <EditProductPageUI params={resolvedParams} />;
-}`,
-    'app/cms/payments/page.tsx': `import { PaymentsPage as PaymentsPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function PaymentsPage() {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <PaymentsPageUI />;
-}`,
-    'app/cms/coupons/page.tsx': `import { CouponsPage as CouponsPageUI } from '@nextblock-cms/ecommerce/server';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function CouponsPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ status?: string; q?: string }>;
-}) {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <CouponsPageUI searchParams={await searchParams} />;
-}`,
-    'app/cms/coupons/[id]/edit/page.tsx': `import { EditCouponPage as EditCouponPageUI } from '@nextblock-cms/ecommerce/server';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { redirect } from 'next/navigation';
-
-export default async function EditCouponPage({
-  params,
-}: {
-  params: Promise<{ id: string }>;
-}) {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    redirect('/cms/settings/packages');
-  }
-
-  return <EditCouponPageUI params={params} />;
-}`,
-    'app/checkout/success/page.tsx': `import { CheckoutSuccessPage as CheckoutSuccessPageUI } from '@nextblock-cms/ecommerce';
-import { verifyPackageOnline } from '@nextblock-cms/db/server';
-import { notFound } from 'next/navigation';
-
-export default async function CheckoutSuccessPage() {
-  const isOnline = await verifyPackageOnline('ecommerce');
-  if (!isOnline) {
-    notFound();
-  }
-
-  return <CheckoutSuccessPageUI />;
-}`,
-    'app/api/checkout/route.ts': `import { NextResponse } from 'next/server';
-import { getPaymentProvider } from '@nextblock-cms/ecommerce/server';
-import { createClient, verifyPackageOnline } from '@nextblock-cms/db/server';
-import { normalizeCustomerAddress } from '@nextblock-cms/ecommerce';
-
-function resolveProviderFromItem(item) {
-  if (item?.provider === 'stripe' || item?.provider === 'freemius') {
-    return item.provider;
-  }
-
-  if (item?.payment_provider === 'stripe' || item?.payment_provider === 'freemius') {
-    return item.payment_provider;
-  }
-
-  if (item?.product_type === 'digital') {
-    return 'freemius';
-  }
-
-  if (item?.product_type === 'physical') {
-    return 'stripe';
-  }
-
-  if (item?.freemius_product_id) {
-    return 'freemius';
-  }
-
-  return null;
-}
-
-export async function POST(req: Request) {
+  const projectDir = process.cwd();
+  let missing = [];
   try {
-    const isOnline = await verifyPackageOnline('ecommerce');
-    if (!isOnline) {
-      return NextResponse.json({ error: 'Ecommerce module license is inactive' }, { status: 403 });
-    }
-
-    const {
-      items,
-      customerEmail,
-      customerPhone,
-      billingAddress,
-      shippingAddress,
-      shippingMethodId,
-      currencyCode,
-      locale,
-      couponCode,
-      couponContextItems,
-    } = await req.json();
-
-    if (!items || !Array.isArray(items)) {
-      return NextResponse.json({ error: 'Invalid items data' }, { status: 400 });
-    }
-
-    const providerNames = Array.from(
-      new Set(items.map((item) => resolveProviderFromItem(item)).filter(Boolean))
-    );
-
-    if (providerNames.length === 0) {
-      return NextResponse.json(
-        { error: 'Each checkout request must include provider-aware cart items.' },
-        { status: 400 }
-      );
-    }
-
-    if (providerNames.length > 1) {
-      return NextResponse.json(
-        { error: 'Mixed-provider carts must be checked out in separate steps.' },
-        { status: 400 }
-      );
-    }
-
-    const providerName = providerNames[0];
-
-    if (providerName === 'freemius' && items.length !== 1) {
-      return NextResponse.json(
-        { error: 'Freemius items must be checked out one at a time.' },
-        { status: 400 }
-      );
-    }
-
-    if (!billingAddress) {
-      return NextResponse.json({ error: 'Billing address is required' }, { status: 400 });
-    }
-
-    const supabase = createClient();
-    const provider = getPaymentProvider(providerName);
-
-    const { data: { user } } = await supabase.auth.getUser();
-    const userId = user?.id;
-    const resolvedCustomerEmail = user?.email || customerEmail || null;
-
-    const { url, error, errorKey, errorParams, errorStatus, customProps } =
-      await provider.createCheckoutSession({
-        items,
-        customerEmail: resolvedCustomerEmail,
-        customerPhone,
-        userId,
-        billingAddress: normalizeCustomerAddress(billingAddress) ?? billingAddress,
-        shippingAddress:
-          providerName === 'stripe'
-            ? normalizeCustomerAddress(shippingAddress)
-            : null,
-        shippingMethodId: providerName === 'stripe' ? shippingMethodId : null,
-        currencyCode: typeof currencyCode === 'string' ? currencyCode : null,
-        locale: typeof locale === 'string' ? locale : null,
-        couponCode: typeof couponCode === 'string' ? couponCode : null,
-        couponContextItems: Array.isArray(couponContextItems) ? couponContextItems : items,
-      });
-
-    if (error) {
-      console.error('Checkout Error:', error);
-      return NextResponse.json(
-        { error, errorKey, errorParams },
-        { status: errorStatus ?? 500 }
-      );
-    }
-
-    return NextResponse.json({ url, customProps });
-  } catch (err: any) {
-    console.error('Checkout API Error:', err);
-    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+    const packageJson = await fs.readJSON(resolve(projectDir, 'package.json'));
+    missing = findMissingPremiumDependencies(packageJson, resolved.packages);
+  } catch {
+    // Not inside a project (or no readable package.json): the same steps apply.
   }
-}`,
-  };
+  const legacyFiles = await findLegacyActivateWrappers(projectDir);
 
-  for (const [routePath, content] of Object.entries(routesToInject)) {
-    const fullPath = resolve(projectPath, routePath);
-    await fs.ensureDir(dirname(fullPath));
-    await fs.writeFile(fullPath, content);
-  }
-
-  clack.outro(
-    '✅ Ecommerce module activated successfully! You can now use the storefront features.',
-  );
+  const guide = buildActivationGuide(resolved.packages, { missing, legacyFiles });
+  console.log(['', ...guide, ''].join('\n'));
 }
 
 // clack validator that rejects empty/whitespace-only input with a labelled message.
