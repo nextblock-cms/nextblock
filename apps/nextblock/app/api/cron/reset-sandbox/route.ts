@@ -16,6 +16,7 @@ import postgres from 'postgres';
 
 import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
 import { SANDBOX_RESET_SQL } from './sandboxResetSql';
+import { COMMERCE_PRODUCT_COPY } from './commerce-product-copy';
 import { CORTEX_PRODUCT_COPY } from './cortex-product-copy';
 import { activateSandboxPackage } from './activate-package';
 
@@ -856,266 +857,18 @@ async function enrichCommerceProducts(params: {
     );
   }
 
-  const shortDescEn =
-    'NextBlock™ Commerce Pro is the ultimate AI-native, block-based headless e-commerce engine for Next.js. Deploy fast global storefronts with native multi-currency pricing, Stripe/Freemius checkouts, automatic tax calculations, and flexible shipping zones.';
-
-  // ── Section 0: Hero Gradient ──
-  const commerceS0En = {
-    container_type: 'container',
-    background: {
-      type: 'gradient',
-      gradient: {
-        type: 'linear',
-        direction: '135deg',
-        stops: [
-          { color: '#022c22', position: 0 },
-          { color: '#064e3b', position: 40 },
-          { color: '#0f172a', position: 100 },
-        ],
-      },
-    },
-    responsive_columns: { mobile: 1, tablet: 1, desktop: 2 },
-    column_gap: 'xl',
-    vertical_alignment: 'center',
-    padding: { top: 'xl', bottom: 'xl' },
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-emerald-400 font-semibold mb-4">Enterprise E-Commerce Engine</p>
-<h2 class="text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5">Turn Next.js Into a<br/>Global Storefront.</h2>
-<p class="text-base md:text-lg text-slate-200 leading-relaxed mb-6">Commerce Pro is a composable, developer-first engine that powers physical product catalogs, digital licensing, and subscription commerce — all from your existing Next.js stack.</p>`,
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Get Commerce Pro →',
-            url: 'https://nextblock.dev/product/nextblock-commerce-pro-commerce-license',
-            variant: 'default',
-            size: 'lg',
-            position: 'left',
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="rounded-2xl border border-emerald-700 bg-slate-950 p-6 shadow-xl sm:p-8">
-<h3 class="text-lg font-bold text-white mb-5">Why Teams Choose Commerce Pro</h3>
-<ul class="space-y-4 text-sm leading-relaxed text-slate-300">
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Multi-Currency Pricing</strong> — real-time exchange rates, charm pricing rules, and automatic locale detection.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Tax Automation</strong> — built-in Stripe Tax integration calculates, collects, and reports in 40+ countries.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Resilient Stock Tracking</strong> — inventory locks at checkout to prevent over-selling, with per-variant control.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Flexible Shipping Zones</strong> — rate tables, free-shipping thresholds, and per-country rules out of the box.</span>
-  </li>
-</ul>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  // ── Section 1: Social-proof metrics bar ──
-  const commerceS1En = {
-    container_type: 'container',
-    background: { type: 'theme', theme: 'muted' },
-    responsive_columns: { mobile: 1, tablet: 2, desktop: 4 },
-    column_gap: 'lg',
-    padding: { top: 'lg', bottom: 'lg' },
-    vertical_alignment: 'center',
-    column_blocks: [
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">40+</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Tax Jurisdictions</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">135+</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Currencies Supported</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">&lt; 50ms</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Cart API Response</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">100 %</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Lighthouse Score</span></p>' } }],
-    ],
-  };
-
-  // ── Section 2: Three-column feature cards ──
-  const commerceS2En = {
-    container_type: 'container',
-    background: { type: 'none' },
-    responsive_columns: { mobile: 1, tablet: 2, desktop: 3 },
-    column_gap: 'lg',
-    padding: { top: 'xl', bottom: 'xl' },
-    vertical_alignment: 'stretch',
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M7 15h3"></path></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Headless Stripe Checkout</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Integrated checkout session creation for single or multiple items. Auto-fulfillment fires via webhook events, with built-in idempotency guards.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 7a4 4 0 1 1-2.83 6.83L7 19H4v-3h3l2.17-2.17A4 4 0 0 1 15 7Z"></path><path d="M17.5 8.5h.01"></path></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Freemius Digital Licensing</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Distribute software downloads, validate license keys, and manage SaaS trial periods natively — no third-party integration layer required.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"></rect><path d="m4 15 4-4 4 4 3-3 5 5"></path><circle cx="15" cy="9" r="1"></circle></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Visual Merchandising</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Content creators can add product details pages, highlight promotions, and build full landing pages — all inside the block editor, no code needed.</p>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  // ── Section 3: Deep-dive 2-col ──
-  const commerceS3En = {
-    container_type: 'container',
-    background: {
-      type: 'gradient',
-      gradient: {
-        type: 'linear',
-        direction: '180deg',
-        stops: [
-          { color: '#020617', position: 0 },
-          { color: '#0f172a', position: 100 },
-        ],
-      },
-    },
-    responsive_columns: { mobile: 1, tablet: 1, desktop: 2 },
-    column_gap: 'xl',
-    vertical_alignment: 'center',
-    padding: { top: 'xl', bottom: 'xl' },
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-emerald-400 font-semibold mb-4">Under The Hood</p>
-<h3 class="text-2xl md:text-3xl font-extrabold text-white mb-4">Built for Production Scale</h3>
-<p class="text-slate-300 leading-relaxed mb-5">Commerce Pro was designed from day one for high-traffic stores. Every API path is edge-cached, every database query is indexed, and every webhook handler is idempotent.</p>
-<ul class="space-y-3 text-sm text-slate-400">
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Variant-level inventory with optimistic locking</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Automatic shipping zone calculation and rate tables</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Real-time order status with Stripe webhook sync</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Product attributes and filterable facets system</span>
-  </li>
-</ul>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="space-y-4">
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Order Management</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Full order lifecycle from cart to fulfillment. Automatic status transitions, email notifications, and refund handling baked in.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Product Categories</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Hierarchical taxonomy with slugs, media attachments, and full i18n support. Categories are managed directly in the CMS dashboard.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Multi-Language Storefronts</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Products, categories, and checkout flows are fully translatable. Each language variant shares inventory and pricing while maintaining its own SEO metadata.</p>
-</div>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  // ── Section 4: CTA ──
-  const commerceS4En = {
-    container_type: 'container',
-    background: {
-      type: 'gradient',
-      gradient: {
-        type: 'linear',
-        direction: '135deg',
-        stops: [
-          { color: '#064e3b', position: 0 },
-          { color: '#022c22', position: 100 },
-        ],
-      },
-    },
-    responsive_columns: { mobile: 1, tablet: 1, desktop: 1 },
-    column_gap: 'none',
-    padding: { top: 'xl', bottom: 'xl' },
-    vertical_alignment: 'center',
-    column_blocks: [
-      [
-        {
-          block_type: 'heading',
-          content: { level: 2, text_content: 'Ready to launch your storefront?', textAlign: 'center', textColor: 'background' },
-        },
-        {
-          block_type: 'text',
-          content: {
-            html_content: '<p class="text-center text-emerald-100 max-w-xl mx-auto mt-2 mb-6">Start selling today with Commerce Pro. Multi-currency, tax-compliant, and lightning-fast out of the box.</p>',
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Purchase Commerce Pro',
-            url: 'https://nextblock.dev/product/nextblock-commerce-pro-commerce-license',
-            variant: 'secondary',
-            size: 'lg',
-            position: 'center',
-          },
-        },
-      ],
-    ],
-  };
-
-  const commerceSectionsEn = [commerceS0En, commerceS1En, commerceS2En, commerceS3En, commerceS4En];
+  // Copy (EN + FR) lives in ./commerce-product-copy.ts, shared with migration 02020, which applies
+  // the same sections to nextblock.dev. Keep the two in step.
+  const copyEn = COMMERCE_PRODUCT_COPY.en;
+  const copyFr = COMMERCE_PRODUCT_COPY.fr;
 
   await params.sql`
     UPDATE public.products
     SET
-      title = 'NextBlock™ Commerce Pro - Commerce License',
-      short_description = ${shortDescEn},
+      title = ${copyEn.title},
+      short_description = ${copyEn.short_description},
+      meta_title = ${copyEn.meta_title},
+      meta_description = ${copyEn.meta_description},
       description_json = NULL,
       product_type = 'digital',
       payment_provider = 'freemius'
@@ -1126,207 +879,13 @@ async function enrichCommerceProducts(params: {
 
   // Set description blocks for English product
   await params.sql`DELETE FROM public.blocks WHERE product_id = ${product.id}`;
-  for (let i = 0; i < commerceSectionsEn.length; i++) {
+  for (let i = 0; i < copyEn.sections.length; i++) {
     await params.sql`
       INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
-      VALUES (${product.id}, ${params.enLangId}, 'section', ${params.sql.json(commerceSectionsEn[i] as any)}, ${i})
+      VALUES (${product.id}, ${params.enLangId}, 'section', ${params.sql.json(copyEn.sections[i] as any)}, ${i})
     `;
   }
 
-  // ── French Sections ──
-  const shortDescFr =
-    "NextBlock™ Commerce Pro est le moteur e-commerce headless et orienté IA ultime pour Next.js. Déployez des boutiques mondiales ultra-rapides avec support multi-devises, Stripe/Freemius, taxes automatisées et zones d'expédition.";
-
-  const commerceS0Fr = {
-    ...commerceS0En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-emerald-400 font-semibold mb-4">Moteur E-Commerce d'Entreprise</p>
-<h2 class="text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5">Faites de Next.js une<br/>Boutique Mondiale.</h2>
-<p class="text-base md:text-lg text-slate-200 leading-relaxed mb-6">Commerce Pro est un moteur composable pensé pour les développeurs : catalogues physiques, licences numériques et abonnements — le tout depuis votre stack Next.js existant.</p>`,
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Obtenir Commerce Pro →',
-            url: 'https://nextblock.dev/product/nextblock-commerce-pro-commerce-license',
-            variant: 'default',
-            size: 'lg',
-            position: 'left',
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="rounded-2xl border border-emerald-700 bg-slate-950 p-6 shadow-xl sm:p-8">
-<h3 class="text-lg font-bold text-white mb-5">Pourquoi choisir Commerce Pro</h3>
-<ul class="space-y-4 text-sm leading-relaxed text-slate-300">
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Multi-Devises</strong> — taux de change en temps réel, arrondis personnalisés et détection automatique de la localisation.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Taxes automatisées</strong> — intégration Stripe Tax pour le calcul, la collecte et le reporting dans plus de 40 pays.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Gestion des Stocks</strong> — verrouillage de l'inventaire au checkout pour éviter les surventes, avec contrôle par variante.</span>
-  </li>
-  <li class="flex items-start gap-3">
-    <span class="flex-shrink-0 w-6 h-6 rounded-full bg-emerald-950 flex items-center justify-center text-emerald-300 text-xs font-bold">✓</span>
-    <span><strong class="text-white">Zones d'expédition flexibles</strong> — tables de tarifs, seuils de livraison gratuite et règles par pays inclus.</span>
-  </li>
-</ul>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const commerceS1Fr = {
-    ...commerceS1En,
-    column_blocks: [
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">40+</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Juridictions fiscales</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">135+</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Devises supportées</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">&lt; 50ms</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Réponse API panier</span></p>' } }],
-      [{ block_type: 'text', content: { html_content: '<p class="text-center"><span class="block text-2xl font-extrabold text-foreground">100 %</span><span class="text-xs text-muted-foreground uppercase tracking-wider">Score Lighthouse</span></p>' } }],
-    ],
-  };
-
-  const commerceS2Fr = {
-    ...commerceS2En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M3 10h18M7 15h3"></path></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Checkout Stripe Headless</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Création de sessions Stripe Checkout pour un ou plusieurs articles. Traitement automatique des commandes par webhooks avec protection d'idempotence.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 7a4 4 0 1 1-2.83 6.83L7 19H4v-3h3l2.17-2.17A4 4 0 0 1 15 7Z"></path><path d="M17.5 8.5h.01"></path></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Licences Numériques Freemius</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Distribuez vos logiciels, validez les clés de licence et gérez les périodes d'essai SaaS — aucune intégration tierce requise.</p>
-</div>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-emerald-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-emerald-500 sm:p-7">
-<div class="mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="2"></rect><path d="m4 15 4-4 4 4 3-3 5 5"></path><circle cx="15" cy="9" r="1"></circle></svg></div>
-<h4 class="text-base font-bold text-slate-900 dark:text-white mb-2">Merchandising Visuel</h4>
-<p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">Vos équipes éditoriales enrichissent les fiches produits de landing pages, promotions et galeries — directement dans l'éditeur de blocs.</p>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const commerceS3Fr = {
-    ...commerceS3En,
-    column_blocks: [
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<p class="text-xs uppercase tracking-[0.3em] text-emerald-400 font-semibold mb-4">Sous le capot</p>
-<h3 class="text-2xl md:text-3xl font-extrabold text-white mb-4">Conçu pour la production à grande échelle</h3>
-<p class="text-slate-300 leading-relaxed mb-5">Commerce Pro a été conçu dès le départ pour les boutiques à fort trafic. Chaque API est mise en cache à la périphérie, chaque requête est indexée, et chaque gestionnaire de webhook est idempotent.</p>
-<ul class="space-y-3 text-sm text-slate-400">
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Inventaire par variante avec verrouillage optimiste</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Calcul automatique des zones d'expédition et tables de tarifs</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Statut des commandes en temps réel via synchronisation Stripe webhook</span>
-  </li>
-  <li class="flex items-start gap-2.5">
-    <span class="text-emerald-400">→</span>
-    <span>Système d'attributs produits et de facettes filtrables</span>
-  </li>
-</ul>`,
-          },
-        },
-      ],
-      [
-        {
-          block_type: 'text',
-          content: {
-            html_content: `<div class="space-y-4">
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Gestion des commandes</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Cycle de vie complet : du panier à la livraison. Transitions automatiques, notifications par courriel et gestion des remboursements intégrées.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Catégories de produits</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Taxonomie hiérarchique avec slugs, médias associés et support i18n complet. Les catégories sont gérées directement dans le tableau de bord du CMS.</p>
-</div>
-<div class="p-5 rounded-xl border border-slate-700 bg-slate-900">
-  <h5 class="text-sm font-bold text-white mb-1">Boutiques multilingues</h5>
-  <p class="text-xs text-slate-400 leading-relaxed">Produits, catégories et flux de paiement entièrement traduisibles. Chaque variante linguistique partage l'inventaire et les prix tout en conservant ses propres métadonnées SEO.</p>
-</div>
-</div>`,
-          },
-        },
-      ],
-    ],
-  };
-
-  const commerceS4Fr = {
-    ...commerceS4En,
-    column_blocks: [
-      [
-        {
-          block_type: 'heading',
-          content: { level: 2, text_content: 'Prêt à lancer votre boutique ?', textAlign: 'center', textColor: 'background' },
-        },
-        {
-          block_type: 'text',
-          content: {
-            html_content: '<p class="text-center text-emerald-100 max-w-xl mx-auto mt-2 mb-6">Commencez à vendre dès aujourd\'hui avec Commerce Pro. Multi-devises, conforme aux taxes, ultra-rapide dès l\'installation.</p>',
-          },
-        },
-        {
-          block_type: 'button',
-          content: {
-            text: 'Acheter Commerce Pro',
-            url: 'https://nextblock.dev/product/nextblock-commerce-pro-commerce-license',
-            variant: 'secondary',
-            size: 'lg',
-            position: 'center',
-          },
-        },
-      ],
-    ],
-  };
-
-  const commerceSectionsFr = [commerceS0Fr, commerceS1Fr, commerceS2Fr, commerceS3Fr, commerceS4Fr];
 
   const [frProduct] = await params.sql`
     INSERT INTO public.products (
@@ -1338,6 +897,8 @@ async function enrichCommerceProducts(params: {
       stock,
       status,
       short_description,
+      meta_title,
+      meta_description,
       description_json,
       product_type,
       payment_provider,
@@ -1350,13 +911,15 @@ async function enrichCommerceProducts(params: {
     )
     VALUES (
       ${product.sku},
-      'Licence NextBlock™ Commerce Pro',
+      ${copyFr.title},
       ${String(product.slug) + '-fr'},
       ${product.price},
       ${product.sale_price},
       ${product.stock || 99},
       ${product.status},
-      ${shortDescFr},
+      ${copyFr.short_description},
+      ${copyFr.meta_title},
+      ${copyFr.meta_description},
       NULL,
       'digital',
       'freemius',
@@ -1371,6 +934,8 @@ async function enrichCommerceProducts(params: {
     SET
       title = EXCLUDED.title,
       short_description = EXCLUDED.short_description,
+      meta_title = EXCLUDED.meta_title,
+      meta_description = EXCLUDED.meta_description,
       description_json = NULL,
       price = EXCLUDED.price,
       sale_price = EXCLUDED.sale_price,
@@ -1386,10 +951,10 @@ async function enrichCommerceProducts(params: {
   if (frProduct?.id) {
     await attachProductMedia(params.sql, frProduct.id as string, commerceMediaId);
     await params.sql`DELETE FROM public.blocks WHERE product_id = ${frProduct.id}`;
-    for (let i = 0; i < commerceSectionsFr.length; i++) {
+    for (let i = 0; i < copyFr.sections.length; i++) {
       await params.sql`
         INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
-        VALUES (${frProduct.id}, ${params.frLangId}, 'section', ${params.sql.json(commerceSectionsFr[i] as any)}, ${i})
+        VALUES (${frProduct.id}, ${params.frLangId}, 'section', ${params.sql.json(copyFr.sections[i] as any)}, ${i})
       `;
     }
   }
