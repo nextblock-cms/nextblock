@@ -1,0 +1,32 @@
+name: Jules task
+description: Background task for Jules (maintainer only). Add the jules label yourself after creating the issue.
+title: "[Jules] "
+body:
+  - type: markdown
+    attributes:
+      value: "Jules starts only when the maintainer adds the **jules** label. Write the task so it can be done without asking questions."
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should change, in plain words.
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Where
+      description: The apps/ or libs/ path, if you know it.
+      placeholder: apps/nextblock/...
+  - type: textarea
+    id: done-when
+    attributes:
+      label: Done when
+      value: |
+        - [ ] `npx nx affected -t lint test build --base=origin/master` passes
+  - type: textarea
+    id: do-not-touch
+    attributes:
+      label: Do not touch
+      value: |
+        Database migrations, .env files, anything in .github/
