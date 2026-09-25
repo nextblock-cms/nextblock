@@ -70,3 +70,15 @@ For more detail, read `docs/04-DATABASE-AND-AUTH.md` and
 - **Execution mode**: Reversible file edits, refactoring, and code changes are in fast/direct mode ("yolo mode") since the user can revert changes.
 - **Non-revertable operations require confirmation**: Any destructive or irreversible operation (e.g., dropping database tables, permanent data deletions, external/remote side effects) must be confirmed with the user prior to execution.
 
+## Automated runs (Jarvis, Jules, Codex)
+
+These rules apply when you work without Nick watching: a Jarvis task on a `jarvis/*` branch, or a Jules task. Nick reviews the result as a pull request.
+
+- Read `CLAUDE.md` first: layout, commands, conventions and gotchas.
+- Install with `npm ci`. Test with `npx vitest run <path>` (always pass a path; there are no per-project `nx test` targets). Before finishing, `npx nx affected -t lint test build --base=origin/master` must pass.
+- Don't commit or push. The Jarvis script does that after its own checks.
+- Don't create or edit migrations, touch `.env*` files or anything in `.github/`, or run any `db:*` or `sandbox:*` script. If the task needs a migration, make no changes and say so.
+- Don't add, remove or upgrade dependencies unless the task asks for it.
+- Keep changes small and focused on the task. Add or update tests for behaviour changes.
+- Work only inside this repository.
+- If the task is unclear, make no changes and explain what you need in your final message.

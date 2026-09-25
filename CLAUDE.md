@@ -5,6 +5,8 @@ CLI. Code is the authority over `docs/NN-*.md` (the maintained reference set: re
 your subsystem, update it when you change that subsystem). Per-project `CLAUDE.md` files load
 on demand when you work inside a project.
 
+See @AGENTS.md for migration rules and the rules for automated runs.
+
 ## Layout
 
 - `apps/nextblock` — the only runtime: site, CMS (`app/cms`), API (`app/api`), `/setup`, `proxy.ts`.
