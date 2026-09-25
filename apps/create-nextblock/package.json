@@ -7,7 +7,6 @@
     "create-nextblock": "bin/create-nextblock.js"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "sync-template": "node ./scripts/sync-template.js",
     "prepack": "npm run sync-template"
   },
