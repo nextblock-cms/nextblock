@@ -1,0 +1,16 @@
+name: jules-notify
+on:
+  pull_request:
+    types: [opened]
+jobs:
+  ntfy:
+    if: contains(github.event.pull_request.body, 'created automatically by Jules')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify phone
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          URL: ${{ github.event.pull_request.html_url }}
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl -s -H "Title: Jules PR ready" -H "Click: $URL" -d "$TITLE" "https://ntfy.sh/$TOPIC"
