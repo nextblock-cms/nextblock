@@ -1,4 +1,4 @@
-name: Jules task
+name: 🤖 Jules task
 description: Background task for Jules (maintainer only). Add the jules label yourself after creating the issue.
 title: "[Jules] "
 body:
