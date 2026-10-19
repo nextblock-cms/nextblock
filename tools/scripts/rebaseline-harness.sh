@@ -97,13 +97,14 @@ EOF
 
   dump)
     pgenv; D="$W/$3"; mkdir -p "$D"
-    pg_dump -n public -s --no-owner --no-tablespaces --no-security-labels --no-publications --no-subscriptions \
+    pg_dump -n public -n private -s --no-owner --no-tablespaces --no-security-labels --no-publications --no-subscriptions \
       -T 'public._nextblock_docker_migrations' > "$D/schema.sql"
     pg_dump -n public -a --column-inserts --on-conflict-do-nothing --no-owner \
       --exclude-table-data=public.profiles -T 'public._nextblock_docker_migrations' > "$D/data.sql"
     psql -tA > "$D/counts.txt" <<'SQL'
 select 'types', count(*) from pg_type t join pg_namespace n on n.oid=t.typnamespace where n.nspname='public' and t.typtype='e'
 union all select 'functions', count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public'
+union all select 'private_functions', count(*) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='private'
 union all select 'tables', count(*) from pg_tables where schemaname='public'
 union all select 'indexes', count(*) from pg_indexes where schemaname='public'
 union all select 'constraints', count(*) from pg_constraint c join pg_namespace n on n.oid=c.connamespace where n.nspname='public'

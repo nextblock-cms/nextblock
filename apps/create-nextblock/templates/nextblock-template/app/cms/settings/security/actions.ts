@@ -1,6 +1,6 @@
 'use server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import { sendTwoFactorCodeEmail } from '../../../actions/twoFactorEmail';
 import {
@@ -14,6 +14,7 @@ import {
 } from '../../../../lib/privacy/types';
 import {
   createEmailChallenge,
+  evaluateTwoFactor,
   getEmailResendCooldownSeconds,
   issueTwoFactorVerifiedCookie,
   clearTwoFactorVerifiedCookie,
@@ -62,7 +63,25 @@ async function requireUser() {
   if (!user) {
     throw new Error('You must be signed in.');
   }
+  // A server action is reachable with nothing but the session cookie, so the /cms layout's
+  // second-factor gate does not protect it. A first-factor-only session (a stolen cookie,
+  // or a user who has not finished the challenge) must not be able to disable or re-enrol
+  // the factor that is still owed.
+  const twoFactor = await evaluateTwoFactor();
+  if (twoFactor.status === 'totp_required' || twoFactor.status === 'email_required') {
+    throw new Error('Verify your second factor before changing security settings.');
+  }
   return { supabase, user };
+}
+
+/**
+ * user_security_settings is written through the service role only (migration 02021 removed
+ * the owner INSERT/UPDATE policies): the row decides whether /cms asks for a second factor,
+ * so a session must not be able to flip it over REST without passing the verification these
+ * actions perform first.
+ */
+function securitySettingsWriter() {
+  return getServiceRoleSupabaseClient().from('user_security_settings');
 }
 
 /**
@@ -248,7 +267,7 @@ export async function verifyTotpEnrollment(formData: FormData): Promise<ActionRe
       return { ok: false, error: 'That code was not valid. Please try again.' };
     }
 
-    const { error: upsertError } = await supabase.from('user_security_settings').upsert({
+    const { error: upsertError } = await securitySettingsWriter().upsert({
       user_id: user.id,
       mfa_enabled: true,
       mfa_type: 'totp',
@@ -309,7 +328,7 @@ export async function sendEmailEnrollmentCode(): Promise<ActionResult> {
 
 export async function verifyEmailEnrollment(formData: FormData): Promise<ActionResult> {
   return guard(async () => {
-    const { supabase, user } = await requireUser();
+    const { user } = await requireUser();
     const code = (formData.get('code')?.toString() ?? '').trim();
 
     const verified = await verifyEmailChallenge(user.id, code);
@@ -317,7 +336,7 @@ export async function verifyEmailEnrollment(formData: FormData): Promise<ActionR
       return { ok: false, error: 'That code was incorrect or expired. Request a new one.' };
     }
 
-    const { error } = await supabase.from('user_security_settings').upsert({
+    const { error } = await securitySettingsWriter().upsert({
       user_id: user.id,
       mfa_enabled: true,
       mfa_type: 'email',
@@ -345,7 +364,7 @@ export async function disableMfa(): Promise<ActionResult> {
       await supabase.auth.mfa.unenroll({ factorId: factor.id });
     }
 
-    const { error } = await supabase.from('user_security_settings').upsert({
+    const { error } = await securitySettingsWriter().upsert({
       user_id: user.id,
       mfa_enabled: false,
       mfa_type: null,

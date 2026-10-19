@@ -60,6 +60,11 @@ That trigger:
 - inserts or updates `profiles`
 - copies selected metadata such as `full_name`, avatar URL, and GitHub username
 
+Sign-up is public on every install (`/sign-up`; `system_configuration.auto_accept_signups`
+only decides whether e-mail confirmation is skipped), so every policy granted to
+`authenticated` is reachable by anyone who registers. After creation, `profiles.role` changes
+only through an `ADMIN` session or the service role (`protect_profile_role` trigger, `02021`).
+
 ### CMS authorization
 
 The CMS shell in `app/cms/CmsClientLayout.tsx` currently expects:
@@ -69,6 +74,12 @@ The CMS shell in `app/cms/CmsClientLayout.tsx` currently expects:
 
 Writers and admins can enter the CMS. Admin-only navigation is used for
 settings such as payments, shipping, users, and some branding/config surfaces.
+
+`proxy.ts`, `app/cms/layout.tsx` and every `get_current_user_role()` policy trust
+`profiles.role`, which is why that column is guarded at the database (see "Row Level
+Security Patterns"). The role lookup itself is `private.current_user_role()`, a
+`SECURITY DEFINER` function the API roles can execute from inside a policy but cannot call
+over REST; `public.get_current_user_role()` and `public.is_admin()` are its invoker wrappers.
 
 ### No live app middleware file
 
@@ -147,21 +158,37 @@ history now):
 
 The high-level access model is:
 
-- public read access for languages, media, translations, published content, and
+- public read access for languages, media, translations, live content (status published or
+  active, `published_at` null or past — scheduled rows are staff-only until then), and
   several storefront commerce tables
-- authenticated self-service access for user addresses and customer-owned
-  orders
-- `ADMIN` or `WRITER` write access for most CMS authoring tables
+- `profiles` (`02021`): a signed-in user reads and edits their own row, `ADMIN` and `WRITER`
+  read every row, the public key reads nothing. Public review, comment and staff-reply cards
+  get the author's name and avatar through `author()`, a computed relationship on
+  `cms_interactions` (`select=*,author(full_name,avatar_url)`) that answers only for approved
+  rows. `role` changes are `ADMIN` or service-role only: the update policy's `WITH CHECK`
+  pins the column and the `protect_profile_role` trigger backs it; the users screen already
+  writes through the service role.
+- authenticated self-service access for user addresses and customer-owned orders.
+  `user_security_settings` is read by its owner but written only by the server: the
+  security actions verify the factor first, then upsert with the service role.
+- `ADMIN` or `WRITER` write access for most CMS authoring tables, and staff-only reads of
+  revisions and drafts
+- `site_settings` reads tiered by key (public / signed-in / staff / `ADMIN`, see "Important
+  Site Settings in Active Use" below); writes unchanged
 - `ADMIN`-only write access for higher-risk configuration surfaces
 - `service_role` full access where background jobs or system syncs need it
 
 Commerce-specific policy highlights include:
 
-- public read access for products, product media, product attributes, variants,
-  shipping zones, shipping methods, tax rates, and active currencies
+- public read access for live products and their variants (the rows of draft, archived and
+  scheduled products are staff-only; their media links, stock rows and category links stay
+  public), product media, product attributes, shipping zones, shipping methods, tax rates,
+  and active currencies. A customer's own invoice looks the purchased products up with the
+  service role, so an archived product still appears on it.
 - customer-scoped read access for `orders` and `order_items`
 - service-role management access for orders, order items, inventory, taxes, and
-  currencies
+  currencies; invoice numbering (`generate_order_invoice_number()`,
+  `assign_order_invoice_metadata()`) is callable by the service role only
 
 Supabase Advisor hygiene (kept clean since `02013`; re-check the dashboard after any policy
 change):
@@ -177,6 +204,52 @@ change):
   caller's EXECUTE privilege, so revoke it. Note that a database which recorded the
   baseline without running it (production after a squash) keeps the old grants until a
   forward migration revokes them.
+- A `CREATE POLICY` without a `TO` clause applies to PUBLIC, `anon` included, and
+  `USING (true)` on such a policy publishes the table to anyone holding the site's public
+  key. The baseline's `profiles_read_policy` was exactly that (every account's name, phone,
+  website and role); `02021` re-cuts it `TO authenticated`. When the public site needs one
+  field of a private row, give it a computed relationship that returns only that field
+  (`author()`), not a policy on the table.
+- A self-service `FOR UPDATE ... USING (id = auth.uid())` policy covers every column the
+  role is granted, so a row that carries an authorization column (`profiles.role`) needs
+  the `WITH CHECK` to pin that column and a trigger guard behind it
+  (`protect_profile_role()`): before `02021`, any self-registered account could `PATCH` its
+  own `role` to `ADMIN` through PostgREST and walk into `/cms` as an administrator.
+- Helpers that a policy on `profiles` itself must call read the table as its owner. They are
+  `SECURITY DEFINER` functions in the non-exposed `private` schema
+  (`private.current_user_role()`, `private.author_card()`), and `public.get_current_user_role()`,
+  `public.is_admin()` and `public.author()` are `SECURITY INVOKER` wrappers that keep the old
+  names. Advisor lints 0028/0029 flag a `SECURITY DEFINER` function in an exposed schema that
+  `anon` or `authenticated` can execute, and a policy runs with the querying role's rights, so
+  the API roles keep `USAGE` on `private` and `EXECUTE` on the helpers while PostgREST cannot
+  RPC them. Never create a `SECURITY DEFINER` function in `public`.
+- Row-level security does not govern `TRUNCATE`; `02021` revokes it from `anon` and
+  `authenticated` on every table that exists at that point, and `/setup`'s grant pass repeats
+  the revoke. A later migration that grants on a new table grants `SELECT, INSERT, UPDATE,
+  DELETE` rather than `ALL` (the lint accepts either; the convention is the guard).
+- `ADMIN` and `WRITER` read every `profiles` row, phone and website included: the dashboard,
+  revision history and author pickers embed `profiles(full_name)` with the cookie client, and
+  staff are trusted with the customer contact data the CMS already shows them. Customers never
+  read another account's row.
+- A table whose row decides authorization elsewhere (`user_security_settings` drives the
+  second-factor gate) gets no owner write policy at all; the server verifies, then writes
+  with the service role.
+
+Explicit grants on every new table, view and sequence. Supabase no longer grants `anon`,
+`authenticated` and `service_role` on new objects in `public` — the default for projects
+created since 2026-05-30 and for every existing project from 2026-10-30 (changelog 45329:
+"new tables in the public schema are no longer automatically exposed to the Data API";
+existing tables "keep their current grants and stay reachable"). A forward migration that
+creates a table, view or sequence ships its `GRANT ... ON TABLE public.x TO anon,
+authenticated, service_role` (and `ON SEQUENCE`, including the implicit sequence of a serial or
+identity column) plus `ENABLE ROW LEVEL SECURITY` and policies in the same file, exactly as
+`02003` does for the baseline; without the grant PostgREST answers 42501 whatever the policies
+say. `npm run db:migrate:check` and `npm run generate:migrations-bundle` refuse a forward
+migration that creates such an object without granting on it to an API role
+(`tools/scripts/lib/migration-grants.js`). Two places still apply blanket grants afterwards:
+the sandbox reset (`ALTER DEFAULT PRIVILEGES ... GRANT ALL` in `generate-sandbox-reset.ts`) and
+`/setup`'s post-apply pass (`lib/setup/schema-apply.ts`, which then re-applies the `02021`
+revokes so a wizard-installed database matches a CLI-migrated one).
 
 ## Migration Structure
 
@@ -417,7 +490,7 @@ and are what the next squash repeats with `G = 3`.
    CRLF (git checkouts) and LF (tool-written files), and a multi-line `replace()` pattern
    only matches content seeded with the same line endings — building generation 2 from the
    raw tree silently lost migration 042's copy change. The git-canonical form is LF.
-3. **Dump.** Schema: `pg_dump -n public -s --no-owner --no-tablespaces --no-security-labels
+3. **Dump.** Schema: `pg_dump -n public -n private -s --no-owner --no-tablespaces --no-security-labels
    --no-publications --no-subscriptions -T public._nextblock_docker_migrations > schema.sql`.
    Data: `pg_dump -n public -a --column-inserts --on-conflict-do-nothing --no-owner
    --exclude-table-data=public.profiles -T public._nextblock_docker_migrations > data.sql`.
@@ -473,3 +546,26 @@ These keys are actively referenced by the current codebase:
 
 There are many more seeded settings, but these are the most important ones for
 understanding current runtime behavior.
+
+Reads are tiered by key (`02021`; the baseline published every non-secret key to the public
+key). The two policies on `site_settings` are the only place the tiers live, so a new key is
+`ADMIN`-only until one of them lists it:
+
+- public (anon and every signed-in user): `site_title`, `site_description`, `site_keywords`,
+  `site_social_image`, `footer_copyright`, `footer_show_attribution`, `global_css`,
+  `language_detection_settings`, `seo_robots_settings`, `bot_protection_public`,
+  `active_logo_id`, `is_admin_created` (the `/setup` redirect in `proxy.ts` reads it with the
+  anon key — an empty result sends every visitor to `/setup`), `privacy_settings`,
+  `enabled_payment_providers` (an empty result disables every Buy button),
+  `ecommerce_inventory_settings`, `migration_baseline_generation`
+- any signed-in user: `invoice_settings` (a customer's own invoice page renders the seller
+  block with the cookie client)
+- `ADMIN` and `WRITER`: `security_settings`, `onboarding_state`, `email_public`,
+  `cortex_ai_site_brief` (loaded by the CMS shell and dashboard for every staff role)
+- `ADMIN`: everything else — the secrets (`*_secret`, `*_api_key`, `cortex_ai_mcp_settings`),
+  `interactions_notification_emails`, `payment_public`, `store_contact`, `forms_contact`,
+  the Cortex model/agent keys and any key not listed above
+
+Server code that reads a key for the public site with the service role is unaffected; code that
+reads one with the cookie or SSG client for a visitor must use a public-tier key, or the loader
+caches its fallback value (`unstable_cache` keeps whatever the first read returned).

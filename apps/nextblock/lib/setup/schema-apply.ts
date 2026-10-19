@@ -179,13 +179,36 @@ begin
   end loop;
 end $nb_trg$;`;
 
+// The blanket grants above also hand back what migration 02021 deliberately takes away from
+// the API roles: TRUNCATE (not governed by RLS), the invoice-numbering RPCs (service role
+// only) and anon's EXECUTE on upsert_product_with_variants. Re-apply those revokes so a
+// /setup-installed database ends in the same state as one migrated with the CLI. Guarded by
+// catalog lookups: a database that stopped before 02021 simply has nothing to revoke.
+const API_ROLE_REVOKE_SQL = `do $nb_api$
+begin
+  revoke truncate on all tables in schema public from anon, authenticated;
+  if to_regprocedure('public.generate_order_invoice_number()') is not null then
+    revoke execute on function public.generate_order_invoice_number() from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.assign_order_invoice_metadata(uuid, timestamp with time zone)') is not null then
+    revoke execute on function public.assign_order_invoice_metadata(uuid, timestamp with time zone) from public, anon, authenticated;
+  end if;
+  if to_regclass('public.order_invoice_number_seq') is not null then
+    revoke all on sequence public.order_invoice_number_seq from anon, authenticated;
+  end if;
+  if to_regprocedure('public.upsert_product_with_variants(jsonb)') is not null then
+    revoke execute on function public.upsert_product_with_variants(jsonb) from public, anon;
+  end if;
+end $nb_api$;`;
+
 const GRANTS_SQL =
   'grant usage on schema public to anon, authenticated, service_role;' +
   'grant select on all tables in schema public to anon;' +
   'grant all on all tables in schema public to authenticated, service_role;' +
   'grant all on all sequences in schema public to anon, authenticated, service_role;' +
   'grant execute on all functions in schema public to anon, authenticated, service_role;' +
-  TRIGGER_FUNCTION_REVOKE_SQL;
+  TRIGGER_FUNCTION_REVOKE_SQL +
+  API_ROLE_REVOKE_SQL;
 
 function recordSql(version: string, file: string): string {
   return (

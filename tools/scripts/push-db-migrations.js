@@ -23,6 +23,7 @@ const {
   isBaselineMigration,
   validateMigrationNames,
 } = require('./lib/migration-naming');
+const { validateMigrationGrants } = require('./lib/migration-grants');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -180,6 +181,24 @@ function assertMigrationNaming(localFiles) {
   return naming;
 }
 
+/**
+ * Refuse a forward migration that creates a table or sequence without granting on it
+ * (tools/scripts/lib/migration-grants.js). Supabase grants nothing on new objects in `public`
+ * (projects created since 2026-05-30, every project from 2026-10-30), so such a file would
+ * ship an object the Data API cannot reach.
+ */
+function assertMigrationGrants(localFiles) {
+  const dir = path.join(workdir, 'supabase/migrations');
+  const grants = validateMigrationGrants(localFiles, (file) => fs.readFileSync(path.join(dir, file), 'utf8'));
+  if (grants.errors.length > 0) {
+    log('Forward migrations create objects without explicit grants (tools/scripts/lib/migration-grants.js):', colors.red);
+    for (const error of grants.errors) {
+      log(`  - ${error}`, colors.red);
+    }
+    process.exit(1);
+  }
+}
+
 // A version is any run of digits: the legacy generation-1 files were 14-digit, the
 // GGNNN scheme is 5-digit, and the remote history can hold both at once during a squash.
 const VERSION_PATTERN = /^\d+$/;
@@ -330,19 +349,39 @@ function parseMigrationList(output) {
  *
  * `--output-format json` (a global flag) pins the JSON form so a human terminal and an agent
  * session read the same thing. CLI 2.107 and 2.108 accept the flag but still print the text
- * table for this command, which parseMigrationList also reads.
+ * table for this command, which parseMigrationList also reads. A CLI older than 2.107
+ * rejects the flag outright ("unknown flag: --output-format"); the same read-only command is
+ * then re-run without it and its text table parsed, so a stale node_modules (package.json
+ * pins a newer CLI) degrades to a warning instead of an unreadable history.
  */
+function isUnknownOutputFormatFlag(output) {
+  return /unknown flag: --output-format/i.test(output || '');
+}
+
 function readMigrationStatus(dbPassword, { allowFailure = false } = {}) {
-  const result = supabase(
-    ['migration', 'list', '--workdir', workdir, '--password', dbPassword, '--output-format', 'json'],
-    { allowFailure, capture: true, echoStdout: false },
-  );
+  const listArgs = ['migration', 'list', '--workdir', workdir, '--password', dbPassword];
+  let result = supabase([...listArgs, '--output-format', 'json'], {
+    allowFailure: true,
+    capture: true,
+    echoStdout: false,
+  });
 
-  const output = allowFailure ? result.output : result;
-
-  if (allowFailure && result.failed) {
-    return null;
+  if (result.failed && isUnknownOutputFormatFlag(result.output)) {
+    log(
+      'This Supabase CLI predates `--output-format`; reading the text table instead. Run `npm ci` to install the version package.json pins.',
+      colors.yellow,
+    );
+    result = supabase(listArgs, { allowFailure: true, capture: true, echoStdout: false });
   }
+
+  if (result.failed) {
+    if (allowFailure) {
+      return null;
+    }
+    process.exit(1);
+  }
+
+  const output = result.output;
 
   const status = parseMigrationList(output);
 
@@ -430,6 +469,7 @@ function main() {
 
   log(isCheck ? 'Supabase migration check (read-only)' : 'Supabase migration-only push', colors.green);
   assertMigrationNaming(localFiles);
+  assertMigrationGrants(localFiles);
   log(`Target project: ${process.env.SUPABASE_PROJECT_ID}`, colors.dim);
   log(
     isCheck
@@ -572,7 +612,7 @@ function main() {
 
 // Pure helpers are exported for tests; `main()` runs only on direct execution so
 // requiring this file never touches a database.
-module.exports = { getMigrationVersion, isBaselineMigration, parseMigrationList };
+module.exports = { getMigrationVersion, isBaselineMigration, isUnknownOutputFormatFlag, parseMigrationList };
 
 if (require.main === module) {
   main();

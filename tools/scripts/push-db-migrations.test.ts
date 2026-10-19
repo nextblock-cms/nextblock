@@ -3,7 +3,28 @@ import { describe, expect, it } from 'vitest';
 // CommonJS CLI script. Requiring it is safe: `main()` is guarded by `require.main`,
 // so importing here never opens a database connection.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { getMigrationVersion, isBaselineMigration, parseMigrationList } = require('./push-db-migrations.js');
+const {
+  getMigrationVersion,
+  isBaselineMigration,
+  isUnknownOutputFormatFlag,
+  parseMigrationList,
+} = require('./push-db-migrations.js');
+
+describe('isUnknownOutputFormatFlag', () => {
+  // A CLI older than 2.107 (a stale node_modules) rejects the JSON flag; the check must
+  // notice that specific refusal and retry the plain read-only command, nothing else.
+  it('recognises the pre-2.107 refusal of --output-format', () => {
+    const usage = 'Usage:\n  supabase migration list [flags]\n\nunknown flag: --output-format\nTry rerunning the command with --debug to troubleshoot the error.\n';
+    expect(isUnknownOutputFormatFlag(usage)).toBe(true);
+  });
+
+  it('ignores every other failure', () => {
+    expect(isUnknownOutputFormatFlag('Cannot find project ref. Have you run supabase link?')).toBe(false);
+    expect(isUnknownOutputFormatFlag('failed to connect to postgres: password authentication failed')).toBe(false);
+    expect(isUnknownOutputFormatFlag('')).toBe(false);
+    expect(isUnknownOutputFormatFlag(undefined)).toBe(false);
+  });
+});
 
 /**
  * These cover the migration-status parser that replaced `link` + `db push --dry-run`

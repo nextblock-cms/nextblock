@@ -10,8 +10,10 @@ import { ShieldCheck } from 'lucide-react';
  *
  * A reply is stored as an ordinary approved `type='comment'` row carrying its parent's
  * target, so it is readable through the same public RLS policy the parent is — no
- * special access, nothing new exposed. It is fetched separately rather than joined
- * because the parents arrive one page at a time.
+ * special access, nothing new exposed. The staff member's name comes from `author()`,
+ * the computed relationship migration 02021 added for approved interactions (profiles
+ * itself is not readable with the public key). It is fetched separately rather than
+ * joined because the parents arrive one page at a time.
  *
  * Shared by the product-reviews and post-comments sections, which are otherwise near
  * duplicates of each other.
@@ -22,7 +24,7 @@ export interface StaffReply {
   content: string;
   created_at: string;
   parent_id: string;
-  profiles?: { full_name?: string | null } | null;
+  author?: { full_name?: string | null } | null;
 }
 
 /** One query for a whole page of parents, keyed by parent id. */
@@ -41,7 +43,7 @@ export function useStaffReplies(parentIds: string[]): Record<string, StaffReply[
 
     void supabase
       .from('cms_interactions' as any)
-      .select('id, content, created_at, parent_id, profiles(full_name)')
+      .select('id, content, created_at, parent_id, author(full_name)')
       .in('parent_id', parentIds)
       .eq('status', 'approved')
       .order('created_at', { ascending: true })
@@ -82,7 +84,7 @@ export function StaffReplies({ replies }: { replies: StaffReply[] | undefined })
               {badgeLabel}
             </span>
             <span className="text-xs font-semibold text-foreground">
-              {reply.profiles?.full_name || 'Support'}
+              {reply.author?.full_name || 'Support'}
             </span>
             <time className="text-[10px] text-muted-foreground" suppressHydrationWarning>
               {new Date(reply.created_at).toLocaleDateString(lang, {

@@ -182,15 +182,20 @@ export async function getInvoiceOrder(orderId: string, client?: SupabaseLikeClie
     .map((item: any) => item.variant_id)
     .filter(Boolean);
 
+  // The order itself was read with the caller's client, so ownership is already settled.
+  // The catalog rows are looked up with the service role: a product archived, unpublished
+  // or rescheduled after the purchase is hidden from the customer by RLS (migration 02021),
+  // but their invoice must still name what they bought.
+  const catalog = getServiceRoleSupabaseClient() as SupabaseLikeClient;
   const [productsResponse, variantsResponse] = await Promise.all([
     productIds.length
-      ? supabase
+      ? catalog
           .from('products')
           .select('id, title, sku')
           .in('id', productIds)
       : Promise.resolve({ data: [], error: null }),
     variantIds.length
-      ? supabase
+      ? catalog
           .from('product_variants')
           .select('id, sku')
           .in('id', variantIds)

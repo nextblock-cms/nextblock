@@ -48,6 +48,20 @@ if (naming.errors.length > 0) {
   process.exit(1);
 }
 
+// Refuse a forward migration that creates a table, view or sequence without granting on it:
+// Supabase grants nothing on new objects (projects created since 2026-05-30, every project
+// from 2026-10-30), so /setup would install an object the Data API cannot reach (docs/04 →
+// "Row Level Security Patterns").
+const { validateMigrationGrants } = require('./lib/migration-grants.js');
+const grants = validateMigrationGrants(files, (name: string) =>
+  readFileSync(path.join(MIGRATIONS_DIR, name), 'utf8'),
+);
+if (grants.errors.length > 0) {
+  console.error('[generate-migrations-bundle] forward migrations create objects without explicit grants:');
+  grants.errors.forEach((error: string) => console.error(`  - ${error}`));
+  process.exit(1);
+}
+
 const entries = files.map((name) => ({
   version: name.split('_')[0],
   name,

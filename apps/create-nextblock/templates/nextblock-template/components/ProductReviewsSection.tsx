@@ -91,7 +91,9 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
     try {
       const { data, error: dbError } = await supabase
         .from("cms_interactions" as any)
-        .select("*, profiles(full_name, avatar_url)")
+        // author() is a computed relationship (migration 02021): the name and avatar of an
+        // approved row's author, the only profile fields the public key can read.
+        .select("*, author(full_name, avatar_url)")
         .eq("product_id", productId)
         .eq("type", "review")
         .eq("status", "approved")
@@ -363,7 +365,7 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
             const hasLiked = likedIds.includes(review.id) || review.tempHasReacted;
             const likeCount = (review.reactions as Record<string, number>)?.likes || 0;
             const reviewerName =
-              review.profiles?.full_name || label("interactions.anonymous", "Anonymous", "Anonyme");
+              review.author?.full_name || label("interactions.anonymous", "Anonymous", "Anonyme");
             const dateStr = new Date(review.created_at).toLocaleDateString(lang, {
               year: "numeric",
               month: "long",
@@ -379,9 +381,9 @@ export default function ProductReviewsSection({ productId }: ProductReviewsSecti
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex items-center gap-3">
                     <Avatar className="h-10 w-10 border">
-                      <AvatarImage src={review.profiles?.avatar_url || undefined} alt={reviewerName} />
+                      <AvatarImage src={review.author?.avatar_url || undefined} alt={reviewerName} />
                       <AvatarFallback className="bg-primary/5 text-primary text-xs font-semibold">
-                        {getInitials(review.profiles)}
+                        {getInitials(review.author)}
                       </AvatarFallback>
                     </Avatar>
                     <div>

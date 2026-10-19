@@ -95,6 +95,14 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   `useOptionalTranslations()` (ui), and seed every new key EN + FR in a forward migration
   (`02015` is the model). Shop prices go through `usePriceFormatter()`, never bare `formatPrice`.
   Accessibility traps and the audit: docs/05 → "Public UI Copy and Accessibility".
+- RLS: a policy without `TO` applies to `anon` too, and `USING (true)` on it publishes the
+  table to anyone with the public key. Role helpers are `SECURITY DEFINER` in the non-exposed
+  `private` schema with `SECURITY INVOKER` wrappers in `public` (`02021`); never create a
+  `SECURITY DEFINER` function in `public` (advisor lints 0028/0029). A forward migration that
+  creates a table, view or sequence must `GRANT` on it in the same file (Supabase grants
+  nothing on new objects: projects created since 2026-05-30, every project from 2026-10-30;
+  `db:migrate:check` and the bundle generator fail otherwise). Docs/04 → "Row Level Security
+  Patterns".
 
 ## Gotchas
 

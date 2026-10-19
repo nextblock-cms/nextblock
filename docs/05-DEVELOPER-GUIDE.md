@@ -76,7 +76,9 @@ Every later sign-up gets the `USER` role.
 
 - `npm run db:link`: link the Supabase CLI to the target project
 - `npm run db:migrate:check`: preview pending remote migrations without
-  applying them
+  applying them; it also refuses a badly named file and a forward migration that
+  creates a table, view or sequence without granting on it (docs/04 → "Row Level
+  Security Patterns")
 - `npm run db:migrate`: apply pending migration files only; this is the
   production-safe path for live databases
 - `npm run db:migrate:fresh`: apply the full migration baseline to a
