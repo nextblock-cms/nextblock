@@ -103,6 +103,12 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   nothing on new objects: projects created since 2026-05-30, every project from 2026-10-30;
   `db:migrate:check` and the bundle generator fail otherwise). Docs/04 → "Row Level Security
   Patterns".
+- Both apply paths (`/setup` via `lib/setup/schema-apply.ts`, the build hook via
+  `tools/lib/migrate-core.mjs`) end with `grant execute on all functions in schema public`
+  to the API roles, then revoke it again on trigger functions and on the explicit list in
+  `API_ROLE_REVOKE_SQL`. A migration that revokes EXECUTE from `anon`/`authenticated` must
+  add the function to that list in BOTH files (`migrate-core.test.mjs` fails on drift), or
+  the next deploy hands the privilege back (how the 0028/0029 advisor warnings returned).
 
 ## Gotchas
 

@@ -211,7 +211,10 @@ The two jobs that used to be crons are handled like this:
   `DROP SCHEMA public CASCADE` tries to drop pg_net itself while the pg_net worker still
   holds the request that triggered the reset: each waits on the other until Vercel kills
   the route at 60 s (a 504 on every run, and the "Extension in Public" advisor warning).
-  The generated reset SQL now refuses to run while any extension lives in `public`.
+  The generated reset SQL now refuses to run while any extension lives in `public`, and
+  migration `02024` re-registers a `pg_net` it finds in `public` under `extensions`
+  (drop + re-create, since pg_net is not relocatable), so a database that got the bare
+  `create extension` heals on its next migrate.
   Debugging a silent reset: `npm run sandbox:schedule -- status` (504 = the route timed
   out), then the project's Postgres logs for `still waiting for AccessExclusiveLock`. A branch
   carrying the cron was tried first and rejected: every Vercel project on the repo builds

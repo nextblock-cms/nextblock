@@ -320,6 +320,14 @@ logs a warning and continues. That guarantee is why it loads `migrate-core.mjs` 
 *guarded dynamic import*: an unresolvable top-level import is a hard ESM error no `try`
 could contain.
 
+After the pending files, this hook and `/setup` run the same post-apply grant pass
+(`GRANTS_SQL` in `migrate-core.mjs` and `lib/setup/schema-apply.ts`): blanket grants on
+`public` for the API roles, then the revokes those grants would otherwise undo (EXECUTE on
+every trigger function, and the explicit list of `02021`/`02022`). The two copies must
+stay identical; `tools/lib/migrate-core.test.mjs` fails when they drift. Until 2026-10-20
+the hook had the grants without the revokes, which is how the Security Advisor's
+SECURITY DEFINER warnings came back after every deploy (`02024` repairs that).
+
 ### Conflicts hold the schema back
 
 If a standalone merge left conflicts, `npm run update` finishes the code and dependency

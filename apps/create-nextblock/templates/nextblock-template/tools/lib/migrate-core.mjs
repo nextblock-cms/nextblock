@@ -268,12 +268,62 @@ const TRACKING_DDL =
   'create table if not exists supabase_migrations.schema_migrations ' +
   '(version text primary key, name text, statements text[]);';
 
-const GRANTS_SQL =
+// The blanket EXECUTE grant below is then taken back from every trigger function: Postgres
+// only checks EXECUTE on a trigger function at CREATE TRIGGER time, never when it fires, and
+// PostgREST cannot call a `RETURNS trigger` function via /rpc, so the API roles never need
+// it. Until 02024 this file had the grant but not the revoke, so every production build
+// re-granted anon/authenticated on the SECURITY DEFINER triggers (handle_new_user,
+// update_product_ratings) that 02013 revokes, and the Security Advisor flagged them again
+// after each deploy. migrate-core.test.mjs keeps this SQL identical to schema-apply.ts.
+const TRIGGER_FUNCTION_REVOKE_SQL = `do $nb_trg$
+declare r record;
+begin
+  for r in
+    select p.oid::regprocedure as sig
+      from pg_proc p
+      join pg_type t on t.oid = p.prorettype
+     where p.pronamespace = 'public'::regnamespace and t.typname = 'trigger'
+  loop
+    execute format('revoke execute on function %s from public, anon, authenticated', r.sig);
+  end loop;
+end $nb_trg$;`;
+
+// The blanket grants also hand back what migrations 02021/02022 deliberately take away from
+// the API roles: TRUNCATE (not governed by RLS), the invoice-numbering RPCs (service role
+// only), anon's EXECUTE on upsert_product_with_variants, and the two service-role-only
+// wrappers of 02022 (bump_email_2fa_attempts, redeem_coupon_atomically). Guarded by catalog
+// lookups: a database that stopped before those migrations simply has nothing to revoke.
+const API_ROLE_REVOKE_SQL = `do $nb_api$
+begin
+  revoke truncate on all tables in schema public from anon, authenticated;
+  if to_regprocedure('public.generate_order_invoice_number()') is not null then
+    revoke execute on function public.generate_order_invoice_number() from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.assign_order_invoice_metadata(uuid, timestamp with time zone)') is not null then
+    revoke execute on function public.assign_order_invoice_metadata(uuid, timestamp with time zone) from public, anon, authenticated;
+  end if;
+  if to_regclass('public.order_invoice_number_seq') is not null then
+    revoke all on sequence public.order_invoice_number_seq from anon, authenticated;
+  end if;
+  if to_regprocedure('public.upsert_product_with_variants(jsonb)') is not null then
+    revoke execute on function public.upsert_product_with_variants(jsonb) from public, anon;
+  end if;
+  if to_regprocedure('public.bump_email_2fa_attempts(uuid)') is not null then
+    revoke execute on function public.bump_email_2fa_attempts(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.redeem_coupon_atomically(uuid)') is not null then
+    revoke execute on function public.redeem_coupon_atomically(uuid) from public, anon, authenticated;
+  end if;
+end $nb_api$;`;
+
+export const GRANTS_SQL =
   'grant usage on schema public to anon, authenticated, service_role;' +
   'grant select on all tables in schema public to anon;' +
   'grant all on all tables in schema public to authenticated, service_role;' +
   'grant all on all sequences in schema public to anon, authenticated, service_role;' +
-  'grant execute on all functions in schema public to anon, authenticated, service_role;';
+  'grant execute on all functions in schema public to anon, authenticated, service_role;' +
+  TRIGGER_FUNCTION_REVOKE_SQL +
+  API_ROLE_REVOKE_SQL;
 
 function recordSql(version, file) {
   return (

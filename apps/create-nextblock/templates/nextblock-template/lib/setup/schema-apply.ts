@@ -181,9 +181,12 @@ end $nb_trg$;`;
 
 // The blanket grants above also hand back what migration 02021 deliberately takes away from
 // the API roles: TRUNCATE (not governed by RLS), the invoice-numbering RPCs (service role
-// only) and anon's EXECUTE on upsert_product_with_variants. Re-apply those revokes so a
-// /setup-installed database ends in the same state as one migrated with the CLI. Guarded by
-// catalog lookups: a database that stopped before 02021 simply has nothing to revoke.
+// only), anon's EXECUTE on upsert_product_with_variants, and the two service-role-only
+// wrappers of 02022 (bump_email_2fa_attempts, redeem_coupon_atomically). Re-apply those
+// revokes so a /setup-installed database ends in the same state as one migrated with the
+// CLI. Guarded by catalog lookups: a database that stopped before 02021 simply has nothing
+// to revoke. tools/lib/migrate-core.mjs carries the same two blocks for the build-time hook;
+// tools/lib/migrate-core.test.mjs fails when the two copies drift.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
 begin
   revoke truncate on all tables in schema public from anon, authenticated;
@@ -198,6 +201,12 @@ begin
   end if;
   if to_regprocedure('public.upsert_product_with_variants(jsonb)') is not null then
     revoke execute on function public.upsert_product_with_variants(jsonb) from public, anon;
+  end if;
+  if to_regprocedure('public.bump_email_2fa_attempts(uuid)') is not null then
+    revoke execute on function public.bump_email_2fa_attempts(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.redeem_coupon_atomically(uuid)') is not null then
+    revoke execute on function public.redeem_coupon_atomically(uuid) from public, anon, authenticated;
   end if;
 end $nb_api$;`;
 

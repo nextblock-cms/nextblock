@@ -206,7 +206,22 @@ change):
   must not be executable by `anon` or `authenticated`. Triggers fire regardless of the
   caller's EXECUTE privilege, so revoke it. Note that a database which recorded the
   baseline without running it (production after a squash) keeps the old grants until a
-  forward migration revokes them.
+  forward migration revokes them. Both apply paths end with a blanket
+  `grant execute on all functions in schema public` to the API roles, so each path must
+  take it back in the same pass: `TRIGGER_FUNCTION_REVOKE_SQL` (every `RETURNS trigger`
+  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`) in
+  `lib/setup/schema-apply.ts` (`/setup`) and `tools/lib/migrate-core.mjs` (the build-time
+  hook). The hook lacked both until 2026-10-20, so every production deploy re-granted the
+  triggers and the advisor flagged them again; `02024` repairs the databases that were
+  re-granted, and `tools/lib/migrate-core.test.mjs` fails when the two copies drift. A
+  migration that revokes EXECUTE from an API role must add the function to
+  `API_ROLE_REVOKE_SQL` in both files, or the next deploy hands it back.
+- Lint 0014 (`extension_in_public`): a bare `create extension` lands in `public`. For a
+  relocatable extension `alter extension … set schema extensions` is enough; `pg_net` is
+  not relocatable, so `02024` drops and re-creates it `with schema extensions` when it
+  finds it in `public` (its objects live in `net` either way; the request queue and
+  response log are transient, and pg_cron commands are plain text). Install extensions
+  `with schema extensions` from the start.
 - A `CREATE POLICY` without a `TO` clause applies to PUBLIC, `anon` included, and
   `USING (true)` on such a policy publishes the table to anyone holding the site's public
   key. The baseline's `profiles_read_policy` was exactly that (every account's name, phone,
