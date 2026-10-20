@@ -1,8 +1,9 @@
 'use server';
 
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
-import { 
-  getProduct as getProductLib, 
+import { requireEcomAdmin } from '../../../server-actions/require-ecom-role';
+import {
+  getProduct as getProductLib,
   getProducts as getProductsLib
 } from '../../../product-actions';
 
@@ -30,6 +31,7 @@ import { revalidatePath } from 'next/cache';
 
 export async function triggerFreemiusSync() {
   try {
+    await requireEcomAdmin();
     const result = await syncFreemiusProductsToSupabase();
     revalidatePath('/cms/products', 'page');
     return { success: true, data: result };
@@ -40,6 +42,7 @@ export async function triggerFreemiusSync() {
 
 export async function triggerSingleProductSync(productId: string) {
   try {
+    await requireEcomAdmin();
     const result = await syncSingleFreemiusProduct(productId);
     revalidatePath('/cms/products', 'page');
     // The sync writes pricing directly onto the live product row(s). Also

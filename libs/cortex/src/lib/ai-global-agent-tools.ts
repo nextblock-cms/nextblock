@@ -4,7 +4,7 @@
 // Importing next/cache is safe outside a request scope; only calling it needs one. Every
 // caller runs inside a route handler, and tests inject their own revalidatePath.
 import { revalidatePath as nextRevalidatePath } from 'next/cache';
-import { isBlockedFetchHost } from './fetch-host-guard';
+import { isBlockedFetchHost, resolvedHostIsBlocked } from './fetch-host-guard';
 
 export { isBlockedFetchHost };
 import { tool, type ToolSet } from 'ai';
@@ -6239,7 +6239,7 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
     return { message: 'Only http and https URLs can be fetched.', success: false, url: parsed.url };
   }
 
-  if (isBlockedFetchHost(target.hostname)) {
+  if (isBlockedFetchHost(target.hostname) || (await resolvedHostIsBlocked(target.hostname))) {
     return {
       message: 'Refusing to fetch a local, private, or internal address.',
       success: false,
@@ -6272,7 +6272,8 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
     const finalUrl = response.url || target.toString();
 
     try {
-      if (isBlockedFetchHost(new URL(finalUrl).hostname)) {
+      const finalHost = new URL(finalUrl).hostname;
+      if (isBlockedFetchHost(finalHost) || (await resolvedHostIsBlocked(finalHost))) {
         return {
           message: 'The URL redirected to a blocked internal address.',
           success: false,

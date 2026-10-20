@@ -13,6 +13,7 @@ import {
 } from '@nextblock-cms/ecommerce/currency';
 import { mapRawVariantRelations } from '@nextblock-cms/ecommerce/variation-utils';
 import type { CartItem, ProductVariant } from '@nextblock-cms/ecommerce/types';
+import { randomToken, safeEqual, sha256Hex } from '../../../lib/auth/crypto';
 import { resolveMediaUrl } from '../../../lib/media/resolveMediaUrl';
 import { resolveProductMetaDescription, stripHtmlToText } from '../seo';
 
@@ -1658,8 +1659,143 @@ async function buildCartFromRequest(body: unknown): Promise<CartBuildResult> {
   };
 }
 
-function buildCartContinueUrl(baseUrl: string, cartId: string) {
-  return `${baseUrl.replace(/\/+$/, '')}/checkout?ucp_cart=${encodeURIComponent(cartId)}`;
+/**
+ * Cart access control.
+ *
+ * `/ucp/v1/carts/{id}` is unauthenticated (any agent may open a cart) and reads through the
+ * service-role client, so the cart UUID used to be the only thing standing between a stranger
+ * and `buyer_identity` (name, email, phone, shipping address). The id is not a secret: it sits
+ * in `links.self`, in agent transcripts and, before this change, in the checkout URL.
+ *
+ * Each cart therefore carries a capability token, minted at creation and returned exactly once
+ * in the create response (`access_token`); only `sha256(token)` is stored
+ * (`ucp_cart_sessions.access_token_hash`). Every GET / PUT / PATCH / cancel by id must present
+ * it in `X-Cart-Token` (or `Authorization: Bearer`). A missing or wrong token answers exactly
+ * like a cart that does not exist, so the id never becomes an oracle.
+ *
+ * The buyer's `continue_url` carries a DIFFERENT, derived credential: the stored hash itself
+ * (`?ucp_cart=<id>.<sha256(token)>`). The checkout page only hydrates line items from it, and
+ * the hash cannot be turned back into the API token, so a checkout URL leaked through Referer,
+ * history, analytics or a shared link can at most seed a storefront cart; it never reads buyer
+ * identity or mutates the cart through the API.
+ *
+ * Legacy rows (`access_token_hash IS NULL`, created before the column existed) have no token
+ * anyone could present: the API treats them as not found. The checkout hand-off still accepts
+ * their bare-id `continue_url` until they expire (7 days after the deploy at most), because
+ * that path exposes products and quantities only.
+ */
+const CART_TOKEN_HEADER = 'x-cart-token';
+const CART_TOKEN_BYTES = 32;
+const CART_TOKEN_MIN_LENGTH = 16;
+const CART_TOKEN_MAX_LENGTH = 512;
+const CART_CHECKOUT_REFERENCE_SEPARATOR = '.';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;
+
+interface CartAccessRow {
+  id: string;
+  access_token_hash?: string | null;
+}
+
+export function mintCartAccessToken() {
+  const token = randomToken(CART_TOKEN_BYTES);
+  return { token, tokenHash: sha256Hex(token) };
+}
+
+/** The capability token a caller presents for `/ucp/v1/carts/{id}`, or null when it sent none. */
+export function readCartAccessToken(request: Request): string | null {
+  const direct = request.headers.get(CART_TOKEN_HEADER)?.trim();
+  const bearer = request.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  const candidate = direct || bearer || '';
+
+  if (candidate.length < CART_TOKEN_MIN_LENGTH || candidate.length > CART_TOKEN_MAX_LENGTH) {
+    return null;
+  }
+
+  return candidate;
+}
+
+/** True only when the row has a token hash and `token` hashes to it (constant-time). */
+export function cartAccessTokenMatches(
+  row: CartAccessRow | null | undefined,
+  token: string | null | undefined
+): boolean {
+  if (!row?.access_token_hash || !token) {
+    return false;
+  }
+
+  return safeEqual(sha256Hex(token), row.access_token_hash);
+}
+
+/** `continue_url` reference: `<cart id>.<sha256(token)>`, or the bare id for a legacy row. */
+export function buildCartCheckoutReference(row: CartAccessRow) {
+  return row.access_token_hash
+    ? `${row.id}${CART_CHECKOUT_REFERENCE_SEPARATOR}${row.access_token_hash}`
+    : row.id;
+}
+
+export function parseCartCheckoutReference(
+  value: unknown
+): { id: string; handoffKey: string | null } | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  const separatorIndex = trimmed.indexOf(CART_CHECKOUT_REFERENCE_SEPARATOR);
+  const id = separatorIndex === -1 ? trimmed : trimmed.slice(0, separatorIndex);
+  const handoffKey = separatorIndex === -1 ? null : trimmed.slice(separatorIndex + 1);
+
+  if (!UUID_PATTERN.test(id)) {
+    return null;
+  }
+
+  if (handoffKey !== null && !SHA256_HEX_PATTERN.test(handoffKey)) {
+    return null;
+  }
+
+  return { id, handoffKey };
+}
+
+/**
+ * Whether a checkout hand-off reference may hydrate this row's line items. A tokenised row
+ * requires its derived key; a legacy row (no hash) is accepted by bare id until it expires.
+ */
+export function cartCheckoutHandoffAllowed(
+  row: CartAccessRow | null | undefined,
+  handoffKey: string | null | undefined
+): boolean {
+  if (!row) {
+    return false;
+  }
+
+  if (!row.access_token_hash) {
+    return true;
+  }
+
+  return Boolean(handoffKey) && safeEqual(handoffKey as string, row.access_token_hash);
+}
+
+function buildCartContinueUrl(baseUrl: string, row: CartAccessRow) {
+  return `${baseUrl.replace(/\/+$/, '')}/checkout?ucp_cart=${encodeURIComponent(
+    buildCartCheckoutReference(row)
+  )}`;
+}
+
+/**
+ * One answer for "no such cart", "expired", "cancelled", "no token" and "wrong token": HTTP 404
+ * with the UCP business error, so the status and body never tell an id-holder which it was.
+ */
+function buildCartNotFoundResult(baseUrl: string) {
+  return {
+    status: 404,
+    body: buildUcpBusinessError({
+      capability: UCP_CAPABILITIES.cart,
+      code: 'not_found',
+      content: 'Cart not found or has expired',
+      continueUrl: baseUrl,
+    }),
+  };
 }
 
 function rowToUcpCart(row: any, baseUrl: string) {
@@ -1680,7 +1816,7 @@ function rowToUcpCart(row: any, baseUrl: string) {
         url: `${baseUrl.replace(/\/+$/, '')}${UCP_REST_BASE_PATH}/carts/${row.id}`,
       },
     ],
-    continue_url: row.checkout_url || buildCartContinueUrl(baseUrl, row.id),
+    continue_url: row.checkout_url || buildCartContinueUrl(baseUrl, row),
     expires_at: row.expires_at,
   };
 }
@@ -1710,6 +1846,7 @@ export async function createUcpCart(body: unknown, request: Request) {
     };
   }
 
+  const { token, tokenHash } = mintCartAccessToken();
   const client = getUcpSupabaseClient();
   const { data, error } = await client
     .from('ucp_cart_sessions')
@@ -1724,6 +1861,7 @@ export async function createUcpCart(body: unknown, request: Request) {
       line_items: cart.lineItems,
       totals: cart.totals,
       checkout_url: null,
+      access_token_hash: tokenHash,
       metadata: {
         source: 'ucp',
         version: UCP_VERSION,
@@ -1736,7 +1874,7 @@ export async function createUcpCart(body: unknown, request: Request) {
     throw error;
   }
 
-  const checkoutUrl = buildCartContinueUrl(baseUrl, data.id);
+  const checkoutUrl = buildCartContinueUrl(baseUrl, { id: data.id, access_token_hash: tokenHash });
   const { data: updatedRow, error: updateError } = await client
     .from('ucp_cart_sessions')
     .update({ checkout_url: checkoutUrl })
@@ -1752,6 +1890,8 @@ export async function createUcpCart(body: unknown, request: Request) {
     status: 201,
     body: {
       ...rowToUcpCart(updatedRow, baseUrl),
+      // Returned once. Later reads never echo it; the caller must send it back in X-Cart-Token.
+      access_token: token,
       messages: cart.messages,
     },
   };
@@ -1774,20 +1914,24 @@ async function fetchActiveCartRow(id: string) {
   return data;
 }
 
-export async function getUcpCart(id: string, request: Request) {
-  const baseUrl = getOriginFromRequest(request);
+/**
+ * The live cart row for an API call, or null when the caller may not see it: unknown, expired
+ * or cancelled id, no token, wrong token, or a legacy row with no token on file. Callers map
+ * every null to the same not-found answer.
+ */
+async function fetchAuthorizedCartRow(id: string, request: Request) {
+  const token = readCartAccessToken(request);
   const row = await fetchActiveCartRow(id);
 
+  return cartAccessTokenMatches(row, token) ? row : null;
+}
+
+export async function getUcpCart(id: string, request: Request) {
+  const baseUrl = getOriginFromRequest(request);
+  const row = await fetchAuthorizedCartRow(id, request);
+
   if (!row) {
-    return {
-      status: 200,
-      body: buildUcpBusinessError({
-        capability: UCP_CAPABILITIES.cart,
-        code: 'not_found',
-        content: 'Cart not found or has expired',
-        continueUrl: baseUrl,
-      }),
-    };
+    return buildCartNotFoundResult(baseUrl);
   }
 
   return {
@@ -1798,18 +1942,10 @@ export async function getUcpCart(id: string, request: Request) {
 
 export async function updateUcpCart(id: string, body: unknown, request: Request) {
   const baseUrl = getOriginFromRequest(request);
-  const existing = await fetchActiveCartRow(id);
+  const existing = await fetchAuthorizedCartRow(id, request);
 
   if (!existing) {
-    return {
-      status: 200,
-      body: buildUcpBusinessError({
-        capability: UCP_CAPABILITIES.cart,
-        code: 'not_found',
-        content: 'Cart not found or has expired',
-        continueUrl: baseUrl,
-      }),
-    };
+    return buildCartNotFoundResult(baseUrl);
   }
 
   const cart = await buildCartFromRequest(body);
@@ -1829,7 +1965,7 @@ export async function updateUcpCart(id: string, body: unknown, request: Request)
                   severity: 'unrecoverable',
                 },
               ],
-        continue_url: existing.checkout_url || buildCartContinueUrl(baseUrl, existing.id),
+        continue_url: existing.checkout_url || buildCartContinueUrl(baseUrl, existing),
       },
     };
   }
@@ -1846,7 +1982,7 @@ export async function updateUcpCart(id: string, body: unknown, request: Request)
       attribution: cart.attribution,
       line_items: cart.lineItems,
       totals: cart.totals,
-      checkout_url: existing.checkout_url || buildCartContinueUrl(baseUrl, existing.id),
+      checkout_url: existing.checkout_url || buildCartContinueUrl(baseUrl, existing),
     })
     .eq('id', id)
     .select('*')
@@ -1867,18 +2003,10 @@ export async function updateUcpCart(id: string, body: unknown, request: Request)
 
 export async function cancelUcpCart(id: string, request: Request) {
   const baseUrl = getOriginFromRequest(request);
-  const existing = await fetchActiveCartRow(id);
+  const existing = await fetchAuthorizedCartRow(id, request);
 
   if (!existing) {
-    return {
-      status: 200,
-      body: buildUcpBusinessError({
-        capability: UCP_CAPABILITIES.cart,
-        code: 'not_found',
-        content: 'Cart not found or has expired',
-        continueUrl: baseUrl,
-      }),
-    };
+    return buildCartNotFoundResult(baseUrl);
   }
 
   const client = getUcpSupabaseClient();
@@ -1899,13 +2027,23 @@ export async function cancelUcpCart(id: string, request: Request) {
   };
 }
 
-export async function getUcpCartCheckoutItems(cartId: string | null | undefined) {
-  if (!cartId) {
+/**
+ * Line items for the storefront checkout, from the `?ucp_cart=` reference in a cart's
+ * `continue_url` (`<id>.<sha256(token)>`, or a bare id for a legacy row). Returns [] for
+ * anything it may not hydrate; never the buyer identity.
+ */
+export async function getUcpCartCheckoutItems(cartReference: string | null | undefined) {
+  const parsed = parseCartCheckoutReference(cartReference);
+  if (!parsed) {
     return [];
   }
 
   try {
-    const row = await fetchActiveCartRow(cartId);
+    const row = await fetchActiveCartRow(parsed.id);
+    if (!cartCheckoutHandoffAllowed(row, parsed.handoffKey)) {
+      return [];
+    }
+
     const lineItems = Array.isArray(row?.line_items) ? row.line_items : [];
 
     return lineItems

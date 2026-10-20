@@ -1918,9 +1918,12 @@ export async function GET(request: NextRequest) {
     return new NextResponse('Not Found', { status: 404 });
   }
 
-  // 2. Guard: Verify Cron Secret
+  // 2. Guard: Verify Cron Secret. Fail CLOSED when the secret is unset — otherwise the template
+  // literal below becomes the string "Bearer undefined", which an attacker can send verbatim to
+  // trigger a destructive reset on a misconfigured sandbox.
+  const cronSecret = process.env.CRON_SECRET?.trim();
   const authHeader = request.headers.get('authorization');
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
     return new NextResponse('Unauthorized', {
       status: 401,
     });

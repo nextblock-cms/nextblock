@@ -30,6 +30,7 @@ type ChallengeRow = {
   expires_at: string;
   consumed_at: string | null;
   created_at: string;
+  attempts?: number;
 };
 
 /**
@@ -102,6 +103,7 @@ function createFakeDb() {
             consumed_at: null,
             // Distinct, ordered timestamps regardless of how fast the test runs.
             created_at: new Date(Date.UTC(2026, 0, 1) + sequence).toISOString(),
+            attempts: 0,
             ...values,
           });
           return Promise.resolve({ data: null, error: null });
@@ -109,6 +111,22 @@ function createFakeDb() {
         select: () => makeQuery('select'),
         update: (patch: Partial<ChallengeRow>) => makeQuery('update', patch),
       };
+    },
+    // Mirrors public.bump_email_2fa_attempts(uuid): atomically increments attempts on every live
+    // code for the user and returns the new maximum.
+    rpc(fn: string, args: { p_user_id?: string }) {
+      if (fn !== 'bump_email_2fa_attempts') {
+        return Promise.resolve({ data: null, error: null });
+      }
+      const nowIso = new Date().toISOString();
+      let max = 0;
+      for (const row of rows) {
+        if (row.user_id === args.p_user_id && row.consumed_at === null && row.expires_at > nowIso) {
+          row.attempts = (row.attempts ?? 0) + 1;
+          if (row.attempts > max) max = row.attempts;
+        }
+      }
+      return Promise.resolve({ data: max, error: null });
     },
   };
 
@@ -161,6 +179,19 @@ describe('email 2FA challenges', () => {
 
     // Unreachable even though its row has not expired — the window caps the guess surface.
     await expect(verifyEmailChallenge(USER, oldest)).resolves.toBe(false);
+  });
+
+  it('burns the live pool after too many wrong guesses (brute-force lockout)', async () => {
+    const code = await createEmailChallenge(USER);
+    const wrong = code === '000000' ? '111111' : '000000';
+
+    // Five wrong guesses exhaust the shared attempt budget and burn the pool.
+    for (let i = 0; i < 5; i += 1) {
+      await expect(verifyEmailChallenge(USER, wrong)).resolves.toBe(false);
+    }
+
+    // The correct code no longer verifies: the user must request a fresh one.
+    await expect(verifyEmailChallenge(USER, code)).resolves.toBe(false);
   });
 
   it('keeps all three in-window codes usable', async () => {

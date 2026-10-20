@@ -64,12 +64,17 @@ interface FullBackupSummary {
   contentBundleBytes?: number;
   storageObjects?: number;
   missingStorageObjects?: number;
+  usersInArchive?: number | null;
   warnings: string[];
   databaseRestored?: boolean;
   storageObjectsUploaded?: number;
   storageObjectsDeleted?: number;
   mediaUrlRewriteMode?: FullBackupMediaUrlMode;
   mediaUrlRowsUpdated?: number;
+  usersCreated?: number;
+  usersUpdated?: number;
+  usersDeleted?: number;
+  usersSkipped?: number;
 }
 
 const CONTENT_TYPES: Array<{ value: CmsContentType; label: string }> = [
@@ -238,6 +243,9 @@ function FullBackupSummaryPanel({
         <Badge variant="outline">{summary.storageObjects || 0} R2 objects</Badge>
         <Badge variant="outline">{formatBytes(summary.databaseDumpBytes)} DB</Badge>
         <Badge variant="outline">{formatBytes(summary.contentBundleBytes)} content JSON</Badge>
+        {typeof summary.usersInArchive === "number" ? (
+          <Badge variant="outline">{summary.usersInArchive} accounts</Badge>
+        ) : null}
         {summary.missingStorageObjects ? (
           <Badge variant="destructive">{summary.missingStorageObjects} missing files</Badge>
         ) : null}
@@ -259,6 +267,9 @@ function FullBackupSummaryPanel({
             Uploaded {summary.storageObjectsUploaded || 0} R2 object(s), restored the database,
             and updated {summary.mediaUrlRowsUpdated || 0} media URL row(s).
             {summary.storageObjectsDeleted ? ` Deleted ${summary.storageObjectsDeleted} extra R2 object(s).` : ""}
+            {typeof summary.usersInArchive === "number"
+              ? ` Accounts: ${summary.usersCreated || 0} recreated, ${summary.usersUpdated || 0} updated, ${summary.usersDeleted || 0} removed${summary.usersSkipped ? `, ${summary.usersSkipped} skipped` : ""}. Everyone signs in with their original password.`
+              : ""}
           </AlertDescription>
         </Alert>
       ) : null}

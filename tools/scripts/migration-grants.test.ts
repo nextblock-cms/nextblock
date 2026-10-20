@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const { codeOnly, findUngrantedObjects, validateMigrationGrants } = require('./lib/migration-grants.js');
+const { codeOnly, findUngrantedObjects, findTablesWithoutRls, validateMigrationGrants } = require('./lib/migration-grants.js');
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '../../libs/db/src/supabase/migrations');
 
@@ -97,9 +97,23 @@ describe('explicit grants on new tables, views and sequences', () => {
 
   it('lints forward migrations only', () => {
     const files = ['02000_catchup_gen1.sql', '02001_baseline_schema.sql', '02005_add_widgets.sql', 'notes.txt'];
+    // A bare CREATE TABLE in a forward migration now trips BOTH the missing-grant check and the
+    // missing-RLS check; baseline/catch-up/non-sql files are not linted.
     const result = validateMigrationGrants(files, () => 'CREATE TABLE public.widgets (id uuid);');
-    expect(result.errors).toHaveLength(1);
-    expect(result.errors[0]).toMatch(/^02005_add_widgets\.sql: table public\.widgets/);
+    expect(result.errors).toHaveLength(2);
+    expect(result.errors.every((e) => e.startsWith('02005_add_widgets.sql: table public.widgets'))).toBe(true);
+    expect(result.errors.some((e) => /GRANT/.test(e))).toBe(true);
+    expect(result.errors.some((e) => /ROW LEVEL SECURITY/.test(e))).toBe(true);
+  });
+
+  it('flags a new table without ENABLE ROW LEVEL SECURITY, accepts one with it', () => {
+    const noRls = 'CREATE TABLE public.widgets (id uuid);\nGRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.widgets TO anon, authenticated, service_role;';
+    expect(findTablesWithoutRls(noRls)).toHaveLength(1);
+    const withRls =
+      noRls + '\nALTER TABLE public.widgets ENABLE ROW LEVEL SECURITY;';
+    expect(findTablesWithoutRls(withRls)).toEqual([]);
+    // views and sequences are not row-secured, so they are never flagged
+    expect(findTablesWithoutRls('CREATE VIEW public.v AS SELECT 1; CREATE SEQUENCE public.s;')).toEqual([]);
   });
 
   it('passes for every forward migration on disk', () => {

@@ -7,7 +7,7 @@ import { after } from "next/server";
 import { redirect } from "next/navigation";
 import { resolvePostAuthRedirect } from "../lib/auth-redirects";
 import { createEmailChallenge, evaluateTwoFactor } from "../lib/auth/twoFactor";
-import { REMEMBER_INTENT_COOKIE, setSecureCookie } from "../lib/auth/cookies";
+import { REMEMBER_INTENT_COOKIE, TWO_FACTOR_COOKIE, clearCookie, setSecureCookie } from "../lib/auth/cookies";
 import { sendTwoFactorCodeEmail } from "./actions/twoFactorEmail";
 import { getSystemConfiguration } from "../lib/setup/system-config";
 import { verifyBotProtection } from "../lib/botProtection/verify";
@@ -278,5 +278,11 @@ export const resetPasswordAction = async (formData: FormData) => {
 export const signOutAction = async () => {
   const supabase = await createClient();
   await supabase.auth.signOut();
+  // Drop the second-factor "satisfied" marker (userId-bound, 12h) and the remember-intent flag so
+  // a later sign-in on a shared device re-presents 2FA instead of inheriting this session's. The
+  // long-lived trusted-device cookie is left intentionally (that is the "remember this device"
+  // feature; it is revocable from the security settings page).
+  await clearCookie(TWO_FACTOR_COOKIE);
+  await clearCookie(REMEMBER_INTENT_COOKIE);
   return redirect("/");
 };

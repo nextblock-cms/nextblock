@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const cacheMocks = vi.hoisted(() => ({
   revalidatePath: vi.fn(),
@@ -13,6 +13,8 @@ const dbServerMocks = vi.hoisted(() => ({
   getProfileWithRoleServerSide: vi.fn(),
 }));
 
+// Deliberately exports no `headers`: the notification link must not come from the
+// request's Host header, so nothing in the module under test may reach for it.
 const headersMocks = vi.hoisted(() => {
   const get = vi.fn();
   const set = vi.fn();
@@ -21,10 +23,15 @@ const headersMocks = vi.hoisted(() => {
   };
 });
 
+const emailMocks = vi.hoisted(() => ({
+  sendEmail: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("next/cache", () => cacheMocks);
 vi.mock("next/headers", () => headersMocks);
 vi.mock("@nextblock-cms/db/server", () => dbServerMocks);
 vi.mock("server-only", () => ({}));
+vi.mock("./email", () => emailMocks);
 
 import {
   submitInteraction,
@@ -34,18 +41,88 @@ import {
   saveNotificationEmails,
 } from "./interactions";
 
+const INTERACTION_ID = "44444444-4444-4444-4444-444444444444";
+
+/**
+ * A chainable PostgREST-style query stub: every builder method returns the same object,
+ * `await`ing it (or calling single/maybeSingle) resolves to `result`.
+ */
+function makeQuery(result: unknown) {
+  const q: Record<string, any> = {};
+  for (const method of ["select", "eq", "gte", "is", "order", "limit", "insert", "update", "range"]) {
+    q[method] = vi.fn(() => q);
+  }
+  q.single = vi.fn(() => Promise.resolve(result));
+  q.maybeSingle = vi.fn(() => Promise.resolve(result));
+  q.then = (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) =>
+    Promise.resolve(result).then(resolve, reject);
+  return q;
+}
+
+function authedClient(userId: string | null, extra: Record<string, unknown> = {}) {
+  return {
+    auth: {
+      getUser: vi.fn().mockResolvedValue({
+        data: { user: userId ? { id: userId } : null },
+        error: null,
+      }),
+    },
+    ...extra,
+  };
+}
+
+/** Service-role client whose `from(table)` dispatches to a per-table query stub. */
+function serviceClient(tables: Record<string, Record<string, any>>) {
+  const from = vi.fn((table: string) => {
+    const q = tables[table];
+    if (!q) throw new Error(`unexpected service-role table ${table}`);
+    return q;
+  });
+  return { from, client: { from } };
+}
+
+function pendingRows(count: number, ageMs: number) {
+  const createdAt = new Date(Date.now() - ageMs).toISOString();
+  return Array.from({ length: count }, () => ({ created_at: createdAt }));
+}
+
 describe("Interactions Server Actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
   describe("submitInteraction", () => {
-    it("returns an error if the user is not logged in", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({ data: { user: null }, error: null }),
-        },
+    const review = {
+      type: "review" as const,
+      content: "Awesome tool, works perfectly!",
+      rating: 5,
+      productId: "prod-1",
+    };
+
+    function arrange(opts: {
+      pending?: { data: unknown; error: unknown };
+      emails?: string;
+    } = {}) {
+      // `.insert()` with no `.select()`: a RETURNING clause is checked against the
+      // approved-only SELECT policy and fails for a plain USER, so the action must not
+      // ask for the row back. The stub has no `select` so a regression throws here.
+      const insertMock = vi.fn().mockResolvedValue({ error: null });
+      const userFrom = vi.fn(() => ({ insert: insertMock }));
+      dbServerMocks.createClient.mockReturnValue(authedClient("user-1", { from: userFrom }));
+
+      const pendingQuery = makeQuery(opts.pending ?? { data: [], error: null });
+      const settingsQuery = makeQuery({
+        data: opts.emails ? { value: { emails: opts.emails } } : null,
+        error: null,
       });
+      const svc = serviceClient({ cms_interactions: pendingQuery, site_settings: settingsQuery });
+      dbServerMocks.getServiceRoleSupabaseClient.mockReturnValue(svc.client);
+
+      return { insertMock, userFrom, pendingQuery, serviceFrom: svc.from };
+    }
+
+    it("returns an error if the user is not logged in", async () => {
+      dbServerMocks.createClient.mockReturnValue(authedClient(null));
 
       const res = await submitInteraction({
         type: "review",
@@ -55,36 +132,16 @@ describe("Interactions Server Actions", () => {
       });
 
       expect(res).toEqual({ error: "You must be logged in to submit a review or comment." });
+      expect(dbServerMocks.getServiceRoleSupabaseClient).not.toHaveBeenCalled();
     });
 
     it("inserts a new review successfully and triggers revalidation", async () => {
-      const singleMock = vi.fn().mockResolvedValue({
-        data: { id: "int-1", type: "review", status: "pending" },
-        error: null,
-      });
-      const selectMock = vi.fn(() => ({ single: singleMock }));
-      const insertMock = vi.fn(() => ({ select: selectMock }));
-      const fromMock = vi.fn(() => ({ insert: insertMock }));
+      const { insertMock, userFrom, pendingQuery } = arrange();
 
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "user-1" } },
-            error: null,
-          }),
-        },
-        from: fromMock,
-      });
-
-      const res = await submitInteraction({
-        type: "review",
-        content: "Awesome tool, works perfectly!",
-        rating: 5,
-        productId: "prod-1",
-      });
+      const res = await submitInteraction(review);
 
       expect(res.success).toBe(true);
-      expect(fromMock).toHaveBeenCalledWith("cms_interactions");
+      expect(userFrom).toHaveBeenCalledWith("cms_interactions");
       expect(insertMock).toHaveBeenCalledWith({
         type: "review",
         status: "pending",
@@ -96,21 +153,135 @@ describe("Interactions Server Actions", () => {
         reactions: {},
       });
       expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/cms/interactions");
+      // The throttle counted THIS user's pending rows as the service role (a USER cannot
+      // read their own pending rows under RLS).
+      expect(pendingQuery.eq).toHaveBeenCalledWith("user_id", "user-1");
+      expect(pendingQuery.eq).toHaveBeenCalledWith("status", "pending");
+      expect(pendingQuery.limit).toHaveBeenCalledWith(50);
+    });
+
+    it("rejects a sixth pending submission inside the 10-minute window", async () => {
+      const { insertMock } = arrange({
+        pending: { data: pendingRows(5, 60_000), error: null },
+      });
+
+      const res = await submitInteraction(review);
+
+      expect(res.success).toBeUndefined();
+      expect(res.error).toMatch(/submitted several/i);
+      // Generic on purpose: no limit, window or count is disclosed.
+      expect(res.error).not.toMatch(/\d/);
+      expect(insertMock).not.toHaveBeenCalled();
+      expect(emailMocks.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it("allows a submission when the recent pending rows are below the burst limit", async () => {
+      const { insertMock } = arrange({
+        pending: { data: pendingRows(4, 60_000), error: null },
+      });
+
+      const res = await submitInteraction(review);
+
+      expect(res.success).toBe(true);
+      expect(insertMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores old pending rows for the burst limit but enforces the 50-row backlog ceiling", async () => {
+      const dayMs = 24 * 60 * 60_000;
+      const { insertMock: insertBelowCeiling } = arrange({
+        pending: { data: pendingRows(49, dayMs), error: null },
+      });
+      expect((await submitInteraction(review)).success).toBe(true);
+      expect(insertBelowCeiling).toHaveBeenCalledTimes(1);
+
+      const { insertMock: insertAtCeiling } = arrange({
+        pending: { data: pendingRows(50, dayMs), error: null },
+      });
+      const res = await submitInteraction(review);
+      expect(res.error).toMatch(/submitted several/i);
+      expect(insertAtCeiling).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when the pending count cannot be read", async () => {
+      const { insertMock } = arrange({
+        pending: { data: null, error: { message: "boom" } },
+      });
+
+      const res = await submitInteraction(review);
+
+      expect(res.error).toBe("Could not submit right now. Please try again later.");
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when the service-role client is unavailable", async () => {
+      arrange();
+      dbServerMocks.getServiceRoleSupabaseClient.mockImplementation(() => {
+        throw new Error("Missing Supabase Service Role environment variables");
+      });
+
+      const res = await submitInteraction(review);
+
+      expect(res.success).toBeUndefined();
+      expect(res.error).toBeTruthy();
+    });
+
+    describe("moderator notification link", () => {
+      const savedEnv = { ...process.env };
+
+      afterEach(() => {
+        process.env = { ...savedEnv };
+      });
+
+      it("points at the configured site URL, not the request host, and is attribute-safe", async () => {
+        process.env.NEXT_PUBLIC_URL = "https://shop.example.com/";
+        arrange({ emails: "mods@example.com" });
+
+        const res = await submitInteraction({
+          ...review,
+          content: 'Nice product "><img src=x onerror=alert(1)>',
+        });
+
+        expect(res.success).toBe(true);
+        expect(emailMocks.sendEmail).toHaveBeenCalledTimes(1);
+        const message = emailMocks.sendEmail.mock.calls[0][0] as {
+          to: string;
+          html: string;
+          text: string;
+        };
+        expect(message.to).toBe("mods@example.com");
+        expect(message.html).toContain('href="https://shop.example.com/cms/interactions"');
+        expect(message.text).toContain("Moderation Dashboard: https://shop.example.com/cms/interactions");
+        expect(message.html).not.toContain("evil");
+        // Visitor text is still escaped.
+        expect(message.html).not.toContain("<img src=x");
+        expect(message.html).toContain("&lt;img src=x");
+      });
+
+      it("falls back to the local default when no site URL is configured", async () => {
+        delete process.env.NEXT_PUBLIC_URL;
+        delete process.env.VERCEL_PROJECT_PRODUCTION_URL;
+        delete process.env.NEXT_PUBLIC_VERCEL_PROJECT_PRODUCTION_URL;
+        arrange({ emails: "mods@example.com" });
+
+        await submitInteraction(review);
+
+        const message = emailMocks.sendEmail.mock.calls[0][0] as { html: string };
+        expect(message.html).toContain('href="http://localhost:3000/cms/interactions"');
+      });
     });
   });
 
   describe("toggleReaction", () => {
-    it("toggles a reaction and updates cookies", async () => {
-      const getCookieMock = vi.fn().mockReturnValue(undefined);
+    function arrange(opts: { user?: string | null; reactions?: unknown; cookie?: string } = {}) {
+      const getCookieMock = vi.fn().mockReturnValue(opts.cookie ? { value: opts.cookie } : undefined);
       const setCookieMock = vi.fn();
-      headersMocks.cookies.mockResolvedValue({
-        get: getCookieMock,
-        set: setCookieMock,
-      } as any);
+      headersMocks.cookies.mockResolvedValue({ get: getCookieMock, set: setCookieMock } as any);
 
-      const singleMock = vi.fn().mockResolvedValue({
+      dbServerMocks.createClient.mockReturnValue(authedClient(opts.user === undefined ? "user-1" : opts.user));
+
+      const query = makeQuery({
         data: {
-          reactions: { likes: 3 },
+          reactions: opts.reactions ?? { likes: 3 },
           type: "review",
           product_id: "prod-1",
           post_id: null,
@@ -118,45 +289,103 @@ describe("Interactions Server Actions", () => {
         },
         error: null,
       });
-      const eqSelectMock = vi.fn().mockReturnValue({ single: singleMock });
-      const selectMock = vi.fn().mockReturnValue({ eq: eqSelectMock });
-      const eqUpdateMock = vi.fn().mockResolvedValue({ error: null });
-      const updateMock = vi.fn().mockReturnValue({ eq: eqUpdateMock });
-      const fromMock = vi.fn().mockReturnValue({
-        select: selectMock,
-        update: updateMock,
-      });
+      const svc = serviceClient({ cms_interactions: query });
+      dbServerMocks.getServiceRoleSupabaseClient.mockReturnValue(svc.client);
 
-      dbServerMocks.getServiceRoleSupabaseClient.mockReturnValue({
-        from: fromMock,
-      });
+      return { query, serviceFrom: svc.from, setCookieMock };
+    }
 
-      const res = await toggleReaction("int-1");
+    it("toggles a reaction and updates cookies", async () => {
+      const { query, setCookieMock } = arrange();
+
+      const res = await toggleReaction(INTERACTION_ID);
 
       expect(res.success).toBe(true);
       expect(res.count).toBe(4);
       expect(res.hasReacted).toBe(true);
-      expect(updateMock).toHaveBeenCalledWith({ reactions: { likes: 4 } });
-      expect(eqUpdateMock).toHaveBeenCalledWith("id", "int-1");
+      expect(query.update).toHaveBeenCalledWith({ reactions: { likes: 4 } });
+      expect(query.eq).toHaveBeenCalledWith("id", INTERACTION_ID);
+      // Only published rows can be reacted to; the lookup bypasses RLS.
+      expect(query.eq).toHaveBeenCalledWith("status", "approved");
       expect(setCookieMock).toHaveBeenCalledWith(
         "reacted_interactions",
-        JSON.stringify(["int-1"]),
+        JSON.stringify([INTERACTION_ID]),
         expect.any(Object)
       );
       expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/product/my-product");
+    });
+
+    it("removes the reaction when the cookie says the user already reacted", async () => {
+      const { query } = arrange({ cookie: JSON.stringify([INTERACTION_ID]) });
+
+      const res = await toggleReaction(INTERACTION_ID);
+
+      expect(res).toMatchObject({ success: true, count: 2, hasReacted: false });
+      expect(query.update).toHaveBeenCalledWith({ reactions: { likes: 2 } });
+    });
+
+    it("rejects an unauthenticated caller without touching the row", async () => {
+      const { serviceFrom } = arrange({ user: null });
+
+      const res = await toggleReaction(INTERACTION_ID);
+
+      expect(res).toEqual({ error: "You must be logged in to react." });
+      expect(serviceFrom).not.toHaveBeenCalled();
+      expect(cacheMocks.revalidatePath).not.toHaveBeenCalled();
+    });
+
+    it("rejects a malformed interaction id before any lookup", async () => {
+      const { serviceFrom } = arrange();
+
+      expect(await toggleReaction("int-1")).toEqual({ error: "Interaction ID is required." });
+      expect(await toggleReaction("")).toEqual({ error: "Interaction ID is required." });
+      expect(await toggleReaction(undefined as unknown as string)).toEqual({
+        error: "Interaction ID is required.",
+      });
+      expect(serviceFrom).not.toHaveBeenCalled();
+      expect(dbServerMocks.createClient).not.toHaveBeenCalled();
+    });
+
+    it("rejects a reaction type outside the allowlist", async () => {
+      const { serviceFrom } = arrange();
+
+      expect(await toggleReaction(INTERACTION_ID, "__proto__")).toEqual({ error: "Unsupported reaction." });
+      expect(await toggleReaction(INTERACTION_ID, "hearts")).toEqual({ error: "Unsupported reaction." });
+      expect(serviceFrom).not.toHaveBeenCalled();
+    });
+
+    it("clamps a malformed stored count so a toggle moves it by exactly one", async () => {
+      const { query } = arrange({ reactions: { likes: -12.5 } });
+
+      const res = await toggleReaction(INTERACTION_ID);
+
+      expect(res).toMatchObject({ success: true, count: 1 });
+      expect(query.update).toHaveBeenCalledWith({ reactions: { likes: 1 } });
+    });
+
+    it("never writes a negative count", async () => {
+      const { query } = arrange({ reactions: { likes: 0 }, cookie: JSON.stringify([INTERACTION_ID]) });
+
+      const res = await toggleReaction(INTERACTION_ID);
+
+      expect(res).toMatchObject({ success: true, count: 0 });
+      expect(query.update).toHaveBeenCalledWith({ reactions: { likes: 0 } });
+    });
+
+    it("returns not found when the row is not approved", async () => {
+      const { query } = arrange();
+      query.single.mockResolvedValue({ data: null, error: { code: "PGRST116" } });
+
+      const res = await toggleReaction(INTERACTION_ID);
+
+      expect(res).toEqual({ error: "Interaction not found." });
+      expect(query.update).not.toHaveBeenCalled();
     });
   });
 
   describe("updateInteractionStatus", () => {
     it("returns error if non-admin attempts moderation", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "user-1" } },
-            error: null,
-          }),
-        },
-      });
+      dbServerMocks.createClient.mockReturnValue(authedClient("user-1"));
       dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
         role: "WRITER",
       } as any);
@@ -166,14 +395,7 @@ describe("Interactions Server Actions", () => {
     });
 
     it("allows admins to approve and triggers path revalidation", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "admin-1" } },
-            error: null,
-          }),
-        },
-      });
+      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1"));
       dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
         role: "ADMIN",
       } as any);
@@ -211,14 +433,7 @@ describe("Interactions Server Actions", () => {
 
   describe("Notification Emails Settings Actions", () => {
     it("returns error if non-admin attempts to get or save configuration", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "user-1" } },
-            error: null,
-          }),
-        },
-      });
+      dbServerMocks.createClient.mockReturnValue(authedClient("user-1"));
       dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
         role: "WRITER",
       } as any);
@@ -231,14 +446,6 @@ describe("Interactions Server Actions", () => {
     });
 
     it("allows admins to get configuration", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "admin-1" } },
-            error: null,
-          }),
-        },
-      });
       dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
         role: "ADMIN",
       } as any);
@@ -251,15 +458,7 @@ describe("Interactions Server Actions", () => {
       const selectMock = vi.fn().mockReturnValue({ eq: eqMock });
       const fromMock = vi.fn().mockReturnValue({ select: selectMock });
 
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "admin-1" } },
-            error: null,
-          }),
-        },
-        from: fromMock,
-      });
+      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1", { from: fromMock }));
 
       const res = await getNotificationEmails();
       expect(res.success).toBe(true);
@@ -267,14 +466,6 @@ describe("Interactions Server Actions", () => {
     });
 
     it("allows admins to save configuration", async () => {
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "admin-1" } },
-            error: null,
-          }),
-        },
-      });
       dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
         role: "ADMIN",
       } as any);
@@ -282,15 +473,7 @@ describe("Interactions Server Actions", () => {
       const upsertMock = vi.fn().mockResolvedValue({ error: null });
       const fromMock = vi.fn().mockReturnValue({ upsert: upsertMock });
 
-      dbServerMocks.createClient.mockReturnValue({
-        auth: {
-          getUser: vi.fn().mockResolvedValue({
-            data: { user: { id: "admin-1" } },
-            error: null,
-          }),
-        },
-        from: fromMock,
-      });
+      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1", { from: fromMock }));
 
       const res = await saveNotificationEmails(" a@b.com , c@d.com ");
       expect(res.success).toBe(true);

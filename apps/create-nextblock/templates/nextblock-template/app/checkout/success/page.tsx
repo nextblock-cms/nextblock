@@ -30,6 +30,7 @@ export default function CheckoutSuccessPage() {
   const isCartHydrated = useIsCartHydrated();
   const searchParams = useSearchParams();
   const sessionId = searchParams.get('session_id');
+  const accessToken = searchParams.get('token');
   const [invoice, setInvoice] = useState<InvoicePresentationData | null>(null);
   const [license, setLicense] = useState<FreemiusOrderLicense | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -68,7 +69,7 @@ export default function CheckoutSuccessPage() {
       setSyncError(null);
 
       try {
-        const result = await fulfillOrderAction(sessionId);
+        const result = await fulfillOrderAction(sessionId, accessToken);
 
         if (!result.success) {
           setSyncError(

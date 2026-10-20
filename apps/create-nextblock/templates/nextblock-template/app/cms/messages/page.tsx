@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
-import { createClient } from '@nextblock-cms/db/server';
 
+import { getCmsActor, isCmsStaffRole } from '../../../lib/auth/cms-actor';
 import { isEmailConfigured } from '../../../lib/config/email-settings';
 import {
   getStoreContactEmail,
@@ -24,23 +24,14 @@ export default async function MessagesPage({
 }) {
   const params = await searchParams;
 
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) redirect('/sign-in');
+  const actor = await getCmsActor();
+  if (!actor) redirect('/sign-in');
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle();
-
-  if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') {
+  if (!isCmsStaffRole(actor.role)) {
     redirect('/unauthorized');
   }
 
-  const isAdmin = profile?.role === 'ADMIN';
+  const isAdmin = actor.role === 'ADMIN';
 
   const [inbox, storeContactEmail, resolvedFallback, smtpConfigured] = await Promise.all([
     loadInbox({

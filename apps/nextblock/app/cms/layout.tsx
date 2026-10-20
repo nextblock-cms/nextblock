@@ -3,6 +3,7 @@ import { redirect } from 'next/navigation';
 import { after } from 'next/server';
 import CmsClientLayout from "./CmsClientLayout";
 import { verifyPackageOnline, createClient } from '@nextblock-cms/db/server';
+import { getCmsActor } from '../../lib/auth/cms-actor';
 import { evaluateTwoFactor, getStaffTwoFactorReminder } from '../../lib/auth/twoFactor';
 import { maybeRefreshUpstreamStatus } from '../../lib/updates/check-upstream';
 import { maybeRevalidatePackageActivations } from '../../lib/packages/revalidate-activations';
@@ -53,14 +54,11 @@ export default async function CmsLayout({
     redirect('/two-factor?redirect_to=/cms/dashboard');
   }
 
-  const supabaseForRole = createClient();
-  const {
-    data: { user: cmsUser },
-  } = await supabaseForRole.auth.getUser();
-  const { data: cmsProfile } = cmsUser
-    ? await supabaseForRole.from('profiles').select('role').eq('id', cmsUser.id).maybeSingle()
-    : { data: null };
-  const isAdmin = cmsProfile?.role === 'ADMIN';
+  // Memoised for the request, so the page and the helpers below that re-check the role
+  // (getCortexChatStatus and friends read with the service role; see lib/auth/cms-actor.ts)
+  // reuse this lookup instead of each hitting the auth server again.
+  const actor = await getCmsActor();
+  const isAdmin = actor?.role === 'ADMIN';
 
   const [
     isEcommerceActive,

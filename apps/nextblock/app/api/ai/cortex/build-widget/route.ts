@@ -15,6 +15,7 @@ import {
   CUSTOM_BLOCK_DEFINITIONS_CACHE_TAG,
   getCustomBlockDefinitionCacheTag,
 } from '../../../../../lib/custom-block-definitions';
+import { enforceCortexAiRequestQuota } from '../../../../../lib/cortex-ai/request-quota';
 import {
   safeParseCortexAiModelSelection,
   summarizeCortexAiRoutingError,
@@ -46,7 +47,8 @@ async function requireCmsWriterAccess(supabase: SupabaseServerClient) {
     return null;
   }
 
-  return { userId: user.id };
+  // The role rides along because the request quota that follows is per role.
+  return { role: profile.role, userId: user.id };
 }
 
 function jsonError(message: string, status: number) {
@@ -75,6 +77,18 @@ export async function POST(request: Request) {
 
     if (!access) {
       return jsonError('You do not have permission to build Cortex widgets.', 403);
+    }
+
+    // Per-user hourly cap (writer-openrouter-cost-abuse): one request-log row per call,
+    // 429 past the role's cap. Runs before anything that can reach a model.
+    const quotaResponse = await enforceCortexAiRequestQuota({
+      role: access.role,
+      route: 'ai/cortex/build-widget',
+      userId: access.userId,
+    });
+
+    if (quotaResponse) {
+      return quotaResponse;
     }
 
     const isCortexAiActive = await verifyPackageOnline('cortex-ai');

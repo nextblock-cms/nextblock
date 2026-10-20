@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, verifyPackageOnline } from '@nextblock-cms/db/server';
 
 import {
   generateEditorHtmlFragment,
@@ -11,8 +11,14 @@ import {
   summarizeCortexAiRoutingError,
 } from '@nextblock-cms/cortex';
 
+import { enforceCortexAiRequestQuota } from '../../../../lib/cortex-ai/request-quota';
+
 export const dynamic = 'force-dynamic';
 
+/**
+ * ADMIN or WRITER from the cookie session. Returns the role as well as the id because the
+ * request quota that follows is per role (WRITER 60/h, ADMIN 300/h).
+ */
 async function requireCmsEditorAccess() {
   const supabase = createClient();
   const {
@@ -21,7 +27,7 @@ async function requireCmsEditorAccess() {
   } = await supabase.auth.getUser();
 
   if (userError || !user) {
-    return false;
+    return null;
   }
 
   const { data: profile, error: profileError } = await supabase
@@ -30,7 +36,11 @@ async function requireCmsEditorAccess() {
     .eq('id', user.id)
     .single();
 
-  return !profileError && (profile?.role === 'ADMIN' || profile?.role === 'WRITER');
+  if (profileError || !profile || (profile.role !== 'ADMIN' && profile.role !== 'WRITER')) {
+    return null;
+  }
+
+  return { role: profile.role, userId: user.id };
 }
 
 function jsonError(message: string, status: number) {
@@ -39,10 +49,31 @@ function jsonError(message: string, status: number) {
 
 export async function POST(request: Request) {
   try {
-    const hasAccess = await requireCmsEditorAccess();
+    const access = await requireCmsEditorAccess();
 
-    if (!hasAccess) {
+    if (!access) {
       return jsonError('You do not have permission to generate editor blocks.', 403);
+    }
+
+    // Per-user hourly cap (writer-openrouter-cost-abuse): one request-log row per call,
+    // 429 past the role's cap. Runs before anything that can reach a model.
+    const quotaResponse = await enforceCortexAiRequestQuota({
+      role: access.role,
+      route: 'ai/generate-blocks',
+      userId: access.userId,
+    });
+
+    if (quotaResponse) {
+      return quotaResponse;
+    }
+
+    // The same package gate the three sibling AI routes already have (docs/08 follow-up
+    // #6). Block generation spends the operator's OpenRouter credit or the shared house
+    // key, so an install without an active `cortex-ai` activation must not reach a model.
+    const isCortexAiActive = await verifyPackageOnline('cortex-ai');
+
+    if (!isCortexAiActive) {
+      return jsonError('NextBlock Cortex AI is not active for this workspace.', 403);
     }
 
     const body = await request.json().catch(() => null);

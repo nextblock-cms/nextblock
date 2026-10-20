@@ -6,10 +6,13 @@ import {
   FULL_BACKUP_CONTENT_PATH,
   FULL_BACKUP_DATABASE_PATH,
   FULL_BACKUP_STORAGE_PREFIX,
+  FULL_BACKUP_USERS_PATH,
+  FULL_BACKUP_USERS_TYPE,
   archivePathForObjectKey,
   isValidFullBackupConfirmation,
   objectKeyFromArchivePath,
   parseFullBackupManifest,
+  parseFullBackupUsersBundle,
   replaceMediaBaseUrlInJson,
   replaceMediaBaseUrlInString,
 } from "./manifest";
@@ -117,5 +120,63 @@ describe("full backup manifest helpers", () => {
   it("requires the typed destructive restore confirmation", () => {
     expect(isValidFullBackupConfirmation(FULL_BACKUP_CONFIRMATION)).toBe(true);
     expect(isValidFullBackupConfirmation("restore full backup")).toBe(false);
+  });
+
+  it("reads the users entry and treats its absence as an older archive", () => {
+    expect(parseFullBackupManifest(buildManifest()).users).toBeNull();
+    expect(parseFullBackupManifest(buildManifest({ users: { path: FULL_BACKUP_USERS_PATH, count: 3 } })).users).toEqual({
+      path: FULL_BACKUP_USERS_PATH,
+      count: 3,
+    });
+    expect(parseFullBackupManifest(buildManifest({ users: { path: "elsewhere.json", count: 3 } })).users).toBeNull();
+  });
+});
+
+describe("full backup users bundle", () => {
+  const record = {
+    id: "11111111-1111-4111-8111-111111111111",
+    email: "admin@example.com",
+    password_hash: "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQ",
+    email_confirmed: true,
+    user_metadata: { full_name: "Site Admin" },
+    providers: ["email"],
+    has_totp: true,
+  };
+
+  function bundle(users: unknown[]) {
+    return JSON.stringify({ type: FULL_BACKUP_USERS_TYPE, version: 1, exported_at: "2026-10-20T00:00:00.000Z", users });
+  }
+
+  it("parses records and fills defaults for optional fields", () => {
+    const parsed = parseFullBackupUsersBundle(bundle([record]));
+
+    expect(parsed.users).toEqual([
+      {
+        id: record.id,
+        email: "admin@example.com",
+        phone: null,
+        password_hash: record.password_hash,
+        email_confirmed: true,
+        phone_confirmed: false,
+        user_metadata: { full_name: "Site Admin" },
+        created_at: null,
+        last_sign_in_at: null,
+        banned_until: null,
+        providers: ["email"],
+        has_totp: true,
+        is_sso_user: false,
+        is_anonymous: false,
+      },
+    ]);
+  });
+
+  it("rejects a bundle of another type, an invalid id, or an unrecognised hash", () => {
+    expect(() => parseFullBackupUsersBundle(JSON.stringify({ type: "other", version: 1, users: [] }))).toThrow(
+      "auth users bundle version 1"
+    );
+    expect(() => parseFullBackupUsersBundle(bundle([{ ...record, id: "not-a-uuid" }]))).toThrow("invalid account id");
+    expect(() => parseFullBackupUsersBundle(bundle([{ ...record, password_hash: "plaintext" }]))).toThrow(
+      "unrecognised password hash"
+    );
   });
 });

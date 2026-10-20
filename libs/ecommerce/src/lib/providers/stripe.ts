@@ -29,14 +29,21 @@ import {
   STRIPE_TAX_CODE_NONTAXABLE,
 } from '../tax-calculation';
 import {
-  convertMinorUnitAmount,
   getDefaultCurrency,
   normalizePriceMap,
   resolveEffectivePriceForCurrency,
 } from '../currency';
 import { buildOrderTaxDetailsFromCalculation } from '../order-tax-details';
-import { isDigitalItem, PaymentProvider, TranslationMap } from '../types';
-import { resolveTranslatedText } from '../variation-utils';
+import {
+  createInvalidShippingMethodError,
+  createShippingAddressRequiredError,
+  createShippingMethodRequiredError,
+  listEligibleShippingMethods,
+  normalizeShippingDestination,
+  resolveCheckoutShippingMethod,
+} from '../shipping/checkout-shipping-method';
+import { isDigitalItem, PaymentProvider } from '../types';
+import { normalizeCheckoutItems } from './checkout-items';
 
 const STRIPE_ALLOWED_COUNTRIES =
   countries.map((country) => country.code) as Stripe.Checkout.SessionCreateParams.ShippingAddressCollection.AllowedCountry[];
@@ -116,17 +123,6 @@ function resolveStripeCheckoutLocale(locale?: string | null) {
   return undefined;
 }
 
-function resolveShippingMethodName(
-  method: { name: string; name_translations?: TranslationMap | null },
-  locale?: string | null
-) {
-  return resolveTranslatedText(
-    method.name,
-    (method.name_translations || null) as TranslationMap | null,
-    locale
-  );
-}
-
 async function upsertStripeCheckoutCustomer(input: {
   email?: string | null;
   phone?: string | null;
@@ -191,7 +187,7 @@ export class StripeProvider implements PaymentProvider {
   }
 
   async createCheckoutSession({
-    items: cartItems,
+    items: submittedCartItems,
     customerEmail,
     customerPhone,
     userId,
@@ -201,7 +197,7 @@ export class StripeProvider implements PaymentProvider {
     currencyCode,
     locale,
     couponCode,
-    couponContextItems,
+    couponContextItems: submittedCouponContextItems,
   }: CheckoutSessionInput): Promise<{
     url: string | null;
     error?: string;
@@ -222,11 +218,34 @@ export class StripeProvider implements PaymentProvider {
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
     const siteUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:4200';
-    const hasPhysicalProducts = cartItems.some((item) => !isDigitalItem(item));
 
-    if (!cartItems.length) {
+    if (!submittedCartItems?.length) {
       return { error: 'Cart is empty', url: null };
     }
+
+    // The request body is the only source of quantities. Reject anything that is not a
+    // positive integer and merge duplicate product+variant lines before any pricing,
+    // inventory check or order row sees them (see checkout-items.ts for the failure mode).
+    const normalizedCartItems = normalizeCheckoutItems(submittedCartItems);
+
+    if (!normalizedCartItems.ok) {
+      return { url: null, ...normalizedCartItems.error };
+    }
+
+    const cartItems = normalizedCartItems.items;
+    let couponContextItems = cartItems;
+
+    if (submittedCouponContextItems && submittedCouponContextItems.length > 0) {
+      const normalizedContextItems = normalizeCheckoutItems(submittedCouponContextItems);
+
+      if (!normalizedContextItems.ok) {
+        return { url: null, ...normalizedContextItems.error };
+      }
+
+      couponContextItems = normalizedContextItems.items;
+    }
+
+    const hasPhysicalProducts = cartItems.some((item) => !isDigitalItem(item));
 
     const { data: currenciesResult, error: currenciesError } = await supabase
       .from('currencies')
@@ -343,7 +362,7 @@ export class StripeProvider implements PaymentProvider {
       const quoteResult = await getCouponQuote({
         client: supabase as any,
         code: couponCode,
-        items: couponContextItems && couponContextItems.length > 0 ? couponContextItems : cartItems,
+        items: couponContextItems,
         currencyCode: selectedCurrency.code,
       });
 
@@ -543,25 +562,65 @@ export class StripeProvider implements PaymentProvider {
 
     let shippingAmount = 0;
     let resolvedShippingMethodName: string | null = null;
-    if (shippingMethodId) {
-      const { data: method, error: methodError } = await supabase
-        .from('shipping_zone_methods')
-        .select('id, name, name_translations, cost_amount, cost_currency')
-        .eq('id', shippingMethodId)
-        .single();
 
-      if (methodError) {
-        console.error('Failed to load shipping method:', methodError);
-        return { error: 'Failed to load shipping method', url: null };
+    if (hasPhysicalProducts) {
+      // The request only names a method id; its cost, free-shipping threshold and zone are
+      // re-read from the DB against the shipping address and the DISCOUNTED subtotal, the
+      // same inputs the estimate shown at checkout used (resolveShippingOptions). Method
+      // rows are publicly readable, so an unvalidated id was a free pick of the cheapest
+      // rate in the store, and omitting the id was a free pick of no rate at all.
+      const shippingDestination = normalizeShippingDestination({
+        country: shippingAddress?.country_code,
+        state: shippingAddress?.state,
+        postal_code: shippingAddress?.postal_code,
+      });
+
+      if (!shippingDestination) {
+        return { url: null, ...createShippingAddressRequiredError() };
       }
 
-      shippingAmount = convertMinorUnitAmount({
-        amount: method.cost_amount ?? 0,
-        fromCurrencyCode: method.cost_currency || defaultCurrency.code,
-        toCurrencyCode: selectedCurrency.code,
+      const shippingRateInput = {
+        destination: shippingDestination,
+        cartTotal: Math.max(0, totalAmount - discountTotal),
         currencies,
-      });
-      resolvedShippingMethodName = resolveShippingMethodName(method, locale);
+        currencyCode: selectedCurrency.code,
+      };
+
+      if (shippingMethodId) {
+        const resolution = await resolveCheckoutShippingMethod(supabase as any, {
+          ...shippingRateInput,
+          methodId: shippingMethodId,
+          languageCode: locale,
+        });
+
+        if (!resolution.ok) {
+          if (resolution.reason === 'load_failed') {
+            console.error('Failed to load shipping method:', resolution.error);
+            return { error: 'Failed to load shipping method', url: null };
+          }
+
+          console.warn(
+            `Checkout rejected shipping method ${shippingMethodId}: ${resolution.reason}`
+          );
+          return { url: null, ...createInvalidShippingMethodError() };
+        }
+
+        shippingAmount = resolution.method.amount;
+        resolvedShippingMethodName = resolution.method.name;
+      } else {
+        // No method submitted: only acceptable when the store offers none for this
+        // destination (the storefront disables payment otherwise).
+        const eligible = await listEligibleShippingMethods(supabase as any, shippingRateInput);
+
+        if (!eligible.ok) {
+          console.error('Failed to load shipping methods:', eligible.error);
+          return { error: 'Failed to load shipping method', url: null };
+        }
+
+        if (eligible.methods.length > 0) {
+          return { url: null, ...createShippingMethodRequiredError() };
+        }
+      }
     }
 
     const taxDestination = hasPhysicalProducts ? shippingAddress ?? billingAddress : billingAddress;
@@ -715,7 +774,7 @@ export class StripeProvider implements PaymentProvider {
     }
 
     if (couponQuote) {
-      await recordCouponRedemption({
+      const redemption = await recordCouponRedemption({
         client: supabase as any,
         quote: couponQuote,
         orderId,
@@ -730,6 +789,14 @@ export class StripeProvider implements PaymentProvider {
           tax_total: manualTaxAmount,
         },
       });
+
+      // The redemption counter is enforced atomically in the DB. If it was already exhausted the
+      // coupon must not apply: fail the just-created order and stop before a Stripe session is
+      // created, rather than letting the N+1 buyer check out with a discount they cannot claim.
+      if (!redemption.success) {
+        await supabase.from('orders').update({ status: 'failed' }).eq('id', orderId);
+        return { url: null, error: 'Coupon is no longer available.', errorKey: 'ecommerce.coupon_invalid' };
+      }
     }
 
     const stripeCustomerId = await upsertStripeCheckoutCustomer({

@@ -98,17 +98,33 @@ export async function deleteMediaItem(mediaId: string, objectKey: string) {
       return encodedRedirect("error", "/cms/media", "R2 client is not configured for deletion.");
     }
 
-    // Fetch media to get variants
-    const { data: mediaToDelete } = await supabase
-      .from('media')
-      .select('variants')
-      .eq('id', mediaId)
-      .single();
+    // Delete the DB row FIRST and read back the rows that were actually removed. Under RLS
+    // (media_delete_policy, migration 02022 §9) a non-owner WRITER matches zero rows, so if we
+    // destroyed the storage objects before the DB delete the object would be gone while the row
+    // survived (an orphan) and the UI would still report success. Only objects belonging to a row
+    // we were allowed to delete are safe to remove.
+    const { data: deletedRows, error: dbError } = await supabase
+      .from("media")
+      .delete()
+      .eq("id", mediaId)
+      .select("object_key, variants");
 
-    const keysToDelete = [objectKey];
-    if (mediaToDelete?.variants && Array.isArray(mediaToDelete.variants)) {
-        mediaToDelete.variants.forEach((v: any) => {
-            if (v.objectKey) keysToDelete.push(v.objectKey);
+    if (dbError) {
+        console.error("Error deleting media record from DB:", dbError);
+        return encodedRedirect("error", "/cms/media", `Failed to delete media record: ${dbError.message}`);
+    }
+
+    if (!deletedRows || deletedRows.length === 0) {
+        // RLS removed nothing: the row either does not exist or belongs to another uploader.
+        // Leave storage untouched so we never orphan an object we had no right to delete.
+        return encodedRedirect("error", "/cms/media", "Media item not found or you do not have permission to delete it.");
+    }
+
+    const deletedRow = deletedRows[0];
+    const keysToDelete = [deletedRow.object_key ?? objectKey];
+    if (deletedRow.variants && Array.isArray(deletedRow.variants)) {
+        deletedRow.variants.forEach((v: any) => {
+            if (v?.objectKey) keysToDelete.push(v.objectKey);
         });
     }
 
@@ -124,18 +140,9 @@ export async function deleteMediaItem(mediaId: string, objectKey: string) {
             }));
         }
     } catch (r2Error: unknown) {
+        // The DB row is already gone; a storage failure here leaves an orphaned OBJECT (not an
+        // orphaned row), which the full-backup/orphan sweep can reclaim. Log and report success.
         console.error("Error deleting from storage:", r2Error);
-        // Decide if you want to proceed with DB deletion if R2 deletion fails
-        // It's often better to proceed and log, or handle more gracefully.
-        // For now, we'll let it proceed to DB deletion but the error is logged.
-        // You could redirect with a partial success/warning message here.
-    }
-
-    const { error: dbError } = await supabase.from("media").delete().eq("id", mediaId);
-
-    if (dbError) {
-        console.error("Error deleting media record from DB:", dbError);
-        return encodedRedirect("error", "/cms/media", `Failed to delete media record: ${dbError.message}`);
     }
 
     revalidatePath("/cms/media");
@@ -170,35 +177,45 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
     return { error: "R2 client is not configured for deletion." };
   }
 
-  // Fetch variants for all items
-  const { data: mediaItems } = await supabase
-    .from('media')
-    .select('id, object_key, variants')
-    .in('id', items.map(i => i.id));
+  const itemIdsToDelete = items.map(item => item.id);
 
-  const allKeysToDelete: string[] = [];
-  
-  // If we found the items in DB, use their variants data
-  if (mediaItems) {
-      mediaItems.forEach(item => {
-          allKeysToDelete.push(item.object_key);
-          if (item.variants && Array.isArray(item.variants)) {
-              item.variants.forEach((v: any) => {
-                  if (v.objectKey) allKeysToDelete.push(v.objectKey);
-              });
-          }
-      });
-  } else {
-      // Fallback to just the provided keys if DB fetch fails (unlikely)
-      items.forEach(item => allKeysToDelete.push(item.objectKey));
+  // Delete the DB rows FIRST and read back the rows that were actually removed. RLS
+  // (media_delete_policy, migration 02022 §9) silently drops rows this user does not own, so
+  // deleting storage up front would destroy objects while their rows survived (orphans) and
+  // still report success. We only ever remove objects for rows we were allowed to delete.
+  const { data: deletedRows, error: dbDeleteError } = await supabase
+    .from("media")
+    .delete()
+    .in("id", itemIdsToDelete)
+    .select("object_key, variants");
+
+  if (dbDeleteError) {
+    console.error("Error batch deleting media records from DB:", dbDeleteError);
+    return { error: `Failed to delete media records from DB: ${dbDeleteError.message}` };
   }
 
-  const r2ObjectsToDelete = allKeysToDelete.map(key => ({ Key: key }));
-  const itemIdsToDelete = items.map(item => item.id);
-  let r2DeletionError = null;
-  let dbDeletionError = null;
+  if (!deletedRows || deletedRows.length === 0) {
+    // Nothing was removed: the rows are missing or owned by another uploader. Touch no storage.
+    return { error: "None of the selected media could be deleted (not found, or you do not have permission to delete them)." };
+  }
 
-  // Batch delete from object storage
+  // Build the storage key list from the rows that were actually deleted — never from the
+  // caller-supplied object keys, which could name objects for rows RLS refused to delete.
+  const allKeysToDelete: string[] = [];
+  deletedRows.forEach(item => {
+    if (item.object_key) allKeysToDelete.push(item.object_key);
+    if (item.variants && Array.isArray(item.variants)) {
+      item.variants.forEach((v: any) => {
+        if (v?.objectKey) allKeysToDelete.push(v.objectKey);
+      });
+    }
+  });
+
+  const r2ObjectsToDelete = allKeysToDelete.map(key => ({ Key: key }));
+  let r2DeletionError = null;
+
+  // Batch delete from object storage. The DB rows are already gone, so a storage failure here
+  // leaves orphaned OBJECTS (reclaimable by the orphan sweep), not orphaned rows.
   try {
     if (r2ObjectsToDelete.length > 0) {
       if (backend === 'supabase') {
@@ -220,27 +237,19 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
     r2DeletionError = `Failed to delete objects from storage: ${error instanceof Error ? error.message : String(error)}`;
   }
 
-  // Batch delete from Supabase
-  try {
-    if (itemIdsToDelete.length > 0) {
-      const { error } = await supabase.from("media").delete().in("id", itemIdsToDelete);
-      if (error) {
-        throw error;
-      }
-    }
-  } catch (error: unknown) {
-    console.error("Error batch deleting media records from DB:", error);
-    dbDeletionError = `Failed to delete media records from DB: ${error instanceof Error ? error.message : String(error)}`;
-  }
-
-  if (r2DeletionError || dbDeletionError) {
-    // Construct a combined error message
-    const errors = [r2DeletionError, dbDeletionError].filter(Boolean).join(" | ");
+  if (r2DeletionError) {
     // No redirect here, return error object for client-side handling
-    return { error: `Deletion process encountered issues: ${errors}` };
+    return { error: `Deletion process encountered issues: ${r2DeletionError}` };
   }
 
   revalidatePath("/cms/media");
+
+  // Some selected rows may have been left untouched by RLS (not owned). Report that honestly
+  // instead of claiming a full success the user did not actually get.
+  const skipped = itemIdsToDelete.length - deletedRows.length;
+  if (skipped > 0) {
+    return { success: `Deleted ${deletedRows.length} item(s); ${skipped} could not be deleted (not found, or you do not have permission).` };
+  }
   // No redirect here, return success object for client-side handling
   return { success: "Selected media items deleted successfully." };
 }
@@ -299,15 +308,27 @@ export async function moveMultipleMediaItems(
 
   for (const item of items) {
     try {
-      // Load media to retrieve variants
-      const { data: mediaRow, error: mediaError } = await supabase
+      // Claim the row with an ownership-scoped write BEFORE touching storage, and read it back.
+      // A move both relocates the storage objects AND rewrites the row's keys; under RLS
+      // (media_update_policy, migration 02022 §9) a non-owner WRITER matches zero rows, so moving
+      // the objects first would relocate them while the row kept pointing at the old (now gone)
+      // keys — a broken record the UI would report as moved. The guard update is a no-op bump that
+      // returns the row only when RLS allows us to write it; a SELECT cannot tell us that because
+      // media_read_policy still lets any staff member read every row.
+      const { data: claimedRows, error: claimError } = await supabase
         .from("media")
-        .select("id, object_key, file_type, variants")
+        .update({ updated_at: new Date().toISOString() })
         .eq("id", item.id)
-        .single();
+        .select("id, object_key, file_type, variants");
 
-      if (mediaError || !mediaRow) {
-        results.push({ id: item.id, ok: false, error: mediaError?.message || 'Media not found' });
+      if (claimError) {
+        results.push({ id: item.id, ok: false, error: claimError.message });
+        continue;
+      }
+
+      const mediaRow = claimedRows && claimedRows.length > 0 ? claimedRows[0] : null;
+      if (!mediaRow) {
+        results.push({ id: item.id, ok: false, error: 'Media not found, or you do not have permission to move it' });
         continue;
       }
 

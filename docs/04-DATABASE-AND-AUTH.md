@@ -174,7 +174,10 @@ The high-level access model is:
 - `ADMIN` or `WRITER` write access for most CMS authoring tables, and staff-only reads of
   revisions and drafts
 - `site_settings` reads tiered by key (public / signed-in / staff / `ADMIN`, see "Important
-  Site Settings in Active Use" below); writes unchanged
+  Site Settings in Active Use" below); writes tiered since `02022` (the sensitive keys are
+  `ADMIN`-only); since `02023` the `ADMIN` tier of both requires a satisfied second factor
+  (`is_admin_mfa()`), so the CMS reads and writes it with the service role after its own
+  role check
 - `ADMIN`-only write access for higher-risk configuration surfaces
 - `service_role` full access where background jobs or system syncs need it
 
@@ -227,13 +230,118 @@ change):
   `authenticated` on every table that exists at that point, and `/setup`'s grant pass repeats
   the revoke. A later migration that grants on a new table grants `SELECT, INSERT, UPDATE,
   DELETE` rather than `ALL` (the lint accepts either; the convention is the guard).
-- `ADMIN` and `WRITER` read every `profiles` row, phone and website included: the dashboard,
-  revision history and author pickers embed `profiles(full_name)` with the cookie client, and
-  staff are trusted with the customer contact data the CMS already shows them. Customers never
-  read another account's row.
+- `ADMIN` and `WRITER` read every `profiles` row, phone and website included, and staff are
+  trusted with the customer contact data the CMS already shows them. Customers never read
+  another account's row. Since `02023` the `ADMIN` half of that read (and the admin
+  INSERT/UPDATE) goes through `is_admin_mfa()`, so an ADMIN on an `aal1` "remember this device"
+  session sees only their own row through the cookie client: the dashboard, the revision lists
+  and the inbox resolve author names, and the users screen counts admins, with the service role
+  after a staff check (`lib/auth/cms-actor.ts`). The `WRITER` half is unchanged.
 - A table whose row decides authorization elsewhere (`user_security_settings` drives the
   second-factor gate) gets no owner write policy at all; the server verifies, then writes
   with the service role.
+
+`02022` (second red-team pass, 2026-10-19) hardens the writer boundary and adds a second-factor
+check inside RLS:
+
+- **`site_settings` writes are tiered like reads.** `privacy_settings` (carries
+  `custom_scripts`), `global_css`, `is_admin_created` and `security_settings` join the ADMIN-only
+  write array of the three write policies. A `WRITER` could previously write them over PostgREST:
+  `custom_scripts`/`global_css` are injected site-wide (stored XSS across the WRITER→visitor/ADMIN
+  boundary), `is_admin_created` gates both the first-admin bootstrap and the `/setup` redirect
+  (reset it → self-promote on next sign-up, or funnel all traffic to `/setup`), and
+  `security_settings` holds `enforce_staff_2fa`. Reads are unchanged.
+- **`handle_new_user()` is a one-shot.** It grants `ADMIN` only when the flag is unset AND no
+  `ADMIN` profile exists, and always self-heals the flag to `true`. A reset flag or a concurrent
+  first-boot can no longer mint a second administrator.
+- **Second factor inside RLS.** `private.meets_aal_requirement()` (owner-privileged, in `private`)
+  is true unless the caller has a verified MFA factor but the session is not `aal2`;
+  `public.is_admin_mfa()` is the `SECURITY INVOKER` wrapper (`is_admin()` AND the aal check). A
+  no-MFA admin is never locked out. Applied to `mcp_access_tokens` (self-minting a bearer is a
+  persistence primitive) and `package_activations` (plaintext license keys, now ADMIN-only read),
+  so an `aal1` ADMIN session JWT used directly against PostgREST cannot reach them. The app
+  enforces 2FA only in `proxy.ts`/`app/cms/layout.tsx`, so this closes the Data-API path; `02023`
+  widens `is_admin_mfa()` to the remaining ADMIN policies (below). The MCP route's
+  admin-session path and the full-backup export/restore routes enforce the same second factor in
+  code (`evaluateTwoFactor()`).
+- **Draft content: media, categories and stock are staff-only until the product is live.** 02021
+  re-cut `products`/`product_variants`; `02022` does the same for `product_media`,
+  `product_categories` and `inventory_items` (an `EXISTS` on an active, published product; stock is
+  matched by SKU against products and variants). `tax_rates`/`shipping_*` stay public (checkout
+  needs them).
+
+**Server actions enforce their own authorization — RLS is not a backstop for them.** A Next.js
+server action is a public POST dispatched by its action id regardless of route, and `proxy.ts`
+only gates `/cms` *URLs*, so an action bundled into a public page runs for anyone who has the id
+(the id ships in the client bundle). An action that reaches for `getServiceRoleSupabaseClient()`
+(which bypasses RLS) therefore has **no** guard unless it checks the caller itself. Use
+`requireEcomAdmin()` / `requireEcomStaff()` (`libs/ecommerce/src/lib/server-actions/require-ecom-role.ts`,
+mirroring `requireAdminActor()` in `app/actions/package-actions.ts`) at the top of every such
+action, or write with the cookie client so RLS still applies. The 2026-10-19 pass found the
+inventory, product-taxonomy, Freemius-sync and shipping-zone/rate actions and the checkout-success
+order lookup all missing this; they now gate (financial order transitions are ADMIN-only, content
+taxonomy is ADMIN/WRITER, checkout-success binds the order to its owner). Guest Freemius checkout
+still works because the provider mints a capability token (HMAC of the order id,
+`libs/ecommerce/src/lib/order-access-token.ts`) into the success redirect, which the action
+accepts as a third authorization path alongside owner / staff.
+
+`02022` also carries these DB-level hardenings (second red-team pass):
+
+- **`media` is owner-scoped for staff.** `media_update_policy` / `media_delete_policy` let a WRITER
+  change or delete only rows where `uploader_id = (select auth.uid())`; ADMIN keeps every row. The
+  CMS media actions and the product orphan-media sweep now do the DB write **first** and only touch
+  storage for the rows RLS actually returned, so a non-owner's request can no longer destroy a
+  storage object while orphaning its row.
+- **Atomic, limit-aware coupon redemption.** `public.redeem_coupon_atomically(uuid)` (service-role
+  only) increments `coupons.redemptions_count` under the row lock and returns false past the limit;
+  the Stripe and Freemius providers fail the order and abort checkout when it returns false, so a
+  `redemption_limit = N` coupon can never be redeemed past N.
+- **`order_items.quantity > 0` CHECK** backstops the checkout quantity clamp for every writer.
+- **`cms_interactions` flood trigger** (`private.enforce_cms_interaction_rate_limit`, BEFORE INSERT)
+  caps how many pending interactions one ordinary user can create (staff and the service role are
+  exempt), closing the direct-PostgREST flood the app-layer limit could not see.
+- **Email-2FA lockout** is atomic: `public.bump_email_2fa_attempts(uuid)` (service-role only)
+  increments every live code's `attempts` under its lock and returns the new maximum; the server
+  burns the live pool once it reaches the cap, so the 10^6 code space cannot be iterated.
+- **`ucp_cart_sessions.access_token_hash`** holds the sha256 of a per-cart capability token the app
+  now requires on every read/modify/cancel, closing the cart IDOR.
+- **`cortex_request_log`** (service-role only, RLS on, no API-role policy) backs a per-role hourly
+  quota on the AI routes so a WRITER cannot drain the operator's model key.
+- **aal2 reaches the app's own reads correctly.** Because `is_admin_mfa()` requires an `aal2`
+  session for a factor-enrolled admin, the CMS pages that read `package_activations` /
+  `mcp_access_tokens` now read with the service-role client behind the existing `/cms` 2FA gate, so
+  a "remember this device" (aal1) admin is not locked out of their own screens while the Data-API
+  path stays gated. The tokenless-localhost MCP trust now defaults off and requires the
+  `NEXTBLOCK_MCP_TRUST_LOCALHOST` opt-in.
+
+`02023` (2026-10-20) finishes the aal2-in-RLS pass. `public.is_admin_mfa()` replaces `is_admin()`
+in every ADMIN branch of `orders`, `order_items`, `profiles` (other accounts' rows, and the admin
+INSERT/UPDATE) and `site_settings` (reads above the staff tier, writes of the sensitive keys). The
+owner branches, the `WRITER` branches, the staff tier and the anon policy are untouched, and
+`user_addresses` has no ADMIN policy at all (owner + service role), so nothing changes there. An
+ADMIN session JWT carrying only a first factor now reaches no order, no other account's profile
+row and no setting above the staff tier over the Data API, and cannot write any of them. Every
+policy is dropped by name and recreated, so the file re-runs cleanly.
+
+The app rule that makes this possible: **a CMS read or write of one of those rows goes through
+the service role after an in-code role check, never through the cookie client**, because a
+"remember this device" admin passes the app's 2FA gate on an `aal1` Supabase session and would
+otherwise see their own screens empty. `apps/nextblock/lib/auth/cms-actor.ts` is the app helper:
+`getCmsActor()` reads the caller's own profile row (the one branch no aal check touches) and is
+memoised per request with React `cache`, so the layout, the page and every helper they call
+resolve the actor once; `requireCmsAdmin()` / `requireCmsStaff()` throw `Unauthorized` /
+`Forbidden` and return the service-role client. `getEcomActorRole()` / `requireEcomAdmin()` in
+`libs/ecommerce/.../server-actions/require-ecom-role.ts` are the lib equivalents. Users: the
+dashboard (orders and the ledger profiles for ADMIN, the user count and recent-post authors for
+staff), the orders list, order detail and report export, the revision lists and the inbox (author
+names), the users screen's last-admin count, the Cortex and SEO admin gates (`require-admin.ts`
+now returns the service-role client), the Cortex setup/chat status helpers, and the email,
+payment, bot-protection, privacy/security, language-detection and global-CSS settings writers.
+Where a WRITER could already open the screen (the orders list, the payments credentials view)
+a non-ADMIN keeps the empty result RLS gave them instead of meeting an error page; nothing a
+WRITER can see or do has widened. `tools/scripts/security-verify.sql` sections 13–17 assert the
+policies from five seats: an ADMIN with a verified factor at `aal1` and at `aal2`, an ADMIN who
+never enrolled a factor, a WRITER and a customer.
 
 Explicit grants on every new table, view and sequence. Supabase no longer grants `anon`,
 `authenticated` and `service_role` on new objects in `public` — the default for projects
@@ -245,8 +353,10 @@ authenticated, service_role` (and `ON SEQUENCE`, including the implicit sequence
 identity column) plus `ENABLE ROW LEVEL SECURITY` and policies in the same file, exactly as
 `02003` does for the baseline; without the grant PostgREST answers 42501 whatever the policies
 say. `npm run db:migrate:check` and `npm run generate:migrations-bundle` refuse a forward
-migration that creates such an object without granting on it to an API role
-(`tools/scripts/lib/migration-grants.js`). Two places still apply blanket grants afterwards:
+migration that creates such an object without granting on it to an API role, and (since `02022`)
+without an `ALTER TABLE … ENABLE ROW LEVEL SECURITY` for each new table in the same file — an
+API-reachable table with RLS off exposes every row to the public key
+(`tools/scripts/lib/migration-grants.js`: `findUngrantedObjects` + `findTablesWithoutRls`). Two places still apply blanket grants afterwards:
 the sandbox reset (`ALTER DEFAULT PRIVILEGES ... GRANT ALL` in `generate-sandbox-reset.ts`) and
 `/setup`'s post-apply pass (`lib/setup/schema-apply.ts`, which then re-applies the `02021`
 revokes so a wizard-installed database matches a CLI-migrated one).
@@ -534,6 +644,68 @@ and are what the next squash repeats with `G = 3`.
     production via `--reconcile-squash`, the sandbox via its reset.
 11. **The first new migration is `G005`.** Never reuse a retired number.
 
+## Full Site Backup and Restore
+
+The CMS "Full ZIP backup" (`apps/nextblock/lib/full-backup/`, routes under
+`app/api/cms/full-backup/`) is the whole-site migration path: it moves a site, accounts
+included, to another Supabase project the way an all-in-one WordPress migration plugin does.
+Export and restore are ADMIN-only and require a satisfied second factor. The archive holds:
+
+- `database/dump.sql` — `pg_dump --clean --if-exists --no-owner` of the **application schemas
+  only**: `public`, `private` and `supabase_migrations` (so the restored site knows which
+  migrations it has). `auth`, `storage`, `extensions`, … are owned by Supabase's own roles
+  (`supabase_auth_admin`, …); the `postgres` role the restore runs as cannot recreate them, so
+  they are not dumped. (Before this scoping the dump carried them and the restore, run without
+  error-stop, skipped every failing `auth.*` statement in silence while reporting success.)
+- `users/auth-users.json` — one record per live `auth.users` row: id, email/phone and their
+  confirmation state, the **original password hash** (`encrypted_password`), user metadata, ban,
+  identity providers, and whether a TOTP factor was verified. No tokens, sessions or TOTP secrets.
+- `content/nextblock-content-backup.json` (the content-transfer bundle) and every R2 object.
+
+A restore runs in this order and fails loudly at the first problem instead of skipping it:
+
+1. **Accounts first.** The dump re-adds every foreign key to `auth.users` after loading
+   `profiles`/`orders`/…, so the ids must already exist. Each backup account is recreated through
+   the GoTrue admin API with its original `id` and `password_hash` (`POST /admin/users` honours
+   both); an account that already exists here under the same id is updated instead. An account on
+   this site that holds an email the backup needs under a different id is removed first.
+   `planUserRestore()` in `users.ts` is the pure planner.
+2. **SQL restore** as one `psql --single-transaction -v ON_ERROR_STOP=1` script
+   (`database.ts`): a preamble detaches every trigger that sits on a table outside the
+   application schemas but fires a function inside them (`auth.users` → `public.handle_new_user`;
+   otherwise the dump's `DROP FUNCTION` fails on the dependency — the role holds `TRIGGER` on
+   `auth.users`, which is how `02003` attaches it); then the dump rewritten by
+   `prepareDumpForRestore()` — schema-level `DROP/CREATE SCHEMA`, `ALTER DEFAULT PRIVILEGES`
+   (`FOR ROLE supabase_admin` needs membership the role lacks) and `OWNER TO` statements are
+   removed, every object outside the three schemas is dropped by pg_dump's own object headers
+   (COPY data is never inspected), `CREATE SCHEMA` becomes `IF NOT EXISTS`, and version-specific
+   settings such as pg_dump 17's `transaction_timeout` are stripped; then one
+   `UPDATE auth.users SET encrypted_password` per restored account (`PUT /admin/users/{id}`
+   ignores `password_hash` in GoTrue v2.189, so an account that already existed here would
+   otherwise keep this site's password); then a postamble that re-attaches the triggers and
+   switches off authenticator-app enrolment in `user_security_settings` for any account without a
+   verified TOTP factor on this project. Either everything applies or nothing does, and the
+   failing statement is in the error message.
+3. Media URL rewrite (unchanged), then every account on this site that is not in the backup is
+   removed — including the one that ran the restore if it was not part of the backup (its
+   `profiles` row is gone with the dump anyway). The result reports what was recreated, updated,
+   removed and skipped.
+
+Consequences: after a migration everybody signs in with the password they had on the source
+site, so a restored backup still needs the original admin password (the maintainer's chosen
+security property for a feature that deliberately keeps accounts in the archive). Social-login
+links, SSO and anonymous accounts do not cross (listed as skipped or warned). TOTP users must
+re-enrol; email codes keep working. Archives exported before accounts were included restore
+content only and keep this site's accounts; the restore then fails on the `auth.users` foreign
+keys if the content references accounts that do not exist here, which is the correct outcome.
+`pg_dump`/`psql` must be on the server process's PATH, `POSTGRES_URL`/`DATABASE_URL` must point
+at the database, and the `postgres` role needs `INSERT`/`UPDATE`/`TRIGGER` on `auth.users`
+(every Supabase project grants them). The rewrite and planning logic is pure and unit-tested
+(`database.test.ts`, `users.test.ts`, `manifest.test.ts`); the full cycle was verified on a local
+Supabase replay: export → change a password, delete and add accounts, change content → restore
+→ original passwords work, ids preserved, the extra account is gone, the trigger is re-attached
+and still creates profiles, and a dump with a failing statement rolls back completely.
+
 ## Important Site Settings in Active Use
 
 These keys are actively referenced by the current codebase:
@@ -564,7 +736,11 @@ key). The two policies on `site_settings` are the only place the tiers live, so 
   `cortex_ai_site_brief` (loaded by the CMS shell and dashboard for every staff role)
 - `ADMIN`: everything else — the secrets (`*_secret`, `*_api_key`, `cortex_ai_mcp_settings`),
   `interactions_notification_emails`, `payment_public`, `store_contact`, `forms_contact`,
-  the Cortex model/agent keys and any key not listed above
+  the Cortex model/agent keys and any key not listed above. Since `02023` this tier (and the
+  ADMIN-only write tier) answers only to `is_admin_mfa()`: an ADMIN with a verified second factor
+  must be on an `aal2` session, so CMS code reads and writes it with the service role after
+  `requireCmsAdmin()` (`lib/auth/cms-actor.ts`) or `requireEcomAdmin()`, never with the cookie
+  client (a "remember this device" admin is on `aal1` and would get nothing).
 
 Server code that reads a key for the public site with the service role is unaffected; code that
 reads one with the cookie or SSG client for a visitor must use a public-tier key, or the loader

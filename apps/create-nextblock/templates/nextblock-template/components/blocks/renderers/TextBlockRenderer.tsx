@@ -1,8 +1,7 @@
 import React from "react";
-import { headers } from 'next/headers';
 import ClientTextBlockRenderer from "./ClientTextBlockRenderer";
 import type { VisualEditAttributes } from "../../../lib/visual-editing/types";
-import { addNonceToInlineScripts } from "../../../lib/blocks/inlineScriptNonce";
+import { sanitizeAuthoredBlockHtml } from "../../../lib/blocks/inlineScriptNonce";
 import { substitutePrivacyMergeTags } from "../../../lib/privacy/contact-emails";
 
 export type TextBlockContent = {
@@ -25,14 +24,12 @@ const TextBlockRenderer: React.FC<TextBlockRendererProps> = async ({
   renderContext = 'prose',
   priority = false,
 }) => {
-  const hdrs = await headers();
-  const nonce = hdrs.get('x-nonce') || '';
   let html = content.html_content || '';
   if (html.includes('{{')) {
     html = await substitutePrivacyMergeTags(html);
   }
-  const htmlWithNonce = html ? addNonceToInlineScripts(html, nonce) : '';
-  const patchedContent = { ...content, html_content: htmlWithNonce };
+  const safeHtml = html ? sanitizeAuthoredBlockHtml(html) : '';
+  const patchedContent = { ...content, html_content: safeHtml };
   return (
     <ClientTextBlockRenderer
       content={patchedContent}

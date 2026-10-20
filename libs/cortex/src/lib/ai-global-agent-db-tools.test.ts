@@ -352,6 +352,75 @@ describe('Cortex AI generic database tools', () => {
     ]);
   });
 
+  it('redacts protected site_settings rows even when the key column is not selected', async () => {
+    const envelope = {
+      algorithm: 'aes-256-gcm',
+      authTag: 'CB0cnt8bv6+2NgG0CKmKLw==',
+      ciphertext: '7zeCzkxZshi26TAZDE50aX0ZrLUtPvM1h62zXD8=',
+      iv: 'wdRLiafQbg+ndsBJ',
+      last4: 'EAK9',
+      updatedAt: '2026-10-19T18:13:39.171Z',
+      version: 1,
+    };
+    const { supabase } = createMockSupabase({
+      site_settings: [
+        { key: 'site_name', value: { en: 'NextBlock' } },
+        // SMTP credentials: no sub-key name trips isSensitiveKey, so only the row key protects them.
+        { key: 'email_secret', value: { pass: envelope, user: envelope } },
+        // A bare envelope stored directly as the value.
+        { key: 'cortex_ai_pexels_api_key', value: envelope },
+      ],
+    });
+
+    const filtered = await executeReadDatabaseRecords(
+      {
+        columns: ['value'],
+        filters: [{ column: 'key', operator: 'eq', value: 'email_secret' }],
+        table: 'site_settings',
+      },
+      { supabase }
+    );
+
+    expect(filtered.columns).toEqual(['value']);
+    expect(filtered.rows).toEqual([{ value: '[REDACTED]' }]);
+
+    const unfiltered = await executeReadDatabaseRecords({ columns: ['value'], table: 'site_settings' }, { supabase });
+
+    expect(unfiltered.rows).toEqual([{ value: { en: 'NextBlock' } }, { value: '[REDACTED]' }, { value: '[REDACTED]' }]);
+    expect(JSON.stringify(unfiltered.rows)).not.toMatch(/ciphertext|authTag|last4|EAK9/);
+
+    const keysOnly = await executeReadDatabaseRecords({ columns: ['key'], table: 'site_settings' }, { supabase });
+
+    expect(keysOnly.rows).toEqual([{ key: 'site_name' }, { key: 'email_secret' }, { key: 'cortex_ai_pexels_api_key' }]);
+  });
+
+  it('protects credential-shaped and MCP-control site_settings keys that are not listed by name', async () => {
+    const { supabase } = createMockSupabase({
+      site_settings: [
+        { key: 'cortex_ai_mcp_settings', value: { enabled: true, trustLocalhost: true } },
+        { key: 'smtp_relay_api_key', value: 'rk_live_123' },
+        { key: 'webhook_signing_secret', value: { ciphertext: 'b', iv: 'a' } },
+        { key: 'design_tokens', value: { primary: '#000' } },
+      ],
+      translations: [{ key: 'payment_secret', translations: { en: 'Payment secret' } }],
+    });
+
+    const settings = await executeReadDatabaseRecords({ columns: ['value'], table: 'site_settings' }, { supabase });
+
+    expect(settings.rows).toEqual([
+      { value: '[REDACTED]' },
+      { value: '[REDACTED]' },
+      { value: '[REDACTED]' },
+      { value: { primary: '#000' } },
+    ]);
+
+    // Key-based protection is a site_settings rule; a translation string that happens
+    // to share a protected name is ordinary content.
+    const translations = await executeReadDatabaseRecords({ table: 'translations' }, { supabase });
+
+    expect(translations.rows).toEqual([{ key: 'payment_secret', translations: { en: 'Payment secret' } }]);
+  });
+
   it('refuses to write any protected site_settings key', async () => {
     const { supabase } = createMockSupabase();
 
@@ -367,6 +436,73 @@ describe('Cortex AI generic database tools', () => {
         )
       ).rejects.toThrow('is protected');
     }
+  });
+
+  it('refuses credential-shaped site_settings keys and protected rows reached through broad filters', async () => {
+    const { database, supabase } = createMockSupabase({
+      site_settings: [
+        { key: 'site_name', value: { en: 'NextBlock' } },
+        { key: 'email_secret', value: { pass: { ciphertext: 'x' } } },
+      ],
+    });
+    // skipConfirmation: a guard that failed to fire would really mutate the rows below.
+    const context = { actorUserId: 'user_1', skipConfirmation: true, supabase };
+
+    await expect(
+      executeDatabaseMutation(
+        { operation: 'upsert', rows: [{ key: 'smtp_relay_api_key', value: 'rk_live_123' }], table: 'site_settings' },
+        context
+      )
+    ).rejects.toThrow('"smtp_relay_api_key" site setting is protected');
+
+    // Renaming an ordinary row to a protected name is the same write.
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'key', operator: 'eq', value: 'site_name' }],
+          operation: 'update',
+          table: 'site_settings',
+          values: { key: 'cortex_ai_mcp_token' },
+        },
+        context
+      )
+    ).rejects.toThrow('"cortex_ai_mcp_token" site setting is protected');
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'key', operator: 'in', value: ['site_name', 'webhook_signing_secret'] }],
+          operation: 'delete',
+          table: 'site_settings',
+        },
+        context
+      )
+    ).rejects.toThrow('"webhook_signing_secret" site setting is protected');
+
+    // These filters never name the protected row, but they match it.
+    await expect(
+      executeDatabaseMutation(
+        { filters: [{ column: 'key', operator: 'ilike', value: '%' }], operation: 'delete', table: 'site_settings' },
+        context
+      )
+    ).rejects.toThrow('"email_secret" site setting is protected');
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'key', operator: 'neq', value: 'site_name' }],
+          operation: 'update',
+          table: 'site_settings',
+          values: { value: {} },
+        },
+        context
+      )
+    ).rejects.toThrow('"email_secret" site setting is protected');
+
+    expect(database.site_settings).toEqual([
+      { key: 'site_name', value: { en: 'NextBlock' } },
+      { key: 'email_secret', value: { pass: { ciphertext: 'x' } } },
+    ]);
   });
 
   it('previews and confirms a mutation before changing rows and writing an audit record', async () => {

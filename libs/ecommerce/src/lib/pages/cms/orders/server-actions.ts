@@ -34,8 +34,17 @@ async function requireOrderManager() {
         return { error: 'Forbidden' as const };
     }
 
-    return { supabase, user };
+    return { supabase, user, role: profile.role as 'ADMIN' | 'WRITER' };
 }
+
+// Financial transitions (recording payment, refunds, cancellation) are ADMIN-only; a WRITER
+// may move an order through fulfillment (processing/shipped) but must not be able to mark an
+// order paid or refunded. Mirrors the ADMIN gate on coupons/taxes/payments config.
+const ADMIN_ONLY_ORDER_STATUSES: ReadonlySet<ManageableOrderStatus> = new Set([
+    'paid',
+    'cancelled',
+    'refunded',
+]);
 
 function createAdminSupabaseClient() {
     // Accept the Vercel Marketplace integration's new key names too.
@@ -70,6 +79,10 @@ export async function updateOrderStatus(
 
     if (!MANAGEABLE_ORDER_STATUSES.includes(nextStatus)) {
         return { success: false, error: 'Invalid order status' };
+    }
+
+    if (ADMIN_ONLY_ORDER_STATUSES.has(nextStatus) && auth.role !== 'ADMIN') {
+        return { success: false, error: 'Forbidden' };
     }
 
     let adminSupabase;

@@ -14,12 +14,56 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 const PROJECT_ROOT = resolve(__dirname, '..');
 const ENV_PATH = resolve(PROJECT_ROOT, '.env');
 
-const TURNSTILE_TEST_SITE_KEY = '1x00000000000000000000AA';
-const TURNSTILE_TEST_SECRET_KEY = '1x0000000000000000000000000000000AA';
+// Cloudflare's documented Turnstile TEST keys (site keys: 1x… always passes, 2x… always blocks,
+// 3x… forces a challenge; secret keys: 1x… accepts every token, 2x… rejects every token, 3x…
+// "token already spent"). None is valid for a real site. Earlier versions of this script wrote the
+// 1x pair into .env as the "skipped" default, which made a Turnstile-enabled form LOOK protected
+// while the test secret passed every bot. A fresh install now gets no captcha keys at all (public
+// forms are honeypot-only until real keys are set in CMS → Settings → Bot Protection), and a
+// re-run scrubs any test key left in an existing .env.
+export const TURNSTILE_TEST_KEYS = Object.freeze([
+  '1x00000000000000000000AA',
+  '1x00000000000000000000BB',
+  '2x00000000000000000000AB',
+  '2x00000000000000000000BB',
+  '3x00000000000000000000FF',
+  '1x0000000000000000000000000000000AA',
+  '2x0000000000000000000000000000000AA',
+  '3x0000000000000000000000000000000AA',
+]);
+
+/** True when `value` is one of Cloudflare's Turnstile test keys (never a production credential). */
+export function isTurnstileTestKey(value) {
+  return TURNSTILE_TEST_KEYS.includes(String(value ?? '').trim());
+}
+
+/**
+ * The Turnstile values to write to .env: whatever the existing .env holds, minus Cloudflare's test
+ * keys (listed in `scrubbed`). With nothing configured both stay blank, which the app treats as
+ * "no captcha": the honeypot still runs, and an operator who enables Turnstile without keys gets a
+ * visible "Bot protection is misconfigured" failure instead of a captcha that passes everything.
+ */
+export function resolveTurnstileKeys(existingEnv) {
+  const scrubbed = [];
+  const keep = (envKey, value) => {
+    if (!isTurnstileTestKey(value)) return value;
+    scrubbed.push(envKey);
+    return '';
+  };
+  return {
+    siteKey: keep(
+      'NEXT_PUBLIC_TURNSTILE_SITE_KEY',
+      readEnvValue(existingEnv, 'NEXT_PUBLIC_TURNSTILE_SITE_KEY'),
+    ),
+    secretKey: keep('TURNSTILE_SECRET_KEY', readEnvValue(existingEnv, 'TURNSTILE_SECRET_KEY')),
+    scrubbed,
+  };
+}
 
 const generateSecret = () => randomBytes(32).toString('hex');
 const base64url = (value) =>
@@ -146,10 +190,8 @@ async function main() {
   }
 
   // No CLI prompts. Bot protection (Turnstile) and SMTP are configured later in the browser
-  // /setup wizard and CMS settings. Default to Turnstile TEST keys (always pass) and no SMTP,
-  // so GoTrue auto-confirms new accounts and the first admin can sign in immediately.
-  const turnstileSiteKey = TURNSTILE_TEST_SITE_KEY;
-  const turnstileSecretKey = TURNSTILE_TEST_SECRET_KEY;
+  // /setup wizard and CMS settings. Default to NO captcha keys and no SMTP, so the stack boots
+  // cleanly and the first admin can be created with no email round-trip (GoTrue auto-confirms).
   const smtp = { host: '', port: '', user: '', pass: '', fromEmail: '', fromName: '' };
   const mailerAutoconfirm = 'true';
 
@@ -167,6 +209,17 @@ async function main() {
     .split(/\r?\n/)
     .filter((line) => !line.startsWith('NEXT_PUBLIC_IS_SANDBOX='))
     .join('\n');
+
+  // Cloudflare's Turnstile TEST keys only LOOK protected: the test secret accepts every token, so
+  // a form using them passes all bots. Keep real keys already in .env, drop any test key, and
+  // default a fresh install to blank (public forms are honeypot-only until real keys are set in
+  // CMS → Settings → Bot Protection).
+  const turnstile = resolveTurnstileKeys(existing);
+  if (turnstile.scrubbed.length > 0) {
+    console.log(
+      `  ! Dropped Cloudflare Turnstile TEST key(s) from .env (${turnstile.scrubbed.join(', ')}): the test secret accepts every token, so forms only looked protected.`,
+    );
+  }
 
   const reuse = (key, gen) => readEnvValue(existing, key) || gen();
 
@@ -268,8 +321,8 @@ async function main() {
     R2_FORCE_PATH_STYLE: 'R2_FORCE_PATH_STYLE=true',
     NEXT_PUBLIC_R2_BASE_URL: `NEXT_PUBLIC_R2_BASE_URL=http://127.0.0.1:${minioS3Port}/${bucket}`,
     NEXT_PUBLIC_R2_PUBLIC_URL: `NEXT_PUBLIC_R2_PUBLIC_URL=http://127.0.0.1:${minioS3Port}/${bucket}`,
-    NEXT_PUBLIC_TURNSTILE_SITE_KEY: `NEXT_PUBLIC_TURNSTILE_SITE_KEY=${turnstileSiteKey}`,
-    TURNSTILE_SECRET_KEY: `TURNSTILE_SECRET_KEY=${turnstileSecretKey}`,
+    NEXT_PUBLIC_TURNSTILE_SITE_KEY: `NEXT_PUBLIC_TURNSTILE_SITE_KEY=${turnstile.siteKey}`,
+    TURNSTILE_SECRET_KEY: `TURNSTILE_SECRET_KEY=${turnstile.secretKey}`,
     GOTRUE_MAILER_AUTOCONFIRM: `GOTRUE_MAILER_AUTOCONFIRM=${mailerAutoconfirm}`,
     SMTP_HOST: `SMTP_HOST=${smtp.host}`,
     SMTP_PORT: `SMTP_PORT=${smtp.port}`,
@@ -325,7 +378,16 @@ async function main() {
   console.log(`\n  Logs: ${composeStr} logs -f nextblock-cms   |   Stop: ${composeStr} down   (add -v to wipe data)`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Run only when executed directly (`npm run docker:setup`), so tests/tools can import the helpers
+// above without preflighting Docker, writing .env or starting the stack.
+const entry = process.argv[1] ? resolve(process.argv[1]) : '';
+const isMain =
+  process.platform === 'win32'
+    ? entry.toLowerCase() === __filename.toLowerCase()
+    : entry === __filename;
+if (isMain) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

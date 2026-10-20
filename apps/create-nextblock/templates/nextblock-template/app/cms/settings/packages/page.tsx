@@ -1,29 +1,47 @@
 import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
-import { createClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { ActivationForm } from './activation-form';
 import { PackageCard } from './package-card';
 
 export const dynamic = 'force-dynamic';
 
 export default async function PackagesPage() {
-  const supabase = await createClient();
+  // Read with the service role, not the signed-in (cookie) client. Migration 02022 gates
+  // `package_activations` SELECT behind `public.is_admin_mfa()` (ADMIN *and* an aal2 session
+  // whenever an MFA factor is enrolled). An ADMIN who signed in with "remember this device"
+  // passes the app's own 2FA gate (evaluateTwoFactor is satisfied by the trusted device) while
+  // the Supabase session stays aal1, so a cookie-client read would return nothing and lock the
+  // admin out of their own packages screen. This page is ADMIN-only (/cms/settings, enforced by
+  // proxy.ts) and sits behind the /cms 2FA gate (app/cms/layout.tsx); the RLS policy is left
+  // untouched so direct PostgREST access stays protected. Mirrors verifyPackageOnline.
+  type ActivationRow = {
+    package_id: string;
+    status: string;
+    license_key: string | null;
+    // jsonb provenance blob read dynamically below
+    meta: any;
+  };
+  let activations: ActivationRow[] = [];
 
-  // Fetch all activations for this instance
-  const { data: activations } = await supabase
-    .from('package_activations')
-    .select('package_id, status, license_key, meta')
-    .in('status', ['active', 'expired']);
+  try {
+    const supabase = getServiceRoleSupabaseClient();
+    const { data } = await supabase
+      .from('package_activations')
+      .select('package_id, status, license_key, meta')
+      .in('status', ['active', 'expired']);
+    activations = (data ?? []) as unknown as ActivationRow[];
+  } catch (err) {
+    console.error('Packages page activation read failed:', err);
+  }
 
   // One row per package, an active one winning over an expired one.
-  const activationMap = new Map();
-  if (activations) {
-      activations.forEach((a: any) => {
-          const current = activationMap.get(a.package_id);
-          if (!current || (current.status !== 'active' && a.status === 'active')) {
-              activationMap.set(a.package_id, a);
-          }
-      });
-  }
+  const activationMap = new Map<string, ActivationRow>();
+  activations.forEach((a) => {
+    const current = activationMap.get(a.package_id);
+    if (!current || (current.status !== 'active' && a.status === 'active')) {
+      activationMap.set(a.package_id, a);
+    }
+  });
 
   return (
     <div className="container mx-auto py-10 max-w-5xl">
@@ -50,7 +68,7 @@ export default async function PackagesPage() {
                     pkg={pkg}
                     isActive={activation?.status === 'active'}
                     isExpired={activation?.status === 'expired'}
-                    licenseKey={activation?.license_key}
+                    licenseKey={activation?.license_key ?? undefined}
                     provenance={provenance}
                 />
             );

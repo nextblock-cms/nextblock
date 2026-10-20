@@ -210,6 +210,47 @@ function findUngrantedObjects(sql) {
   return problems;
 }
 
+/** Table names that the file turns row-level security ON for (ALTER TABLE ... ENABLE RLS). */
+function rlsEnabledTables(code) {
+  const names = new Set();
+  for (const m of code.matchAll(
+    /\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:"?([a-z_][a-z0-9_]*)"?\s*\.\s*)?"?([a-z_][a-z0-9_]*)"?\s+ENABLE\s+ROW\s+LEVEL\s+SECURITY/gi,
+  )) {
+    if (m[1] && m[1].toLowerCase() !== 'public') continue;
+    names.add(m[2].toLowerCase());
+  }
+  return names;
+}
+
+/**
+ * Tables a migration creates in `public` without enabling row-level security in the same file,
+ * as [{ name, problem }]. RLS is the ONLY thing standing between the public key and a table's
+ * rows (the grants above make the table reachable; without RLS + policies that reach is
+ * unrestricted). Views/sequences/foreign tables are not row-secured and are not flagged.
+ */
+function findTablesWithoutRls(sql) {
+  const code = codeOnly(sql);
+  const enabled = rlsEnabledTables(code);
+  const problems = [];
+  const seen = new Set();
+  for (const match of code.matchAll(CREATE_RE)) {
+    const kind = match[1].toUpperCase().replace(/\s+/g, ' ');
+    if (kind !== 'TABLE') continue;
+    const schema = match[2];
+    const name = match[3].toLowerCase();
+    if (schema && schema.toLowerCase() !== 'public') continue;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (!enabled.has(name)) {
+      problems.push({
+        name,
+        problem: `table public.${name} is created without ALTER TABLE public.${name} ENABLE ROW LEVEL SECURITY in the same file; a table reachable by the API roles with no RLS exposes every row to the public key`,
+      });
+    }
+  }
+  return problems;
+}
+
 /**
  * Lint every forward migration (sequence >= 005) in a directory listing. The catch-up and
  * the baseline are the generation's own business. `readFile(name)` returns the SQL.
@@ -218,7 +259,11 @@ function validateMigrationGrants(files, readFile) {
   const errors = [];
   for (const file of files) {
     if (!parseMigrationName(file) || isCatchupMigration(file) || isBaselineMigration(file)) continue;
-    for (const problem of findUngrantedObjects(readFile(file))) {
+    const sql = readFile(file);
+    for (const problem of findUngrantedObjects(sql)) {
+      errors.push(`${file}: ${problem.problem}`);
+    }
+    for (const problem of findTablesWithoutRls(sql)) {
       errors.push(`${file}: ${problem.problem}`);
     }
   }
@@ -228,5 +273,6 @@ function validateMigrationGrants(files, readFile) {
 module.exports = {
   codeOnly,
   findUngrantedObjects,
+  findTablesWithoutRls,
   validateMigrationGrants,
 };

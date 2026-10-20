@@ -7,6 +7,58 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+/**
+ * Dedicated bearer for this function. It runs with the service-role key (which bypasses RLS) and
+ * can wipe content, mint confirmed users and fetch arbitrary URLs, so it must NEVER be reachable
+ * with the public anon JWT (the platform `verify_jwt` default accepts the anon key, which ships in
+ * every site bundle). The operator sets MIGRATION_INGEST_BEARER to a high-entropy secret that is
+ * NOT the anon or service key; the function is fail-closed — with the var unset it rejects every
+ * request, because this is a maintainer migration tool, not a public endpoint.
+ */
+function isAuthorizedIngestRequest(req: Request): boolean {
+  const expected = (Deno.env.get('MIGRATION_INGEST_BEARER') ?? '').trim();
+  if (!expected) return false;
+  const provided = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
+  if (!provided || provided.length !== expected.length) return false;
+  // constant-time compare
+  let diff = 0;
+  for (let i = 0; i < expected.length; i += 1) diff |= provided.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * SSRF guard for the outbound media fetch. Blocks obvious private, loopback, link-local and
+ * cloud-metadata destinations and requires http(s). Defence in depth behind the bearer: an
+ * authorized caller still should not be able to turn this into an internal port scanner or a
+ * cloud-credential exfiltrator. (DNS rebinding is further limited by redirect:'error' on the
+ * fetch; full rebind protection would require pinning the resolved IP, which the edge runtime
+ * does not expose.)
+ */
+function isBlockedFetchTarget(rawUrl: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return true;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return true;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal')) return true;
+  // IPv6 loopback / link-local / unique-local
+  if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return true;
+  // IPv4 literals in private / loopback / link-local / metadata ranges
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    if (a === 10 || a === 127 || a === 0) return true;
+    if (a === 169 && b === 254) return true; // link-local incl. 169.254.169.254 metadata
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  }
+  return false;
+}
+
 // Upload S3 / R2 Proxy Handler
 async function processMediaUpload(url: string, r2Config: any, warnings: string[]): Promise<{ publicUrl: string; objectKey: string; contentType: string } | null> {
    if (!r2Config || !r2Config.account_id) {
@@ -37,11 +89,15 @@ async function processMediaUpload(url: string, r2Config: any, warnings: string[]
            const extension = contentType.split('/')[1] || 'jpg';
            filename = `upload_${crypto.randomUUID()}.${extension}`;
        } else {
+           if (isBlockedFetchTarget(url)) {
+               warnings.push(`Refused to fetch blocked/internal URL: ${url}`);
+               return null;
+           }
            const controller = new AbortController();
            const timeoutId = setTimeout(() => controller.abort(), 6000); // 6-second timeout
            let fileResponse;
            try {
-               fileResponse = await fetch(url, { signal: controller.signal });
+               fileResponse = await fetch(url, { signal: controller.signal, redirect: 'error' });
                clearTimeout(timeoutId);
            } catch (err: any) {
                clearTimeout(timeoutId);
@@ -89,6 +145,13 @@ async function processMediaUpload(url: string, r2Config: any, warnings: string[]
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
+  }
+
+  if (!isAuthorizedIngestRequest(req)) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      headers: { ...corsHeaders, 'Content-Type': 'application/json', 'WWW-Authenticate': 'Bearer' },
+      status: 401,
+    });
   }
 
   try {

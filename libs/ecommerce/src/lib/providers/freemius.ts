@@ -5,6 +5,7 @@ import { Freemius } from '@freemius/sdk';
 import { hydrateFreemiusEnvFromDb } from '../payment-config';
 import { CheckoutSessionInput, normalizeOrderCustomerDetails } from '../customer';
 import { getCouponQuote, recordCouponRedemption } from '../coupon-server';
+import { mintOrderAccessToken } from '../order-access-token';
 import type { CouponQuote } from '../coupons';
 import {
   fillMissingUserProfileCheckoutDetails,
@@ -15,6 +16,7 @@ import {
   isSaleWindowActive,
   resolveEffectivePriceForCurrency,
 } from '../currency';
+import { normalizeCheckoutItems } from './checkout-items';
 
 export type FreemiusCheckoutCredentialEntry = {
     publicKey?: string;
@@ -249,7 +251,7 @@ export class FreemiusProvider implements PaymentProvider {
       shippingAddress,
       currencyCode,
       couponCode,
-      couponContextItems,
+      couponContextItems: submittedCouponContextItems,
     }: CheckoutSessionInput): Promise<{
       url: string | null;
       error?: string;
@@ -276,6 +278,26 @@ export class FreemiusProvider implements PaymentProvider {
           return { error: 'Freemius items must be checked out one at a time.', url: null };
       }
 
+      // Quantity is multiplied into the recorded subtotal and stored on order_items;
+      // only a positive integer may get that far (see checkout-items.ts).
+      const normalizedCartItems = normalizeCheckoutItems(cartItems);
+
+      if (!normalizedCartItems.ok) {
+          return { url: null, ...normalizedCartItems.error };
+      }
+
+      let couponContextItems = normalizedCartItems.items;
+
+      if (submittedCouponContextItems && submittedCouponContextItems.length > 0) {
+          const normalizedContextItems = normalizeCheckoutItems(submittedCouponContextItems);
+
+          if (!normalizedContextItems.ok) {
+              return { url: null, ...normalizedContextItems.error };
+          }
+
+          couponContextItems = normalizedContextItems.items;
+      }
+
       const { data: currenciesResult, error: currenciesError } = await supabase
         .from('currencies')
         .select(
@@ -294,7 +316,7 @@ export class FreemiusProvider implements PaymentProvider {
         currencies.find((currency) => currency.code === (currencyCode || '').toUpperCase()) ??
         defaultCurrency;
       
-      const item = cartItems[0];
+      const item = normalizedCartItems.items[0];
       const { data: product, error: productError } = await supabase
         .from('products')
         .select('id, title, price, prices, sale_price, sale_prices, sale_start_at, sale_end_at, scheduled_price, scheduled_prices, scheduled_price_at, freemius_plan_id, freemius_product_id, trial_period_days, trial_requires_payment_method')
@@ -341,10 +363,7 @@ export class FreemiusProvider implements PaymentProvider {
           const quoteResult = await getCouponQuote({
               client: supabase as any,
               code: couponCode,
-              items:
-                  couponContextItems && couponContextItems.length > 0
-                      ? couponContextItems
-                      : cartItems,
+              items: couponContextItems,
               currencyCode: selectedCurrency.code,
           });
 
@@ -462,7 +481,7 @@ export class FreemiusProvider implements PaymentProvider {
       }
 
       if (couponQuote) {
-          await recordCouponRedemption({
+          const redemption = await recordCouponRedemption({
               client: supabase as any,
               quote: couponQuote,
               orderId: order.id,
@@ -476,6 +495,14 @@ export class FreemiusProvider implements PaymentProvider {
                   final_amount_owned_by: 'freemius',
               },
           });
+
+          // The redemption counter is enforced atomically in the DB. If it was already exhausted
+          // the coupon must not apply: fail the just-created order and stop before the Freemius
+          // checkout URL is built, rather than honouring a discount the buyer cannot claim.
+          if (!redemption.success) {
+              await supabase.from('orders').update({ status: 'failed' }).eq('id', order.id);
+              return { url: null, error: 'Coupon is no longer available.', errorKey: 'ecommerce.coupon_invalid' };
+          }
       }
             
       // Overlay any CMS-configured Freemius credentials (DB-first) onto the env reads below.
@@ -623,7 +650,10 @@ export class FreemiusProvider implements PaymentProvider {
               trial_requires_payment_method: product.trial_requires_payment_method,
               initial_order_status: initialOrderStatus,
               coupon: couponQuote?.code ?? null,
-              order_id: order.id
+              order_id: order.id,
+              // Capability token for /checkout/success: proves the holder initiated this order
+              // (guest or signed-in) without exposing the order to anyone who learns its id.
+              success_token: mintOrderAccessToken(order.id)
           }
       };
     }

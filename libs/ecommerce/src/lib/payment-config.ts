@@ -17,6 +17,8 @@ import {
   resolveConfigValue,
   tryDecryptWithEnvKey,
 } from '@nextblock-cms/db/server';
+import type { Json } from '@nextblock-cms/db';
+import { getEcomActorRole, requireEcomAdmin } from './server-actions/require-ecom-role';
 
 const PAYMENT_SECRET_KEY = 'payment_secret';
 const PAYMENT_PUBLIC_KEY = 'payment_public';
@@ -199,8 +201,13 @@ export interface PaymentCredentialsView {
 }
 
 export async function getPaymentCredentialsView(): Promise<PaymentCredentialsView> {
-  // Request-scoped client: RLS restricts the secret row to ADMIN, who reaches this page.
-  const supabase = createClient();
+  // `payment_secret` is the ADMIN tier of site_settings, which migration 02023 gates behind
+  // is_admin_mfa(): an ADMIN reads it with the service role after the role check, because
+  // through the cookie client an admin on an aal1 "remember this device" session would see
+  // "no key stored" on their own form. Anyone else keeps the cookie client, which (as before)
+  // returns the public row only — a WRITER can open the payments screen.
+  const role = await getEcomActorRole();
+  const supabase = role === 'ADMIN' ? getServiceRoleSupabaseClient() : createClient();
   const [{ data: secretData }, { data: publicData }] = await Promise.all([
     supabase.from('site_settings').select('value').eq('key', PAYMENT_SECRET_KEY).maybeSingle(),
     supabase.from('site_settings').select('value').eq('key', PAYMENT_PUBLIC_KEY).maybeSingle(),
@@ -249,11 +256,13 @@ export interface SavePaymentCredentialsInput {
 /**
  * Persist payment credentials. Public fields always overwrite; secret fields are
  * encrypted and only written when a new value is supplied (blank keeps the stored
- * secret). Refuses to store real secrets in the sandbox. Caller enforces ADMIN; RLS
- * double-enforces.
+ * secret). Refuses to store real secrets in the sandbox. Enforces ADMIN itself (throws
+ * otherwise) and writes with the service role: `payment_secret` is in the ADMIN-only write
+ * tier that migration 02023 gates behind `is_admin_mfa()`, which a "remember this device"
+ * (aal1) admin cannot satisfy through the cookie client.
  */
 export async function savePaymentCredentials(input: SavePaymentCredentialsInput): Promise<void> {
-  const supabase = createClient();
+  const supabase = await requireEcomAdmin();
 
   const publicValue = {
     stripe: { publishableKey: input.stripe.publishableKey.trim() },
@@ -301,7 +310,7 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
 
     const { error: secretError } = await supabase
       .from('site_settings')
-      .upsert({ key: PAYMENT_SECRET_KEY, value: nextValue });
+      .upsert({ key: PAYMENT_SECRET_KEY, value: nextValue as Json });
     if (secretError) {
       console.error('Error saving payment_secret settings:', secretError.message);
       throw new Error('Failed to save payment credentials.');

@@ -1,22 +1,63 @@
 'use server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {
   applyOrderInventoryDeduction,
   assignInvoiceMetadata,
 } from '@nextblock-cms/ecommerce/server';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import { getCmsActor } from '../../../lib/auth/cms-actor';
 import { OrderWithDetails } from './types';
 
 const ITEMS_PER_PAGE = 20;
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * `.or()` takes a PostgREST filter-DSL string, so user input must never be spliced into
+ * it raw (`,`, `(`, `)` and `.` are syntax there). Both searchable columns are uuids:
+ * accept exactly a uuid, lower-cased — an alphabet with no DSL characters — or nothing.
+ */
+function normalizeUuidSearch(search: string | undefined): string | null {
+  const trimmed = typeof search === 'string' ? search.trim() : '';
+  if (!trimmed || !UUID_PATTERN.test(trimmed)) return null;
+  return trimmed.toLowerCase();
+}
+
+/**
+ * The client for a CMS order read, or null when the caller may not see orders.
+ *
+ * Orders are ADMIN-only in the CMS (RLS: a customer reads their own, a WRITER nothing), and
+ * since migration 02023 the ADMIN branch of every `orders` / `order_items` policy requires
+ * `public.is_admin_mfa()`: an admin who enrolled a second factor must be on an `aal2`
+ * session. The app's own 2FA gate accepts a "remember this device" cookie, so a legitimate
+ * admin is routinely inside /cms on an `aal1` session, and a cookie-client read would show
+ * them an empty orders screen. So the role is verified through the session (own profile row,
+ * never gated) and the read goes through the service role; a non-ADMIN gets the empty result
+ * RLS always gave them rather than an error page.
+ */
+async function orderReader() {
+  const actor = await getCmsActor();
+  return actor?.role === 'ADMIN' ? getServiceRoleSupabaseClient() : null;
+}
 
 export async function getOrders(
   page = 1,
   status?: string,
   search?: string
 ): Promise<{ data: OrderWithDetails[]; total: number; totalPages: number }> {
-  const supabase = createClient();
-  const from = (page - 1) * ITEMS_PER_PAGE;
+  const uuidSearch = normalizeUuidSearch(search);
+  if (search && !uuidSearch) {
+    // A term that is not a uuid can never match either column; skip the round-trip.
+    return { data: [], total: 0, totalPages: 0 };
+  }
+
+  const supabase = await orderReader();
+  if (!supabase) {
+    return { data: [], total: 0, totalPages: 0 };
+  }
+  const safePage = Number.isInteger(page) && page > 0 ? page : 1;
+  const from = (safePage - 1) * ITEMS_PER_PAGE;
   const to = from + ITEMS_PER_PAGE - 1;
 
   // 1. Fetch Orders first
@@ -36,8 +77,8 @@ export async function getOrders(
     query = query.eq('status', status);
   }
 
-  if (search) {
-      query = query.or(`id.eq.${search},user_id.eq.${search}`);
+  if (uuidSearch) {
+      query = query.or(`id.eq.${uuidSearch},user_id.eq.${uuidSearch}`);
   }
 
   const { data: ordersData, error: ordersError, count } = await query;
@@ -79,7 +120,10 @@ export async function getOrders(
 }
 
 export async function getOrderDetails(orderId: string): Promise<OrderWithDetails | null> {
-  const supabase = createClient();
+  const supabase = await orderReader();
+  if (!supabase) {
+    return null;
+  }
 
   // 1. Fetch Order
   const { data: orderData, error: orderError } = await supabase
@@ -158,6 +202,19 @@ export async function markOrderAsPaid(orderId: string): Promise<{ success: boole
     
     if (authError || !user) {
         return { success: false, error: 'Unauthorized' };
+    }
+
+    // Recording a payment is ADMIN-only (same gate as the ecommerce lib's order
+    // server-actions). A server action is a public POST endpoint, and the write below
+    // bypasses RLS, so "signed in" alone would let any customer mark any order paid.
+    const { data: profile } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('id', user.id)
+        .maybeSingle();
+
+    if (profile?.role !== 'ADMIN') {
+        return { success: false, error: 'Forbidden' };
     }
 
     // 2. Perform Update using Service Role (Bypass RLS)

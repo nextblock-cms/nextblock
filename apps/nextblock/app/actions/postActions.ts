@@ -1,10 +1,14 @@
 'use server';
 
 import { cache } from 'react';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createClient } from '@nextblock-cms/db/server';
 import { buildPublishedAtOrFilter } from '@nextblock-cms/utils';
 import { revalidatePath } from 'next/cache';
+import { headers } from 'next/headers';
 import type { Database } from '@nextblock-cms/db';
+import { resolveRevalidateSecret } from '../../lib/app-secrets';
+import { isSafeInternalPath } from '../../lib/auth-redirects';
 import type { PostWithMediaDimensions } from '../../components/blocks/types';
 import { resolveMediaUrl } from '../../lib/media/resolveMediaUrl';
 import { estimateReadTimeMinutesFromBlocks } from '../../lib/posts/readTime';
@@ -151,34 +155,59 @@ export const fetchInitialPublishedPosts = cache(async (languageId: number, limit
     error: result.error ?? null,
   };
 });
+
+/** Constant-time comparison that does not leak length either. */
+function secretsMatch(provided: string, expected: string): boolean {
+  const a = createHash('sha256').update(provided).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Forced cache eviction is an operator action. A server action is a public POST endpoint
+ * dispatched by its action id (the `/cms` proxy gate does not apply), so the caller must
+ * prove itself here: either the on-demand revalidation secret (`x-revalidate-secret`, the
+ * same header `/api/revalidate` checks) or a signed-in ADMIN/WRITER session.
+ */
+async function canForceRevalidation(): Promise<boolean> {
+  const requestHeaders = await headers();
+  const providedSecret = requestHeaders.get('x-revalidate-secret');
+  const expectedSecret = resolveRevalidateSecret();
+  if (providedSecret && expectedSecret && secretsMatch(providedSecret, expectedSecret)) {
+    return true;
+  }
+
+  const supabase = createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return false;
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  return profile?.role === 'ADMIN' || profile?.role === 'WRITER';
+}
+
 export async function revalidateAndLog(path: string): Promise<{ success: boolean; error?: string }> {
   try {
-    // Step 1: Revalidate the path
+    if (!(typeof path === 'string' && isSafeInternalPath(path))) {
+      return { success: false, error: 'Path must be a site-relative path.' };
+    }
+
+    if (!(await canForceRevalidation())) {
+      return { success: false, error: 'Unauthorized' };
+    }
+
     revalidatePath(path);
-
-    // Step 2: Log the revalidation by calling the API route
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL;
-    if (!baseUrl) {
-      throw new Error('NEXT_PUBLIC_BASE_URL is not set in environment variables.');
-    }
-    
-    const logUrl = new URL('/api/revalidate-log', baseUrl);
-
-    const response = await fetch(logUrl.toString(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ path }),
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.json();
-      throw new Error(`Failed to log revalidation: ${response.status} ${response.statusText} - ${errorBody.error}`);
-    }
+    // The log line `/api/revalidate-log` used to print; emitted directly instead of
+    // through a self-fetch that needed NEXT_PUBLIC_BASE_URL and failed without it.
+    console.log(JSON.stringify({ type: 'isr_revalidate', path }));
 
     return { success: true };
-
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
     console.error(`Error in revalidateAndLog for path "${path}":`, errorMessage);

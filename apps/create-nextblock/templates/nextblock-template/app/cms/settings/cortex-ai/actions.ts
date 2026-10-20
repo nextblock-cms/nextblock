@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 
+import type { Json } from '@nextblock-cms/db';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
 
 import { requireAdminSupabaseClient as requireAdminAccess } from './require-admin';
@@ -263,7 +264,9 @@ export async function saveStockPhotoKeysAction(formData: FormData) {
       rows.push({ key: CORTEX_AI_UNSPLASH_APP_NAME_SETTING_KEY, value: unsplashAppName });
     }
 
-    const { error } = await supabase.from('site_settings').upsert(rows);
+    const { error } = await supabase
+      .from('site_settings')
+      .upsert(rows as Array<{ key: string; value: Json }>);
 
     if (error) {
       throw new Error(error.message);
@@ -415,7 +418,7 @@ export async function saveCortexAiModelSelectionAction(formData: FormData) {
 
     const { error } = await supabase.from('site_settings').upsert({
       key: CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY,
-      value: createCortexAiStoredModelSelection(selectedModel),
+      value: createCortexAiStoredModelSelection(selectedModel) as unknown as Json,
     });
 
     if (error) {

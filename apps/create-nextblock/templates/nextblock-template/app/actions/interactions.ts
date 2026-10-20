@@ -2,7 +2,8 @@
 
 import { createClient, getServiceRoleSupabaseClient, getProfileWithRoleServerSide } from "@nextblock-cms/db/server";
 import { revalidatePath } from "next/cache";
-import { cookies, headers } from "next/headers";
+import { cookies } from "next/headers";
+import { resolveSiteUrl } from "../../lib/site-url";
 import { sendEmail } from "./email";
 
 export interface SubmitInteractionInput {
@@ -13,12 +14,28 @@ export interface SubmitInteractionInput {
   postId?: number;
 }
 
+// Self-submitted rows always land as 'pending', and nothing stops one account from
+// piling thousands of them into the moderation queue (and, where notification emails
+// are configured, mailing the moderators once per row). Cap what one user may have
+// waiting: a burst limit over a short window and a hard ceiling on the backlog.
+const PENDING_WINDOW_MINUTES = 10;
+const PENDING_MAX_PER_WINDOW = 5;
+const PENDING_MAX_TOTAL = 50;
+// Deliberately generic: it does not say which limit was hit or where it sits.
+const SUBMISSION_THROTTLED_MESSAGE =
+  "You have submitted several reviews or comments recently. Please wait a while before submitting another.";
+
+// Reactions are an allowlist, not free text: the key is written straight into the
+// `reactions` JSONB and read back by the public UI as `reactions.likes`.
+const REACTION_TYPES = new Set(["likes"]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Submits a new comment or review. Default status is 'pending' for moderation.
  */
 export async function submitInteraction(input: SubmitInteractionInput) {
   const supabase = createClient();
-  
+
   // 1. Authenticate user
   const { data: { user }, error: authError } = await supabase.auth.getUser();
   if (authError || !user) {
@@ -46,8 +63,41 @@ export async function submitInteraction(input: SubmitInteractionInput) {
   }
 
   try {
-    // 3. Insert interaction
-    const { data, error } = await supabase
+    // 3. Throttle. A plain USER cannot read their own pending rows (the read policy is
+    // approved-only below staff), so the count has to run as the service role. One
+    // query serves both limits: the newest PENDING_MAX_TOTAL rows are enough to decide
+    // the ceiling (hitting the cap means the ceiling is reached), and every row inside
+    // the burst window is necessarily among the newest. Fails closed: a limit that
+    // cannot be checked is not enforced.
+    const admin = getServiceRoleSupabaseClient();
+    const since = Date.now() - PENDING_WINDOW_MINUTES * 60_000;
+    const { data: pendingRows, error: pendingError } = await admin
+      .from("cms_interactions")
+      .select("created_at")
+      .eq("user_id", user.id)
+      .eq("status", "pending")
+      .order("created_at", { ascending: false })
+      .limit(PENDING_MAX_TOTAL);
+
+    if (pendingError) {
+      console.error("Error checking interaction submission limits:", pendingError);
+      return { error: "Could not submit right now. Please try again later." };
+    }
+
+    const pending = pendingRows ?? [];
+    const recent = pending.filter((row) => {
+      const createdAt = Date.parse(row.created_at);
+      return Number.isFinite(createdAt) && createdAt >= since;
+    });
+    if (pending.length >= PENDING_MAX_TOTAL || recent.length >= PENDING_MAX_PER_WINDOW) {
+      return { error: SUBMISSION_THROTTLED_MESSAGE };
+    }
+
+    // 4. Insert interaction. No `.select()`: that adds RETURNING, and Postgres checks
+    // a returned row against the SELECT policy, which only shows a USER approved rows.
+    // The insert itself passes the INSERT policy; asking for the row back is what made
+    // every customer submission fail with an RLS violation. Nothing reads the row.
+    const { error } = await supabase
       .from("cms_interactions" as any)
       .insert({
         type: input.type,
@@ -58,21 +108,18 @@ export async function submitInteraction(input: SubmitInteractionInput) {
         product_id: input.type === "review" ? input.productId : null,
         post_id: input.type === "comment" ? input.postId : null,
         reactions: {},
-      })
-      .select()
-      .single();
+      });
 
     if (error) {
       console.error("Error inserting interaction:", error);
       return { error: `Failed to submit: ${error.message}` };
     }
 
-    // 4. Revalidate moderation panel path
+    // 5. Revalidate moderation panel path
     revalidatePath("/cms/interactions");
 
-    // 5. Send email notification asynchronously if emails are configured
+    // 6. Send email notification asynchronously if emails are configured
     try {
-      const admin = getServiceRoleSupabaseClient();
       if (admin) {
         const { data: config } = await admin
           .from("site_settings")
@@ -83,9 +130,11 @@ export async function submitInteraction(input: SubmitInteractionInput) {
         const emailsString = (config?.value as any)?.emails || "";
 
         if (emailsString) {
-          const host = (await headers()).get("host");
-          const protocol = host?.includes("localhost") || host?.includes("127.0.0.1") ? "http" : "https";
-          const origin = `${protocol}://${host}`;
+          // The dashboard link comes from the configured site URL, never from the
+          // request's Host/Origin header: on a self-hosted or proxied install that
+          // header is whatever the submitter sent, which put an attacker-chosen domain
+          // (or raw markup) inside the moderators' own notification mail.
+          const dashboardUrl = `${resolveSiteUrl()}/cms/interactions`;
 
           const capitalizedType = input.type.charAt(0).toUpperCase() + input.type.slice(1);
           const subject = `New Pending ${capitalizedType} Submitted`;
@@ -107,7 +156,7 @@ export async function submitInteraction(input: SubmitInteractionInput) {
               </div>
               <p>Please log in to the moderation dashboard to approve or deny this interaction:</p>
               <p style="margin-top: 20px;">
-                <a href="${origin}/cms/interactions" style="background-color: #6366f1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                <a href="${escapeHtml(dashboardUrl)}" style="background-color: #6366f1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
                   Go to Moderation Dashboard
                 </a>
               </p>
@@ -125,7 +174,7 @@ Type: ${capitalizedType}
 ${input.type === "review" && input.rating ? `Rating: ${input.rating} / 5\n` : ""}
 Content: "${input.content.trim()}"
 
-Moderation Dashboard: ${origin}/cms/interactions
+Moderation Dashboard: ${dashboardUrl}
           `;
 
           sendEmail({
@@ -142,7 +191,7 @@ Moderation Dashboard: ${origin}/cms/interactions
       console.error("Failed to process email notifications:", emailErr);
     }
 
-    return { success: true, data };
+    return { success: true };
   } catch (err: any) {
     console.error("Submit interaction failed:", err);
     return { error: err.message || "An unexpected error occurred." };
@@ -150,20 +199,40 @@ Moderation Dashboard: ${origin}/cms/interactions
 }
 
 /**
- * Toggles a reaction (like) on a comment or review. Rate-limited and validated using cookies.
+ * Toggles a reaction (like) on a comment or review.
+ *
+ * Signed-in users only. The write runs as the service role (visitors hold no UPDATE
+ * policy on `cms_interactions`), and a server action is a public POST endpoint, so
+ * the action itself has to establish who is calling before it touches the row.
+ * Duplicate prevention is still the `reacted_interactions` cookie the public UI reads
+ * to draw the "liked" state; it is a convenience, not a security control.
  */
 export async function toggleReaction(interactionId: string, reactionType = "likes") {
-  if (!interactionId) return { error: "Interaction ID is required." };
+  if (typeof interactionId !== "string" || !UUID_RE.test(interactionId)) {
+    return { error: "Interaction ID is required." };
+  }
+  if (typeof reactionType !== "string" || !REACTION_TYPES.has(reactionType)) {
+    return { error: "Unsupported reaction." };
+  }
 
   try {
-    // Rate limit / duplicate prevention using cookies
+    const supabase = createClient();
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      return { error: "You must be logged in to react." };
+    }
+
+    // Duplicate prevention using cookies
     const cookieStore = await cookies();
     const reactedCookie = cookieStore.get("reacted_interactions")?.value;
     let reactedList: string[] = [];
 
     try {
       if (reactedCookie) {
-        reactedList = JSON.parse(reactedCookie);
+        const parsed: unknown = JSON.parse(reactedCookie);
+        if (Array.isArray(parsed)) {
+          reactedList = parsed.filter((id): id is string => typeof id === "string");
+        }
       }
     } catch {
       reactedList = [];
@@ -173,12 +242,14 @@ export async function toggleReaction(interactionId: string, reactionType = "like
 
     // Call service role client since visitors don't have update RLS policies
     const admin = getServiceRoleSupabaseClient();
-    
-    // Fetch current reactions
+
+    // Fetch current reactions. Only published rows can be reacted to: a pending or
+    // denied row is invisible on the site, and this lookup bypasses RLS.
     const { data: interaction, error: fetchError } = await admin
       .from("cms_interactions")
       .select("reactions, type, product_id, post_id, products(slug), posts(slug)")
       .eq("id", interactionId)
+      .eq("status", "approved")
       .single();
 
     if (fetchError || !interaction) {
@@ -186,7 +257,10 @@ export async function toggleReaction(interactionId: string, reactionType = "like
     }
 
     const reactions = (interaction.reactions as Record<string, number>) || {};
-    const currentCount = reactions[reactionType] || 0;
+    const storedCount = Number(reactions[reactionType]);
+    // Clamp whatever is stored to a non-negative integer so a malformed value can
+    // neither go negative nor carry a fraction, and a single toggle moves it by one.
+    const currentCount = Number.isFinite(storedCount) && storedCount > 0 ? Math.floor(storedCount) : 0;
     const newCount = hasReacted ? Math.max(0, currentCount - 1) : currentCount + 1;
     reactions[reactionType] = newCount;
 

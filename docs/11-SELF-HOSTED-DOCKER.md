@@ -43,10 +43,11 @@ npm create nextblock          # →  pick "Local Self-Hosted Docker Mode"
 `docker:setup` then:
 
 1. Verifies Docker is installed and running.
-2. Asks **two optional questions** (Cloudflare Turnstile, SMTP) — both skippable with Enter.
-3. Generates a root `.env` with secure random secrets and **properly-signed Supabase
-   anon/service keys** (real HS256 JWTs derived from a generated `JWT_SECRET`).
-4. Builds the app image and boots the whole stack.
+2. Generates a root `.env` with secure random secrets and **properly-signed Supabase
+   anon/service keys** (real HS256 JWTs derived from a generated `JWT_SECRET`). It asks no
+   questions: Cloudflare Turnstile and SMTP stay blank (see "Optional integrations" below)
+   and are configured later in the CMS.
+3. Builds the app image and boots the whole stack.
 
 When it finishes:
 
@@ -88,15 +89,23 @@ MCP token minting, and saving AI keys. Only the hosted demo at nextblock.dev set
 mode the Cortex AI license is activated inside the container from `NEXTBLOCK_LICENSE_KEY`
 (docs/08 → "Headless bootstrap").
 
-## The two optional prompts
+## Optional integrations (blank by default)
 
-| Prompt | If you skip it |
+| Integration | Default on a fresh install |
 | :--- | :--- |
-| **Cloudflare Turnstile** site + secret key | Uses Cloudflare's official "always pass" test keys — forms work, with no real bot protection. |
-| **SMTP** host (+ port / user / pass / from) | GoTrue **auto-confirms** sign-ups; no email is sent, and the first admin can sign in immediately. |
+| **Cloudflare Turnstile** (`NEXT_PUBLIC_TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY`) | **No captcha keys.** The bot-protection provider is `none`, so the sign-up and contact forms rely on the honeypot field (plus the contact form's per-IP throttle). Enable a real captcha in **CMS → Settings → Bot Protection** with keys from your Cloudflare account. |
+| **SMTP** (`SMTP_HOST` + port / user / pass / from) | GoTrue **auto-confirms** sign-ups; no email is sent, and the first admin can sign in immediately. |
 
 Provide real SMTP if you want actual confirmation emails — auto-confirm is then disabled,
 exactly like the cloud flow.
+
+> **Never use Cloudflare's Turnstile test keys** (the `1x…`, `2x…`, `3x…` site and secret
+> keys) on an install. The `1x…` secret accepts every token, so a form renders a working-looking
+> widget while passing every bot. Earlier versions of `docker:setup` wrote that pair into
+> `.env` as the "skipped" default; it now writes blank values and drops any test key it finds in
+> an existing `.env` on re-run (a yellow `Dropped Cloudflare Turnstile TEST key(s)` line). With
+> blank keys, switching the provider to Turnstile without configuring keys **fails closed**
+> ("Bot protection is misconfigured") instead of silently passing.
 
 ## What you get (the stack)
 
@@ -136,10 +145,52 @@ Both named volumes persist your database and uploaded media across restarts.
 > extra here: the generation's catch-up file consults `public._nextblock_docker_migrations`
 > by file stem, so it replays only what this stack never applied.
 
-### Ports (override with env vars)
+### Ports and host interfaces (override with env vars)
 
-`APP_PORT` (3000), `KONG_HTTP_PORT` (8000), `MINIO_S3_PORT` (9000),
-`MINIO_CONSOLE_PORT` (9001), `POSTGRES_PORT_EXTERNAL` (54322).
+Only the app is published on every interface. Everything else binds to **`127.0.0.1`**, so it
+is reachable from the Docker host itself (psql, the MinIO console, `http://localhost:8000` in
+your browser) and from nothing else:
+
+| Service | Host binding (default) | Interface var | Port var |
+| :--- | :--- | :--- | :--- |
+| `nextblock-cms` | `0.0.0.0:3000` — **public** | — | `APP_PORT` (3000) |
+| `kong` | `127.0.0.1:8000` | `KONG_BIND_HOST` | `KONG_HTTP_PORT` (8000) |
+| `minio` S3 API | `127.0.0.1:9000` | `MINIO_BIND_HOST` | `MINIO_S3_PORT` (9000) |
+| `minio` admin console | `127.0.0.1:9001` | `MINIO_BIND_HOST` | `MINIO_CONSOLE_PORT` (9001) |
+| `db` | `127.0.0.1:54322` | `DB_BIND_HOST` | `POSTGRES_PORT_EXTERNAL` (54322) |
+
+Containers talk to each other over the compose network (`db:5432`, `kong:8000`, `minio:9000`),
+and the app container reaches Kong and MinIO through its in-container `socat` proxy, so the
+loopback binding changes nothing for the stack itself.
+
+**Exposing a port deliberately.** Set the interface variable in `.env` and restart
+(`npm run docker:up`), e.g. `DB_BIND_HOST=0.0.0.0` to let another machine run psql, or
+`KONG_BIND_HOST=0.0.0.0` when browsers on other machines must reach the Supabase API directly
+(they then also need `NEXT_PUBLIC_SUPABASE_URL` / `API_EXTERNAL_URL` pointing at that host,
+which is baked into the app image at build time). For one-off psql or MinIO-console access, an
+SSH tunnel is safer and needs no change at all:
+`ssh -L 54322:127.0.0.1:54322 -L 9001:127.0.0.1:9001 user@server`, then connect to
+`localhost:54322` / `http://localhost:9001` on your laptop.
+
+### Hardening on a public server
+
+The defaults are tuned for a workstation. On a VPS or any host with a public address:
+
+- **Put a TLS reverse proxy (Caddy, nginx, Traefik) in front of `APP_PORT`** and point
+  `NEXT_PUBLIC_URL` / `SITE_URL` at the public `https://` origin. Route `/auth/v1`,
+  `/rest/v1` and `/graphql/v1` from the proxy to Kong on `127.0.0.1:8000` rather than
+  publishing Kong itself, and serve media the same way (or from a CDN) rather than publishing
+  MinIO.
+- **A firewall is required, and it must be Docker-aware.** Docker inserts published ports into
+  its own `DOCKER` iptables chain, which is evaluated *before* the `INPUT` chain where `ufw`
+  / `firewalld` rules live — so `ufw deny 54322` does **not** block a port published on
+  `0.0.0.0`. Keep the loopback bindings above (that is what makes the ports unreachable), and
+  add host rules in the `DOCKER-USER` chain or a cloud security group that allows only 80/443
+  (and your SSH port) inbound.
+- **Rotate the MinIO root user.** `MINIO_ROOT_USER` defaults to `nextblock`; set a non-default
+  value in `.env` before the first boot (the password is already crypto-random).
+- **Never publish `9001` or `54322`.** The MinIO console carries the root credentials and
+  Postgres holds every table; use the SSH tunnel above when you need them.
 
 ## How it works
 
@@ -197,6 +248,10 @@ configuration:
 
 - **`port is already allocated`.** Another process (often a previous stack) holds 8000 /
   9000 / 3000 / 54322. Stop it, or override the port env vars above.
+
+- **Can't reach Postgres / MinIO / Kong from another machine.** By design: those ports bind to
+  `127.0.0.1` (see "Ports and host interfaces"). Use an SSH tunnel, or set the matching
+  `*_BIND_HOST=0.0.0.0` in `.env` and `npm run docker:up` — behind a firewall.
 
 - **GoTrue fails with `password authentication failed for user "supabase_auth_admin"`
   (28P01) after a re-clone.** A leftover named volume from a previous install still holds

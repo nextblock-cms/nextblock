@@ -24,9 +24,51 @@ const __dirname = dirname(__filename);
 const REPO_ROOT = resolve(__dirname, '../..');
 const ENV_PATH = resolve(REPO_ROOT, '.env');
 
-// Cloudflare's official "always passes" Turnstile test keys — the skip / sandbox fallback.
-const TURNSTILE_TEST_SITE_KEY = '1x00000000000000000000AA';
-const TURNSTILE_TEST_SECRET_KEY = '1x0000000000000000000000000000000AA';
+// Cloudflare's documented Turnstile TEST keys (site keys: 1x… always passes, 2x… always blocks,
+// 3x… forces a challenge; secret keys: 1x… accepts every token, 2x… rejects every token, 3x…
+// "token already spent"). None is valid for a real site. Earlier versions of this script wrote the
+// 1x pair into .env as the "skipped" default, which made a Turnstile-enabled form LOOK protected
+// while the test secret passed every bot. A fresh install now gets no captcha keys at all (public
+// forms are honeypot-only until real keys are set in CMS → Settings → Bot Protection), and a
+// re-run scrubs any test key left in an existing .env.
+export const TURNSTILE_TEST_KEYS = Object.freeze([
+  '1x00000000000000000000AA',
+  '1x00000000000000000000BB',
+  '2x00000000000000000000AB',
+  '2x00000000000000000000BB',
+  '3x00000000000000000000FF',
+  '1x0000000000000000000000000000000AA',
+  '2x0000000000000000000000000000000AA',
+  '3x0000000000000000000000000000000AA',
+]);
+
+/** True when `value` is one of Cloudflare's Turnstile test keys (never a production credential). */
+export function isTurnstileTestKey(value) {
+  return TURNSTILE_TEST_KEYS.includes(String(value ?? '').trim());
+}
+
+/**
+ * The Turnstile values to write to .env: whatever the existing .env holds, minus Cloudflare's test
+ * keys (listed in `scrubbed`). With nothing configured both stay blank, which the app treats as
+ * "no captcha": the honeypot still runs, and an operator who enables Turnstile without keys gets a
+ * visible "Bot protection is misconfigured" failure instead of a captcha that passes everything.
+ */
+export function resolveTurnstileKeys(existingEnv) {
+  const scrubbed = [];
+  const keep = (envKey, value) => {
+    if (!isTurnstileTestKey(value)) return value;
+    scrubbed.push(envKey);
+    return '';
+  };
+  return {
+    siteKey: keep(
+      'NEXT_PUBLIC_TURNSTILE_SITE_KEY',
+      readEnvValue(existingEnv, 'NEXT_PUBLIC_TURNSTILE_SITE_KEY'),
+    ),
+    secretKey: keep('TURNSTILE_SECRET_KEY', readEnvValue(existingEnv, 'TURNSTILE_SECRET_KEY')),
+    scrubbed,
+  };
+}
 
 async function ensureDockerRunning() {
   try {
@@ -98,13 +140,11 @@ async function main() {
     .join('\n');
 
   // Integrations (Cloudflare Turnstile, SMTP) and the first admin are configured later in the
-  // browser /setup wizard, not here. Default to Turnstile test keys (always pass) and no SMTP so
-  // the stack boots cleanly and the first admin can be created without an email round-trip
-  // (GoTrue auto-confirms). Existing .env values are preserved.
-  const turnstileSiteKey =
-    readEnvValue(existing, 'NEXT_PUBLIC_TURNSTILE_SITE_KEY') || TURNSTILE_TEST_SITE_KEY;
-  const turnstileSecretKey =
-    readEnvValue(existing, 'TURNSTILE_SECRET_KEY') || TURNSTILE_TEST_SECRET_KEY;
+  // browser (/setup for the admin, CMS → Settings for the rest), not here. Default to NO captcha
+  // keys and no SMTP so the stack boots cleanly and the first admin can be created without an
+  // email round-trip (GoTrue auto-confirms). Existing .env values are preserved, except
+  // Cloudflare's Turnstile test keys, which are dropped (see TURNSTILE_TEST_KEYS).
+  const turnstile = resolveTurnstileKeys(existing);
   const smtp = {
     host: readEnvValue(existing, 'SMTP_HOST'),
     port: readEnvValue(existing, 'SMTP_PORT'),
@@ -114,11 +154,19 @@ async function main() {
     fromName: readEnvValue(existing, 'SMTP_FROM_NAME'),
   };
   const mailerAutoconfirm = smtp.host ? 'false' : 'true';
-  console.log(
-    chalk.gray(
-      '  → Turnstile test keys + no SMTP (auto-confirm). Configure real values later in /setup or CMS settings.',
-    ),
-  );
+  if (turnstile.scrubbed.length > 0) {
+    console.log(
+      chalk.yellow(
+        `  ! Dropped Cloudflare Turnstile TEST key(s) from .env (${turnstile.scrubbed.join(', ')}): the test secret accepts every token, so forms only looked protected.`,
+      ),
+    );
+  }
+  const captchaNote =
+    turnstile.siteKey && turnstile.secretKey
+      ? 'Turnstile keys kept from .env'
+      : 'no captcha keys (public forms are honeypot-only until set in CMS → Settings → Bot Protection)';
+  const smtpNote = smtp.host ? 'SMTP kept from .env' : 'no SMTP (sign-ups auto-confirm)';
+  console.log(chalk.gray(`  → ${captchaNote}; ${smtpNote}.`));
 
   // 2. Assemble .env, reusing already-generated secrets so re-runs are idempotent.
   const reuse = (key, gen) => readEnvValue(existing, key) || gen();
@@ -178,8 +226,8 @@ async function main() {
     R2_FORCE_PATH_STYLE: 'R2_FORCE_PATH_STYLE=true',
     NEXT_PUBLIC_R2_BASE_URL: `NEXT_PUBLIC_R2_BASE_URL=http://127.0.0.1:9000/${bucket}`,
     NEXT_PUBLIC_R2_PUBLIC_URL: `NEXT_PUBLIC_R2_PUBLIC_URL=http://127.0.0.1:9000/${bucket}`,
-    NEXT_PUBLIC_TURNSTILE_SITE_KEY: `NEXT_PUBLIC_TURNSTILE_SITE_KEY=${turnstileSiteKey}`,
-    TURNSTILE_SECRET_KEY: `TURNSTILE_SECRET_KEY=${turnstileSecretKey}`,
+    NEXT_PUBLIC_TURNSTILE_SITE_KEY: `NEXT_PUBLIC_TURNSTILE_SITE_KEY=${turnstile.siteKey}`,
+    TURNSTILE_SECRET_KEY: `TURNSTILE_SECRET_KEY=${turnstile.secretKey}`,
     GOTRUE_MAILER_AUTOCONFIRM: `GOTRUE_MAILER_AUTOCONFIRM=${mailerAutoconfirm}`,
     SMTP_HOST: `SMTP_HOST=${smtp.host}`,
     SMTP_PORT: `SMTP_PORT=${smtp.port}`,
@@ -254,6 +302,11 @@ async function main() {
   console.log(
     `  3. Supabase API:    ${chalk.cyan('http://localhost:8000')}   ${chalk.gray('MinIO console:')} ${chalk.cyan('http://localhost:9001')}`,
   );
+  console.log(
+    chalk.gray(
+      '     Postgres (54322), MinIO (9000/9001) and Kong (8000) listen on 127.0.0.1 only; the app port is the public one. See docs/11 before exposing a server.',
+    ),
+  );
   console.log('');
   console.log(
     chalk.gray(
@@ -262,7 +315,16 @@ async function main() {
   );
 }
 
-main().catch((err) => {
-  console.error(chalk.red('Unexpected error:'), err);
-  process.exit(1);
-});
+// Run only when executed directly (`npm run docker:setup`), so tests can import the helpers above
+// without preflighting Docker, writing .env or starting the stack.
+const entry = process.argv[1] ? resolve(process.argv[1]) : '';
+const isMain =
+  process.platform === 'win32'
+    ? entry.toLowerCase() === __filename.toLowerCase()
+    : entry === __filename;
+if (isMain) {
+  main().catch((err) => {
+    console.error(chalk.red('Unexpected error:'), err);
+    process.exit(1);
+  });
+}

@@ -178,7 +178,10 @@ export async function updateUserProfile(userIdToUpdate: string, formData: FormDa
   // Prevent an admin from accidentally removing their own admin role if they are the only admin
   // This is a basic check; a more robust system might count admins.
   if (userIdToUpdate === adminCheck.userId && rawFormData.role !== 'ADMIN') {
-      const { count } = await supabase
+      // Counted with the service role: other accounts' rows sit behind is_admin_mfa() since
+      // migration 02023, so through the cookie client an admin on an aal1 "remember this
+      // device" session only sees their own row and would always read as the last admin.
+      const { count } = await createServiceRoleClient()
         .from('profiles')
         .select('*', { count: 'exact', head: true })
         .eq('role', 'ADMIN');

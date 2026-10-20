@@ -8,6 +8,7 @@ import {
   summarizeCortexAiRoutingError,
 } from '@nextblock-cms/cortex';
 
+import { enforceCortexAiRequestQuota } from '../../../../../lib/cortex-ai/request-quota';
 import { z } from '../../../../../lib/zod-config';
 
 export const dynamic = 'force-dynamic';
@@ -57,7 +58,8 @@ async function requireCmsWriterAccess(supabase: SupabaseServerClient) {
     return null;
   }
 
-  return { userId: user.id };
+  // The role rides along because the request quota that follows is per role.
+  return { role: profile.role, userId: user.id };
 }
 
 function jsonError(message: string, status: number) {
@@ -120,8 +122,20 @@ export async function POST(request: Request) {
       return jsonError('You do not have permission to generate image alt text.', 403);
     }
 
-    // The package gate that /api/ai/generate-blocks is missing (docs/08 follow-up
-    // #6). Alt-text generation is a paid Cortex AI feature that burns either the
+    // Per-user hourly cap (writer-openrouter-cost-abuse): one request-log row per call,
+    // 429 past the role's cap. Runs before anything that can reach a model.
+    const quotaResponse = await enforceCortexAiRequestQuota({
+      role: access.role,
+      route: 'ai/seo/alt-text',
+      userId: access.userId,
+    });
+
+    if (quotaResponse) {
+      return quotaResponse;
+    }
+
+    // The same package gate as every other /api/ai/* route (docs/08 follow-up #6).
+    // Alt-text generation is a paid Cortex AI feature that burns either the
     // operator's own OpenRouter credit or the shared house key, so an install
     // without an active `cortex-ai` activation must not reach a model at all. The
     // package id is `cortex-ai`; `ai` is not a package id anywhere in this system.

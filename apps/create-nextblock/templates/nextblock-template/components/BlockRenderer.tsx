@@ -17,7 +17,7 @@ import { PUBLIC_CONTENT_REVALIDATE_SECONDS } from "../lib/public-content-cache";
 type Block = Database['public']['Tables']['blocks']['Row'];
 import SectionBlockRenderer from "./blocks/renderers/SectionBlockRenderer"; // Static import for LCP
 import ClientTextBlockRenderer from "./blocks/renderers/ClientTextBlockRenderer"; // Static import for client component
-import { addNonceToInlineScripts } from "../lib/blocks/inlineScriptNonce";
+import { sanitizeAuthoredBlockHtml } from "../lib/blocks/inlineScriptNonce";
 import { getCachedCustomBlockDefinitionBySlug } from "../lib/custom-block-definitions";
 import { getCachedLanguageCode } from "../lib/languages/cached-language-code";
 import { CachedDynamicLayoutEngine } from "./renderers/CachedDynamicLayoutEngine";
@@ -183,16 +183,17 @@ async function renderLoadedBlock({
   if (block.block_type === 'text') {
     // Top-level text blocks bypass the server TextBlockRenderer, so everything it
     // would have done to the HTML has to happen here too: merge tags (e.g.
-    // {{privacy_email}} on the Privacy/Terms pages) and — because the CSP carries a
-    // nonce, which makes browsers ignore 'unsafe-inline' — the inline-script nonce.
-    // Without the latter, an inline <script> an editor wrote into a rich-text block
-    // is dropped by the browser with nothing failing server-side.
+    // {{privacy_email}} on the Privacy/Terms pages) and sanitizing author HTML.
+    // Authored <script>/event-handlers are stripped (not nonce-blessed): block HTML is
+    // WRITER-authored and renders on public pages and in /cms, so blessing it would be
+    // stored XSS across the WRITER->visitor/admin boundary (operator scripts use the
+    // ADMIN-only site_scripts path instead).
     const textContent = block.content as { html_content?: string } | null;
     const rawHtml = typeof textContent?.html_content === 'string' ? textContent.html_content : '';
     const merged = rawHtml.includes('{{')
       ? await substitutePrivacyMergeTags(rawHtml)
       : rawHtml;
-    const html = addNonceToInlineScripts(merged, scriptNonce ?? '');
+    const html = sanitizeAuthoredBlockHtml(merged);
     return (
       <ClientTextBlockRenderer
         content={{ ...(textContent as any), html_content: html }}

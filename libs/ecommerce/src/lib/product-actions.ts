@@ -686,21 +686,31 @@ export async function updateProduct(supabase: SupabaseClient<Database>, id: stri
 
       if (variantUsageCount && variantUsageCount > 0) continue;
 
-      const { data: mediaToDelete } = await supabase
+      // Delete the media row FIRST and read back the rows actually removed. Under RLS
+      // (media_delete_policy, migration 02022 §9) the cookie-scoped session only deletes media it
+      // uploaded (or any row when ADMIN); a non-owner match removes zero rows. Deleting the
+      // storage files before the DB row would destroy the objects while the row survived — an
+      // orphaned record the product save would silently leave behind. Only purge files for a row
+      // we were allowed to delete.
+      const { data: deletedMediaRows } = await supabase
         .from('media')
-        .select('object_key, variants')
+        .delete()
         .eq('id', removedId)
-        .single();
-      
-      if (mediaToDelete) {
-         const keysToDelete = [mediaToDelete.object_key];
-         if (mediaToDelete.variants && Array.isArray(mediaToDelete.variants)) {
-             mediaToDelete.variants.forEach((v: any) => {
-                 if (v.objectKey) keysToDelete.push(v.objectKey);
+        .select('object_key, variants');
+
+      const deletedMedia =
+        deletedMediaRows && deletedMediaRows.length > 0 ? deletedMediaRows[0] : null;
+      if (deletedMedia) {
+         const keysToDelete: string[] = [];
+         if (deletedMedia.object_key) keysToDelete.push(deletedMedia.object_key);
+         if (deletedMedia.variants && Array.isArray(deletedMedia.variants)) {
+             deletedMedia.variants.forEach((v: any) => {
+                 if (v?.objectKey) keysToDelete.push(v.objectKey);
              });
          }
-         await deleteMediaFiles(keysToDelete);
-         await supabase.from('media').delete().eq('id', removedId);
+         if (keysToDelete.length > 0) {
+           await deleteMediaFiles(keysToDelete);
+         }
       }
     }
   }

@@ -47,16 +47,25 @@ export type CortexAiMcpSettings = {
    */
   enabled: boolean;
   /**
-   * Trust loopback callers without a token. Convenient for `npx nx serve nextblock`
-   * plus a local Claude Code, and safe because the request must already originate on
-   * the machine running the CMS. Ignored entirely in production (see
-   * `shouldTrustLocalMcpRequest`).
+   * Trust loopback callers without a token — the dashboard half of a two-switch opt-in.
+   *
+   * Off by default: a tokenless loopback session is a full read+write surface onto the
+   * CMS, and `Host` is attacker-controllable behind a reverse proxy, so this is never
+   * enabled silently. Turning it on is NOT sufficient on its own — the endpoint also
+   * requires the `NEXTBLOCK_MCP_TRUST_LOCALHOST=true` environment opt-in and a
+   * non-production `NODE_ENV` before any tokenless request is honoured (see
+   * `shouldTrustLocalMcpRequest`, and `lib/cortex-ai/mcp-loopback-trust.ts` in the app
+   * for the forwarded-peer check layered on top). With the variable unset, localhost
+   * still needs a bearer token like everywhere else.
    */
   allowLocalhostWithoutToken: boolean;
 };
 
 export const CORTEX_AI_MCP_SETTINGS_DEFAULTS: CortexAiMcpSettings = {
-  allowLocalhostWithoutToken: true,
+  // Closed by default: the tokenless loopback path 401s unless an operator deliberately
+  // opts in (dashboard toggle AND NEXTBLOCK_MCP_TRUST_LOCALHOST), so a fresh install and
+  // any install that never set the key require a token on every origin.
+  allowLocalhostWithoutToken: false,
   enabled: false,
 };
 
@@ -269,11 +278,16 @@ export function isLocalhostHost(value: string | null | undefined): boolean {
 /**
  * Decide whether a tokenless request may be trusted as local.
  *
- * Requires all three of: the setting on, a loopback Host header, and a non-production
- * `NODE_ENV`. The last condition is the important one — behind a reverse proxy the
- * Host header is attacker-controllable, so localhost trust is a development
- * affordance only and must never be the thing standing between the public internet
- * and a write-capable CMS endpoint.
+ * Requires all three of: the dashboard setting on, a loopback `Host` header, and a
+ * non-production `NODE_ENV`. Because the `Host` header is attacker-controllable behind
+ * a reverse proxy, this function is deliberately NOT the whole gate: the endpoint
+ * (`app/api/mcp/route.ts`) additionally requires the `NEXTBLOCK_MCP_TRUST_LOCALHOST=true`
+ * environment opt-in and a forwarded-peer-is-loopback check
+ * (`lib/cortex-ai/mcp-loopback-trust.ts`) before honouring a tokenless request. The
+ * environment variable is the real gate — without it the tokenless path does not exist,
+ * whatever the dashboard toggle says; this check is one of several AND-ed conditions.
+ * Localhost trust is a development affordance only and must never be the single thing
+ * standing between the public internet and a write-capable CMS endpoint.
  */
 export function shouldTrustLocalMcpRequest(params: {
   hostHeader: string | null | undefined;

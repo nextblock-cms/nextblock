@@ -6,6 +6,23 @@ import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { getStorageBackend, getStorageBucket } from "../../../../lib/storage/provider";
 import { supabaseCreateSignedUpload } from "../../../../lib/storage/supabase-storage";
+import {
+  formatUploadTimestamp,
+  isAllowedContentType,
+  isSafeObjectKey,
+  normalizeContentType,
+  resolveExtension,
+  resolveUploadFolder,
+  sanitizeBaseFilename,
+} from "../../../../lib/storage/upload-policy";
+
+export const runtime = 'nodejs';
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+
+// The content-type allowlist, folder resolver, filename sanitiser, extension resolver and
+// object-key traversal guard are shared with /api/upload/proxy (and /api/media/record) via
+// ../../../../lib/storage/upload-policy: one policy to audit, applied identically everywhere.
 
 export async function POST(request: NextRequest) {
   const supabase = createClient();
@@ -40,46 +57,54 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'File uploads are not configured on this server.' }, { status: 500 });
     }
 
-    const { filename, contentType, size, folder: rawFolder } = await request.json();
+    let payload: Record<string, unknown>;
+    try {
+      const parsed: unknown = await request.json();
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      return NextResponse.json({ error: "Expected a JSON body." }, { status: 400 });
+    }
+
+    const filename = typeof payload.filename === 'string' ? payload.filename.trim() : '';
+    const contentType = normalizeContentType(payload.contentType);
+    const size =
+      typeof payload.size === 'number'
+        ? payload.size
+        : typeof payload.size === 'string'
+          ? Number(payload.size)
+          : Number.NaN;
 
     if (!filename || !contentType || !size) {
       return NextResponse.json({ error: "Missing filename, contentType, or size" }, { status: 400 });
     }
-
-    // Basic validation (you can enhance this)
-    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
-    if (size > MAX_FILE_SIZE) {
-        return NextResponse.json({ error: `File size exceeds limit of ${MAX_FILE_SIZE / (1024*1024)}MB.` }, { status: 400 });
+    if (filename.length > 255) {
+      return NextResponse.json({ error: "Filename is too long." }, { status: 400 });
     }
-    // Add content type validation if needed
+    if (!isAllowedContentType(contentType)) {
+      return NextResponse.json(
+        { error: "Unsupported file type. Upload an image, a video, a PDF, or a text/office document." },
+        { status: 415 },
+      );
+    }
+    if (!Number.isInteger(size) || size <= 0) {
+      return NextResponse.json({ error: "A positive integer file size is required." }, { status: 400 });
+    }
+    if (size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: `File size exceeds limit of ${MAX_FILE_SIZE / (1024*1024)}MB.` }, { status: 400 });
+    }
 
-    const fileExtension = filename.split('.').pop() || '';
-    const baseFilename = fileExtension ? filename.substring(0, filename.length - (fileExtension.length + 1)) : filename;
+    const folder = resolveUploadFolder(payload.folder);
+    if (!folder) {
+      return NextResponse.json({ error: "Invalid upload folder." }, { status: 400 });
+    }
 
-    // Sanitize baseFilename to remove characters not suitable for URLs/filenames, replace spaces with hyphens
-    const sanitizedBaseFilename = baseFilename
-        .toLowerCase()
-        .replace(/\s+/g, '-') // Replace spaces with hyphens
-        .replace(/[^\w.-]+/g, ''); // Remove non-alphanumeric characters except hyphen and period
+    const timestamp = formatUploadTimestamp(new Date());
 
-    const now = new Date();
-    const timestamp = `${now.getFullYear()}${(now.getMonth() + 1).toString().padStart(2, '0')}${now.getDate().toString().padStart(2, '0')}${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}${now.getSeconds().toString().padStart(2, '0')}`;
-
-    // Sanitize and normalize folder path
-    const sanitizeFolder = (input?: string | null) => {
-      const f = (input ?? '').toString().trim();
-      if (!f) return 'uploads/';
-      // remove leading slashes, collapse .. and illegal chars
-      let cleaned = f.replace(/^\/+/, '');
-      cleaned = cleaned.replace(/\\/g, '/');
-      cleaned = cleaned.replace(/\.{2,}/g, '');
-      cleaned = cleaned.replace(/[^a-zA-Z0-9_\-/]+/g, '-');
-      if (cleaned && !cleaned.endsWith('/')) cleaned += '/';
-      return cleaned || 'uploads/';
-    };
-    const folder = sanitizeFolder(rawFolder);
-
-    const uniqueKey = `${folder}${sanitizedBaseFilename}_${timestamp}${fileExtension ? '.' + fileExtension : ''}`;
+    const uniqueKey = `${folder}${sanitizeBaseFilename(filename)}_${timestamp}.${resolveExtension(filename, contentType)}`;
+    if (!isSafeObjectKey(uniqueKey)) {
+      return NextResponse.json({ error: "Invalid object key." }, { status: 400 });
+    }
 
     if (backend === 'supabase') {
       // Native Supabase Storage: hand the browser a signed upload URL to PUT to directly.
@@ -102,8 +127,12 @@ export async function POST(request: NextRequest) {
       }
     });
 
+    if (!s3Client) {
+      // Unreachable: the S3 client was verified above; keeps the type narrow without an assertion.
+      throw new Error('Storage client unavailable.');
+    }
     const expiresIn = 300; // 5 minutes
-    const presignedUrl = await getSignedUrl(s3Client!, command, { expiresIn });
+    const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn });
 
     return NextResponse.json({
       presignedUrl,

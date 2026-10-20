@@ -1,5 +1,6 @@
 // app/api/process-image/route.ts
 import { NextRequest, NextResponse } from 'next/server';
+import { createClient } from '@nextblock-cms/db/server';
 import { getS3Client } from '@nextblock-cms/utils/server';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
@@ -47,6 +48,29 @@ const TARGET_FORMAT = 'avif';
 const TARGET_MIME_TYPE = 'image/avif';
 
 export async function POST(request: NextRequest) {
+  // This endpoint reads AND writes arbitrary storage objects by key with the server's storage
+  // credentials, so it must not be callable unauthenticated. It is a CMS tool (the media upload
+  // pipeline), reachable only from /cms, so require a staff session. Without this, an anonymous
+  // caller could read any object by key (blur-preview exfiltration), write processed variants, or
+  // drive sharp to exhaust the server.
+  {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+    if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+  }
+
   const backend = getStorageBackend();
   const bucket = getStorageBucket();
   const publicUrlBase = resolveMediaBaseUrl();
@@ -92,6 +116,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing objectKey or contentType in request body.' }, { status: 400 });
     }
 
+    // Constrain the key to a plain in-bucket relative path: no traversal, no leading slash, no
+    // scheme/host. Defence in depth behind the staff gate above so a key cannot be aimed outside
+    // the media namespace.
+    if (
+      typeof originalObjectKey !== 'string' ||
+      originalObjectKey.includes('..') ||
+      originalObjectKey.startsWith('/') ||
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(originalObjectKey)
+    ) {
+      return NextResponse.json({ error: 'Invalid objectKey.' }, { status: 400 });
+    }
+
     if (!originalContentType.startsWith('image/')) {
       // For now, we only process images. Could be extended for other file types if needed.
       return NextResponse.json({
@@ -115,7 +151,8 @@ export async function POST(request: NextRequest) {
       }
       imageBuffer = await streamToBuffer(getObjectResponse.Body as Readable);
     }
-    let sharpInstance = sharp(imageBuffer);
+    // Cap decode cost: reject absurdly large images rather than letting sharp allocate for them.
+    let sharpInstance = sharp(imageBuffer, { limitInputPixels: 50_000_000, failOn: 'error' });
     let originalMetadata = await sharpInstance.metadata();
 
     const MAX_WIDTH = 2560; // Define max width

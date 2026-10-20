@@ -1,10 +1,10 @@
 // app/cms/settings/languages/actions.ts
 "use server";
 
-import { createClient } from "@nextblock-cms/db/server";
+import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { revalidatePath, updateTag } from "next/cache";
 import { redirect } from "next/navigation";
-import type { Database } from "@nextblock-cms/db";
+import type { Database, Json } from "@nextblock-cms/db";
 import {
   LANGUAGE_DETECTION_SETTING_KEY,
   LANGUAGE_DETECTION_CACHE_TAG,
@@ -296,9 +296,12 @@ export async function updateLanguageDetectionSettings(
   // Never trust the client payload shape — coerce to a valid settings object.
   const settings = normalizeLanguageDetectionSettings(input);
 
-  const { error } = await supabase
+  // ADMIN verified above; written with the service role because the key is in the
+  // ADMIN-only write tier that migration 02023 gates behind is_admin_mfa(), which an admin
+  // on an aal1 "remember this device" session cannot satisfy through the cookie client.
+  const { error } = await getServiceRoleSupabaseClient()
     .from("site_settings")
-    .upsert({ key: LANGUAGE_DETECTION_SETTING_KEY, value: settings });
+    .upsert({ key: LANGUAGE_DETECTION_SETTING_KEY, value: settings as unknown as Json });
 
   if (error) {
     console.error("Error saving language detection settings:", error);

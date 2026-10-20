@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { revalidatePath } from 'next/cache';
 import { createClient } from '@nextblock-cms/db/server';
 import type { Database } from '@nextblock-cms/db';
+import {
+  hasAllowedObjectKeyExtension,
+  isSafeObjectKey,
+} from '../../../../lib/storage/upload-policy';
 
 type Media = Database['public']['Tables']['media']['Row'];
 
@@ -112,6 +116,18 @@ export async function POST(request: NextRequest) {
     const objectKey = primaryVariant.objectKey.replace(/^\/+/, '');
     const folderMatch = objectKey.match(/^(.*\/)?.*$/);
     const folder = folderMatch && folderMatch[1] ? folderMatch[1] : null;
+
+    // Harden: every object key recorded here is client-supplied. The upload routes mint safe
+    // keys ending in an allowed media/document extension, but this endpoint trusts whatever the
+    // caller sends, so re-apply the shared upload policy (isSafeObjectKey + the extension
+    // allowlist): refuse a traversal/absolute/odd key, or one pointing at a non-media object
+    // (e.g. `.html` / `.js` / extension-less), before it reaches the media table.
+    const recordedKeys = [objectKey, ...allVariantsToStore.map((variant) => variant.objectKey)];
+    for (const key of recordedKeys) {
+      if (!isSafeObjectKey(key) || !hasAllowedObjectKeyExtension(key)) {
+        return NextResponse.json({ error: 'Invalid object key.' }, { status: 400 });
+      }
+    }
 
     const mediaData: Omit<Media, 'id' | 'created_at' | 'updated_at'> & {
       uploader_id: string;

@@ -1,6 +1,7 @@
 'use server';
 
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { requireEcomStaff } from '../../../server-actions/require-ecom-role';
 import { ProductFormValues } from '../../../product-schema';
 import {
   createProduct as createProductLib,
@@ -266,7 +267,7 @@ export async function publishProductAction(
 }
 
 export async function createProductAttributeAction(input: { name: string; slug?: string }) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const name = input.name.trim();
   const slug = slugify(input.slug?.trim() || input.name);
 
@@ -290,7 +291,7 @@ export async function createProductAttributeAction(input: { name: string; slug?:
 }
 
 export async function deleteProductAttributeAction(attributeId: string) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const { error } = await supabase.from('product_attributes').delete().eq('id', attributeId);
 
   if (error) {
@@ -308,7 +309,7 @@ export async function createProductAttributeTermAction(input: {
   value: string;
   slug?: string;
 }) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const value = input.value.trim();
   const slug = slugify(input.slug?.trim() || input.value);
 
@@ -347,7 +348,7 @@ export async function reorderProductAttributeTermsAction(input: {
   attributeId: string;
   orderedTermIds: string[];
 }) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
 
   for (const [index, termId] of input.orderedTermIds.entries()) {
     const { error } = await supabase
@@ -378,7 +379,7 @@ export async function updateProductAttributeTranslationsAction(input: {
     valueTranslations: Record<string, string>;
   }>;
 }) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
 
   const { error: attributeError } = await supabase
     .from('product_attributes')
@@ -414,7 +415,7 @@ export async function updateProductAttributeTranslationsAction(input: {
 }
 
 export async function deleteProductAttributeTermAction(termId: string) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const { error } = await supabase.from('product_attribute_terms').delete().eq('id', termId);
 
   if (error) {
@@ -434,7 +435,7 @@ export async function createCategoryAction(input: {
   nameTranslations?: Record<string, string>;
   descriptionTranslations?: Record<string, string>;
 }) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const name = input.name.trim();
   const slug = slugify(input.slug?.trim() || input.name);
 
@@ -474,7 +475,7 @@ export async function updateCategoryAction(
     descriptionTranslations?: Record<string, string>;
   }
 ) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const name = input.name.trim();
   const slug = slugify(input.slug?.trim() || input.name);
 
@@ -504,7 +505,7 @@ export async function updateCategoryAction(
 }
 
 export async function deleteCategoryAction(id: string) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   const { error } = await supabase.from('categories' as any).delete().eq('id', id);
 
   if (error) {
@@ -518,7 +519,7 @@ export async function deleteCategoryAction(id: string) {
 }
 
 export async function syncProductCategoriesAction(productId: string, categoryIds: string[]) {
-  const supabase = getServiceRoleSupabaseClient();
+  const supabase = await requireEcomStaff();
   
   try {
     await syncCategoriesForTranslationGroup(supabase, productId, categoryIds);

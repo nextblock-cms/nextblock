@@ -1,8 +1,8 @@
 'use server';
 
 import { revalidatePath } from 'next/cache';
-import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 
+import { requireEcomAdmin } from '../../../../server-actions/require-ecom-role';
 import {
   getInventoryItems,
   setSharedInventoryQuantity,
@@ -72,12 +72,16 @@ function buildInventoryKey(item: Pick<InventoryItem, 'sku'>) {
 
 export async function updateInventoryQuantityAction(input: UpdateInventoryQuantityInput) {
   try {
+    const supabase = await requireEcomAdmin();
     const stock = Math.max(0, Math.trunc(input.stock));
 
-    await setSharedInventoryQuantity({
-      sku: input.sku,
-      stock,
-    });
+    await setSharedInventoryQuantity(
+      {
+        sku: input.sku,
+        stock,
+      },
+      supabase
+    );
 
     revalidatePath('/cms/products');
     revalidatePath('/cms/products/inventory');
@@ -97,6 +101,7 @@ export async function updateInventoryQuantityAction(input: UpdateInventoryQuanti
 
 export async function importInventoryCsvAction(csvText: string) {
   try {
+    const supabase = await requireEcomAdmin();
     const parsedRows = parseCsvRows(csvText);
 
     if (parsedRows.length < 2) {
@@ -116,7 +121,6 @@ export async function importInventoryCsvAction(csvText: string) {
       };
     }
 
-    const supabase = getServiceRoleSupabaseClient();
     let updatedCount = 0;
 
     for (const row of dataRows) {

@@ -10,7 +10,7 @@ export type Database = {
   // Allows to automatically instantiate createClient with right options
   // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
-    PostgrestVersion: "14.5"
+    PostgrestVersion: "14.1"
   }
   public: {
     Tables: {
@@ -126,6 +126,11 @@ export type Database = {
           type: Database["public"]["Enums"]["interaction_type"]
           updated_at: string
           user_id: string
+          author: {
+            avatar_url: string | null
+            full_name: string | null
+            id: string | null
+          } | null
         }
         Insert: {
           content: string
@@ -175,6 +180,13 @@ export type Database = {
             columns: ["product_id"]
             isOneToOne: false
             referencedRelation: "products"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "cms_interactions_user_id_profiles_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
             referencedColumns: ["id"]
           },
           {
@@ -255,6 +267,13 @@ export type Database = {
             foreignKeyName: "content_drafts_author_id_fkey"
             columns: ["author_id"]
             isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "content_drafts_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
             referencedRelation: "profiles"
             referencedColumns: ["id"]
           },
@@ -308,10 +327,38 @@ export type Database = {
             foreignKeyName: "cortex_ai_db_mutation_audit_actor_user_id_fkey"
             columns: ["actor_user_id"]
             isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "cortex_ai_db_mutation_audit_actor_user_id_fkey"
+            columns: ["actor_user_id"]
+            isOneToOne: false
             referencedRelation: "profiles"
             referencedColumns: ["id"]
           },
         ]
+      }
+      cortex_request_log: {
+        Row: {
+          created_at: string
+          id: string
+          route: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          route: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          route?: string
+          user_id?: string
+        }
+        Relationships: []
       }
       coupon_freemius_mappings: {
         Row: {
@@ -603,6 +650,7 @@ export type Database = {
       }
       email_2fa_challenges: {
         Row: {
+          attempts: number
           consumed_at: string | null
           created_at: string
           expires_at: string
@@ -611,6 +659,7 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          attempts?: number
           consumed_at?: string | null
           created_at?: string
           expires_at: string
@@ -619,6 +668,7 @@ export type Database = {
           user_id: string
         }
         Update: {
+          attempts?: number
           consumed_at?: string | null
           created_at?: string
           expires_at?: string
@@ -915,6 +965,13 @@ export type Database = {
           width?: number | null
         }
         Relationships: [
+          {
+            foreignKeyName: "media_uploader_id_fkey"
+            columns: ["uploader_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "media_uploader_id_fkey"
             columns: ["uploader_id"]
@@ -1285,6 +1342,13 @@ export type Database = {
             foreignKeyName: "page_revisions_author_id_fkey"
             columns: ["author_id"]
             isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "page_revisions_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
             referencedRelation: "profiles"
             referencedColumns: ["id"]
           },
@@ -1354,6 +1418,13 @@ export type Database = {
             foreignKeyName: "pages_author_id_fkey"
             columns: ["author_id"]
             isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "pages_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
             referencedRelation: "profiles"
             referencedColumns: ["id"]
           },
@@ -1402,6 +1473,13 @@ export type Database = {
           version?: number
         }
         Relationships: [
+          {
+            foreignKeyName: "post_revisions_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "post_revisions_author_id_fkey"
             columns: ["author_id"]
@@ -1480,6 +1558,13 @@ export type Database = {
           version?: number
         }
         Relationships: [
+          {
+            foreignKeyName: "posts_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "posts_author_id_fkey"
             columns: ["author_id"]
@@ -1657,6 +1742,13 @@ export type Database = {
           updated_at?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "product_drafts_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "product_drafts_author_id_fkey"
             columns: ["author_id"]
@@ -1848,6 +1940,13 @@ export type Database = {
           version?: number
         }
         Relationships: [
+          {
+            foreignKeyName: "product_revisions_author_id_fkey"
+            columns: ["author_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "product_revisions_author_id_fkey"
             columns: ["author_id"]
@@ -2516,6 +2615,7 @@ export type Database = {
       }
       ucp_cart_sessions: {
         Row: {
+          access_token_hash: string | null
           attribution: Json
           buyer_identity: Json
           checkout_url: string | null
@@ -2533,6 +2633,7 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          access_token_hash?: string | null
           attribution?: Json
           buyer_identity?: Json
           checkout_url?: string | null
@@ -2550,6 +2651,7 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          access_token_hash?: string | null
           attribution?: Json
           buyer_identity?: Json
           checkout_url?: string | null
@@ -2618,6 +2720,13 @@ export type Database = {
           user_id?: string
         }
         Relationships: [
+          {
+            foreignKeyName: "user_addresses_user_id_fkey"
+            columns: ["user_id"]
+            isOneToOne: false
+            referencedRelation: "profile_cards"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "user_addresses_user_id_fkey"
             columns: ["user_id"]
@@ -2707,7 +2816,24 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      profile_cards: {
+        Row: {
+          avatar_url: string | null
+          full_name: string | null
+          id: string | null
+        }
+        Insert: {
+          avatar_url?: string | null
+          full_name?: string | null
+          id?: string | null
+        }
+        Update: {
+          avatar_url?: string | null
+          full_name?: string | null
+          id?: string | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
       apply_order_inventory_deduction: {
@@ -2721,6 +2847,21 @@ export type Database = {
           paid_at: string
         }[]
       }
+      author: {
+        Args: { "": Database["public"]["Tables"]["cms_interactions"]["Row"] }
+        Returns: {
+          avatar_url: string | null
+          full_name: string | null
+          id: string | null
+        }
+        SetofOptions: {
+          from: "cms_interactions"
+          to: "profile_cards"
+          isOneToOne: true
+          isSetofReturn: true
+        }
+      }
+      bump_email_2fa_attempts: { Args: { p_user_id: string }; Returns: number }
       clear_currency_price_overrides: {
         Args: { target_currency: string }
         Returns: undefined
@@ -2756,6 +2897,7 @@ export type Database = {
       get_ecommerce_track_quantities: { Args: never; Returns: boolean }
       get_my_claim: { Args: { claim: string }; Returns: Json }
       is_admin: { Args: never; Returns: boolean }
+      is_admin_mfa: { Args: never; Returns: boolean }
       is_valid_currency_amount_map: {
         Args: { amounts: Json }
         Returns: boolean
@@ -2773,6 +2915,10 @@ export type Database = {
         Returns: boolean
       }
       normalize_currency_amount_map: { Args: { amounts: Json }; Returns: Json }
+      redeem_coupon_atomically: {
+        Args: { p_coupon_id: string }
+        Returns: boolean
+      }
       sync_inventory_cache_for_sku: {
         Args: { p_sku: string }
         Returns: undefined

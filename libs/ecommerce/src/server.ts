@@ -7,6 +7,7 @@ export * from './lib/order-inventory';
 export * from './lib/order-tax-details';
 export * from './lib/invoice';
 export * from './lib/invoice-server';
+export * from './lib/order-access-token';
 export * from './lib/customer-orders';
 export * from './lib/coupon-server';
 export * from './lib/freemius-coupons';

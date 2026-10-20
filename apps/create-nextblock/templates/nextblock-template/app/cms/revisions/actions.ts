@@ -3,6 +3,7 @@
 
 import { revalidatePath } from "next/cache";
 import { createClient } from "@nextblock-cms/db/server";
+import { requireCmsStaff } from "../../../lib/auth/cms-actor";
 import { revalidatePublicContent } from "../../../lib/public-content-cache";
 import {
   restorePageToVersion,
@@ -110,6 +111,19 @@ function paginate(
   };
 }
 
+/**
+ * The revision lists embed the author's name (`author:profiles(full_name)`). Other accounts'
+ * profiles rows sit behind `is_admin_mfa()` since migration 02023, so through the cookie
+ * client that join reads null for an ADMIN on an aal1 "remember this device" session. The
+ * revision tables are staff-only reads already (02021), so the list is read with the service
+ * role after verifying the caller is staff — same rows, with the names intact. Everything
+ * else here stays on the cookie client.
+ */
+async function revisionReader() {
+  const { supabase } = await requireCmsStaff();
+  return supabase;
+}
+
 function applyDateFilters(query: any, startDate?: string, endDate?: string) {
   if (startDate) query = query.gte('created_at', `${startDate}T00:00:00.000Z`);
   if (endDate) query = query.lte('created_at', `${endDate}T23:59:59.999Z`);
@@ -118,9 +132,10 @@ function applyDateFilters(query: any, startDate?: string, endDate?: string) {
 
 export async function listPageRevisions(pageId: number, page = 1, startDate?: string, endDate?: string) {
   const supabase = createClient();
+  const staffReader = await revisionReader();
 
   const query = applyDateFilters(
-    supabase
+    staffReader
       .from('page_revisions')
       .select('id, page_id, author_id, version, revision_type, created_at, content, author:profiles(full_name)')
       .eq('page_id', pageId)
@@ -147,9 +162,10 @@ export async function listPageRevisions(pageId: number, page = 1, startDate?: st
 
 export async function listPostRevisions(postId: number, page = 1, startDate?: string, endDate?: string) {
   const supabase = createClient();
+  const staffReader = await revisionReader();
 
   const query = applyDateFilters(
-    supabase
+    staffReader
       .from('post_revisions')
       .select('id, post_id, author_id, version, revision_type, created_at, content, author:profiles(full_name)')
       .eq('post_id', postId)
@@ -176,9 +192,10 @@ export async function listPostRevisions(postId: number, page = 1, startDate?: st
 
 export async function listProductRevisions(productId: string, page = 1, startDate?: string, endDate?: string) {
   const supabase = createClient();
+  const staffReader = await revisionReader();
 
   const query = applyDateFilters(
-    (supabase as any)
+    (staffReader as any)
       .from('product_revisions')
       .select('id, product_id, author_id, version, revision_type, created_at, content, author:profiles(full_name)')
       .eq('product_id', productId)

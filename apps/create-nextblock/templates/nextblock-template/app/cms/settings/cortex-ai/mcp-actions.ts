@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache';
 
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {
   CORTEX_AI_MCP_SETTINGS_KEY,
   CORTEX_AI_MCP_TOKENS_TABLE,
@@ -12,6 +13,21 @@ import {
 } from '@nextblock-cms/cortex';
 
 import { requireAdminSupabaseClient } from './require-admin';
+
+/**
+ * `mcp_access_tokens` is RLS-gated by `is_admin_mfa()` (migration 02022 §5b): a SELECT,
+ * INSERT, UPDATE or DELETE on it succeeds only for an ADMIN whose session is aal2 (or
+ * who has no second factor enrolled). That correctly stops a lower session from minting
+ * a persistence primitive, but it also locks a legitimate ADMIN out of their own token
+ * list the moment they are at aal1 — the common "remember this device" case.
+ *
+ * Every entry point below first runs `requireAdminSupabaseClient()`, which is the real
+ * authorization boundary (a logged-in ADMIN behind the `/cms` gate). Once that has
+ * passed, the token table is reached with the service-role client so the aal2 RLS floor
+ * does not second-guess an already-authorized admin. `site_settings` stays on the cookie
+ * client — its MCP key is ADMIN-write but not MFA-gated, so RLS still backstops it.
+ * Mirrors the package-reads service-role fix.
+ */
 
 /**
  * Server actions for the "MCP server access" card.
@@ -77,10 +93,11 @@ function toScopeList(raw: unknown): CortexAiMcpScope[] {
  */
 export async function getMcpSettingsStatus(): Promise<McpSettingsStatus> {
   const { supabase } = await requireAdminSupabaseClient();
+  const admin = getServiceRoleSupabaseClient();
 
   const [{ data: settingsRow }, { data: tokenRows }] = await Promise.all([
     supabase.from('site_settings').select('value').eq('key', CORTEX_AI_MCP_SETTINGS_KEY).maybeSingle(),
-    supabase
+    admin
       .from(CORTEX_AI_MCP_TOKENS_TABLE)
       .select('id, name, scopes, token_prefix, created_at, expires_at, last_used_at, revoked_at')
       .is('revoked_at', null)
@@ -156,7 +173,8 @@ export async function createMcpAccessTokenAction(
   if (rejected) return rejected;
 
   try {
-    const { supabase, userId } = await requireAdminSupabaseClient();
+    const { userId } = await requireAdminSupabaseClient();
+    const admin = getServiceRoleSupabaseClient();
 
     const name = String(input.name || '').trim().slice(0, MAX_TOKEN_NAME_LENGTH);
 
@@ -166,7 +184,7 @@ export async function createMcpAccessTokenAction(
 
     const scopes = toScopeList(input.scopes);
 
-    const { count } = await supabase
+    const { count } = await admin
       .from(CORTEX_AI_MCP_TOKENS_TABLE)
       .select('id', { count: 'exact', head: true })
       .is('revoked_at', null);
@@ -188,7 +206,7 @@ export async function createMcpAccessTokenAction(
 
     const minted = mintCortexAiMcpToken();
 
-    const { error } = await supabase.from(CORTEX_AI_MCP_TOKENS_TABLE).insert({
+    const { error } = await admin.from(CORTEX_AI_MCP_TOKENS_TABLE).insert({
       created_by: userId,
       expires_at: expiresAt,
       name,
@@ -221,14 +239,15 @@ export async function revokeMcpAccessTokenAction(input: {
   if (rejected) return rejected;
 
   try {
-    const { supabase } = await requireAdminSupabaseClient();
+    await requireAdminSupabaseClient();
+    const admin = getServiceRoleSupabaseClient();
     const id = String(input.id || '').trim();
 
     if (!id) {
       throw new Error('Missing token id.');
     }
 
-    const { error } = await supabase
+    const { error } = await admin
       .from(CORTEX_AI_MCP_TOKENS_TABLE)
       .update({ revoked_at: new Date().toISOString() })
       .eq('id', id);

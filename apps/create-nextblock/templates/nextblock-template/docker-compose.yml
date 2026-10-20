@@ -24,7 +24,10 @@ services:
       # supabase/postgres runs a heavy first-init; give it time before counting health failures.
       start_period: 60s
     ports:
-      - '${POSTGRES_PORT_EXTERNAL:-54322}:5432'
+      # Published on loopback only: psql/Studio from this machine work, nothing off-box can reach
+      # Postgres (internal services use db:5432). Set DB_BIND_HOST=0.0.0.0 to expose it on purpose,
+      # behind a firewall — see docs/11 → "Hardening on a public server".
+      - '${DB_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT_EXTERNAL:-54322}:5432'
 
   auth:
     image: ${SUPABASE_GOTRUE_IMAGE:-supabase/gotrue:v2.189.0}
@@ -107,7 +110,10 @@ services:
       - ./docker/kong/kong.yml:/home/kong/temp.yml:ro
     entrypoint: bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml && /docker-entrypoint.sh kong docker-start'
     ports:
-      - '${KONG_HTTP_PORT:-8000}:8000'
+      # Loopback only by default: the browser reaches it as http://localhost:8000 on this machine
+      # and the app container goes through its own socat proxy. On a server, route to Kong from the
+      # reverse proxy (or set KONG_BIND_HOST=0.0.0.0 deliberately) — docs/11.
+      - '${KONG_BIND_HOST:-127.0.0.1}:${KONG_HTTP_PORT:-8000}:8000'
 
   minio:
     # MinIO stopped publishing to Docker Hub (`minio/minio` now answers "pull access denied");
@@ -121,8 +127,11 @@ services:
     volumes:
       - nextblock_media:/data
     ports:
-      - '${MINIO_S3_PORT:-9000}:9000'
-      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+      # Loopback only by default: media URLs point at http://127.0.0.1:9000 on this machine, and the
+      # admin console (root credentials) must never face the internet. MINIO_BIND_HOST=0.0.0.0
+      # exposes both on purpose; prefer an SSH tunnel for the console — docs/11.
+      - '${MINIO_BIND_HOST:-127.0.0.1}:${MINIO_S3_PORT:-9000}:9000'
+      - '${MINIO_BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001'
 
   minio-init:
     image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z}
@@ -224,6 +233,7 @@ services:
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
     ports:
+      # The one public port: bind it to all interfaces (reverse proxy / TLS in front on a server).
       - '${APP_PORT:-3000}:3000'
 
 volumes:

@@ -1,6 +1,7 @@
 'use server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getEcomActorRole } from '../../../server-actions/require-ecom-role';
 
 export type ReportType = 'general_ledger' | 'tax_liability' | 'currency_summary';
 
@@ -8,7 +9,15 @@ export async function fetchOrderReportData(
   startDate: string,
   endDate: string
 ) {
-  const supabase = createClient();
+  // ADMIN-only, read with the service role after the role check: since migration 02023 the
+  // orders policies require is_admin_mfa(), which an admin on an aal1 "remember this device"
+  // session cannot satisfy through the cookie client (see getOrders in ./actions.ts). A
+  // non-ADMIN gets the empty report RLS gave them before.
+  const role = await getEcomActorRole();
+  if (role !== 'ADMIN') {
+    return [];
+  }
+  const supabase = getServiceRoleSupabaseClient();
 
   // Basic date filtering
   let query = supabase
@@ -25,11 +34,11 @@ export async function fetchOrderReportData(
     query = query.lte('created_at', end.toISOString());
   }
 
-  // Filter only paid orders for accounting reports? 
+  // Filter only paid orders for accounting reports?
   // Usually accountants care about realized revenue.
   // Requirement 1 mentions "Payment Status", so we should fetch all status but maybe default to paid?
   // Let's fetch all and let the mapping handle it or keep it as is.
-  
+
   const { data: orders, error } = await query.order('created_at', { ascending: true });
 
   if (error) {
@@ -41,16 +50,21 @@ export async function fetchOrderReportData(
     return [];
   }
 
-  // For General Ledger and Tax Liability, we might need user emails
-  const userIds = Array.from(new Set(orders.map(o => o.user_id).filter(Boolean)));
+  // Customer names for the General Ledger and Tax Liability reports. (`profiles` has no
+  // `email` column — the e-mail lives in auth.users — and the typed service-role client
+  // rejects selecting one, where the untyped cookie client used to let PostgREST fail the
+  // whole lookup at runtime.)
+  const userIds = Array.from(
+    new Set(orders.map((o) => o.user_id).filter((id): id is string => Boolean(id)))
+  );
   const profilesMap = new Map();
 
   if (userIds.length > 0) {
     const { data: profiles } = await supabase
       .from('profiles')
-      .select('id, full_name, email')
+      .select('id, full_name')
       .in('id', userIds);
-    
+
     if (profiles) {
       profiles.forEach(p => profilesMap.set(p.id, p));
     }

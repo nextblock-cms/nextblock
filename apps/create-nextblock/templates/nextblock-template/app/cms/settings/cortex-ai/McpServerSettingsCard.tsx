@@ -104,6 +104,12 @@ export function McpServerSettingsCard({
    * outright rather than falling back to localhost trust, so pasting the literal
    * placeholder would 401 instead of silently working. Once a real token exists we
    * include it either way, since it works on both origins.
+   *
+   * Caveat, surfaced to the operator below: the tokenless path is now a double opt-in.
+   * This flag only reflects the dashboard toggle; the server also needs
+   * `NEXTBLOCK_MCP_TRUST_LOCALHOST=true` in its environment, which the browser cannot
+   * see. Without it a no-Authorization snippet 401s, so the copy warns to mint a token
+   * when the variable is not set.
    */
   const usesLocalhostTrust = useLocalUrl && allowLocalhost && !mintedToken;
 
@@ -261,9 +267,12 @@ export function McpServerSettingsCard({
                 Trust localhost without a token
               </Label>
               <p className="text-xs text-muted-foreground">
-                Convenience for local development only — it is ignored whenever{' '}
-                <span className="font-mono">NODE_ENV=production</span>, so your deployed site always
-                requires a token.
+                Local development convenience, off by default. This toggle alone does{' '}
+                <span className="font-medium">nothing</span>: the server also requires{' '}
+                <span className="font-mono">NEXTBLOCK_MCP_TRUST_LOCALHOST=true</span> in its
+                environment and a non-production <span className="font-mono">NODE_ENV</span> before a
+                tokenless request is accepted. Without that variable, localhost still needs a token
+                — exactly like your deployed site.
               </p>
             </div>
           </div>
@@ -425,7 +434,7 @@ export function McpServerSettingsCard({
             <p className="text-sm font-medium">Connect a client</p>
             <p className="text-xs text-muted-foreground">
               {usesLocalhostTrust
-                ? 'No token needed: localhost trust covers this connection while the dev server runs. These snippets deliberately send no Authorization header — an invalid one would be rejected rather than falling back to localhost trust.'
+                ? 'These snippets send no Authorization header, relying on localhost trust. That path is off unless the server has NEXTBLOCK_MCP_TRUST_LOCALHOST=true set in its environment (plus a non-production NODE_ENV); without the variable the request is rejected with 401 — mint a token above and these snippets will carry it instead.'
                 : mintedToken
                   ? 'These snippets include the token you just created.'
                   : readOnly

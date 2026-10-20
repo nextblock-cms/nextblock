@@ -1,6 +1,7 @@
 import 'server-only';
 
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { requireCmsStaff } from '../../../lib/auth/cms-actor';
 
 /**
  * One inbox over two storage models.
@@ -205,8 +206,12 @@ export async function loadInbox(options: {
   }
 
   if (wantsInteractions) {
-    // Request-scoped client: RLS is what lets an ADMIN/WRITER see pending rows.
-    const supabase = createClient();
+    // Staff-only (the page checked; this re-checks, memoised per request) and read with the
+    // service role: the row embeds the author's name from `profiles`, and other accounts'
+    // rows sit behind `is_admin_mfa()` since migration 02023, so through the cookie client
+    // an ADMIN on an aal1 "remember this device" session would see every sender as blank.
+    // The interaction rows themselves are what RLS already shows every ADMIN and WRITER.
+    const { supabase } = await requireCmsStaff();
     let query = supabase
       .from('cms_interactions')
       .select(

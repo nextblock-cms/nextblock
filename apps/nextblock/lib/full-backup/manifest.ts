@@ -7,8 +7,41 @@ export const FULL_BACKUP_MANIFEST_PATH = "manifest.json";
 export const FULL_BACKUP_DATABASE_PATH = "database/dump.sql";
 export const FULL_BACKUP_CONTENT_PATH = "content/nextblock-content-backup.json";
 export const FULL_BACKUP_STORAGE_PREFIX = "storage/objects/";
+export const FULL_BACKUP_USERS_PATH = "users/auth-users.json";
+export const FULL_BACKUP_USERS_TYPE = "nextblock-auth-users-v1";
 
 export type FullBackupMediaUrlMode = "rewrite_to_destination" | "keep_exact_urls";
+
+/**
+ * One `auth.users` account as exported for migration. `password_hash` is the ORIGINAL bcrypt
+ * hash, replayed through the GoTrue admin API on restore so the original password keeps
+ * working; nothing here is a session, token or TOTP secret.
+ */
+export interface FullBackupUserRecord {
+  id: string;
+  email: string | null;
+  phone: string | null;
+  password_hash: string | null;
+  email_confirmed: boolean;
+  phone_confirmed: boolean;
+  user_metadata: Record<string, unknown>;
+  created_at: string | null;
+  last_sign_in_at: string | null;
+  banned_until: string | null;
+  /** Identity providers on the source (`email`, `google`, …); only `email`/`phone` cross over. */
+  providers: string[];
+  /** The account had a verified authenticator app on the source; it must be re-enrolled. */
+  has_totp: boolean;
+  is_sso_user: boolean;
+  is_anonymous: boolean;
+}
+
+export interface FullBackupUsersBundleV1 {
+  type: typeof FULL_BACKUP_USERS_TYPE;
+  version: 1;
+  exported_at: string;
+  users: FullBackupUserRecord[];
+}
 
 export interface FullBackupStorageObjectManifest {
   key: string;
@@ -41,10 +74,77 @@ export interface FullBackupManifestV1 {
     public_url: string | null;
     objects: FullBackupStorageObjectManifest[];
   };
+  /** Absent (null) in archives exported before accounts were included. */
+  users: {
+    path: typeof FULL_BACKUP_USERS_PATH;
+    count: number;
+  } | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Modular-crypt hashes as GoTrue stores them (bcrypt `$2a$…`, argon2 `$argon2id$…`, scrypt):
+ * the alphabet excludes quotes and whitespace, which is what lets the restore embed a hash in
+ * SQL without escaping.
+ */
+export const PASSWORD_HASH_PATTERN = /^\$[A-Za-z0-9./+=$,-]{20,}$/;
+
+function optionalString(value: unknown) {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export function parseFullBackupUsersBundle(content: string): FullBackupUsersBundleV1 {
+  const parsed = JSON.parse(content) as unknown;
+  if (!isRecord(parsed) || parsed.type !== FULL_BACKUP_USERS_TYPE || parsed.version !== 1) {
+    throw new Error("Backup archive user bundle must be a NextBlock auth users bundle version 1.");
+  }
+  if (!Array.isArray(parsed.users)) {
+    throw new Error("Backup archive user bundle is missing its users list.");
+  }
+
+  const users = parsed.users.map((item, index): FullBackupUserRecord => {
+    if (!isRecord(item)) {
+      throw new Error(`User bundle entry ${index + 1} must be an object.`);
+    }
+    const id = typeof item.id === "string" ? item.id.toLowerCase() : "";
+    if (!UUID_PATTERN.test(id)) {
+      throw new Error(`User bundle entry ${index + 1} has an invalid account id.`);
+    }
+    const passwordHash = optionalString(item.password_hash);
+    if (passwordHash && !PASSWORD_HASH_PATTERN.test(passwordHash)) {
+      throw new Error(`User bundle entry ${index + 1} has an unrecognised password hash.`);
+    }
+
+    return {
+      id,
+      email: optionalString(item.email),
+      phone: optionalString(item.phone),
+      password_hash: passwordHash,
+      email_confirmed: item.email_confirmed === true,
+      phone_confirmed: item.phone_confirmed === true,
+      user_metadata: isRecord(item.user_metadata) ? item.user_metadata : {},
+      created_at: optionalString(item.created_at),
+      last_sign_in_at: optionalString(item.last_sign_in_at),
+      banned_until: optionalString(item.banned_until),
+      providers: Array.isArray(item.providers)
+        ? item.providers.filter((provider): provider is string => typeof provider === "string")
+        : [],
+      has_totp: item.has_totp === true,
+      is_sso_user: item.is_sso_user === true,
+      is_anonymous: item.is_anonymous === true,
+    };
+  });
+
+  return {
+    type: FULL_BACKUP_USERS_TYPE,
+    version: 1,
+    exported_at: typeof parsed.exported_at === "string" ? parsed.exported_at : "",
+    users,
+  };
 }
 
 export function normalizeMediaBaseUrl(value?: string | null) {
@@ -162,6 +262,13 @@ export function parseFullBackupManifest(content: string): FullBackupManifestV1 {
       public_url: typeof parsed.storage.public_url === "string" ? parsed.storage.public_url : null,
       objects,
     },
+    users:
+      isRecord(parsed.users) && parsed.users.path === FULL_BACKUP_USERS_PATH
+        ? {
+            path: FULL_BACKUP_USERS_PATH,
+            count: typeof parsed.users.count === "number" ? parsed.users.count : 0,
+          }
+        : null,
   };
 }
 

@@ -2,6 +2,15 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { getCortexMcpToolAnnotations } from './mcp-tool-registry';
 
+// fetch_url_content now resolves the target host and rejects private/loopback addresses
+// (DNS-rebinding guard, fetch-host-guard.ts). Resolve every test hostname to a fixed PUBLIC IP so
+// the content tests proceed to the stubbed fetch; the SSRF-block tests use localhost / IP literals
+// which the synchronous host check still rejects before any DNS lookup.
+vi.mock('node:dns', () => {
+  const lookup = async () => [{ address: '93.184.216.34', family: 4 }];
+  return { promises: { lookup }, default: { promises: { lookup } } };
+});
+
 vi.mock('@nextblock-cms/utils', async () => {
   const { z } = await import('zod');
 

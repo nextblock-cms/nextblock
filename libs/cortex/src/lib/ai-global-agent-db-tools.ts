@@ -52,15 +52,34 @@ const PROTECTED_CORTEX_KEY = 'cortex_ai_openrouter_api_key';
  * but they are still credential material and there is no reason for a tool to read
  * them. This matters more now that `read_database_records` is reachable from external
  * MCP clients and not only from the in-dashboard agent.
+ *
+ * `cortex_ai_mcp_settings` holds no credential, but it is the MCP server's own on/off
+ * switch and localhost-trust flag: the database keeps it ADMIN-only next to the secret
+ * rows, and the principal most likely to ask this tool for it is the MCP caller it
+ * governs.
  */
 const PROTECTED_SITE_SETTING_KEYS: ReadonlySet<string> = new Set([
   PROTECTED_CORTEX_KEY,
   'bot_protection_secret',
+  'cortex_ai_mcp_settings',
   'cortex_ai_pexels_api_key',
   'cortex_ai_unsplash_access_key',
   'email_secret',
   'payment_secret',
 ]);
+
+/**
+ * Credential-shaped `site_settings` keys that are not listed above, by suffix. The app
+ * names every stored secret `<feature>_secret` or `<feature>_api_key`, so a row added
+ * after the list was written is still protected. Anchored to the end of the key so a
+ * setting that merely mentions one of these words (`design_tokens`) is left alone.
+ */
+const PROTECTED_SITE_SETTING_KEY_PATTERN =
+  /(?:_secret(?:_key)?|_api_key|_access_key|_private_key|_token|_password|_credentials?)$/i;
+
+function isProtectedSiteSettingKey(key: string) {
+  return PROTECTED_SITE_SETTING_KEYS.has(key) || PROTECTED_SITE_SETTING_KEY_PATTERN.test(key);
+}
 
 /**
  * `site_settings` rows a model may read but must never write through the generic
@@ -674,7 +693,7 @@ const tableConfigs = {
   },
   site_settings: {
     columns: ['key', 'value'],
-    description: 'Global site settings. Cortex AI API-key setting row is protected.',
+    description: 'Global site settings. Credential rows are redacted on read and refused on write (see safetyNotes).',
     primaryKey: ['key'],
   },
   tax_rates: {
@@ -717,6 +736,17 @@ const tableConfigs = {
 
 type TableName = keyof typeof tableConfigs;
 type DatabaseMutationOperation = 'delete' | 'insert' | 'update' | 'upsert';
+
+/**
+ * Tables whose rows are protected by the value of one column rather than by column
+ * name. Reads always fetch that column, whatever the caller projects, decide
+ * redaction from it, and only then trim the row back to the requested columns, so
+ * `columns: ['value']` cannot sidestep the check. Mutations refuse any target row
+ * whose key is protected, however the filter reached it.
+ */
+const ROW_KEY_PROTECTIONS: Partial<Record<TableName, { column: string; isProtected: (key: string) => boolean }>> = {
+  site_settings: { column: 'key', isProtected: isProtectedSiteSettingKey },
+};
 type AuditWriteResult = {
   auditError?: string;
   auditLogged: boolean;
@@ -936,24 +966,78 @@ function redactValue(value: unknown): unknown {
   return output;
 }
 
-function redactRows(rows: unknown[]) {
-  return rows.map((row) => {
-    if (row && typeof row === 'object' && !Array.isArray(row)) {
-      const key = (row as Record<string, unknown>).key;
+function projectRow(row: Record<string, unknown>, columns: readonly string[]) {
+  return Object.fromEntries(columns.filter((column) => column in row).map((column) => [column, row[column]]));
+}
 
-      // Belt and braces: `applyFilters` already excludes the OpenRouter key at the
-      // query level, but this catches every protected key regardless of how the row
-      // was fetched.
-      if (typeof key === 'string' && PROTECTED_SITE_SETTING_KEYS.has(key)) {
-        return { key, value: REDACTED };
-      }
+/**
+ * Redact fetched rows before they reach the model. On a table in
+ * `ROW_KEY_PROTECTIONS` the decision comes from the key column — present in every
+ * row because `executeReadDatabaseRecords` fetches it even when the caller did not
+ * ask for it — and every other column of a protected row becomes `[REDACTED]`
+ * before the row is trimmed to the caller's projection. Everything else goes
+ * through the name-based `redactValue`.
+ */
+function redactRows(table: TableName, rows: unknown[], projection: readonly string[]) {
+  const protection = ROW_KEY_PROTECTIONS[table];
+
+  return rows.map((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      return redactValue(row);
     }
 
-    return redactValue(row);
+    const record = row as Record<string, unknown>;
+
+    if (!protection) {
+      return redactValue(record);
+    }
+
+    const key = record[protection.column];
+    const redacted =
+      typeof key === 'string' && protection.isProtected(key)
+        ? Object.fromEntries(
+            Object.keys(record).map((column) => [column, column === protection.column ? key : REDACTED])
+          )
+        : (redactValue(record) as Record<string, unknown>);
+
+    return projectRow(redacted, projection);
   });
 }
 
-function assertNoProtectedSiteSetting(table: TableName, input: unknown) {
+/**
+ * The `site_settings` keys a mutation names: inserted or upserted rows, a `key` an
+ * update would set, and `key` filters on update or delete.
+ */
+function collectTargetedSiteSettingKeys(input: z.infer<typeof executeDatabaseMutationInputSchema>) {
+  const keys: string[] = [];
+  const collect = (value: unknown) => {
+    if (typeof value === 'string') {
+      keys.push(value);
+    }
+  };
+
+  for (const row of input.rows ?? []) {
+    collect(row.key);
+  }
+
+  collect(input.values?.key);
+
+  for (const filter of input.filters ?? []) {
+    if (filter.column !== 'key') {
+      continue;
+    }
+
+    if (Array.isArray(filter.value)) {
+      filter.value.forEach(collect);
+    } else {
+      collect(filter.value);
+    }
+  }
+
+  return keys;
+}
+
+function assertNoProtectedSiteSetting(table: TableName, input: z.infer<typeof executeDatabaseMutationInputSchema>) {
   if (table !== 'site_settings') {
     return;
   }
@@ -963,6 +1047,33 @@ function assertNoProtectedSiteSetting(table: TableName, input: unknown) {
   for (const protectedKey of PROTECTED_SITE_SETTING_KEYS) {
     if (serialized.includes(protectedKey)) {
       throw new Error(`The "${protectedKey}" site setting is protected.`);
+    }
+  }
+
+  for (const key of collectTargetedSiteSettingKeys(input)) {
+    if (isProtectedSiteSettingKey(key)) {
+      throw new Error(`The "${key}" site setting is protected.`);
+    }
+  }
+}
+
+/**
+ * A filter that never names a protected key can still reach its row (`key ilike '%'`,
+ * `key neq 'x'`). The preview fetches every target's primary key, so this is where a
+ * protected row is caught before an update or delete touches it.
+ */
+function assertNoProtectedTargetRows(table: TableName, rows: Array<Record<string, unknown>>) {
+  const protection = ROW_KEY_PROTECTIONS[table];
+
+  if (!protection) {
+    return;
+  }
+
+  for (const row of rows) {
+    const key = row[protection.column];
+
+    if (typeof key === 'string' && protection.isProtected(key)) {
+      throw new Error(`The "${key}" site setting is protected.`);
     }
   }
 }
@@ -1011,13 +1122,13 @@ function applyFilters(table: TableName, query: any, filters: Array<z.infer<typeo
   return nextQuery;
 }
 
-function selectColumns(table: TableName, columns?: string[]) {
+function resolveReadColumns(table: TableName, columns?: string[]) {
   const config = getTableConfig(table);
   const selected = columns?.length ? columns : config.columns.filter((column) => !isSensitiveKey(column));
 
   selected.forEach((column) => assertSafeColumn(table, column));
 
-  return selected.join(',');
+  return selected;
 }
 
 function getTargetId(row: Record<string, unknown>, primaryKey: readonly string[]) {
@@ -1043,13 +1154,15 @@ async function fetchMutationTargets(
     throw new Error(`Failed to preview database mutation: ${serializeError(error)}`);
   }
 
-  const rows = Array.isArray(data) ? data : [];
+  const rows = (Array.isArray(data) ? data : []) as Array<Record<string, unknown>>;
 
   if (rows.length > MAX_MUTATION_TARGETS) {
     throw new Error(`Refusing to mutate more than ${MAX_MUTATION_TARGETS} rows.`);
   }
 
-  return rows as Array<Record<string, unknown>>;
+  assertNoProtectedTargetRows(table, rows);
+
+  return rows;
 }
 
 function validateMutationInput(input: z.infer<typeof executeDatabaseMutationInputSchema>) {
@@ -1217,7 +1330,7 @@ export async function executeDescribeDatabaseSchema(
       'Use read_database_records for reads and execute_database_mutation/action_plan for writes.',
       'No auth schema access, no arbitrary SQL, no password/secret/API-key fields.',
       'profiles, user_addresses, and cortex_ai_db_mutation_audit are read-only.',
-      `Protected site_settings keys (never readable or writable): ${[...PROTECTED_SITE_SETTING_KEYS].sort().join(', ')}.`,
+      `Protected site_settings keys (never readable or writable): ${[...PROTECTED_SITE_SETTING_KEYS].sort().join(', ')}, plus any key ending in _secret, _api_key, _access_key, _private_key, _token, _password or _credentials.`,
       `Write-protected site_settings keys (readable, never writable here): ${[...WRITE_PROTECTED_SITE_SETTING_KEYS].sort().join(', ')}.`,
       'blocks.content is validated against its block_type (built-in schema or custom block definition) before any insert, upsert, or update; prefer the typed content tools, which also normalize and record revisions.',
     ],
@@ -1232,10 +1345,14 @@ export async function executeReadDatabaseRecords(
 ) {
   const parsed = readDatabaseRecordsInputSchema.parse(input);
   const table = normalizeTableName(parsed.table);
-  const columns = selectColumns(table, parsed.columns);
+  const columns = resolveReadColumns(table, parsed.columns);
+  const protection = ROW_KEY_PROTECTIONS[table];
+  // The protection key rides along even when the caller leaves it out of the
+  // projection; `redactRows` trims it back off after deciding what to redact.
+  const fetched = protection && !columns.includes(protection.column) ? [...columns, protection.column] : columns;
   let query = getSupabase(context)
     .from(table)
-    .select(columns)
+    .select(fetched.join(','))
     .range(parsed.offset, parsed.offset + parsed.limit - 1);
 
   query = applyFilters(table, query, parsed.filters);
@@ -1254,10 +1371,10 @@ export async function executeReadDatabaseRecords(
   const rows = Array.isArray(data) ? data : [];
 
   return {
-    columns: columns.split(','),
+    columns,
     limit: parsed.limit,
     offset: parsed.offset,
-    rows: redactRows(rows),
+    rows: redactRows(table, rows, columns),
     success: true,
     table,
   };

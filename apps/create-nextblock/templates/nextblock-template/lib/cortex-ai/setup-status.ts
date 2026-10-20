@@ -1,6 +1,5 @@
 import 'server-only';
 
-import { createClient } from '@nextblock-cms/db/server';
 import {
   CORTEX_AI_MCP_SETTINGS_KEY,
   CORTEX_AI_OPENROUTER_SETTING_KEY,
@@ -13,6 +12,7 @@ import {
   normalizeCortexAiMcpSettings,
 } from '@nextblock-cms/cortex';
 
+import { requireCmsAdmin } from '../auth/cms-actor';
 import {
   deriveCortexSetupState,
   readCortexSetupRecord,
@@ -29,12 +29,15 @@ export type CortexSetupStatus = CortexSetupState & {
 };
 
 /**
- * One round-trip for everything the wizard and its redirects need. Reads through
- * the caller's cookie session: the secret rows are admin-only under RLS, and every
- * caller of this function is on an admin-gated surface.
+ * One round-trip for everything the wizard and its redirects need. ADMIN only: the key
+ * rows are the ADMIN tier of `site_settings`, which migration 02023 gates behind
+ * `is_admin_mfa()`, so the read verifies the caller's role through the session and then
+ * uses the service role — a cookie-client read would come back empty for an admin on an
+ * aal1 "remember this device" session (see `lib/auth/cms-actor.ts`). Throws for anyone
+ * else; every caller is on an admin-gated surface.
  */
 export async function getCortexSetupStatus(): Promise<CortexSetupStatus> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
   const { data: rows } = await supabase
     .from('site_settings')
     .select('key, value')

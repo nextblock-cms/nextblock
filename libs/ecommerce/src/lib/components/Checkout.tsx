@@ -912,7 +912,10 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
         const cp = data.customProps;
         let checkoutSyncPromise: Promise<void> | null = null;
         const redirectToFreemiusSuccess = () => {
-          window.location.href = `/checkout/success?session_id=${cp.order_id}`;
+          const tokenParam = cp.success_token
+            ? `&token=${encodeURIComponent(cp.success_token)}`
+            : '';
+          window.location.href = `/checkout/success?session_id=${cp.order_id}${tokenParam}`;
         };
         const syncFreemiusCheckout = (checkoutResponse: any) => {
           if (!checkoutSyncPromise) {

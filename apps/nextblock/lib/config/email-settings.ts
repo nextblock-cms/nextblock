@@ -13,6 +13,8 @@ import {
   resolveConfigValue,
   tryDecryptWithEnvKey,
 } from '@nextblock-cms/db/server';
+import type { Json } from '@nextblock-cms/db';
+import { requireCmsAdmin } from '../auth/cms-actor';
 
 const EMAIL_PUBLIC_KEY = 'email_public';
 const EMAIL_SECRET_KEY = 'email_secret';
@@ -84,12 +86,14 @@ export async function getEmailPublicSettings(): Promise<EmailPublicSettings> {
 }
 
 /**
- * Read the public settings plus stored-secret status for the CMS form. Uses the
- * request-scoped client; RLS restricts the secret row to ADMIN, which is who reaches
- * this page.
+ * Read the public settings plus stored-secret status for the CMS form. ADMIN only, read
+ * with the service role after the role check: `email_secret` is the ADMIN tier of
+ * `site_settings`, which migration 02023 gates behind `is_admin_mfa()`, so through the
+ * cookie client an ADMIN on an aal1 "remember this device" session would see "no
+ * credentials stored" on their own form (see `lib/auth/cms-actor.ts`).
  */
 export async function getEmailSettingsView(): Promise<EmailSettingsView> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
   const [{ data: publicData }, { data: secretData }] = await Promise.all([
     supabase.from('site_settings').select('value').eq('key', EMAIL_PUBLIC_KEY).maybeSingle(),
     supabase.from('site_settings').select('value').eq('key', EMAIL_SECRET_KEY).maybeSingle(),
@@ -124,10 +128,13 @@ export type SaveEmailSettingsInput = {
 /**
  * Persist email settings. Public fields always overwrite; secret fields are encrypted
  * and only written when a new value is supplied. Refuses to store real secrets in the
- * sandbox (its DB resets every 15 minutes). Caller must enforce ADMIN; RLS double-enforces.
+ * sandbox (its DB resets every 15 minutes). Enforces ADMIN itself (throws otherwise) and
+ * writes with the service role: `email_secret` is in the ADMIN-only write tier that
+ * migration 02023 gates behind `is_admin_mfa()`, which a "remember this device" (aal1)
+ * admin cannot satisfy through the cookie client.
  */
 export async function saveEmailSettings(input: SaveEmailSettingsInput): Promise<void> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
 
   const publicValue: EmailPublicSettings = {
     host: input.host.trim(),
@@ -166,7 +173,7 @@ export async function saveEmailSettings(input: SaveEmailSettingsInput): Promise<
 
     const { error: secretError } = await supabase
       .from('site_settings')
-      .upsert({ key: EMAIL_SECRET_KEY, value: nextValue });
+      .upsert({ key: EMAIL_SECRET_KEY, value: nextValue as Json });
     if (secretError) {
       console.error('Error saving email_secret settings:', secretError.message);
       throw new Error('Failed to save email credentials.');

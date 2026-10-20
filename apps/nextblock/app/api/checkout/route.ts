@@ -2,6 +2,20 @@ import { NextResponse } from 'next/server';
 import { getPaymentProvider, getProviderReadiness } from '@nextblock-cms/ecommerce/server';
 import { createClient, verifyPackageOnline } from '@nextblock-cms/db/server';
 import { normalizeCustomerAddress } from '@nextblock-cms/ecommerce';
+import { z } from '../../../lib/zod-config';
+
+// Mirrors MAX_CHECKOUT_LINE_QUANTITY in the ecommerce providers (checkout-items.ts), which
+// re-check and merge the lines before pricing them. The route rejects the shape up front so
+// a negative, fractional or absurd quantity never reaches inventory, totals or order rows.
+const MAX_CHECKOUT_LINE_QUANTITY = 10_000;
+const checkoutItemSchema = z.looseObject({
+  // `guid`, not `uuid`: Postgres accepts any 8-4-4-4-12 hex id (seed and fixture products
+  // are not RFC-version-tagged).
+  product_id: z.guid(),
+  variant_id: z.union([z.guid(), z.literal('')]).nullish(),
+  quantity: z.number().int().positive().max(MAX_CHECKOUT_LINE_QUANTITY),
+});
+const checkoutItemsSchema = z.array(checkoutItemSchema).min(1);
 
 function jsonError(errorKey: string, error: string, status: number) {
   return NextResponse.json({ error, errorKey }, { status });
@@ -55,7 +69,20 @@ export async function POST(req: Request) {
       couponContextItems,
     } = await req.json();
     
-    if (!items || !Array.isArray(items)) {
+    if (!Array.isArray(items) || !checkoutItemsSchema.safeParse(items).success) {
+      return jsonError(
+        'ecommerce.checkout_invalid_items',
+        'Invalid items data',
+        400
+      );
+    }
+
+    // The coupon quote prices the whole cart (every provider's lines) and must meet the
+    // same bar as the lines being paid for. An absent or empty list means "this cart".
+    const hasCouponContextItems =
+      Array.isArray(couponContextItems) && couponContextItems.length > 0;
+
+    if (hasCouponContextItems && !checkoutItemsSchema.safeParse(couponContextItems).success) {
       return jsonError(
         'ecommerce.checkout_invalid_items',
         'Invalid items data',
@@ -135,11 +162,15 @@ export async function POST(req: Request) {
         providerName === 'stripe'
           ? normalizeCustomerAddress(shippingAddress)
           : null,
-      shippingMethodId: providerName === 'stripe' ? shippingMethodId : null,
+      // The provider re-reads the method (cost, threshold, zone) from the DB by this id.
+      shippingMethodId:
+        providerName === 'stripe' && typeof shippingMethodId === 'string' && shippingMethodId.trim()
+          ? shippingMethodId.trim()
+          : null,
       currencyCode: typeof currencyCode === 'string' ? currencyCode : null,
       locale: typeof locale === 'string' ? locale : null,
       couponCode: typeof couponCode === 'string' ? couponCode : null,
-      couponContextItems: Array.isArray(couponContextItems) ? couponContextItems : items,
+      couponContextItems: hasCouponContextItems ? couponContextItems : items,
     });
 
     if (error) {

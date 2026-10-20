@@ -16,6 +16,7 @@ import {
   RECAPTCHA_TOKEN_FIELD,
   TURNSTILE_TOKEN_FIELD,
 } from './fields';
+import { BOT_PROTECTION_SECRET_SETTING_KEY, readStoredBotProtectionSecret } from './secret';
 
 export type BotProtectionProvider = 'none' | 'turnstile' | 'recaptcha';
 
@@ -73,19 +74,27 @@ export async function verifyBotProtection(
     const { data: secretSetting } = await supabase
       .from('site_settings')
       .select('value')
-      .eq('key', 'bot_protection_secret')
+      .eq('key', BOT_PROTECTION_SECRET_SETTING_KEY)
       .maybeSingle();
 
     const publicVal = (publicSetting?.value || {}) as Record<string, any>;
-    const secretVal = (secretSetting?.value || {}) as Record<string, any>;
 
     const pinnedProvider =
       options?.botProtectionProvider === 'turnstile' || options?.botProtectionProvider === 'recaptcha'
         ? options.botProtectionProvider
         : undefined;
     const provider: BotProtectionProvider = pinnedProvider || publicVal.provider || 'none';
+
+    // The stored secret is envelope-encrypted at rest (lib/botProtection/secret.ts); a
+    // pre-encryption plaintext row still reads fine. Env is the fallback either way.
+    const stored = readStoredBotProtectionSecret(secretSetting?.value);
+    if (provider !== 'none' && stored.storage === 'unreadable') {
+      console.error(
+        '[Bot Protection] The stored secret key cannot be decrypted with the configured encryption key. Re-enter it in CMS Settings > Bot Protection; falling back to the environment variable.'
+      );
+    }
     const secretKey =
-      secretVal.secretKey ||
+      stored.secretKey ||
       (provider === 'turnstile'
         ? process.env.TURNSTILE_SECRET_KEY
         : process.env.RECAPTCHA_SECRET_KEY) ||

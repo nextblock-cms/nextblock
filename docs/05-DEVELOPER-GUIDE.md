@@ -139,7 +139,9 @@ repo expects at least:
 Captured by the `/setup` wizard and needed for a complete CMS:
 
 - R2 credentials for media storage. The app builds and serves without them, but
-  uploads, image processing, and full-site backups return 500 until R2 is set.
+  uploads, image processing, and full-site backups return 500 until R2 is set. Full-site
+  backup/restore also needs `pg_dump`/`psql` on the server process's PATH and
+  `POSTGRES_URL`/`DATABASE_URL` (see docs/04 → "Full Site Backup and Restore").
 - SMTP credentials for hosted auth email — required to deliver the first admin's
   sign-up confirmation on hosted Supabase.
 

@@ -29,8 +29,10 @@ services:
       # health failures or block dependents until it has had time to come up.
       start_period: 60s
     ports:
-      # Exposed so you can connect with psql/Studio if you like; internal services use db:5432.
-      - '${POSTGRES_PORT_EXTERNAL:-54322}:5432'
+      # Published on loopback only: psql/Studio from this machine work, nothing off-box can reach
+      # Postgres (internal services use db:5432). Set DB_BIND_HOST=0.0.0.0 to expose it on purpose,
+      # behind a firewall — see docs/11 → "Hardening on a public server".
+      - '${DB_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT_EXTERNAL:-54322}:5432'
 
   ###########################################################################
   # GoTrue — manages auth.users + session JWTs locally
@@ -125,7 +127,10 @@ services:
     # Substitute $SUPABASE_ANON_KEY / $SUPABASE_SERVICE_KEY into the declarative config at start.
     entrypoint: bash -c 'eval "echo \"$$(cat ~/temp.yml)\"" > ~/kong.yml && /docker-entrypoint.sh kong docker-start'
     ports:
-      - '${KONG_HTTP_PORT:-8000}:8000'
+      # Loopback only by default: the browser reaches it as http://localhost:8000 on this machine
+      # and the app container goes through its own socat proxy. On a server, route to Kong from the
+      # reverse proxy (or set KONG_BIND_HOST=0.0.0.0 deliberately) — docs/11.
+      - '${KONG_BIND_HOST:-127.0.0.1}:${KONG_HTTP_PORT:-8000}:8000'
 
   ###########################################################################
   # MinIO — S3-compatible object storage for media (sovereign, on-disk)
@@ -142,8 +147,11 @@ services:
     volumes:
       - nextblock_media:/data
     ports:
-      - '${MINIO_S3_PORT:-9000}:9000'
-      - '${MINIO_CONSOLE_PORT:-9001}:9001'
+      # Loopback only by default: media URLs point at http://127.0.0.1:9000 on this machine, and the
+      # admin console (root credentials) must never face the internet. MINIO_BIND_HOST=0.0.0.0
+      # exposes both on purpose; prefer an SSH tunnel for the console — docs/11.
+      - '${MINIO_BIND_HOST:-127.0.0.1}:${MINIO_S3_PORT:-9000}:9000'
+      - '${MINIO_BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001'
 
   # One-shot: create the media bucket and make it public-read so next/image can fetch assets.
   minio-init:
@@ -248,10 +256,13 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-}
-      # Bot protection (optional). Blank => forms fall back to the developer sandbox behaviour.
+      # Bot protection (optional). Blank => no captcha: public forms are honeypot-only until real
+      # keys are set in CMS → Settings → Bot Protection. Never put Cloudflare's TEST keys here —
+      # their secret accepts every token, so a form would look protected while passing all bots.
       TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
       NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${NEXT_PUBLIC_TURNSTILE_SITE_KEY:-}
     ports:
+      # The one public port: bind it to all interfaces (reverse proxy / TLS in front on a server).
       - '${APP_PORT:-3000}:3000'
 
 volumes:

@@ -11,6 +11,7 @@ import {
   type RobotsSettings,
 } from '@nextblock-cms/utils/seo';
 
+import type { Json } from '@nextblock-cms/db';
 import type { SettingsActionResult } from '../../../../lib/cms/action-result';
 import { isSchemaMissingError, CMS_REDIRECTS_TABLE } from '../../../../lib/seo/redirect-store';
 import { z } from '../../../../lib/zod-config';
@@ -429,7 +430,7 @@ export async function saveRobotsSettings(settings: RobotsSettings): Promise<Sett
 
   const { error } = await supabase
     .from('site_settings')
-    .upsert({ key: ROBOTS_SETTINGS_KEY, value: normalized });
+    .upsert({ key: ROBOTS_SETTINGS_KEY, value: normalized as unknown as Json });
 
   if (error) {
     return {

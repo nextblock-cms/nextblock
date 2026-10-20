@@ -14,15 +14,15 @@ export async function POST(req: Request) {
     const signature =
       req.headers.get('x-signature') ?? req.headers.get('x-freemius-signature');
 
-    if (!signature && process.env.NEXT_PUBLIC_IS_SANDBOX !== 'true') {
+    // Always verify the signature. The previous NEXT_PUBLIC_IS_SANDBOX escape hatch let anyone
+    // forge a webhook on a sandbox-flagged install — marking orders paid and writing license ids
+    // (a self-registered account on the public demo could unlock premium). The signature is the
+    // only thing that proves the request came from Freemius, so it is required on every install.
+    if (!signature) {
       return NextResponse.json({ error: 'Missing signature' }, { status: 400 });
     }
 
-    if (
-      signature &&
-      !verifyFreemiusWebhookSignature(rawBody, signature) &&
-      process.env.NEXT_PUBLIC_IS_SANDBOX !== 'true'
-    ) {
+    if (!verifyFreemiusWebhookSignature(rawBody, signature)) {
       return NextResponse.json({ error: 'Invalid signature' }, { status: 401 });
     }
 

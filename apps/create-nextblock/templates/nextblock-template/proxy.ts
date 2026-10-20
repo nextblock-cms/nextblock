@@ -35,11 +35,29 @@ const FALLBACK_LOCALES = ['en', 'fr'];
 const LANGUAGE_COOKIE_MAX_AGE_SECONDS = 31_536_000;
 const cacheLoggingEnabled = process.env.NEXTBLOCK_CACHE_LOGGING_ENABLED === 'true';
 
+// Role required to reach a /cms URL. Longest matching prefix wins (getRequiredRolesForPath), so a
+// more specific entry overrides its parent: `/cms/settings/security` is reachable by every staff
+// member even though `/cms/settings` is ADMIN-only. Keep this in step with the `adminOnly` flags in
+// app/cms/CmsClientLayout.tsx: the sidebar only hides a link, this is what refuses the URL. The
+// server actions behind these pages check the caller's role themselves; this layer is defence in
+// depth, not the only gate.
 const cmsRoutePermissions: Record<string, UserRole[]> = {
   '/cms': ['WRITER', 'ADMIN'],
   '/cms/admin': ['ADMIN'],
   '/cms/users': ['ADMIN'],
+  // Every settings screen (packages, taxes, currencies, backup/restore, email, sign-ups, ...)
+  // except the per-user security page below.
   '/cms/settings': ['ADMIN'],
+  // Per-user 2FA / trusted devices; its admin-only actions (global policy, sign-up policy)
+  // re-check the role themselves.
+  '/cms/settings/security': ['WRITER', 'ADMIN'],
+  // Site navigation menus.
+  '/cms/navigation': ['ADMIN'],
+  // Commerce configuration: provider credentials, shipping zones/rates, coupons, bulk pricing.
+  '/cms/payments': ['ADMIN'],
+  '/cms/shipping': ['ADMIN'],
+  '/cms/coupons': ['ADMIN'],
+  '/cms/promotions': ['ADMIN'],
 };
 
 const securityHeaders = [

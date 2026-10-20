@@ -36,6 +36,36 @@ function unwrapMappedIpv4(host: string): string | null {
   return [(high >> 8) & 255, high & 255, (low >> 8) & 255, low & 255].join('.');
 }
 
+/**
+ * DNS-rebinding guard. `isBlockedFetchHost` only inspects the hostname STRING, so a public name
+ * that resolves to a private/loopback/link-local/metadata address (attacker-controlled DNS) sails
+ * through it and the connection still lands inside the perimeter. This resolves the name and
+ * reports blocked if ANY resolved address is internal. Call it in addition to isBlockedFetchHost,
+ * before the fetch and again on the post-redirect host.
+ *
+ * Residual: there is a TOCTOU window between this lookup and the socket connect (global fetch does
+ * not expose IP pinning); a dispatcher that pins the vetted IP is the complete fix and is tracked
+ * as a follow-up. This check closes the static "public name -> private IP" rebind, which is what
+ * the assessment reproduced.
+ */
+export async function resolvedHostIsBlocked(hostname: string): Promise<boolean> {
+  const host = (hostname || '').trim().toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  // IP literals are already fully covered by the synchronous check; no DNS needed.
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) {
+    return isBlockedFetchHost(host);
+  }
+  try {
+    const dns = await import('node:dns');
+    const records = await dns.promises.lookup(host, { all: true });
+    if (!records || records.length === 0) return true;
+    return records.some((r) => isBlockedFetchHost(r.address));
+  } catch {
+    // Resolution failure -> fail closed (the fetch would fail anyway).
+    return true;
+  }
+}
+
 /** Exported for the SSRF regression tests in ai-global-agent-ssrf.test.ts. */
 export function isBlockedFetchHost(hostname: string): boolean {
   const host = hostname.trim().toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');

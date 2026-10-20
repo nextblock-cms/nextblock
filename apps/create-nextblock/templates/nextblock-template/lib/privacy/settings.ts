@@ -1,7 +1,13 @@
 // Server-only read/write for the `privacy_settings` and `security_settings`
-// rows in the site_settings key-value table. Mirrors the copyright/bot-protection
-// pattern (createClient + RLS for writes; revalidatePath handled by callers).
+// rows in the site_settings key-value table. Reads use the cookie client (both keys are
+// readable by every staff role, privacy_settings by everyone). Writes verify ADMIN and use
+// the service role: both keys are in the ADMIN-only write tier that migration 02023 gates
+// behind `is_admin_mfa()`, which an ADMIN on an aal1 "remember this device" session cannot
+// satisfy through the cookie client (see lib/auth/cms-actor.ts). revalidatePath is handled
+// by callers.
+import type { Json } from '@nextblock-cms/db';
 import { createClient } from '@nextblock-cms/db/server';
+import { requireCmsAdmin } from '../auth/cms-actor';
 import {
   DEFAULT_PRIVACY_SETTINGS,
   DEFAULT_SECURITY_SETTINGS,
@@ -79,11 +85,11 @@ export async function getSecuritySettings(): Promise<SecuritySettings> {
 }
 
 export async function savePrivacySettings(input: PrivacySettings): Promise<void> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
   const value = normalizePrivacy(input);
   const { error } = await supabase
     .from('site_settings')
-    .upsert({ key: PRIVACY_KEY, value });
+    .upsert({ key: PRIVACY_KEY, value: value as unknown as Json });
   if (error) {
     console.error('Error saving privacy settings:', error.message);
     throw new Error('Failed to save privacy settings.');
@@ -103,11 +109,11 @@ export async function mergePrivacySettings(
 }
 
 export async function saveSecuritySettings(input: SecuritySettings): Promise<void> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
   const value = normalizeSecurity(input);
   const { error } = await supabase
     .from('site_settings')
-    .upsert({ key: SECURITY_KEY, value });
+    .upsert({ key: SECURITY_KEY, value: value as unknown as Json });
   if (error) {
     console.error('Error saving security settings:', error.message);
     throw new Error('Failed to save security settings.');

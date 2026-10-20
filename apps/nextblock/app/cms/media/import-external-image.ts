@@ -109,6 +109,27 @@ function isBlockedImportHost(hostname: string): boolean {
   return false;
 }
 
+/**
+ * DNS-rebinding guard: isBlockedImportHost only inspects the hostname string, so a public name
+ * that resolves to an internal address passes it. Resolve the name and block if any address is
+ * internal. (Residual TOCTOU before connect; IP-pinning dispatcher is the complete follow-up.)
+ */
+async function resolvedImportHostIsBlocked(hostname: string): Promise<boolean> {
+  const host = (hostname || "").trim().toLowerCase().replace(/\.$/, "").replace(/^\[|\]$/g, "");
+  if (!host) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":")) {
+    return isBlockedImportHost(host);
+  }
+  try {
+    const dns = await import("node:dns");
+    const records = await dns.promises.lookup(host, { all: true });
+    if (!records || records.length === 0) return true;
+    return records.some((r) => isBlockedImportHost(r.address));
+  } catch {
+    return true;
+  }
+}
+
 function extensionForImage(contentType: string, sharpFormat?: string): string {
   const format = (sharpFormat || "").toLowerCase();
   const byFormat: Record<string, string> = { jpeg: "jpg", jpg: "jpg", png: "png", webp: "webp", avif: "avif", gif: "gif", svg: "svg" };
@@ -143,6 +164,22 @@ function slugifyFileBase(value: string): string {
  */
 async function resolveImportActorId(actorUserId?: string): Promise<{ id: string } | { error: string }> {
   if (actorUserId) {
+    // `actorUserId` is a pre-authenticated principal supplied only by server paths that have no
+    // cookie session (the MCP route, after bearer verification). It must never let a caller that
+    // DOES have a session act as a different staff member: if a session is present, it has to be
+    // the same user. The MCP path carries no session, so this leaves it untouched.
+    try {
+      const sessionClient = createClient();
+      const {
+        data: { user: sessionUser },
+      } = await sessionClient.auth.getUser();
+      if (sessionUser && sessionUser.id !== actorUserId) {
+        return { error: "You do not have permission to import media." };
+      }
+    } catch {
+      // No request context (background/MCP) — nothing to cross-check.
+    }
+
     const { data: profile } = await getServiceRoleSupabaseClient()
       .from("profiles")
       .select("role")
@@ -211,7 +248,7 @@ export async function importExternalImageToMedia(input: {
     return { error: "Only http/https image URLs can be imported." };
   }
 
-  if (isBlockedImportHost(target.hostname)) {
+  if (isBlockedImportHost(target.hostname) || (await resolvedImportHostIsBlocked(target.hostname))) {
     return { error: "Refusing to fetch a local, private, or internal address." };
   }
 
@@ -242,7 +279,8 @@ export async function importExternalImageToMedia(input: {
       return { error: `The image URL responded with HTTP ${response.status}.` };
     }
 
-    if (isBlockedImportHost(new URL(response.url || target.toString()).hostname)) {
+    const finalImportHost = new URL(response.url || target.toString()).hostname;
+    if (isBlockedImportHost(finalImportHost) || (await resolvedImportHostIsBlocked(finalImportHost))) {
       return { error: "The image URL redirected to a blocked internal address." };
     }
 

@@ -3,6 +3,7 @@
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
+import { requireEcomAdmin } from '../../../server-actions/require-ecom-role';
 import { normalizeCountryCode } from '../../../countries';
 import { normalizeCurrencyRecord } from '../../../currency';
 import {
@@ -119,7 +120,7 @@ export async function createShippingZone(
     priority: number,
     locations: ShippingZoneLocationInput[]
 ) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const normalizedLocations = normalizeShippingZoneLocations(locations);
     
     // 1. Insert Zone
@@ -163,7 +164,7 @@ export async function updateShippingZone(
     priority: number,
     locations: ShippingZoneLocationInput[]
 ) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const normalizedLocations = normalizeShippingZoneLocations(locations);
     
     // 1. Update Zone Metadata
@@ -207,7 +208,7 @@ export async function updateShippingZone(
 }
 
 export async function deleteShippingZone(id: string) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const { error } = await supabase.from('shipping_zones').delete().eq('id', id);
     if (error) return { error: error.message };
     revalidatePath('/cms/shipping');
@@ -228,7 +229,7 @@ export async function createShippingRate(zoneId: string, data: {
     costAmounts?: Record<string, number>,
     minOrderAmounts?: Record<string, number>,
 }) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const activeCurrenciesResult = await getActiveShippingCurrencies(supabase);
 
     if ('error' in activeCurrenciesResult) {
@@ -279,7 +280,7 @@ export async function updateShippingRate(id: string, data: {
     costAmounts?: Record<string, number>,
     minOrderAmounts?: Record<string, number>,
 }) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const activeCurrenciesResult = await getActiveShippingCurrencies(supabase);
 
     if ('error' in activeCurrenciesResult) {
@@ -317,7 +318,7 @@ export async function updateShippingRate(id: string, data: {
 }
 
 export async function deleteShippingRate(id: string) {
-    const supabase = getServiceRoleSupabaseClient();
+    const supabase = await requireEcomAdmin();
     const { error } = await supabase.from('shipping_zone_methods').delete().eq('id', id);
     if (error) return { error: error.message };
     revalidatePath('/cms/shipping');

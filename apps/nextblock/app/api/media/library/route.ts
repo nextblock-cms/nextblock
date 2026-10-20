@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import { createClient } from '@nextblock-cms/db/server';
 import type { Database } from '@nextblock-cms/db';
 
 const MAX_MEDIA_LIBRARY_ITEMS = 100;
@@ -28,6 +29,25 @@ function getMediaLibrarySupabaseClient() {
 
 export async function GET(request: NextRequest) {
   try {
+    // CMS-only picker endpoint. Without this gate it served the entire media table (object keys,
+    // folder layout, and each upload's uploader_id) to anyone, with an attacker-driven search
+    // filter and no rate limit. Require a staff session.
+    const authClient = await createClient();
+    const {
+      data: { user },
+    } = await authClient.auth.getUser();
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+    const { data: profile } = await authClient
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .single();
+    if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    }
+
     const { searchParams } = new URL(request.url);
     const query = searchParams.get('q')?.trim() ?? '';
     const limitParam = Number.parseInt(searchParams.get('limit') ?? '', 10);

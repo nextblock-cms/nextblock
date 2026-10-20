@@ -1,5 +1,7 @@
 'use server';
 
+import type { Json } from '@nextblock-cms/db';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {
   CORTEX_AI_MCP_TOKENS_TABLE,
   CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY,
@@ -180,7 +182,7 @@ export async function selectModelForSetupAction(input: {
     const selection = createCortexAiStoredModelSelection(model);
     const { error } = await supabase.from('site_settings').upsert({
       key: CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY,
-      value: selection,
+      value: selection as unknown as Json,
     });
 
     if (error) {
@@ -248,7 +250,9 @@ export async function saveStockPhotoKeysForSetupAction(input: {
     consider('unsplash', unsplashKey, unsplash, CORTEX_AI_UNSPLASH_SETTING_KEY);
 
     if (rows.length > 0) {
-      const { error } = await supabase.from('site_settings').upsert(rows);
+      const { error } = await supabase
+        .from('site_settings')
+        .upsert(rows as Array<{ key: string; value: Json }>);
 
       if (error) {
         throw new Error(error.message);
@@ -338,14 +342,19 @@ export async function reuseExistingMcpTokenForSetupAction(input: {
   let token: { name: string; tokenPrefix: string };
 
   try {
-    const { supabase } = await requireAdminSupabaseClient();
+    // mcp_access_tokens is RLS-gated by is_admin_mfa() (02022 §5b), which would lock a
+    // legitimately-ADMIN aal1 ("remember this device") session out of reading its own
+    // connections mid-wizard. requireAdminSupabaseClient is the authorization boundary;
+    // read the token row with the service-role client once it passes. Mirrors mcp-actions.
+    await requireAdminSupabaseClient();
+    const admin = getServiceRoleSupabaseClient();
     const id = String(input.tokenId || '').trim();
 
     if (!id) {
       return { message: 'Pick a connection, or create a new one.', success: false };
     }
 
-    const { data: row, error } = await supabase
+    const { data: row, error } = await admin
       .from(CORTEX_AI_MCP_TOKENS_TABLE)
       .select('id, name, token_prefix, expires_at, revoked_at')
       .eq('id', id)

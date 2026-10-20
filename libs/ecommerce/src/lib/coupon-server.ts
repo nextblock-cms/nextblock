@@ -1,6 +1,10 @@
+import 'server-only';
+
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
+  COUPON_INVALID_ERROR_KEY,
+  COUPON_INVALID_ERROR_MESSAGE,
   type CouponDiscountType,
   type CouponProviderScope,
   type CouponQuote,
@@ -262,13 +266,67 @@ function allocateFixedDiscount(lines: TrustedCartLine[], amount: number) {
   return allocations;
 }
 
+/**
+ * Why a found-but-unusable coupon answers exactly like a missing one.
+ *
+ * `getCouponQuoteAction` is a public server action (any visitor, no session), so every
+ * distinguishable reply is an oracle. The old per-state keys (`coupon_not_found` vs
+ * `coupon_inactive` / `coupon_expired` / `coupon_limit_reached` / `coupon_not_applicable`)
+ * let a dictionary run confirm which codes EXIST, including unlaunched, staff and
+ * product-scoped promotions. The shopper gets one message for all of them; the detailed
+ * reason is opt-in (`detailedErrors`) for an authenticated CMS surface only — never pass it
+ * from a public caller.
+ */
+type CouponRejectionReason =
+  | 'not_found'
+  | 'inactive'
+  | 'not_started'
+  | 'expired'
+  | 'limit_reached'
+  | 'not_applicable';
+
+const DETAILED_COUPON_REJECTIONS: Record<
+  CouponRejectionReason,
+  { error: string; errorKey: string }
+> = {
+  not_found: { error: 'Coupon code not found.', errorKey: 'ecommerce.coupon_not_found' },
+  inactive: { error: 'This coupon is not active.', errorKey: 'ecommerce.coupon_inactive' },
+  not_started: {
+    error: 'This coupon is not active yet.',
+    errorKey: 'ecommerce.coupon_not_started',
+  },
+  expired: { error: 'This coupon has expired.', errorKey: 'ecommerce.coupon_expired' },
+  limit_reached: {
+    error: 'This coupon has reached its redemption limit.',
+    errorKey: 'ecommerce.coupon_limit_reached',
+  },
+  not_applicable: {
+    error: 'This coupon does not apply to the items in your cart.',
+    errorKey: 'ecommerce.coupon_not_applicable',
+  },
+};
+
+function rejectCoupon(reason: CouponRejectionReason, detailed: boolean): CouponQuoteResult {
+  const detail = detailed
+    ? DETAILED_COUPON_REJECTIONS[reason]
+    : { error: COUPON_INVALID_ERROR_MESSAGE, errorKey: COUPON_INVALID_ERROR_KEY };
+
+  return { success: false, ...detail };
+}
+
 export async function getCouponQuote(input: {
   client: SupabaseLikeClient;
   code?: string | null;
   items: CartItem[];
   currencyCode?: string | null;
+  /**
+   * Return the specific rejection reason instead of the uniform shopper message. Only for
+   * authenticated CMS tooling: on a public path it re-opens the code-enumeration oracle.
+   */
+  detailedErrors?: boolean;
 }): Promise<CouponQuoteResult> {
   const code = normalizeCouponCode(input.code);
+  const detailed = input.detailedErrors === true;
 
   if (!code) {
     return {
@@ -299,11 +357,7 @@ export async function getCouponQuote(input: {
   }
 
   if (!coupon) {
-    return {
-      success: false,
-      error: 'Coupon code not found.',
-      errorKey: 'ecommerce.coupon_not_found',
-    };
+    return rejectCoupon('not_found', detailed);
   }
 
   const couponRow = coupon as CouponRow;
@@ -312,38 +366,24 @@ export async function getCouponQuote(input: {
   const endsAt = toDate(couponRow.ends_at);
 
   if (!couponRow.is_active) {
-    return {
-      success: false,
-      error: 'This coupon is not active.',
-      errorKey: 'ecommerce.coupon_inactive',
-    };
+    return rejectCoupon('inactive', detailed);
   }
 
   if (startsAt && startsAt > now) {
-    return {
-      success: false,
-      error: 'This coupon is not active yet.',
-      errorKey: 'ecommerce.coupon_not_started',
-    };
+    return rejectCoupon('not_started', detailed);
   }
 
   if (endsAt && endsAt <= now) {
-    return {
-      success: false,
-      error: 'This coupon has expired.',
-      errorKey: 'ecommerce.coupon_expired',
-    };
+    return rejectCoupon('expired', detailed);
   }
 
+  // A UX pre-check only: this counter can lag under concurrency. The cap itself is enforced
+  // by `redeem_coupon_atomically` when the redemption is recorded (see recordCouponRedemption).
   if (
     couponRow.redemption_limit !== null &&
     (couponRow.redemptions_count ?? 0) >= couponRow.redemption_limit
   ) {
-    return {
-      success: false,
-      error: 'This coupon has reached its redemption limit.',
-      errorKey: 'ecommerce.coupon_limit_reached',
-    };
+    return rejectCoupon('limit_reached', detailed);
   }
 
   const [{ lines }, productScope] = await Promise.all([
@@ -363,11 +403,7 @@ export async function getCouponQuote(input: {
   );
 
   if (eligibleLines.length === 0) {
-    return {
-      success: false,
-      error: 'This coupon does not apply to the items in your cart.',
-      errorKey: 'ecommerce.coupon_not_applicable',
-    };
+    return rejectCoupon('not_applicable', detailed);
   }
 
   const fixedAllocations =
@@ -423,6 +459,41 @@ export function getQuoteLineDiscountMap(quote?: CouponQuote | null) {
   return discounts;
 }
 
+export type CouponRedemptionResult =
+  | {
+      success: true;
+      /** True when this order already held a redemption, so no new slot was taken. */
+      alreadyRecorded: boolean;
+    }
+  | {
+      success: false;
+      /**
+       * `limit_reached`: `redeem_coupon_atomically` refused the slot (exhausted, or the coupon
+       * was deactivated/deleted since the quote). `error`: a database failure; nothing was
+       * recorded. Both carry the uniform shopper message, so a checkout that surfaces them
+       * tells a probing caller nothing a validation call would not.
+       */
+      reason: 'limit_reached' | 'error';
+      error: string;
+      errorKey: string;
+    };
+
+/**
+ * Take one redemption slot for `quote.couponId` and record it against `orderId`.
+ *
+ * The counter is bumped by `public.redeem_coupon_atomically(uuid)` (migration 02022): a single
+ * locked `UPDATE ... WHERE redemptions_count < redemption_limit RETURNING`, so N concurrent
+ * checkouts of a `redemption_limit = N` coupon get exactly N `true`s and every later call gets
+ * `false`. The previous SELECT-then-UPDATE with an app-computed literal lost increments under
+ * concurrency and let the cap be bypassed. The RPC is EXECUTE-granted to `service_role` only,
+ * so `client` must be the service-role client (the providers already use it here).
+ *
+ * The slot is reserved BEFORE the audit row is inserted: if the insert then fails, the slot
+ * is lost rather than the cap exceeded, which is the conservative failure for a promotion.
+ * The call is idempotent per order so a retry (a redelivered webhook, once redemption moves
+ * to payment confirmation) cannot consume a second slot. Validation (`getCouponQuote`) never
+ * touches the counter.
+ */
 export async function recordCouponRedemption(input: {
   client: SupabaseLikeClient;
   quote: CouponQuote;
@@ -432,7 +503,43 @@ export async function recordCouponRedemption(input: {
   userId?: string | null;
   customerEmail?: string | null;
   metadata?: Record<string, unknown>;
-}) {
+}): Promise<CouponRedemptionResult> {
+  const failure = (reason: 'limit_reached' | 'error'): CouponRedemptionResult => ({
+    success: false,
+    reason,
+    error: COUPON_INVALID_ERROR_MESSAGE,
+    errorKey: COUPON_INVALID_ERROR_KEY,
+  });
+
+  const { data: existing, error: existingError } = await (input.client as any)
+    .from('coupon_redemptions')
+    .select('id')
+    .eq('order_id', input.orderId)
+    .maybeSingle();
+
+  if (existingError) {
+    console.error('Failed to look up existing coupon redemption:', existingError);
+    return failure('error');
+  }
+
+  if (existing) {
+    return { success: true, alreadyRecorded: true };
+  }
+
+  const { data: redeemed, error: redeemError } = await (input.client as any).rpc(
+    'redeem_coupon_atomically',
+    { p_coupon_id: input.quote.couponId }
+  );
+
+  if (redeemError) {
+    console.error('Failed to reserve coupon redemption:', redeemError);
+    return failure('error');
+  }
+
+  if (redeemed !== true) {
+    return failure('limit_reached');
+  }
+
   const { error: redemptionError } = await (input.client as any)
     .from('coupon_redemptions')
     .insert({
@@ -447,21 +554,124 @@ export async function recordCouponRedemption(input: {
     });
 
   if (redemptionError) {
+    // The slot is already counted; the missing audit row is the lesser harm.
     console.error('Failed to record coupon redemption:', redemptionError);
-    return;
   }
 
-  const { data: coupon } = await (input.client as any)
-    .from('coupons')
-    .select('redemptions_count')
-    .eq('id', input.quote.couponId)
-    .single();
+  return { success: true, alreadyRecorded: false };
+}
 
-  await (input.client as any)
-    .from('coupons')
-    .update({
-      redemptions_count: (coupon?.redemptions_count ?? 0) + 1,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', input.quote.couponId);
+/* ------------------------------------------------------------------------------------------
+ * Coupon-validation throttle
+ *
+ * A best-effort token bucket for the public validation action. It lives in process memory:
+ * on serverless hosts every warm instance has its own buckets and a cold start forgets them,
+ * so this slows a single-origin dictionary run (and, with the uniform rejection above, makes
+ * it unreliable) rather than guaranteeing a ceiling. Nothing here is persisted or logged, so
+ * the key is the raw client address, not a masked one: masking to a /24 would make 256 hosts
+ * share one bucket, and a tripped bucket clears the shopper's applied coupon in CouponForm.
+ * ---------------------------------------------------------------------------------------- */
+
+/** Burst allowance per client. CouponForm re-validates on every cart change, so be generous. */
+const COUPON_VALIDATION_BUCKET_CAPACITY = 30;
+/** Sustained rate per client: one validation every 5 s. */
+const COUPON_VALIDATION_REFILL_PER_SECOND = 12 / 60;
+/** Memory bound; beyond it the idlest buckets are evicted (they would be full anyway). */
+const COUPON_VALIDATION_MAX_BUCKETS = 5000;
+
+/**
+ * Shared bucket for requests whose origin cannot be read. Unattributable requests are
+ * throttled TOGETHER, never exempted: "could not parse the address" must not mean "no limit".
+ */
+export const COUPON_VALIDATION_UNKNOWN_CLIENT_KEY = 'unknown';
+
+type TokenBucket = { tokens: number; updatedAt: number };
+
+export function createCouponValidationThrottle(options?: {
+  capacity?: number;
+  refillPerSecond?: number;
+  maxBuckets?: number;
+}) {
+  const capacity = options?.capacity ?? COUPON_VALIDATION_BUCKET_CAPACITY;
+  const refillPerSecond = options?.refillPerSecond ?? COUPON_VALIDATION_REFILL_PER_SECOND;
+  const maxBuckets = options?.maxBuckets ?? COUPON_VALIDATION_MAX_BUCKETS;
+  const fullAfterMs = (capacity / refillPerSecond) * 1000;
+  const buckets = new Map<string, TokenBucket>();
+
+  function evict(now: number) {
+    for (const [key, bucket] of buckets) {
+      if (now - bucket.updatedAt >= fullAfterMs) {
+        buckets.delete(key);
+      }
+    }
+
+    // Still over: drop the oldest entries (Map iterates in insertion order).
+    for (const key of buckets.keys()) {
+      if (buckets.size < maxBuckets) {
+        break;
+      }
+      buckets.delete(key);
+    }
+  }
+
+  return {
+    /** Spend one token for `key`; false means the caller is over its budget right now. */
+    consume(key: string, now: number = Date.now()): boolean {
+      let bucket = buckets.get(key);
+
+      if (!bucket) {
+        if (buckets.size >= maxBuckets) {
+          evict(now);
+        }
+        bucket = { tokens: capacity, updatedAt: now };
+        buckets.set(key, bucket);
+      } else {
+        const elapsedSeconds = Math.max(0, now - bucket.updatedAt) / 1000;
+        bucket.tokens = Math.min(capacity, bucket.tokens + elapsedSeconds * refillPerSecond);
+        bucket.updatedAt = now;
+      }
+
+      if (bucket.tokens < 1) {
+        return false;
+      }
+
+      bucket.tokens -= 1;
+      return true;
+    },
+    get size() {
+      return buckets.size;
+    },
+  };
+}
+
+const couponValidationThrottle = createCouponValidationThrottle();
+
+/** Spend one validation token for `key` on the process-wide bucket set. */
+export function consumeCouponValidationToken(key: string, now?: number): boolean {
+  return couponValidationThrottle.consume(key, now);
+}
+
+function firstHop(headerValue: string | null): string | null {
+  const [first] = (headerValue ?? '').split(',');
+  const trimmed = first?.trim() ?? '';
+  return trimmed || null;
+}
+
+/**
+ * Throttle key for a request: the client address as the platform reports it.
+ *
+ * `x-forwarded-for` is a list the client can prepend to, so on an appending proxy its leftmost
+ * entry is attacker-controlled and would mint a fresh bucket per request. `x-vercel-forwarded-for`
+ * and `x-real-ip` are overwritten by the proxy on every request, so they win. No address at all
+ * lands in the shared unknown bucket.
+ */
+export function resolveCouponValidationThrottleKey(requestHeaders: {
+  get(name: string): string | null;
+}): string {
+  return (
+    firstHop(requestHeaders.get('x-vercel-forwarded-for')) ??
+    firstHop(requestHeaders.get('x-real-ip')) ??
+    firstHop(requestHeaders.get('x-forwarded-for')) ??
+    COUPON_VALIDATION_UNKNOWN_CLIENT_KEY
+  );
 }

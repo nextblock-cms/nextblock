@@ -26,6 +26,11 @@ import {
 
 import { validateBlockContent } from '../../../lib/blocks/blockRegistry';
 import { ensureEnvLicenseActivation } from '../../../lib/packages/env-license';
+import { evaluateTwoFactor } from '../../../lib/auth/twoFactor';
+import {
+  isForwardedPeerLoopback,
+  isMcpLocalhostTrustOptedIn,
+} from '../../../lib/cortex-ai/mcp-loopback-trust';
 import { isFullyConfigured } from '../../../lib/setup/env-status';
 import { hasResolvedSiteUrl, resolveSiteUrl } from '../../../lib/site-url';
 import { importExternalImageToMedia } from '../../cms/media/import-external-image';
@@ -188,7 +193,16 @@ function isOriginAllowed(request: Request): boolean {
  *  1. A bearer token from `mcp_access_tokens` — the path every external client uses.
  *  2. An authenticated ADMIN cookie session — lets the dashboard's own "Test
  *     connection" button reach the endpoint without minting a token first.
- *  3. Loopback in development, when the operator has left that setting on.
+ *  3. Loopback in development — and only with an explicit environment opt-in.
+ *     The `Host` header used to be the whole test, and `Host` is whatever the client
+ *     or the proxy in front says it is: `Host: localhost` from the public internet
+ *     opened a full read+write session on any instance running with a non-production
+ *     `NODE_ENV`. The tokenless path now exists only when
+ *     `NEXTBLOCK_MCP_TRUST_LOCALHOST=true` is set, the forwarded-peer headers (if any)
+ *     name only loopback addresses, the dashboard setting is on, `NODE_ENV` is not
+ *     production and `Host` is loopback. Without the variable, a developer's own
+ *     machine needs a bearer token (`MCP_BEARER_TOKEN` or a minted one) or an admin
+ *     session like anywhere else. See lib/cortex-ai/mcp-loopback-trust.ts.
  */
 async function authenticateMcpRequest(request: Request): Promise<McpAuth | null> {
   const serviceClient = getServiceRoleSupabaseClient();
@@ -247,8 +261,19 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
     };
   }
 
-  if (shouldTrustLocalMcpRequest({ hostHeader: request.headers.get('host'), settings })) {
-    // Loopback trust is an explicit opt-in on a development machine, where anyone
+  // Safer of the two options considered for mcp-localhost-host-spoof: rather than try to
+  // recover the real socket peer (route handlers never see it, and Next fills
+  // `x-forwarded-for` from the socket only when the client sent none, so a direct
+  // caller can forge it), the tokenless path is OFF unless the operator sets
+  // `NEXTBLOCK_MCP_TRUST_LOCALHOST=true`. The forwarded-peer check is defence in depth
+  // for the proxied case, where the proxy appends the real client address.
+  if (
+    isMcpLocalhostTrustOptedIn() &&
+    isForwardedPeerLoopback(request.headers, { isLocalhostHost }) &&
+    shouldTrustLocalMcpRequest({ hostHeader: request.headers.get('host'), settings })
+  ) {
+    // Loopback trust is a double opt-in (NEXTBLOCK_MCP_TRUST_LOCALHOST in the
+    // environment plus the dashboard setting) on a development machine, where anyone
     // who can reach this endpoint can already read the service-role key out of
     // .env.local. Not treated as orphaned: it grants nothing new.
     return {
@@ -309,7 +334,20 @@ async function resolveAdminSessionUserId(): Promise<string | null> {
       .eq('id', user.id)
       .single();
 
-    return profile?.role === 'ADMIN' ? user.id : null;
+    if (profile?.role !== 'ADMIN') {
+      return null;
+    }
+
+    // The admin-session MCP path grants full read/write tool scope from a cookie session, so it
+    // must require a satisfied second factor just like /cms does — otherwise an ADMIN session JWT
+    // alone (first factor) drives the MCP tools against PostgREST's separate endpoint. An admin
+    // with no factor enrolled still passes ('not_required'), matching the aal2-in-RLS posture.
+    const twoFactor = await evaluateTwoFactor();
+    if (twoFactor.status !== 'satisfied' && twoFactor.status !== 'not_required') {
+      return null;
+    }
+
+    return user.id;
   } catch {
     return null;
   }

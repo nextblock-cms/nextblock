@@ -28,6 +28,13 @@ const TWO_FACTOR_SESSION_TTL_SECONDS = 12 * 60 * 60; // 12 hours
 const MAX_LIVE_EMAIL_CODES = 3;
 
 /**
+ * Wrong email-code guesses allowed against one live code pool before it is burned. Low because the
+ * attacker who reaches this already holds the first factor (the password); the legitimate user
+ * mistypes a handful of times at most and can always request a fresh code.
+ */
+const MAX_VERIFY_ATTEMPTS = 5;
+
+/**
  * Minimum gap between user-requested codes. Deliberately shorter than the UI countdown so a
  * normal user never sees the server refusal — the client timer is a courtesy that a crafted
  * request ignores, and this is what actually bounds how fast one session can drive the mailer.
@@ -106,10 +113,30 @@ export async function verifyEmailChallenge(userId: string, code: string): Promis
     .order('created_at', { ascending: false })
     .limit(MAX_LIVE_EMAIL_CODES);
 
+  // An empty pool also covers the locked-out case: once MAX_VERIFY_ATTEMPTS is reached the pool is
+  // burned (consumed) below, so a locked user has no live rows and must request a fresh code.
   if (!data || data.length === 0) return false;
+
   const candidateHash = sha256Hex(trimmed);
   const match = data.find((row) => safeEqual(row.token_hash, candidateHash));
-  if (!match) return false;
+  if (!match) {
+    // Lockout: a party holding the victim's password must not iterate the 10^6 code space.
+    // Count the failed guess atomically across the live pool (one shared budget, no read-then-
+    // write race); when it reaches the cap, burn the pool so none of its codes stays redeemable.
+    // `attempts` / bump_email_2fa_attempts arrive with migration 02022; cast past the generated
+    // types until `npm run db:types` is regenerated.
+    const { data: bumped } = await (svc as unknown as {
+      rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: number | null }>;
+    }).rpc('bump_email_2fa_attempts', { p_user_id: userId });
+    if (typeof bumped === 'number' && bumped >= MAX_VERIFY_ATTEMPTS) {
+      await svc
+        .from('email_2fa_challenges')
+        .update({ consumed_at: nowIso })
+        .eq('user_id', userId)
+        .is('consumed_at', null);
+    }
+    return false;
+  }
 
   // Burn every live code for this user, not just the matched row: the siblings from a
   // resend have served their purpose and must not stay redeemable after a success.
