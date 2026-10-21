@@ -1,3 +1,5 @@
+import 'server-only';
+
 // DB-backed payment provider credentials. Non-secret config (Stripe publishable key,
 // Freemius developer/public/product ids) lives in the public `payment_public` row;
 // secret keys live encrypted in the ADMIN-only `payment_secret` row. Resolution is

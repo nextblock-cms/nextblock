@@ -1,6 +1,7 @@
 import 'server-only';
 
-import { resolveSupabaseServiceKey, resolveSupabaseUrl } from '../setup/env-status';
+import { resolveSupabaseUrl } from '../setup/env-status';
+import { resolveSupabaseServiceKey } from '../setup/service-key';
 
 // NextBlock has two storage backends:
 //

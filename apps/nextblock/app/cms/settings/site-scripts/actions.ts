@@ -1,9 +1,13 @@
 // app/cms/settings/site-scripts/actions.ts
 'use server';
 
+import 'server-only';
+
 import { createClient } from '@nextblock-cms/db/server';
 import { revalidatePath, revalidateTag } from 'next/cache';
 
+import type { Json } from '@nextblock-cms/db';
+import { requireCmsAdmin, type ServiceRoleClient } from '../../../../lib/auth/cms-actor';
 import type { SettingsActionResult } from '../../../../lib/cms/action-result';
 import {
   isSiteScriptLoadStrategy,
@@ -18,7 +22,7 @@ import {
   type SiteScriptRevisionType,
 } from '../../../../lib/site-scripts/revisions';
 
-type SupabaseLike = ReturnType<typeof createClient>;
+type SupabaseLike = ServiceRoleClient;
 
 /**
  * Append one row to the audit log.
@@ -45,7 +49,7 @@ async function recordRevision(
       revision_type: input.revisionType,
       script_id: input.scriptId,
       script_name: snapshot.name,
-      snapshot,
+      snapshot: snapshot as unknown as Json,
       source: 'cms',
       summary: input.summary ?? null,
     });
@@ -66,31 +70,32 @@ async function readScript(supabase: SupabaseLike, id: string) {
 }
 
 /**
- * Site scripts run arbitrary JavaScript on every public page, so unlike most content
- * these are ADMIN-only — a WRITER who can publish a page must not also be able to
- * ship code to every visitor. RLS enforces the same rule; this is the friendly error.
+ * Site scripts run arbitrary JavaScript on every page, /cms included, so unlike most content
+ * these are ADMIN-only — a WRITER who can publish a page must not also be able to ship code
+ * to every visitor.
+ *
+ * Writes go through the service-role client after this check: migration 02028 puts the ADMIN
+ * write policies of site_scripts and site_script_revisions behind public.is_admin_mfa(), which
+ * an admin on a "remember this device" session (aal1) or on the email second factor (never
+ * aal2) does not pass over PostgREST. requireCmsAdmin() is the authorization boundary: it reads
+ * the caller's own role and refuses a session whose second factor is still pending.
  */
-async function requireAdmin() {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return { supabase, userId: null, error: 'You must be logged in to manage site scripts.' as const };
+async function requireAdmin(): Promise<
+  { supabase: SupabaseLike; userId: string; error: null } | { supabase: null; userId: null; error: string }
+> {
+  try {
+    const { supabase, userId } = await requireCmsAdmin();
+    return { supabase, userId, error: null };
+  } catch (error) {
+    return {
+      supabase: null,
+      userId: null,
+      error:
+        error instanceof Error && error.message === 'Forbidden'
+          ? 'Only administrators can manage site scripts.'
+          : 'You must be logged in to manage site scripts.',
+    };
   }
-
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-
-  if (profileError || !profile || profile.role !== 'ADMIN') {
-    return { supabase, userId: null, error: 'Only administrators can manage site scripts.' as const };
-  }
-
-  return { supabase, userId: user.id, error: null };
 }
 
 function revalidateSiteScripts() {
@@ -158,8 +163,9 @@ function buildPayload(input: SiteScriptInput): Record<string, unknown> | { error
 }
 
 export async function createSiteScript(input: SiteScriptInput): Promise<SettingsActionResult> {
-  const { supabase, userId, error: authError } = await requireAdmin();
-  if (authError) return { ok: false, error: authError };
+  const auth = await requireAdmin();
+  if (auth.error !== null) return { ok: false, error: auth.error };
+  const { supabase, userId } = auth;
 
   const payload = buildPayload(input);
   if ('error' in payload) return { ok: false, error: payload.error as string };
@@ -189,8 +195,9 @@ export async function updateSiteScript(
   id: string,
   input: SiteScriptInput
 ): Promise<SettingsActionResult> {
-  const { supabase, userId, error: authError } = await requireAdmin();
-  if (authError) return { ok: false, error: authError };
+  const auth = await requireAdmin();
+  if (auth.error !== null) return { ok: false, error: auth.error };
+  const { supabase, userId } = auth;
 
   const payload = buildPayload(input);
   if ('error' in payload) return { ok: false, error: payload.error as string };
@@ -223,8 +230,9 @@ export async function setSiteScriptActive(
   id: string,
   isActive: boolean
 ): Promise<SettingsActionResult> {
-  const { supabase, userId, error: authError } = await requireAdmin();
-  if (authError) return { ok: false, error: authError };
+  const auth = await requireAdmin();
+  if (auth.error !== null) return { ok: false, error: auth.error };
+  const { supabase, userId } = auth;
 
   const previous = await readScript(supabase, id);
 
@@ -249,8 +257,9 @@ export async function setSiteScriptActive(
 }
 
 export async function deleteSiteScript(id: string): Promise<SettingsActionResult> {
-  const { supabase, userId, error: authError } = await requireAdmin();
-  if (authError) return { ok: false, error: authError };
+  const auth = await requireAdmin();
+  if (auth.error !== null) return { ok: false, error: auth.error };
+  const { supabase, userId } = auth;
 
   // Read before deleting: the snapshot is what makes the delete undoable.
   const previous = await readScript(supabase, id);
@@ -296,8 +305,9 @@ export async function getSiteScriptRevisions(limit = 100): Promise<SiteScriptRev
  * the audit trail stays append-only and the restore is itself undoable.
  */
 export async function revertSiteScript(revisionId: string): Promise<SettingsActionResult> {
-  const { supabase, userId, error: authError } = await requireAdmin();
-  if (authError) return { ok: false, error: authError };
+  const auth = await requireAdmin();
+  if (auth.error !== null) return { ok: false, error: auth.error };
+  const { supabase, userId } = auth;
 
   const { data: revisionRow, error: revisionError } = await supabase
     .from('site_script_revisions')

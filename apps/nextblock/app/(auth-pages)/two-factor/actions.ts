@@ -1,6 +1,7 @@
 'use server';
 
 import { headers } from 'next/headers';
+import { isSafeInternalPath } from '../../../lib/auth-redirects';
 import { redirect } from 'next/navigation';
 import { createClient } from '@nextblock-cms/db/server';
 import {
@@ -18,8 +19,10 @@ import {
 import { sendTwoFactorCodeEmail } from '../../actions/twoFactorEmail';
 import { isEmailConfigured } from '../../../lib/config/email-settings';
 
+// One shared rule for redirect targets: `/\evil.com` (from `/%5Cevil.com`) passed the old
+// startsWith('/') check and sent the user off-site after their second factor (2026-10-21).
 function safeRedirect(path?: string): string {
-  return path && path.startsWith('/') && !path.startsWith('//') ? path : '/cms/dashboard';
+  return path && isSafeInternalPath(path) ? path : '/cms/dashboard';
 }
 
 /** If the user opted into "remember this device" at login, mint the trust now. */

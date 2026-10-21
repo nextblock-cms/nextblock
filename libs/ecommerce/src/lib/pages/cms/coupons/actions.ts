@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { majorUnitAmountToMinor, normalizeCurrencyCode } from '@nextblock-cms/utils';
 import { revalidatePath } from 'next/cache';

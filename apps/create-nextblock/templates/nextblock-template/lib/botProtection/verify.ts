@@ -1,3 +1,5 @@
+import 'server-only';
+
 // lib/botProtection/verify.ts
 //
 // Shared server-side bot-protection verification: the honeypot check plus

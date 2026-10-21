@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import { sendTwoFactorCodeEmail } from '../../../actions/twoFactorEmail';

@@ -75,7 +75,8 @@ For more detail, read `docs/04-DATABASE-AND-AUTH.md` and
 These rules apply when you work without Nick watching: a Jarvis task on a `jarvis/*` branch, or a Jules task. Nick reviews the result as a pull request.
 
 - Read `CLAUDE.md` first: layout, commands, conventions and gotchas.
-- Install with `npm ci`. Test with `npx vitest run <path>` (always pass a path; there are no per-project `nx test` targets). Before finishing, `npx nx affected -t lint test build --base=origin/master` must pass.
+- Install with `npm ci`. Test with `npx vitest run <path>` (always pass a path; there are no per-project `nx test` targets). Before finishing, `npx nx affected -t lint test build --base=origin/master` and `npm run security:check` must pass.
+- If the task touches auth, roles, a server action, a route handler, the service-role client, uploads, webhooks, checkout or Cortex tools, read `.claude/skills/nextblock-security/SKILL.md` and answer its checklist in your final message. CI (`.github/workflows/security.yml`) runs the same gates on every PR.
 - Don't commit or push. The Jarvis script does that after its own checks.
 - Don't create or edit migrations, touch `.env*` files or anything in `.github/`, or run any `db:*` or `sandbox:*` script. If the task needs a migration, make no changes and say so.
 - Don't add, remove or upgrade dependencies unless the task asks for it.

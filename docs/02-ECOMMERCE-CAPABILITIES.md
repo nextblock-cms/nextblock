@@ -298,10 +298,36 @@ Freemius currently handles digital-product checkout and product synchronization.
 - only allows one item per checkout
 - loads the product from Supabase
 - requires `freemius_product_id` and `freemius_plan_id`
-- resolves pricing in the chosen currency
+- resolves the unit amount with `resolveFreemiusUnitAmount`
+  (`libs/ecommerce/src/lib/freemius-pricing-server.ts`), described below
 - inserts a pending order and order item
 - optionally syncs default addresses and profile fields for the current user
-- builds a Freemius checkout URL, including sandbox parameters when enabled
+- builds a Freemius checkout URL with the validated `billing_cycle`, including
+  sandbox parameters when enabled
+
+Freemius charges its own plan price for the cycle the checkout opens on, so the
+order records that price, not `products.price`. The sync sets `products.price`
+to the annual price, falling back to monthly or lifetime only when there is no
+annual price, so it is wrong for a monthly purchase. The resolver:
+
+- reads `freemius_pricing` for the plans of the product and its translation
+  siblings, picks the active tier with the lowest `license_quota`
+  (`ORDER BY license_quota, id`), and uses its `api_*` price, never an
+  `override_*` display price
+- validates `billing_cycle` (`monthly`, `annual`, `lifetime`). It rejects
+  unknown values and cycles the tier has no price for with
+  `ecommerce.checkout_invalid_items`. A missing cycle defaults to annual, then
+  monthly, then lifetime, matching Freemius and the product page.
+- converts from the default currency into the selected one through
+  `currency.ts`
+- takes an active sale off as the same percent the Freemius sale coupon carries
+- falls back to `products.price` / `prices` only when the product has no pricing
+  rows
+
+`getCouponQuote` prices Freemius lines with the same resolver, so a percent
+coupon is computed on the price of the cycle being bought.
+`SubscriptionSelector` uses the same tier rule (`pickFreemiusPricingTier` in
+`freemius-pricing.ts`).
 
 Supported credential sources include:
 

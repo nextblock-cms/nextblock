@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 
@@ -9,7 +11,7 @@ import {
   rebaseStoreCurrencyExchangeRates,
   syncStoreCurrencyRates,
 } from '@nextblock-cms/ecommerce/server';
-import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { requireCmsAdmin } from '../../../../lib/auth/cms-actor';
 import { majorUnitAmountToMinor } from '@nextblock-cms/utils';
 
 const CURRENCY_SETTINGS_PATH = '/cms/settings/currencies';
@@ -106,7 +108,8 @@ export async function upsertCurrencyAction(formData: FormData) {
   let successMessage = 'Currency saved.';
 
   try {
-    const supabase = getServiceRoleSupabaseClient();
+    // Server actions are public POST endpoints: authorize before the service-role client.
+    const { supabase } = await requireCmsAdmin();
     const id = parseCurrencyId(formData.get('id'));
     const code = String(formData.get('code') || '').trim().toUpperCase();
     const symbol = String(formData.get('symbol') || '').trim();
@@ -268,6 +271,7 @@ export async function syncCurrencyRatesAction() {
   let successMessage = 'Currency rates synced successfully.';
 
   try {
+    await requireCmsAdmin();
     const result = await syncStoreCurrencyRates();
 
     successMessage =
@@ -291,7 +295,8 @@ export async function deleteCurrencyAction(formData: FormData) {
   let successMessage = 'Currency deleted.';
 
   try {
-    const supabase = getServiceRoleSupabaseClient();
+    // Server actions are public POST endpoints: authorize before the service-role client.
+    const { supabase } = await requireCmsAdmin();
     const id = String(formData.get('id') || '').trim();
 
     if (!id) {

@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { createClient } from '@nextblock-cms/db/server';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { applyOrderInventoryDeduction } from '../../../order-inventory';

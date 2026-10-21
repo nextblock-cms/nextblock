@@ -7,6 +7,13 @@ on demand when you work inside a project.
 
 See @AGENTS.md for migration rules and the rules for automated runs.
 
+**Security gate.** Before finishing any change to a migration, policy, grant, Postgres function,
+the post-apply grant pass, auth/roles, a server action, a route handler, the service-role client,
+uploads or server-side fetches, webhooks, checkout/orders, Cortex tools or the MCP server, load
+the `nextblock-security` skill (`.claude/skills/nextblock-security/SKILL.md`), run its gates and
+answer its checklist. Every security fix ships the test, lint rule or posture assertion that
+would have caught it. CI (`.github/workflows/security.yml`) re-runs the gates on every push and PR.
+
 ## Layout
 
 - `apps/nextblock` — the only runtime: site, CMS (`app/cms`), API (`app/api`), `/setup`, `proxy.ts`.
@@ -50,6 +57,12 @@ Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` →
 - Read Supabase env through the resolvers in `apps/nextblock/lib/setup/env-status.ts`; hosted
   installs inject `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` beside the
   legacy `NEXT_PUBLIC_SUPABASE_*` names. Libs inline the same alias chain.
+- Service-role boundary (docs/04): a module that builds, hands out or keys a service-role client
+  imports `'server-only'` (server actions, pages and routes included); the secret key is resolved
+  only by the server-only `lib/setup/service-key.ts`; import types from server modules with
+  `import type`. `tools/scripts/service-role-boundary.test.ts` fails on a missing guard, a client
+  graph (any `'use client'` file or client-safe lib entry) reaching service-role code, or a
+  secret behind `NEXT_PUBLIC_` / `next.config.js` `env`.
 - Premium gating: `verifyPackageOnline('ecommerce' | 'cortex-ai')` (cached 60 s).
 - Headless installs (`create-nextblock --non-interactive`, docs/06): `GET /api/setup/status`
   (public readiness), `POST /api/setup/bootstrap` (first admin, bearer = `MCP_BEARER_TOKEN`),
@@ -63,6 +76,8 @@ Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` →
 npx nx serve nextblock              # dev on :4200
 npx nx build nextblock              # prebuild migration hook never fails a build
 npm run lint                        # or npx nx lint <project>
+npm run security:check              # service-role boundary + action actors + migration lint + grant-pass lockstep
+npm run security:db-posture -- --db-url postgresql://postgres:postgres@127.0.0.1:54322/postgres  # local DB only
 npx vitest run <path>               # ALWAYS pass a path (a bare run also collects the template copy); no per-project nx test targets
 npm run db:migrate:check            # ALWAYS first; read-only by construction
 npm run db:migrate && npm run db:types
@@ -98,7 +113,14 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - RLS: a policy without `TO` applies to `anon` too, and `USING (true)` on it publishes the
   table to anyone with the public key. Role helpers are `SECURITY DEFINER` in the non-exposed
   `private` schema with `SECURITY INVOKER` wrappers in `public` (`02021`); never create a
-  `SECURITY DEFINER` function in `public` (advisor lints 0028/0029). A forward migration that
+  `SECURITY DEFINER` function in `public` (advisor lints 0028/0029; the migration lint refuses
+  one without `REVOKE EXECUTE ... FROM PUBLIC, anon, authenticated` in the same file). `anon` is
+  read-only at the grant level and `profiles.role` is pinned by column grants (`02025`): grant
+  `anon` SELECT only (the lint refuses anon/PUBLIC write grants). `authenticated` holds only
+  the writes some policy lets it use (`02026`): a table or command only the service role writes
+  revokes the rest in its migration and in `API_ROLE_REVOKE_SQL` (below). SELECT likewise
+  (`02027`): grant it only to a role some policy lets read the table, and remember a policy
+  subquery, invoker view or PostgREST embed reads its table as the caller. A forward migration that
   creates a table, view or sequence must `GRANT` on it in the same file (Supabase grants
   nothing on new objects: projects created since 2026-05-30, every project from 2026-10-30;
   `db:migrate:check` and the bundle generator fail otherwise). Docs/04 → "Row Level Security
@@ -106,9 +128,14 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - Both apply paths (`/setup` via `lib/setup/schema-apply.ts`, the build hook via
   `tools/lib/migrate-core.mjs`) end with `grant execute on all functions in schema public`
   to the API roles, then revoke it again on trigger functions and on the explicit list in
-  `API_ROLE_REVOKE_SQL`. A migration that revokes EXECUTE from `anon`/`authenticated` must
-  add the function to that list in BOTH files (`migrate-core.test.mjs` fails on drift), or
-  the next deploy hands the privilege back (how the 0028/0029 advisor warnings returned).
+  `API_ROLE_REVOKE_SQL`. A migration that revokes a privilege (EXECUTE, or a table/sequence
+  privilege) from `anon`/`authenticated` that those blanket grants hand back must add it to
+  that list in BOTH files (`migrate-core.test.mjs` fails on drift, `migration-grants.test.ts`
+  on a missing entry, and on a new table or view granted less than the pass grants), or the
+  next deploy hands it back (how the 0028/0029 advisor warnings
+  and 02022's `cortex_request_log` revoke were undone). `tools/scripts/security-verify.sql` is
+  the posture check: run it on a local replay after the post-apply pass (`GRANTS_SQL`), never on
+  production.
 
 ## Gotchas
 

@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
 
 import {
@@ -15,6 +17,7 @@ import {
   parseBearerToken,
   readCortexAiMcpEnvToken,
   resolveCortexAiMcpSettings,
+  resolveCortexAiMcpTokenActor,
   shouldTrustLocalMcpRequest,
   touchCortexAiMcpToken,
   verifyCortexAiMcpToken,
@@ -31,9 +34,9 @@ import {
   isForwardedPeerLoopback,
   isMcpLocalhostTrustOptedIn,
 } from '../../../lib/cortex-ai/mcp-loopback-trust';
-import { isFullyConfigured } from '../../../lib/setup/env-status';
+import { isFullyConfigured } from '../../../lib/setup/service-key';
 import { hasResolvedSiteUrl, resolveSiteUrl } from '../../../lib/site-url';
-import { importExternalImageToMedia } from '../../cms/media/import-external-image';
+import { importExternalImageAsActor } from '../../../lib/media/external-image-import';
 import { captureRevisionBaseline, commitRevisionFromBaseline } from '../../cms/revisions/service';
 import type { AnyFullContent } from '../../cms/revisions/utils';
 
@@ -67,27 +70,23 @@ const SERVER_VERSION = '1.0.0';
 const MCP_SKIP_CONFIRMATION = true;
 
 type McpAuth = {
-  actorUserId: string | null;
   /**
-   * True when this token outlived the account that minted it (`created_by` is
-   * `ON DELETE SET NULL`), so `actorUserId` below is a stand-in rather than the
-   * principal that actually holds the credential.
-   *
-   * A stand-in is fine for *attribution* — a revision needs some author — but it
-   * must never be the basis for *authorization*, or deleting an administrator would
-   * silently promote their leftover token to whichever admin happens to sort first.
-   * Offboarding someone is exactly when their credentials should lose power, not
-   * inherit someone else's.
+   * The ADMIN this request acts as. For a minted token it is the token's creator,
+   * re-checked on every request (`resolveCortexAiMcpTokenActor`): a token whose creator
+   * was demoted or deleted is refused rather than handed a stand-in, because offboarding
+   * someone is exactly when their credentials should lose power, not inherit someone
+   * else's.
    */
-  actorFromOrphanedToken: boolean;
+  actorUserId: string | null;
   scopes: CortexAiMcpScope[];
   source: 'admin-session' | 'env-token' | 'localhost' | 'token';
 };
 
 /**
  * MCP has no cookie session, so the importer is handed the actor this request already
- * authenticated. Without it every image import fails with "You must be signed in to
- * import an image" — which silently strips the imagery out of any page or product
+ * authenticated, through the server-only `importExternalImageAsActor` (never through the
+ * `importExternalImageToMedia` server action, which takes no actor). Without it every
+ * image import would fail, which silently strips the imagery out of any page or product
  * built over MCP, since executors treat an import failure as non-fatal.
  */
 function createMcpImageImporter(actorUserId: string | null) {
@@ -95,8 +94,12 @@ function createMcpImageImporter(actorUserId: string | null) {
     url: string;
     altText?: string;
   }): Promise<{ id: string } | { error: string }> {
-    const result = await importExternalImageToMedia({
-      ...(actorUserId ? { actorUserId } : {}),
+    if (!actorUserId) {
+      return { error: 'Importing an image requires a known CMS user.' };
+    }
+
+    const result = await importExternalImageAsActor({
+      actorUserId,
       altText: input.altText,
       url: input.url,
     });
@@ -219,7 +222,6 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
     }
 
     return {
-      actorFromOrphanedToken: false,
       actorUserId,
       scopes: ['read', 'write'],
       source: 'env-token',
@@ -239,12 +241,20 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
       return null;
     }
 
+    // The token acts as its creator, so the creator's CURRENT role decides, on every
+    // request: a demoted or deleted admin's token stops working at once. A failed
+    // lookup throws, and POST answers 503 rather than 401.
+    const actorUserId = await resolveCortexAiMcpTokenActor(serviceClient, verification.token);
+
+    if (!actorUserId) {
+      return null;
+    }
+
     // Bookkeeping only — never block the call on it.
     void touchCortexAiMcpToken(serviceClient, verification.token.id);
 
     return {
-      actorFromOrphanedToken: !verification.token.created_by,
-      actorUserId: verification.token.created_by ?? (await resolveFallbackAdminUserId()),
+      actorUserId,
       scopes: verification.scopes,
       source: 'token',
     };
@@ -254,7 +264,6 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
 
   if (adminUserId) {
     return {
-      actorFromOrphanedToken: false,
       actorUserId: adminUserId,
       scopes: ['read', 'write'],
       source: 'admin-session',
@@ -275,9 +284,8 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
     // Loopback trust is a double opt-in (NEXTBLOCK_MCP_TRUST_LOCALHOST in the
     // environment plus the dashboard setting) on a development machine, where anyone
     // who can reach this endpoint can already read the service-role key out of
-    // .env.local. Not treated as orphaned: it grants nothing new.
+    // .env.local. It grants nothing new.
     return {
-      actorFromOrphanedToken: false,
       actorUserId: await resolveFallbackAdminUserId(),
       scopes: ['read', 'write'],
       source: 'localhost',
@@ -288,15 +296,15 @@ async function authenticateMcpRequest(request: Request): Promise<McpAuth | null>
 }
 
 /**
- * Every mutating Cortex executor calls `getActorUserId()` and throws without one, so a
- * connection with no identity behind it can read but never write. Two connections have
- * that problem: localhost trust (nobody signed in) and a token whose creator was since
- * deleted (`created_by` is `ON DELETE SET NULL`).
+ * Every mutating Cortex executor requires an ADMIN actor, so a connection with no
+ * identity behind it can read but never write. Two connections have none of their own:
+ * localhost trust (nobody signed in) and the environment bootstrap token.
  *
  * Rather than advertise a `write` scope those connections cannot actually use, fall back
  * to an ADMIN profile so the write is attributed to a real person in Revision History.
  * This grants no new authority — reaching here already required either loopback in
- * development or a valid admin-minted token — it only supplies the author field.
+ * development or the operator's own environment secret — it only supplies the author
+ * field. A minted token never falls back: it acts as its creator or not at all.
  *
  * `id` ordering is arbitrary but stable, which is what matters: the same fallback admin
  * every time, so revision authorship does not jump between people run to run.
@@ -355,7 +363,6 @@ async function resolveAdminSessionUserId(): Promise<string | null> {
 
 function buildToolContext(auth: McpAuth): CortexMcpToolContext {
   return {
-    actorFromOrphanedToken: auth.actorFromOrphanedToken,
     actorUserId: auth.actorUserId,
     importExternalImage: createMcpImageImporter(auth.actorUserId),
     // No open editor over MCP: tools that need a target take it in their arguments

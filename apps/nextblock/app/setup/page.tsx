@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { redirect } from 'next/navigation';
 import { readCortexAiMcpEnvToken } from '@nextblock-cms/cortex';
 import { createClient } from '@nextblock-cms/db/server';

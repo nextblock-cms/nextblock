@@ -2,13 +2,41 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { getCortexMcpToolAnnotations } from './mcp-tool-registry';
 
-// fetch_url_content now resolves the target host and rejects private/loopback addresses
-// (DNS-rebinding guard, fetch-host-guard.ts). Resolve every test hostname to a fixed PUBLIC IP so
-// the content tests proceed to the stubbed fetch; the SSRF-block tests use localhost / IP literals
-// which the synchronous host check still rejects before any DNS lookup.
+// Any code that still resolves a hostname through node:dns gets a fixed PUBLIC IP, so no test
+// depends on real DNS.
 vi.mock('node:dns', () => {
   const lookup = async () => [{ address: '93.184.216.34', family: 4 }];
   return { promises: { lookup }, default: { promises: { lookup } } };
+});
+
+// fetch_url_content's extraction tests serve their page through this stub. With no page set
+// the real guardedFetch runs, which refuses local and private hosts before connecting; the guard
+// itself (pinned DNS, redirect hops, byte cap) is tested against a real server in
+// ai-global-agent-ssrf.test.ts.
+const pageFetch = vi.hoisted(() => ({ html: null as string | null }));
+
+vi.mock('./fetch-host-guard', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./fetch-host-guard')>();
+
+  return {
+    ...actual,
+    guardedFetch: async (url: URL | string, options: Parameters<typeof actual.guardedFetch>[1]) => {
+      if (pageFetch.html === null) {
+        return actual.guardedFetch(url, options);
+      }
+
+      const body = new TextEncoder().encode(pageFetch.html);
+
+      return {
+        discard: () => undefined,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+        mediaType: 'text/html',
+        readBody: async () => body,
+        status: 200,
+        url: new URL(String(url)),
+      };
+    },
+  };
 });
 
 vi.mock('@nextblock-cms/utils', async () => {
@@ -1387,11 +1415,7 @@ describe('Cortex AI global agent tool executors', () => {
     const html =
       '<html><head><title>Acme Co</title><meta name="description" content="We craft fine widgets"></head><body><h1>Welcome to Acme</h1><p>We build the best widgets in town.</p><script>trackingCall()</script></body></html>';
 
-    vi.stubGlobal(
-      'fetch',
-      async () =>
-        new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' }, status: 200 })
-    );
+    pageFetch.html = html;
 
     try {
       const result = (await executeFetchUrlContent({ url: 'https://acme.example.com' })) as {
@@ -1409,7 +1433,7 @@ describe('Cortex AI global agent tool executors', () => {
       expect(result.text).toContain('best widgets');
       expect(result.text).not.toContain('trackingCall');
     } finally {
-      vi.unstubAllGlobals();
+      pageFetch.html = null;
     }
   });
 
@@ -1430,11 +1454,7 @@ describe('Cortex AI global agent tool executors', () => {
       '</body></html>',
     ].join('');
 
-    vi.stubGlobal(
-      'fetch',
-      async () =>
-        new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' }, status: 200 })
-    );
+    pageFetch.html = html;
 
     try {
       const result = (await executeFetchUrlContent({
@@ -1450,7 +1470,7 @@ describe('Cortex AI global agent tool executors', () => {
       // Site chrome is filtered out.
       expect(result.images.some((url) => url.includes('logo.png'))).toBe(false);
     } finally {
-      vi.unstubAllGlobals();
+      pageFetch.html = null;
     }
   });
 
@@ -1464,11 +1484,7 @@ describe('Cortex AI global agent tool executors', () => {
       '</body></html>',
     ].join('');
 
-    vi.stubGlobal(
-      'fetch',
-      async () =>
-        new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' }, status: 200 })
-    );
+    pageFetch.html = html;
 
     try {
       const result = (await executeFetchUrlContent({ url: 'https://acme.example.com/p' })) as {
@@ -1485,7 +1501,7 @@ describe('Cortex AI global agent tool executors', () => {
       expect(result.images.some((url) => url.includes('favicon'))).toBe(false);
       expect(result.images.some((url) => url.includes('tiny.jpg'))).toBe(false);
     } finally {
-      vi.unstubAllGlobals();
+      pageFetch.html = null;
     }
   });
 
@@ -1501,11 +1517,7 @@ describe('Cortex AI global agent tool executors', () => {
       '</body></html>',
     ].join('');
 
-    vi.stubGlobal(
-      'fetch',
-      async () =>
-        new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' }, status: 200 })
-    );
+    pageFetch.html = html;
 
     try {
       const result = (await executeFetchUrlContent({
@@ -1518,18 +1530,14 @@ describe('Cortex AI global agent tool executors', () => {
       // The thumbnail is not offered separately once it has been upgraded.
       expect(result.images.some((url) => url.includes('/thumbnails/'))).toBe(false);
     } finally {
-      vi.unstubAllGlobals();
+      pageFetch.html = null;
     }
   });
 
   it('fetch_url_content reports no mainImage rather than inventing one', async () => {
     const html = '<html><head><title>Text only</title></head><body><p>Just words here.</p></body></html>';
 
-    vi.stubGlobal(
-      'fetch',
-      async () =>
-        new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' }, status: 200 })
-    );
+    pageFetch.html = html;
 
     try {
       const result = (await executeFetchUrlContent({ url: 'https://acme.example.com' })) as {
@@ -1540,7 +1548,7 @@ describe('Cortex AI global agent tool executors', () => {
       expect(result.mainImage).toBeNull();
       expect(result.images).toEqual([]);
     } finally {
-      vi.unstubAllGlobals();
+      pageFetch.html = null;
     }
   });
 

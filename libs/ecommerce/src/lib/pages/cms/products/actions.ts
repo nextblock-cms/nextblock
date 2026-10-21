@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { requireEcomAdmin } from '../../../server-actions/require-ecom-role';
 import {
@@ -142,26 +144,68 @@ export async function getFreemiusPricingByProductId(productId: string) {
   return data;
 }
 
-export async function updateFreemiusOverride(pricingId: string, overrides: { 
-  override_monthly_price?: number | null; 
-  override_annual_price?: number | null; 
-  override_lifetime_price?: number | null; 
-}) {
-  // NOTE: freemius_pricing table exists in migration but may not yet be in
-  // the auto-generated Database types. Using `as any` until DB is reset.
-  const supabase = createClient() as any;
-  const { error } = await supabase
+const FREEMIUS_OVERRIDE_FIELDS = [
+  'override_monthly_price',
+  'override_annual_price',
+  'override_lifetime_price',
+] as const;
+
+type FreemiusOverrides = Partial<Record<(typeof FREEMIUS_OVERRIDE_FIELDS)[number], number | null>>;
+
+/**
+ * Save the per-plan price overrides from the CMS Freemius pricing dashboard. ADMIN-only, and the
+ * write goes through the service role: no RLS policy lets `authenticated` UPDATE
+ * `freemius_pricing` (only the Freemius sync writes it, with the service role), so the old
+ * cookie-client update matched zero rows while reporting success, and since 02026 revoked the
+ * grant it fails with "permission denied". Only the three override columns are writable here.
+ */
+export async function updateFreemiusOverride(pricingId: string, overrides: FreemiusOverrides) {
+  let supabase: Awaited<ReturnType<typeof requireEcomAdmin>>;
+  try {
+    supabase = await requireEcomAdmin();
+  } catch (error: any) {
+    const message =
+      error?.message === 'Unauthorized'
+        ? 'Sign in as an administrator to change Freemius price overrides.'
+        : error?.message === 'Forbidden'
+          ? 'Only administrators can change Freemius price overrides.'
+          : error?.message || 'Failed to update pricing';
+    return { success: false, error: message };
+  }
+
+  const input: Record<string, unknown> = overrides && typeof overrides === 'object' ? overrides : {};
+  const update: FreemiusOverrides = {};
+  for (const field of FREEMIUS_OVERRIDE_FIELDS) {
+    const value = input[field];
+    if (value === undefined) continue;
+    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) {
+      return { success: false, error: 'A price override must be empty or a number of 0 or more.' };
+    }
+    update[field] = value;
+  }
+  if (Object.keys(update).length === 0) {
+    return { success: false, error: 'No price override to save.' };
+  }
+
+  const { data, error } = await supabase
     .from('freemius_pricing')
     .update({
-      ...overrides,
+      ...update,
       updated_at: new Date().toISOString()
     })
-    .eq('id', pricingId);
-    
+    .eq('id', pricingId)
+    .select('id');
+
   if (error) {
     return { success: false, error: error.message };
   }
+  // Zero rows means nothing was saved (the row was removed, e.g. by a re-sync that dropped the
+  // plan): say so instead of reporting a save that did not happen.
+  if (!data || data.length === 0) {
+    return { success: false, error: 'This pricing row no longer exists. Reload the page and try again.' };
+  }
   revalidatePath('/cms/products');
+  revalidatePath('/cms/products/[id]/edit', 'page');
   return { success: true };
 }
 

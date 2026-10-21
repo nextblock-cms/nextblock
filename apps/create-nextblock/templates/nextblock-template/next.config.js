@@ -136,6 +136,11 @@ const nextConfig = {
     removeConsole: process.env.NODE_ENV === 'production' ? { exclude: ['error', 'warn'] } : false,
   },
   turbopack: {
+    // TypeScript before JavaScript, Turbopack's own default order pinned: libs/db and libs/utils
+    // keep stale compiled .js twins beside their .ts sources, and those twins read the service
+    // key without 'server-only'. `.node` keeps native server modules resolvable (the default
+    // adds it on the server). tools/scripts/service-role-boundary.test.ts asserts this order.
+    resolveExtensions: ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.json', '.node'],
     // Work around Turbopack subpath resolution for the latest y-protocols package.
     resolveAlias: {
       'y-protocols/awareness': 'y-protocols/awareness.js',

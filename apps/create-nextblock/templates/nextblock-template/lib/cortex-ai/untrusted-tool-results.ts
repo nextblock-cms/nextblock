@@ -39,16 +39,23 @@ export const UNTRUSTED_DATA_MARKER = 'UNTRUSTED_DATA';
 
 /**
  * Read tools whose output is third-party or content-author text. Running one of these in
- * a turn taints every later write in that turn. Deliberately NOT every read tool:
- * `get_site_overview` (titles and slugs) and `search_stock_photos` (a provider API) are
- * part of the normal unattended build and their output is still wrapped as data; what they
- * return is not a body of prose that can carry an instruction worth a forced confirmation.
+ * a turn taints every later write in that turn.
+ *
+ * `search_stock_photos`, `get_site_overview` and `list_media` were left out until
+ * 2026-10-21 as "titles and slugs" and "a provider API", but each returns free text that
+ * someone other than the operator wrote: photographer names and alt descriptions from
+ * Unsplash/Pexels users, page and post titles any WRITER can set, media file names and
+ * descriptions any uploader can set. Any of them can carry an instruction, so a write that
+ * follows one in a build session confirms again, like a write after a fetched page.
  */
 export const CORTEX_UNTRUSTED_CONTENT_READ_TOOL_NAMES: ReadonlySet<string> = new Set([
   'fetch_url_content',
+  'get_site_overview',
+  'list_media',
   'read_current_cms_item',
   'read_database_records',
   'search_documentation',
+  'search_stock_photos',
 ]);
 
 /** A per-request boundary the wrapped data cannot predict. */

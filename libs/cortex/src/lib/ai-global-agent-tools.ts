@@ -4,15 +4,18 @@
 // Importing next/cache is safe outside a request scope; only calling it needs one. Every
 // caller runs inside a route handler, and tests inject their own revalidatePath.
 import { revalidatePath as nextRevalidatePath } from 'next/cache';
-import { isBlockedFetchHost, resolvedHostIsBlocked } from './fetch-host-guard';
+import type { LookupFunction } from 'node:net';
+
+import { GuardedFetchError, guardedFetch, isBlockedFetchHost } from './fetch-host-guard';
 
 export { isBlockedFetchHost };
 import { tool, type ToolSet } from 'ai';
 import { createCortexDatabaseAgentTools } from './ai-global-agent-db-tools';
 import { createCortexCustomBlockTools } from './ai-global-agent-custom-block-tools';
 import { createCortexContentOpsTools } from './ai-global-agent-content-ops-tools';
-import { createCortexThemingTools } from './ai-global-agent-theming-tools';
+import { createCortexThemingTools, requireActorRole } from './ai-global-agent-theming-tools';
 import { createCortexSiteTools } from './ai-global-agent-site-tools';
+import { CORTEX_MCP_TOOL_KINDS } from './mcp-tool-kinds';
 import { editorDocumentFromHtml } from './editor-document-from-html';
 import { z } from './zod-config';
 
@@ -6224,7 +6227,16 @@ function extractReadableTextFromHtml(html: string, maxChars: number, baseUrl: st
   };
 }
 
-export async function executeFetchUrlContent(input: FetchUrlContentInput) {
+/**
+ * Fetch through `guardedFetch` (fetch-host-guard.ts): every redirect hop is host-checked
+ * against a pinned DNS answer before it is requested, and the body streams under a byte cap.
+ * A refused fetch reports neither a status nor a body, so the tool cannot be used to probe
+ * what an internal address answers. `lookup` is a test override.
+ */
+export async function executeFetchUrlContent(
+  input: FetchUrlContentInput,
+  options: { lookup?: LookupFunction } = {}
+) {
   const parsed = fetchUrlContentInputSchema.parse(input);
 
   let target: URL;
@@ -6239,28 +6251,19 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
     return { message: 'Only http and https URLs can be fetched.', success: false, url: parsed.url };
   }
 
-  if (isBlockedFetchHost(target.hostname) || (await resolvedHostIsBlocked(target.hostname))) {
-    return {
-      message: 'Refusing to fetch a local, private, or internal address.',
-      success: false,
-      url: parsed.url,
-    };
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_URL_CONTENT_TIMEOUT_MS);
-
   try {
-    const response = await fetch(target.toString(), {
+    const response = await guardedFetch(target, {
       headers: {
         accept: 'text/html,application/xhtml+xml,text/plain',
         'user-agent': 'NextBlockCortexAI/1.0 (+https://nextblock.dev)',
       },
-      redirect: 'follow',
-      signal: controller.signal,
+      lookup: options.lookup,
+      maxBytes: FETCH_URL_CONTENT_MAX_BYTES,
+      timeoutMs: FETCH_URL_CONTENT_TIMEOUT_MS,
     });
 
-    if (!response.ok) {
+    if (response.status < 200 || response.status >= 300) {
+      response.discard();
       return {
         message: `The URL responded with HTTP ${response.status}.`,
         status: response.status,
@@ -6269,24 +6272,11 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
       };
     }
 
-    const finalUrl = response.url || target.toString();
-
-    try {
-      const finalHost = new URL(finalUrl).hostname;
-      if (isBlockedFetchHost(finalHost) || (await resolvedHostIsBlocked(finalHost))) {
-        return {
-          message: 'The URL redirected to a blocked internal address.',
-          success: false,
-          url: parsed.url,
-        };
-      }
-    } catch {
-      // Keep the original URL if the resolved URL cannot be parsed.
-    }
-
-    const contentType = response.headers.get('content-type') || '';
+    const finalUrl = response.url.toString();
+    const contentType = String(response.headers['content-type'] ?? '');
 
     if (!/text\/html|text\/plain|application\/xhtml/i.test(contentType)) {
+      response.discard();
       return {
         contentType,
         message: `The URL is not an HTML or text page (content-type: ${contentType || 'unknown'}).`,
@@ -6295,10 +6285,9 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
       };
     }
 
-    const raw = await response.text();
-    const boundedRaw =
-      raw.length > FETCH_URL_CONTENT_MAX_BYTES ? raw.slice(0, FETCH_URL_CONTENT_MAX_BYTES) : raw;
-    const extracted = extractReadableTextFromHtml(boundedRaw, parsed.maxChars, finalUrl);
+    // A page larger than the cap is read up to it: the readable text is near the top.
+    const raw = new TextDecoder('utf-8').decode(await response.readBody({ truncate: true }));
+    const extracted = extractReadableTextFromHtml(raw, parsed.maxChars, finalUrl);
 
     if (!extracted.text && !extracted.title) {
       return { message: 'The URL returned no readable text content.', success: false, url: parsed.url };
@@ -6321,18 +6310,28 @@ export async function executeFetchUrlContent(input: FetchUrlContentInput) {
       url: parsed.url,
     };
   } catch (error) {
+    if (error instanceof GuardedFetchError) {
+      return {
+        message:
+          error.reason === 'blocked'
+            ? error.redirects > 0
+              ? 'The URL redirected to a blocked internal address.'
+              : 'Refusing to fetch a local, private, or internal address.'
+            : error.message,
+        success: false,
+        url: parsed.url,
+      };
+    }
+
     const aborted =
-      error instanceof Error && (error.name === 'AbortError' || /abort/i.test(error.message));
+      error instanceof Error &&
+      (error.name === 'AbortError' || error.name === 'TimeoutError' || /abort/i.test(error.message));
 
     return {
-      message: aborted
-        ? 'Fetching the URL timed out.'
-        : `Failed to fetch the URL: ${serializeError(error)}`,
+      message: aborted ? 'Fetching the URL timed out.' : `Failed to fetch the URL: ${serializeError(error)}`,
       success: false,
       url: parsed.url,
     };
-  } finally {
-    clearTimeout(timeoutId);
   }
 }
 
@@ -7976,7 +7975,7 @@ export async function executeSetContentImages(
 // TypeScript will serialize (TS7056), so no `ai-global-agent-tools.d.ts` was emitted and
 // tools/scripts/verify-lib-dist.js refused to publish the package.
 export function createCortexGlobalAgentTools(context?: ToolExecutionContext): ToolSet {
-  return {
+  return requireAdminForWriteTools(context, {
     ...createCortexDatabaseAgentTools(context),
     ...createCortexCustomBlockTools(context),
     ...createCortexContentOpsTools(context),
@@ -8150,5 +8149,37 @@ export function createCortexGlobalAgentTools(context?: ToolExecutionContext): To
       inputSchema: executeCmsActionPlanInputSchema,
       strict: true,
     }),
-  };
+  });
+}
+
+/**
+ * Re-check the actor's role on every mutating tool, whichever module defines it.
+ *
+ * The executors run with the service-role client, so RLS never stops them; the role is
+ * the authorization. The dashboard route only lets an ADMIN in, but an MCP token acts as
+ * the account that minted it, so without this a token kept full write access after that
+ * account was demoted (2026-10-21). Fails closed: any tool not classified `read` in
+ * `CORTEX_MCP_TOOL_KINDS` is treated as a write. Executors that allow fewer roles still
+ * check their own, after this.
+ */
+function requireAdminForWriteTools(context: ToolExecutionContext | undefined, tools: ToolSet): ToolSet {
+  const kinds: Record<string, string> = CORTEX_MCP_TOOL_KINDS;
+
+  for (const [name, definition] of Object.entries(tools)) {
+    const execute = definition.execute;
+
+    if (kinds[name] === 'read' || typeof execute !== 'function') {
+      continue;
+    }
+
+    tools[name] = {
+      ...definition,
+      execute: async (input: unknown, options: Parameters<typeof execute>[1]) => {
+        await requireActorRole(context, ['ADMIN'], `The ${name} tool`);
+        return execute(input, options);
+      },
+    } as ToolSet[string];
+  }
+
+  return tools;
 }

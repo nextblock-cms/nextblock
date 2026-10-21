@@ -1,3 +1,5 @@
+import 'server-only';
+
 import Stripe from 'stripe';
 import { getStripeClient } from '../stripe/client';
 import { createClient } from '@supabase/supabase-js';
@@ -12,7 +14,7 @@ import {
   getQuoteLineDiscountMap,
   recordCouponRedemption,
 } from '../coupon-server';
-import { type CouponQuote, getCartLineCouponKey } from '../coupons';
+import { type CouponQuote, getCartLineCouponKey, reconcileCouponContextItems } from '../coupons';
 import {
   fillMissingUserProfileCheckoutDetails,
   upsertDefaultUserAddresses,
@@ -242,7 +244,8 @@ export class StripeProvider implements PaymentProvider {
         return { url: null, ...normalizedContextItems.error };
       }
 
-      couponContextItems = normalizedContextItems.items;
+      // The cart's own lines keep the cart's quantities; the context may only add lines.
+      couponContextItems = reconcileCouponContextItems(cartItems, normalizedContextItems.items);
     }
 
     const hasPhysicalProducts = cartItems.some((item) => !isDigitalItem(item));

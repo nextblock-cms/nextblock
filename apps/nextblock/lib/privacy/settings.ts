@@ -1,3 +1,5 @@
+import 'server-only';
+
 // Server-only read/write for the `privacy_settings` and `security_settings`
 // rows in the site_settings key-value table. Reads use the cookie client (both keys are
 // readable by every staff role, privacy_settings by everyone). Writes verify ADMIN and use

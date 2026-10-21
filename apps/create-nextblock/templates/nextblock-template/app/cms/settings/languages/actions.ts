@@ -1,6 +1,8 @@
 // app/cms/settings/languages/actions.ts
 "use server";
 
+import "server-only";
+
 import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { revalidatePath, updateTag } from "next/cache";
 import { redirect } from "next/navigation";

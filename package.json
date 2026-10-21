@@ -1,6 +1,6 @@
 {
   "name": "nextblock",
-  "version": "0.22.2",
+  "version": "0.22.3",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -52,6 +52,8 @@
     "nx:lint:db": "npx nx lint db --skip-nx-cache",
     "nx:lint:sdk": "npx nx lint sdk --skip-nx-cache",
     "lint": "npx nx run-many --target=lint --all --exclude nextblock-template --skip-nx-cache",
+    "security:check": "npx vitest run tools/scripts/service-role-boundary.test.ts tools/scripts/server-action-actors.test.ts tools/scripts/migration-grants.test.ts tools/scripts/run-security-verify.test.ts apps/nextblock/tools/lib/migrate-core.test.mjs",
+    "security:db-posture": "node tools/scripts/run-security-verify.mjs",
     "update": "node apps/nextblock/tools/update.mjs",
     "update:check": "node apps/nextblock/tools/update.mjs --check",
     "db:backup": "node apps/nextblock/scripts/backup.js",

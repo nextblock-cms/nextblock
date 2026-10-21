@@ -1,14 +1,18 @@
 // app/cms/users/actions.ts
 "use server";
 
+import "server-only";
+
 import { createClient } from "@nextblock-cms/db/server";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import type { Database } from "@nextblock-cms/db";
 import { normalizeCustomerAddress } from "@nextblock-cms/ecommerce";
 import { upsertDefaultUserAddresses } from "@nextblock-cms/ecommerce/server";
+import { revokeCortexAiMcpTokensForUser } from "@nextblock-cms/cortex";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import { resolveSupabaseServiceKey, resolveSupabaseUrl } from '../../../lib/setup/env-status';
+import { resolveSupabaseUrl } from '../../../lib/setup/env-status';
+import { resolveSupabaseServiceKey } from '../../../lib/setup/service-key';
 
 type UserRole = Database['public']['Enums']['user_role'];
 
@@ -201,6 +205,26 @@ export async function updateUserProfile(userIdToUpdate: string, formData: FormDa
 
   const adminSupabase = createServiceRoleClient();
 
+  // An MCP token acts as the admin who minted it. /api/mcp re-checks that role on every
+  // request; revoking on any role change as well shows the tokens as revoked and keeps
+  // them dead if the account is promoted again. Revoke first, so a failure changes nothing.
+  const { data: currentProfile, error: currentProfileError } = await adminSupabase
+    .from("profiles")
+    .select("role")
+    .eq("id", userIdToUpdate)
+    .maybeSingle();
+
+  if (currentProfileError) {
+    return { error: `Failed to read the current role: ${currentProfileError.message}` };
+  }
+
+  if (currentProfile && currentProfile.role !== profileData.role) {
+    const revoked = await revokeCortexAiMcpTokensForUser(adminSupabase, userIdToUpdate);
+    if (revoked.error) {
+      return { error: `Role not changed: the user's MCP tokens could not be revoked (${revoked.error}).` };
+    }
+  }
+
   const { error } = await adminSupabase
     .from("profiles")
     .update(profileData)
@@ -276,6 +300,12 @@ export async function deleteUserAndProfile(userIdToDelete: string) {
 
   const serviceSupabase = createServiceRoleClient(supabaseUrl, serviceRoleKey);
 
+  // Revoke before deleting: `mcp_access_tokens.created_by` is ON DELETE SET NULL, so once
+  // the account is gone its tokens can no longer be found by owner.
+  const revoked = await revokeCortexAiMcpTokensForUser(serviceSupabase, userIdToDelete);
+  if (revoked.error) {
+    return { error: `User not deleted: their MCP tokens could not be revoked (${revoked.error}).` };
+  }
 
   const { error: deletionError } = await serviceSupabase.auth.admin.deleteUser(userIdToDelete);
 

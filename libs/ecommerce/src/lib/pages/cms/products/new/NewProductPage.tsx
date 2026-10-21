@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { ProductForm } from '../components/ProductForm';
 import { getGlobalProductAttributes } from '../actions';
 import { mapRawVariantRelations } from '../../../../variation-utils';

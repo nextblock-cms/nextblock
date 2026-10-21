@@ -173,6 +173,48 @@ export type FreemiusLicenseClaimResult =
       status: number;
     };
 
+export type FreemiusLicenseRecords =
+  | { license: FreemiusLicenseRecordLike | null; ok: true; user: FreemiusUserRecordLike | null }
+  | { ok: false; reason: 'not_configured' | 'upstream_error' };
+
+/**
+ * The license and its owner as Freemius reports them, read with the vendor credentials for
+ * `productId`. Credentials come from the CMS settings (hydrated here) or the environment.
+ */
+export async function retrieveFreemiusLicenseRecords(
+  productId: string,
+  licenseId: string
+): Promise<FreemiusLicenseRecords> {
+  await hydrateFreemiusEnvFromDb();
+
+  const credentials = resolveFreemiusCheckoutCredentials(productId);
+
+  if (!credentials.apiKey || !credentials.secretKey || !credentials.publicKey) {
+    return { ok: false, reason: 'not_configured' };
+  }
+
+  const freemius = new Freemius({
+    apiKey: credentials.apiKey,
+    productId: Number(productId),
+    publicKey: credentials.publicKey,
+    secretKey: credentials.secretKey,
+  });
+
+  try {
+    const license = (await freemius.api.license.retrieve(licenseId)) as FreemiusLicenseRecordLike | null;
+    let user: FreemiusUserRecordLike | null = null;
+
+    if (license?.user_id !== null && license?.user_id !== undefined) {
+      user = (await freemius.api.user.retrieve(String(license.user_id))) as FreemiusUserRecordLike | null;
+    }
+
+    return { license, ok: true, user };
+  } catch (error) {
+    console.error('[Freemius License] Freemius lookup failed:', error);
+    return { ok: false, reason: 'upstream_error' };
+  }
+}
+
 /**
  * Look the license up with the vendor credentials for `productId` and return its key
  * when `evaluateFreemiusLicenseClaim` accepts the claim.
@@ -181,45 +223,25 @@ export async function claimFreemiusLicenseKey(
   request: FreemiusLicenseClaimRequest,
   options?: { maxAgeMinutes?: number; now?: Date }
 ): Promise<FreemiusLicenseClaimResult> {
-  await hydrateFreemiusEnvFromDb();
+  const records = await retrieveFreemiusLicenseRecords(request.productId, request.licenseId);
 
-  const credentials = resolveFreemiusCheckoutCredentials(request.productId);
-
-  if (!credentials.apiKey || !credentials.secretKey || !credentials.publicKey) {
-    return {
-      error: 'The license service is not configured for this product.',
-      ok: false,
-      reason: 'not_configured',
-      status: 503,
-    };
+  if (!records.ok) {
+    return records.reason === 'not_configured'
+      ? {
+          error: 'The license service is not configured for this product.',
+          ok: false,
+          reason: 'not_configured',
+          status: 503,
+        }
+      : {
+          error: 'Freemius could not be reached to verify the license.',
+          ok: false,
+          reason: 'upstream_error',
+          status: 502,
+        };
   }
 
-  const freemius = new Freemius({
-    apiKey: credentials.apiKey,
-    productId: Number(request.productId),
-    publicKey: credentials.publicKey,
-    secretKey: credentials.secretKey,
-  });
-
-  let license: FreemiusLicenseRecordLike | null = null;
-  let user: FreemiusUserRecordLike | null = null;
-
-  try {
-    license = (await freemius.api.license.retrieve(request.licenseId)) as FreemiusLicenseRecordLike | null;
-
-    if (license?.user_id !== null && license?.user_id !== undefined) {
-      user = (await freemius.api.user.retrieve(String(license.user_id))) as FreemiusUserRecordLike | null;
-    }
-  } catch (error) {
-    console.error('[Freemius License Claim] Freemius lookup failed:', error);
-
-    return {
-      error: 'Freemius could not be reached to verify the license.',
-      ok: false,
-      reason: 'upstream_error',
-      status: 502,
-    };
-  }
+  const { license, user } = records;
 
   const decision = evaluateFreemiusLicenseClaim({
     license,

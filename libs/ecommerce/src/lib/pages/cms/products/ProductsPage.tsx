@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { Button } from '@nextblock-cms/ui';
 import Link from 'next/link';
 import { getProducts } from './actions';

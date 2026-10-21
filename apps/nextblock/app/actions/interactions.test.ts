@@ -27,11 +27,18 @@ const emailMocks = vi.hoisted(() => ({
   sendEmail: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The notification-address actions authorize with requireCmsAdmin() and write with the
+// service-role client it returns (migration 02028: the key is in the second-factor tier).
+const cmsActorMocks = vi.hoisted(() => ({
+  requireCmsAdmin: vi.fn(),
+}));
+
 vi.mock("next/cache", () => cacheMocks);
 vi.mock("next/headers", () => headersMocks);
 vi.mock("@nextblock-cms/db/server", () => dbServerMocks);
 vi.mock("server-only", () => ({}));
 vi.mock("./email", () => emailMocks);
+vi.mock("../../lib/auth/cms-actor", () => cmsActorMocks);
 
 import {
   submitInteraction,
@@ -433,10 +440,7 @@ describe("Interactions Server Actions", () => {
 
   describe("Notification Emails Settings Actions", () => {
     it("returns error if non-admin attempts to get or save configuration", async () => {
-      dbServerMocks.createClient.mockReturnValue(authedClient("user-1"));
-      dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
-        role: "WRITER",
-      } as any);
+      cmsActorMocks.requireCmsAdmin.mockRejectedValue(new Error("Forbidden"));
 
       const getRes = await getNotificationEmails();
       expect(getRes.error).toContain("Unauthorized");
@@ -445,11 +449,14 @@ describe("Interactions Server Actions", () => {
       expect(saveRes.error).toContain("Unauthorized");
     });
 
-    it("allows admins to get configuration", async () => {
-      dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
-        role: "ADMIN",
-      } as any);
+    it("refuses a caller without a session (or with a pending second factor)", async () => {
+      cmsActorMocks.requireCmsAdmin.mockRejectedValue(new Error("Unauthorized"));
 
+      expect((await getNotificationEmails()).error).toBe("Not authenticated");
+      expect((await saveNotificationEmails("test@example.com")).error).toBe("Not authenticated");
+    });
+
+    it("allows admins to get configuration through the service-role client", async () => {
       const maybeSingleMock = vi.fn().mockResolvedValue({
         data: { value: { emails: "a@b.com, c@d.com" } },
         error: null,
@@ -457,23 +464,19 @@ describe("Interactions Server Actions", () => {
       const eqMock = vi.fn().mockReturnValue({ maybeSingle: maybeSingleMock });
       const selectMock = vi.fn().mockReturnValue({ eq: eqMock });
       const fromMock = vi.fn().mockReturnValue({ select: selectMock });
-
-      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1", { from: fromMock }));
+      cmsActorMocks.requireCmsAdmin.mockResolvedValue({ supabase: { from: fromMock }, userId: "admin-1" });
 
       const res = await getNotificationEmails();
       expect(res.success).toBe(true);
       expect(res.emails).toBe("a@b.com, c@d.com");
+      expect(fromMock).toHaveBeenCalledWith("site_settings");
+      expect(dbServerMocks.createClient).not.toHaveBeenCalled();
     });
 
-    it("allows admins to save configuration", async () => {
-      dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
-        role: "ADMIN",
-      } as any);
-
+    it("allows admins to save configuration through the service-role client", async () => {
       const upsertMock = vi.fn().mockResolvedValue({ error: null });
       const fromMock = vi.fn().mockReturnValue({ upsert: upsertMock });
-
-      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1", { from: fromMock }));
+      cmsActorMocks.requireCmsAdmin.mockResolvedValue({ supabase: { from: fromMock }, userId: "admin-1" });
 
       const res = await saveNotificationEmails(" a@b.com , c@d.com ");
       expect(res.success).toBe(true);
@@ -482,6 +485,7 @@ describe("Interactions Server Actions", () => {
         key: "interactions_notification_emails",
         value: { emails: "a@b.com, c@d.com" },
       });
+      expect(dbServerMocks.createClient).not.toHaveBeenCalled();
     });
   });
 });

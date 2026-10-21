@@ -8,7 +8,8 @@
 //
 // "Configured" here means the Supabase connection vars exist — there is no
 // `DATABASE_URL` in NextBlock; the database is reached through
-// `NEXT_PUBLIC_SUPABASE_URL` + the anon / service-role keys.
+// `NEXT_PUBLIC_SUPABASE_URL` + the anon / service-role keys. Only the public names
+// are resolved here; the secret key is resolved by the server-only ./service-key.ts.
 
 export type DeployChannel = 'docker' | 'vercel' | 'local';
 
@@ -44,14 +45,10 @@ export function resolveSupabaseAnonKey(): string | undefined {
   );
 }
 
-/** The service-role / secret key — the RLS-bypassing admin key, under either alias. */
-export function resolveSupabaseServiceKey(): string | undefined {
-  return (
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.SUPABASE_SECRET_KEY ||
-    undefined
-  );
-}
+// The service-role / secret key resolver (`resolveSupabaseServiceKey`) and
+// `isFullyConfigured` live in ./service-key.ts, which is server-only: client modules import
+// this file, and the RLS-bypassing key must never be named in a module a browser bundle can
+// reach. Service-role boundary: docs/04.
 
 /**
  * True when the public Supabase connection vars are present — enough to create an
@@ -60,14 +57,6 @@ export function resolveSupabaseServiceKey(): string | undefined {
  */
 export function isSupabaseConfigured(): boolean {
   return Boolean(resolveSupabaseUrl() && resolveSupabaseAnonKey());
-}
-
-/**
- * True when service-role work is also possible (creating the first admin, applying
- * schema). The wizard's first-admin step and schema-apply step require this.
- */
-export function isFullyConfigured(): boolean {
-  return isSupabaseConfigured() && Boolean(resolveSupabaseServiceKey());
 }
 
 /**

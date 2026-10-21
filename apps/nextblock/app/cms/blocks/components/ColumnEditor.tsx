@@ -15,6 +15,7 @@ import { ConfirmationDialog } from '@nextblock-cms/ui';
 import BlockTypeSelector from './BlockTypeSelector';
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
 import { CustomBlockEditorPreview } from './CustomBlockEditorPreview';
+import { sanitizeAuthoredBlockHtml } from '../../../../lib/blocks/inlineScriptNonce';
 
 type ColumnBlock = SectionBlockContent['column_blocks'][0][0];
 
@@ -120,7 +121,7 @@ function SortableColumnBlock({ block, index, columnIndex, onEdit, onDelete, bloc
                 <div className={cn("text-xs w-full", alignmentClass)}>
                     {block.content.html_content ? (
                          <div 
-                           dangerouslySetInnerHTML={{ __html: block.content.html_content }} 
+                           dangerouslySetInnerHTML={{ __html: sanitizeAuthoredBlockHtml(block.content.html_content) }} 
                            className={cn(
                              "prose prose-xs max-w-none [&>p]:my-0 [&>h1]:my-0 [&>h2]:my-0 [&>h3]:my-0",
                              isDarkBackground ? "prose-invert text-white/90 drop-shadow-sm" : "dark:prose-invert",

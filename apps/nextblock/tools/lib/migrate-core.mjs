@@ -293,9 +293,203 @@ end $nb_trg$;`;
 // only), anon's EXECUTE on upsert_product_with_variants, and the two service-role-only
 // wrappers of 02022 (bump_email_2fa_attempts, redeem_coupon_atomically). Guarded by catalog
 // lookups: a database that stopped before those migrations simply has nothing to revoke.
+// Migration 02025 added the grant-level hardening this pass must not undo: anon holds no
+// write privilege on any table or sequence (no RLS policy lets anon write, so RLS was the only
+// barrier), cortex_request_log stays service-role only as 02022 designed it (this pass had been
+// re-granting it on every deploy), and authenticated may write every profiles column except
+// `role` (and `id` on UPDATE), so the role pin no longer rests on the policy and trigger alone.
+// The profiles column list is read from the catalog, so a new profiles column is writable by
+// its owner the way it was before; add it to the exclusions if it is sensitive.
+// Migration 02026 did the same for authenticated on the tables where no RLS policy lets it
+// write: the commands listed per table below (each written only by the service role), plus
+// REFERENCES and TRIGGER everywhere. The list is static on purpose: computing it from
+// pg_policies here would hand a table back on the deploy after a policy was added by mistake.
+// Migration 02027 did the same for SELECT: anon keeps it only on the tables a policy lets anon
+// read (the 29 `revoke select` blocks below are every other table), authenticated loses it on
+// email_2fa_challenges and ucp_cart_sessions (service role only), and profile_cards stays a
+// read card (no anon SELECT, no authenticated writes). A table created later is granted SELECT
+// by the blanket grant above: if its migration grants less, add its revoke here too
+// (migration-grants.test.ts fails until you do).
+// Migration 02028 keeps package_activations.license_key and .meta (the Freemius activation
+// response) unreadable by authenticated: table SELECT goes and comes back per column, the
+// column list read from the catalog like profiles. It also keeps media_storage_keys_in_use
+// service-role only (the media delete/move actions call it after their own role check).
+// To open one of these commands to a role, add the policy and the GRANT in a migration and
+// remove the table here and in schema-apply.ts.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
+declare
+  v_insert_cols text;
+  v_update_cols text;
+  v_select_cols text;
 begin
   revoke truncate on all tables in schema public from anon, authenticated;
+  revoke insert, update, delete, references, trigger on all tables in schema public from anon;
+  revoke usage, update on all sequences in schema public from anon;
+  revoke references, trigger on all tables in schema public from authenticated;
+  if to_regclass('public.cortex_request_log') is not null then
+    revoke all on table public.cortex_request_log from public, anon, authenticated;
+  end if;
+  if to_regclass('public.profiles') is not null then
+    select string_agg(quote_ident(a.attname), ', ' order by a.attnum) filter (where a.attname <> 'role'),
+           string_agg(quote_ident(a.attname), ', ' order by a.attnum) filter (where a.attname not in ('id', 'role'))
+      into v_insert_cols, v_update_cols
+      from pg_attribute a
+     where a.attrelid = 'public.profiles'::regclass and a.attnum > 0 and not a.attisdropped;
+    revoke insert, update, delete, references, trigger on table public.profiles from public, anon, authenticated;
+    if v_insert_cols is not null then
+      execute format('grant insert (%s) on table public.profiles to authenticated', v_insert_cols);
+    end if;
+    if v_update_cols is not null then
+      execute format('grant update (%s) on table public.profiles to authenticated', v_update_cols);
+    end if;
+  end if;
+  if to_regclass('public.cortex_ai_db_mutation_audit') is not null then
+    revoke insert, update, delete on table public.cortex_ai_db_mutation_audit from authenticated;
+  end if;
+  if to_regclass('public.coupon_redemptions') is not null then
+    revoke insert, update, delete on table public.coupon_redemptions from authenticated;
+  end if;
+  if to_regclass('public.email_2fa_challenges') is not null then
+    revoke insert, update, delete on table public.email_2fa_challenges from authenticated;
+  end if;
+  if to_regclass('public.freemius_plans') is not null then
+    revoke insert, update, delete on table public.freemius_plans from authenticated;
+  end if;
+  if to_regclass('public.freemius_pricing') is not null then
+    revoke insert, update, delete on table public.freemius_pricing from authenticated;
+  end if;
+  if to_regclass('public.package_activations') is not null then
+    revoke insert, update, delete on table public.package_activations from authenticated;
+  end if;
+  if to_regclass('public.privacy_consent_logs') is not null then
+    revoke insert, update, delete on table public.privacy_consent_logs from authenticated;
+  end if;
+  if to_regclass('public.thread_messages') is not null then
+    revoke insert, update, delete on table public.thread_messages from authenticated;
+  end if;
+  if to_regclass('public.ucp_cart_sessions') is not null then
+    revoke insert, update, delete on table public.ucp_cart_sessions from authenticated;
+  end if;
+  if to_regclass('public.user_security_settings') is not null then
+    revoke insert, update, delete on table public.user_security_settings from authenticated;
+  end if;
+  if to_regclass('public.message_threads') is not null then
+    revoke insert, delete on table public.message_threads from authenticated;
+  end if;
+  if to_regclass('public.product_inquiries') is not null then
+    revoke insert, delete on table public.product_inquiries from authenticated;
+  end if;
+  if to_regclass('public.system_alerts') is not null then
+    revoke insert, delete on table public.system_alerts from authenticated;
+  end if;
+  if to_regclass('public.site_script_revisions') is not null then
+    revoke update, delete on table public.site_script_revisions from authenticated;
+  end if;
+  if to_regclass('public.user_trusted_devices') is not null then
+    revoke insert, update on table public.user_trusted_devices from authenticated;
+  end if;
+  if to_regclass('public.content_drafts') is not null then
+    revoke select on table public.content_drafts from anon;
+  end if;
+  if to_regclass('public.cortex_ai_db_mutation_audit') is not null then
+    revoke select on table public.cortex_ai_db_mutation_audit from anon;
+  end if;
+  if to_regclass('public.coupon_freemius_mappings') is not null then
+    revoke select on table public.coupon_freemius_mappings from anon;
+  end if;
+  if to_regclass('public.coupon_products') is not null then
+    revoke select on table public.coupon_products from anon;
+  end if;
+  if to_regclass('public.coupon_redemptions') is not null then
+    revoke select on table public.coupon_redemptions from anon;
+  end if;
+  if to_regclass('public.coupons') is not null then
+    revoke select on table public.coupons from anon;
+  end if;
+  if to_regclass('public.email_2fa_challenges') is not null then
+    revoke select on table public.email_2fa_challenges from anon, authenticated;
+  end if;
+  if to_regclass('public.form_endpoints') is not null then
+    revoke select on table public.form_endpoints from anon;
+  end if;
+  if to_regclass('public.mcp_access_tokens') is not null then
+    revoke select on table public.mcp_access_tokens from anon;
+  end if;
+  if to_regclass('public.message_threads') is not null then
+    revoke select on table public.message_threads from anon;
+  end if;
+  if to_regclass('public.order_items') is not null then
+    revoke select on table public.order_items from anon;
+  end if;
+  if to_regclass('public.orders') is not null then
+    revoke select on table public.orders from anon;
+  end if;
+  if to_regclass('public.package_activations') is not null then
+    revoke select on table public.package_activations from anon;
+  end if;
+  if to_regclass('public.page_revisions') is not null then
+    revoke select on table public.page_revisions from anon;
+  end if;
+  if to_regclass('public.post_revisions') is not null then
+    revoke select on table public.post_revisions from anon;
+  end if;
+  if to_regclass('public.privacy_consent_logs') is not null then
+    revoke select on table public.privacy_consent_logs from anon;
+  end if;
+  if to_regclass('public.product_drafts') is not null then
+    revoke select on table public.product_drafts from anon;
+  end if;
+  if to_regclass('public.product_freemius_sale_coupons') is not null then
+    revoke select on table public.product_freemius_sale_coupons from anon;
+  end if;
+  if to_regclass('public.product_inquiries') is not null then
+    revoke select on table public.product_inquiries from anon;
+  end if;
+  if to_regclass('public.product_revisions') is not null then
+    revoke select on table public.product_revisions from anon;
+  end if;
+  if to_regclass('public.profiles') is not null then
+    revoke select on table public.profiles from anon;
+  end if;
+  if to_regclass('public.site_script_revisions') is not null then
+    revoke select on table public.site_script_revisions from anon;
+  end if;
+  if to_regclass('public.system_alerts') is not null then
+    revoke select on table public.system_alerts from anon;
+  end if;
+  if to_regclass('public.system_configuration') is not null then
+    revoke select on table public.system_configuration from anon;
+  end if;
+  if to_regclass('public.thread_messages') is not null then
+    revoke select on table public.thread_messages from anon;
+  end if;
+  if to_regclass('public.ucp_cart_sessions') is not null then
+    revoke select on table public.ucp_cart_sessions from anon, authenticated;
+  end if;
+  if to_regclass('public.user_addresses') is not null then
+    revoke select on table public.user_addresses from anon;
+  end if;
+  if to_regclass('public.user_security_settings') is not null then
+    revoke select on table public.user_security_settings from anon;
+  end if;
+  if to_regclass('public.user_trusted_devices') is not null then
+    revoke select on table public.user_trusted_devices from anon;
+  end if;
+  if to_regclass('public.profile_cards') is not null then
+    revoke select on table public.profile_cards from anon;
+    revoke insert, update, delete on table public.profile_cards from authenticated;
+  end if;
+  if to_regclass('public.package_activations') is not null then
+    select string_agg(quote_ident(a.attname), ', ' order by a.attnum)
+      into v_select_cols
+      from pg_attribute a
+     where a.attrelid = 'public.package_activations'::regclass and a.attnum > 0 and not a.attisdropped
+       and a.attname not in ('license_key', 'meta');
+    revoke select on table public.package_activations from authenticated;
+    if v_select_cols is not null then
+      execute format('grant select (%s) on table public.package_activations to authenticated', v_select_cols);
+    end if;
+  end if;
   if to_regprocedure('public.generate_order_invoice_number()') is not null then
     revoke execute on function public.generate_order_invoice_number() from public, anon, authenticated;
   end if;
@@ -313,6 +507,9 @@ begin
   end if;
   if to_regprocedure('public.redeem_coupon_atomically(uuid)') is not null then
     revoke execute on function public.redeem_coupon_atomically(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.media_storage_keys_in_use(text[], uuid)') is not null then
+    revoke execute on function public.media_storage_keys_in_use(text[], uuid) from public, anon, authenticated;
   end if;
 end $nb_api$;`;
 

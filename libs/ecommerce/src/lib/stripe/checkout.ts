@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { getStripeClient } from './client';
 import { createClient } from '@supabase/supabase-js';
 import { type CartItem } from '../types';

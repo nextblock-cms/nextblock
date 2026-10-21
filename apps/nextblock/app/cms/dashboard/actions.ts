@@ -1,5 +1,7 @@
 'use server'
 
+import 'server-only';
+
 import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { formatDistanceToNow, startOfMonth, subMonths } from 'date-fns';
 import { getCmsActor, isCmsStaffRole } from '../../../lib/auth/cms-actor';

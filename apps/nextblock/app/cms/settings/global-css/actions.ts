@@ -1,6 +1,8 @@
 // app/cms/settings/global-css/actions.ts
 'use server';
 
+import 'server-only';
+
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import type { SettingsActionResult } from '../../../../lib/cms/action-result';

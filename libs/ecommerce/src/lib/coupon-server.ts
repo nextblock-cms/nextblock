@@ -22,6 +22,11 @@ import {
   normalizeSalePriceMap,
   resolveEffectivePriceForCurrency,
 } from './currency';
+import {
+  FREEMIUS_PRICED_PRODUCT_COLUMNS,
+  type FreemiusPricingTierCache,
+  resolveFreemiusUnitAmount,
+} from './freemius-pricing-server';
 
 type SupabaseLikeClient = SupabaseClient<any>;
 
@@ -61,6 +66,7 @@ type TrustedScheduleColumns = {
 
 type TrustedProductRow = {
   id: string;
+  translation_group_id?: string | null;
   title: string;
   price: number | null;
   prices?: Record<string, unknown> | null;
@@ -150,7 +156,7 @@ async function buildTrustedCartLines(input: {
     (client as any)
       .from('products')
       .select(
-        'id, title, price, prices, sale_price, sale_prices, sale_start_at, sale_end_at, scheduled_price, scheduled_prices, scheduled_price_at, product_type, payment_provider, freemius_product_id, freemius_plan_id'
+        `${FREEMIUS_PRICED_PRODUCT_COLUMNS}, title, product_type, payment_provider, freemius_product_id, freemius_plan_id`
       )
       .in('id', productIds),
     variantIds.length
@@ -178,6 +184,7 @@ async function buildTrustedCartLines(input: {
     variantRows.map((variant) => [variant.id, variant])
   );
   const lines: TrustedCartLine[] = [];
+  const freemiusTierCache: FreemiusPricingTierCache = new Map();
 
   for (const item of items) {
     const product = productMap.get(item.product_id);
@@ -190,22 +197,45 @@ async function buildTrustedCartLines(input: {
       toProvider(product.payment_provider) ??
       (product.product_type === 'digital' ? 'freemius' : 'stripe');
     const variant = item.variant_id ? variantMap.get(item.variant_id) : null;
-    const priceSource = variant && variant.product_id === product.id ? variant : product;
-    const resolvedPrice = resolveEffectivePriceForCurrency({
-      prices: normalizePriceMap(priceSource.prices),
-      salePrices: normalizeSalePriceMap(priceSource.sale_prices),
-      fallbackPrice: priceSource.price,
-      fallbackSalePrice: priceSource.sale_price,
-      saleStartAt: priceSource.sale_start_at,
-      saleEndAt: priceSource.sale_end_at,
-      scheduledPrice: priceSource.scheduled_price,
-      scheduledPrices: normalizePriceMap(priceSource.scheduled_prices),
-      scheduledPriceAt: priceSource.scheduled_price_at,
-      currencyCode: selectedCurrency.code,
-      currencies,
-    });
+    let unitPrice: number;
+
+    if (provider === 'freemius') {
+      // Priced as the Freemius checkout prices it: the plan's price for the line's cycle.
+      const pricing = await resolveFreemiusUnitAmount({
+        client,
+        product,
+        billingCycle: item.billing_cycle,
+        currencyCode: selectedCurrency.code,
+        currencies,
+        tierCache: freemiusTierCache,
+      });
+
+      // A cycle the plan does not sell cannot be checked out, so it earns no discount.
+      if (!pricing.ok) {
+        continue;
+      }
+
+      unitPrice = pricing.unitAmount;
+    } else {
+      const priceSource = variant && variant.product_id === product.id ? variant : product;
+      const resolvedPrice = resolveEffectivePriceForCurrency({
+        prices: normalizePriceMap(priceSource.prices),
+        salePrices: normalizeSalePriceMap(priceSource.sale_prices),
+        fallbackPrice: priceSource.price,
+        fallbackSalePrice: priceSource.sale_price,
+        saleStartAt: priceSource.sale_start_at,
+        saleEndAt: priceSource.sale_end_at,
+        scheduledPrice: priceSource.scheduled_price,
+        scheduledPrices: normalizePriceMap(priceSource.scheduled_prices),
+        scheduledPriceAt: priceSource.scheduled_price_at,
+        currencyCode: selectedCurrency.code,
+        currencies,
+      });
+      unitPrice = resolvedPrice.sale_price ?? resolvedPrice.price;
+    }
+
     const quantity = provider === 'freemius' ? 1 : Math.max(1, Number(item.quantity) || 1);
-    const unitAmount = Math.max(0, resolvedPrice.sale_price ?? resolvedPrice.price);
+    const unitAmount = Math.max(0, unitPrice);
 
     lines.push({
       key: getCartLineCouponKey(item),
@@ -349,7 +379,10 @@ export async function getCouponQuote(input: {
     .select(
       'id, code, name, provider_scope, discount_type, discount_amount, is_active, starts_at, ends_at, redemption_limit, redemptions_count'
     )
-    .ilike('code', code)
+    // Exact match: stored codes are normalised by the coupons write trigger exactly as
+    // normalizeCouponCode() normalises input. `ilike` treated `%` and `_` in a shopper's input
+    // as wildcards, so `%` applied (and enumerated) secret codes (2026-10-21).
+    .eq('code', code)
     .maybeSingle();
 
   if (couponError) {

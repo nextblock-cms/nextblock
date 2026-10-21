@@ -1,5 +1,9 @@
 // apps/nextblock/app/cms/revisions/service.ts
-"use server";
+//
+// Not a server action: callers pass the author id and, for bearer-authenticated routes, the
+// client, so every export would let a POST choose both. Server actions (./actions.ts) and
+// routes call it after their own auth check, with the author taken from that check.
+import "server-only";
 
 import { createClient } from "@nextblock-cms/db/server";
 import type { Json } from "@nextblock-cms/db";

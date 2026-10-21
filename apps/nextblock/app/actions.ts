@@ -1,5 +1,7 @@
 "use server";
 
+import "server-only";
+
 import { encodedRedirect } from "@nextblock-cms/utils/server";
 import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { headers } from "next/headers";

@@ -7,6 +7,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * destroying the object up front would leave the row behind (an orphan) while the UI reported
  * success. These tests drive deleteMediaItem / deleteMultipleMediaItems / moveMultipleMediaItems
  * with a mocked Supabase + storage client and assert the DB-first ordering and the zero-row gate.
+ *
+ * Since migration 02028 a row also owns only the objects derived from its own object_key (the
+ * upload pipeline's `<base>_<label>.avif` variants), and no key another media row still
+ * references is deleted: the actions ask `media_storage_keys_in_use` (service role) and keep
+ * every key it returns, or every key at all when the check fails. Without that, a WRITER's decoy
+ * row listing another uploader's keys deleted their files.
  */
 
 const callLog: string[] = [];
@@ -18,6 +24,10 @@ const mocks = vi.hoisted(() => ({
   user: { id: 'user-1' } as { id: string } | null,
   backend: 's3' as 's3' | 'supabase',
   bucket: 'test-bucket' as string,
+  // What media_storage_keys_in_use returns (keys another row references), and its error.
+  inUse: [] as string[],
+  inUseError: null as { message: string } | null,
+  rpcCalls: [] as Array<{ fn: string; args: any }>,
 }));
 
 const s3Send = vi.fn(async (cmd: any) => {
@@ -85,6 +95,13 @@ function makeSupabaseClient() {
 
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => makeSupabaseClient(),
+  getServiceRoleSupabaseClient: () => ({
+    rpc: async (fn: string, args: any) => {
+      callLog.push(`rpc:${fn}`);
+      mocks.rpcCalls.push({ fn, args });
+      return { data: mocks.inUseError ? null : mocks.inUse, error: mocks.inUseError };
+    },
+  }),
 }));
 
 vi.mock('@nextblock-cms/db', () => ({
@@ -141,25 +158,80 @@ beforeEach(() => {
   mocks.backend = 's3';
   mocks.bucket = 'test-bucket';
   mocks.mediaWrite = { data: [], error: null };
+  mocks.inUse = [];
+  mocks.inUseError = null;
+  mocks.rpcCalls = [];
 });
 
 describe('deleteMediaItem', () => {
   it('deletes the DB row before storage, and only for keys the row returned', async () => {
     mocks.mediaWrite = {
-      data: [{ object_key: 'uploads/a.avif', variants: [{ objectKey: 'uploads/a_thumb.avif' }] }],
+      data: [{ object_key: 'uploads/a.avif', variants: [{ objectKey: 'uploads/a_thumbnail.avif' }] }],
       error: null,
     };
 
     await deleteMediaItem('media-1', 'uploads/a.avif');
 
-    // DB delete happened and preceded the storage call.
-    expect(callLog).toEqual(['media.delete', 's3.send:DeleteObjects']);
+    // DB delete happened, then the in-use check, then the storage call.
+    expect(callLog).toEqual(['media.delete', 'rpc:media_storage_keys_in_use', 's3.send:DeleteObjects']);
     // The storage call used the keys from the returned row (object + variant).
     expect(s3Send).toHaveBeenCalledTimes(1);
     expect(s3Send.mock.calls[0][0].input.Delete.Objects).toEqual([
       { Key: 'uploads/a.avif' },
-      { Key: 'uploads/a_thumb.avif' },
+      { Key: 'uploads/a_thumbnail.avif' },
     ]);
+    expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
+  });
+
+  it("a decoy row never deletes another upload's objects (the 2026-10-21 audit)", async () => {
+    // A WRITER's own row whose variants name a victim's objects, plus a key outside the media
+    // namespace; the victim's row still references its own primary key.
+    mocks.mediaWrite = {
+      data: [
+        {
+          object_key: 'uploads/decoy_1.png',
+          variants: [
+            { objectKey: 'uploads/victim_2_large.avif' },
+            { objectKey: 'backups/full.zip' },
+            { objectKey: 'uploads/decoy_1_small.avif' },
+          ],
+        },
+      ],
+      error: null,
+    };
+
+    await deleteMediaItem('decoy', 'uploads/victim_2.png');
+
+    expect(mocks.rpcCalls).toEqual([
+      { fn: 'media_storage_keys_in_use', args: { p_keys: ['uploads/decoy_1.png', 'uploads/decoy_1_small.avif'], p_exclude_id: null } },
+    ]);
+    expect(s3Send.mock.calls[0][0].input.Delete.Objects).toEqual([
+      { Key: 'uploads/decoy_1.png' },
+      { Key: 'uploads/decoy_1_small.avif' },
+    ]);
+  });
+
+  it('keeps a key that another media row still references', async () => {
+    mocks.mediaWrite = {
+      data: [{ object_key: 'uploads/a.avif', variants: [{ objectKey: 'uploads/a_small.avif' }] }],
+      error: null,
+    };
+    mocks.inUse = ['uploads/a_small.avif'];
+
+    await deleteMediaItem('media-1');
+
+    expect(s3Send.mock.calls[0][0].input.Delete.Objects).toEqual([{ Key: 'uploads/a.avif' }]);
+  });
+
+  it('deletes no object when the in-use check fails (fails closed)', async () => {
+    mocks.mediaWrite = { data: [{ object_key: 'uploads/a.avif', variants: [] }], error: null };
+    mocks.inUseError = { message: 'function does not exist' };
+
+    await deleteMediaItem('media-1');
+
+    expect(s3Send).not.toHaveBeenCalled();
+    expect(supabaseRemoveObjects).not.toHaveBeenCalled();
+    // The row is gone, so the action still reports the delete; the object is an orphan.
     expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
   });
 
@@ -184,7 +256,7 @@ describe('deleteMultipleMediaItems', () => {
     mocks.mediaWrite = {
       data: [
         { object_key: 'uploads/a.avif', variants: [] },
-        { object_key: 'uploads/b.avif', variants: [{ objectKey: 'uploads/b_t.avif' }] },
+        { object_key: 'uploads/b.avif', variants: [{ objectKey: 'uploads/b_small.avif' }, { objectKey: 'uploads/c.avif' }] },
       ],
       error: null,
     };
@@ -194,11 +266,12 @@ describe('deleteMultipleMediaItems', () => {
       { id: 'b', objectKey: 'uploads/b.avif' },
     ]);
 
-    expect(callLog).toEqual(['media.delete', 's3.send:DeleteObjects']);
+    expect(callLog).toEqual(['media.delete', 'rpc:media_storage_keys_in_use', 's3.send:DeleteObjects']);
+    // b's listed `uploads/c.avif` belongs to another upload and is left alone.
     expect(s3Send.mock.calls[0][0].input.Delete.Objects).toEqual([
       { Key: 'uploads/a.avif' },
       { Key: 'uploads/b.avif' },
-      { Key: 'uploads/b_t.avif' },
+      { Key: 'uploads/b_small.avif' },
     ]);
     expect(res).toEqual({ success: expect.stringContaining('deleted successfully') });
   });
@@ -263,5 +336,43 @@ describe('moveMultipleMediaItems', () => {
     expect(callLog).toEqual(['media.update']); // claim attempted, nothing returned
     expect(s3Send).not.toHaveBeenCalled();
     expect(res.error).toMatch(/not found, or you do not have permission to move/i);
+  });
+
+  it("moves only the row's own objects and never deletes a source another row references", async () => {
+    mocks.mediaWrite = {
+      data: [
+        {
+          id: 'a',
+          object_key: 'uploads/a.avif',
+          file_type: 'image/avif',
+          variants: [{ objectKey: 'uploads/a_small.avif' }, { objectKey: 'uploads/victim_large.avif' }],
+        },
+      ],
+      error: null,
+    };
+    mocks.inUse = ['uploads/a_small.avif'];
+
+    await moveMultipleMediaItems([{ id: 'a', objectKey: 'uploads/a.avif' }], 'photos');
+
+    expect(mocks.rpcCalls).toEqual([
+      { fn: 'media_storage_keys_in_use', args: { p_keys: ['uploads/a.avif', 'uploads/a_small.avif'], p_exclude_id: 'a' } },
+    ]);
+    const sent = s3Send.mock.calls.map((c) => `${c[0].__type}:${c[0].input.Key}`);
+    expect(sent).toContain('CopyObject:photos/a_small.avif');
+    expect(sent).toContain('DeleteObject:uploads/a.avif');
+    expect(sent).not.toContain('DeleteObject:uploads/a_small.avif');
+    expect(sent.some((c) => c.includes('victim'))).toBe(false);
+  });
+
+  it('refuses to move a row whose object_key is not a media path', async () => {
+    mocks.mediaWrite = {
+      data: [{ id: 'a', object_key: 'backups/full.zip', file_type: 'application/zip', variants: [] }],
+      error: null,
+    };
+
+    const res = await moveMultipleMediaItems([{ id: 'a', objectKey: 'backups/full.zip' }], 'photos');
+
+    expect(s3Send).not.toHaveBeenCalled();
+    expect(res.error).toMatch(/does not point at a media file/i);
   });
 });

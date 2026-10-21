@@ -125,6 +125,11 @@ class MockQuery {
     return this;
   }
 
+  async maybeSingle() {
+    const { data, error } = await this.execute();
+    return { data: Array.isArray(data) ? (data[0] ?? null) : data, error };
+  }
+
   then<TResult1 = any, TResult2 = never>(
     onfulfilled?: ((value: any) => TResult1 | PromiseLike<TResult1>) | null,
     onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
@@ -302,7 +307,7 @@ describe('Cortex AI generic database tools', () => {
           table: 'profiles',
           values: { full_name: 'Changed' },
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow('read-only');
   });
@@ -320,7 +325,7 @@ describe('Cortex AI generic database tools', () => {
           rows: [{ key: 'demo', api_key: 'secret' }],
           table: 'site_settings',
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow('Protected field');
 
@@ -432,7 +437,7 @@ describe('Cortex AI generic database tools', () => {
       await expect(
         executeDatabaseMutation(
           { operation: 'insert', rows: [{ key, value: 'x' }], table: 'site_settings' },
-          { supabase }
+          { actorUserId: 'user_1', supabase }
         )
       ).rejects.toThrow('is protected');
     }
@@ -503,6 +508,170 @@ describe('Cortex AI generic database tools', () => {
       { key: 'site_name', value: { en: 'NextBlock' } },
       { key: 'email_secret', value: { pass: { ciphertext: 'x' } } },
     ]);
+  });
+
+  // 2026-10-21: the write-protected list was checked only for rows[].key, values.key and the
+  // first `eq` filter on key, so a write-scope MCP token could delete `is_admin_created`
+  // (the proxy then sends every request to /setup) or rewrite `security_settings` through an
+  // `in` or `ilike` filter.
+  it('refuses write-protected site_settings rows however the filter or operation reaches them', async () => {
+    const original = [
+      { key: 'site_name', value: { en: 'NextBlock' } },
+      { key: 'is_admin_created', value: true },
+      { key: 'security_settings', value: { enforce_2fa: true } },
+      { key: 'cortex_ai_build_session', value: { id: 'real' } },
+    ];
+    const { database, supabase } = createMockSupabase({ site_settings: original.map((row) => ({ ...row })) });
+    const context = { actorUserId: 'user_1', skipConfirmation: true, supabase };
+    const attempts = [
+      { filters: [{ column: 'key', operator: 'eq' as const, value: 'is_admin_created' }], operation: 'delete' as const },
+      { filters: [{ column: 'key', operator: 'in' as const, value: ['site_name', 'is_admin_created'] }], operation: 'delete' as const },
+      { filters: [{ column: 'key', operator: 'ilike' as const, value: '%admin%' }], operation: 'delete' as const },
+      { filters: [{ column: 'key', operator: 'neq' as const, value: 'site_name' }], operation: 'delete' as const },
+      {
+        filters: [{ column: 'key', operator: 'in' as const, value: ['security_settings'] }],
+        operation: 'update' as const,
+        values: { value: { enforce_2fa: false } },
+      },
+      {
+        filters: [{ column: 'key', operator: 'ilike' as const, value: '%build_session' }],
+        operation: 'update' as const,
+        values: { value: { id: 'forged' } },
+      },
+      // Renaming a write-protected row away is a write to it too.
+      {
+        filters: [{ column: 'key', operator: 'ilike' as const, value: 'is_admin%' }],
+        operation: 'update' as const,
+        values: { key: 'renamed' },
+      },
+    ];
+
+    for (const attempt of attempts) {
+      await expect(
+        executeDatabaseMutation({ ...attempt, table: 'site_settings' }, context),
+        JSON.stringify(attempt)
+      ).rejects.toThrow(/cannot be written through Cortex AI database tools/);
+    }
+
+    await expect(
+      executeDatabaseActionPlan(
+        {
+          actions: [
+            {
+              filters: [{ column: 'key', operator: 'in', value: ['is_admin_created'] }],
+              operation: 'delete',
+              table: 'site_settings',
+            },
+          ],
+        },
+        context
+      )
+    ).rejects.toThrow(/cannot be written through Cortex AI database tools/);
+
+    expect(database.site_settings).toEqual(original);
+  });
+
+  it('validates a site_settings value against every row an update reaches, not just an eq filter', async () => {
+    const { supabase } = createMockSupabase({
+      site_settings: [{ key: 'footer_copyright', value: { en: '© {year} Acme' } }],
+    });
+
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'key', operator: 'in', value: ['footer_copyright'] }],
+          operation: 'update',
+          table: 'site_settings',
+          values: { value: 'plain string' },
+        },
+        { actorUserId: 'user_1', skipConfirmation: true, supabase }
+      )
+    ).rejects.toThrow(/Invalid value for site setting "footer_copyright"/);
+  });
+
+  // 2026-10-21: the DB tools never re-checked the actor's role, so a token minted by an
+  // admin who was later demoted kept full raw-table write access.
+  it('requires an ADMIN actor for database mutations and action plans', async () => {
+    const { database, supabase } = createMockSupabase({
+      profiles: [
+        { id: 'user_1', role: 'ADMIN' },
+        { id: 'writer_1', role: 'WRITER' },
+      ],
+    });
+    const input = {
+      filters: [{ column: 'id', operator: 'eq' as const, value: 1 }],
+      operation: 'update' as const,
+      table: 'pages',
+      values: { status: 'published' },
+    };
+
+    await expect(
+      executeDatabaseMutation(input, { actorUserId: 'writer_1', skipConfirmation: true, supabase })
+    ).rejects.toThrow(/requires the ADMIN role/);
+    await expect(
+      executeDatabaseActionPlan({ actions: [input] }, { actorUserId: 'writer_1', skipConfirmation: true, supabase })
+    ).rejects.toThrow(/requires the ADMIN role/);
+    await expect(executeDatabaseMutation(input, { skipConfirmation: true, supabase })).rejects.toThrow(
+      /requires a known CMS user/
+    );
+    await expect(
+      executeDatabaseMutation(input, {
+        actorFromOrphanedToken: true,
+        actorUserId: 'user_1',
+        skipConfirmation: true,
+        supabase,
+      })
+    ).rejects.toThrow(/no longer exists/);
+    expect(database.pages.find((page) => page.id === 1)?.status).toBe('draft');
+
+    const result = await executeDatabaseMutation(input, { actorUserId: 'user_1', skipConfirmation: true, supabase });
+    expect(result).toMatchObject({ mutationExecuted: true, success: true });
+  });
+
+  // 2026-10-21: read_database_records returned package_activations.license_key in clear.
+  it('never returns, filters on, or writes a license key', async () => {
+    const { supabase } = createMockSupabase({
+      package_activations: [
+        {
+          id: 'act_1',
+          instance_name: 'prod',
+          license_key: 'sk_live_license_abc',
+          meta: { nested: { license_key: 'sk_live_license_abc' } },
+          package_id: 'cortex-ai',
+          status: 'active',
+        },
+      ],
+    });
+
+    const result = await executeReadDatabaseRecords({ table: 'package_activations' }, { supabase });
+
+    expect(JSON.stringify(result.rows)).not.toContain('sk_live_license_abc');
+    expect(result.columns).not.toContain('license_key');
+    expect(result.rows[0]).toMatchObject({ id: 'act_1', meta: { nested: { license_key: '[REDACTED]' } } });
+
+    await expect(
+      executeReadDatabaseRecords({ columns: ['license_key'], table: 'package_activations' }, { supabase })
+    ).rejects.toThrow(/protected/);
+    await expect(
+      executeReadDatabaseRecords(
+        { filters: [{ column: 'license_key', operator: 'ilike', value: 'sk_live%' }], table: 'package_activations' },
+        { supabase }
+      )
+    ).rejects.toThrow(/protected/);
+    await expect(
+      executeDatabaseMutation(
+        {
+          filters: [{ column: 'id', operator: 'eq', value: 'act_1' }],
+          operation: 'update',
+          table: 'package_activations',
+          values: { license_key: 'stolen' },
+        },
+        { actorUserId: 'user_1', supabase }
+      )
+    ).rejects.toThrow(/Protected field/);
+
+    const schema = await executeDescribeDatabaseSchema({ table: 'package_activations' });
+    expect(schema.tables[0]?.columns).not.toContain('license_key');
   });
 
   it('previews and confirms a mutation before changing rows and writing an audit record', async () => {
@@ -694,21 +863,21 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
     });
 
     await expect(
-      executeDatabaseMutation({ operation: 'insert', rows: [row({}, 'no-such-block')], table: 'blocks' }, { supabase })
+      executeDatabaseMutation({ operation: 'insert', rows: [row({}, 'no-such-block')], table: 'blocks' }, { actorUserId: 'user_1', supabase })
     ).rejects.toThrow(/neither a built-in block type nor a custom block slug/);
 
     await expect(
-      executeDatabaseMutation({ operation: 'insert', rows: [row({ headline: 'Sale' })], table: 'blocks' }, { supabase })
+      executeDatabaseMutation({ operation: 'insert', rows: [row({ headline: 'Sale' })], table: 'blocks' }, { actorUserId: 'user_1', supabase })
     ).rejects.toThrow(/Unknown field "headline".*Field "title" is required/);
 
     await expect(
-      executeDatabaseMutation({ operation: 'insert', rows: [row({ title: 'Sale', photo: 'https://x/y.jpg' })], table: 'blocks' }, { supabase })
+      executeDatabaseMutation({ operation: 'insert', rows: [row({ title: 'Sale', photo: 'https://x/y.jpg' })], table: 'blocks' }, { actorUserId: 'user_1', supabase })
     ).rejects.toThrow(/"photo" must be an uploaded image object/);
 
     const preview = asDbConfirmation(
       await executeDatabaseMutation(
         { operation: 'insert', rows: [row({ title: 'Sale', photo: { object_key: 'uploads/a.jpg', url: 'https://cdn/a.jpg' } })], table: 'blocks' },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     );
     expect(preview.requiresConfirmation).toBe(true);
@@ -732,7 +901,7 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
           table: 'blocks',
           values: { content: heading },
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/block_type "text"/);
 
@@ -744,7 +913,7 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
           table: 'blocks',
           values: { block_type: 'text' },
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/requires the new content/);
 
@@ -756,7 +925,7 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
           table: 'blocks',
           values: { content: { level: 3, text_content: 'Renamed' } },
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     );
     expect(preview.requiresConfirmation).toBe(true);
@@ -768,14 +937,14 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
     await expect(
       executeDatabaseMutation(
         { operation: 'upsert', rows: [{ key: 'footer_copyright', value: 'plain string' }], table: 'site_settings' },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/Invalid value for site setting "footer_copyright"/);
 
     await expect(
       executeDatabaseMutation(
         { operation: 'upsert', rows: [{ key: 'cortex_ai_build_session', value: { id: 'x' } }], table: 'site_settings' },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/cannot be written through Cortex AI database tools/);
 
@@ -787,14 +956,14 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
           table: 'site_settings',
           values: { value: 'false' },
         },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     ).rejects.toThrow(/cannot be written/);
 
     const preview = asDbConfirmation(
       await executeDatabaseMutation(
         { operation: 'upsert', rows: [{ key: 'footer_copyright', value: { en: '© {year} Acme' } }], table: 'site_settings' },
-        { supabase }
+        { actorUserId: 'user_1', supabase }
       )
     );
     expect(preview.requiresConfirmation).toBe(true);

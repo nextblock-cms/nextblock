@@ -1,14 +1,13 @@
 'use server';
 
+import 'server-only';
+
 import { createClient } from '@supabase/supabase-js';
 import { getPackageById } from '@nextblock-cms/utils';
 import { createClient as createCookieClient } from '@nextblock-cms/db/server';
 import { headers } from 'next/headers';
-import {
-  resolveSupabaseAnonKey,
-  resolveSupabaseServiceKey,
-  resolveSupabaseUrl,
-} from '../../lib/setup/env-status';
+import { resolveSupabaseAnonKey, resolveSupabaseUrl } from '../../lib/setup/env-status';
+import { resolveSupabaseServiceKey } from '../../lib/setup/service-key';
 import {
   activateLicenseKeyWithFreemius,
   buildPackageActivationInstance,

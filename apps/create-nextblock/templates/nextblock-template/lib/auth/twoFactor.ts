@@ -1,3 +1,5 @@
+import 'server-only';
+
 // Server-only two-factor orchestration: email-code challenges, the signed
 // "email second factor satisfied" session cookie, and the gate that decides
 // whether a signed-in user still owes a second factor before reaching the CMS.

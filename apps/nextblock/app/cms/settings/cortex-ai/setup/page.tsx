@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { redirect } from 'next/navigation';
 
 import { verifyPackageOnline } from '@nextblock-cms/db/server';

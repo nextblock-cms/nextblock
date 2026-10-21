@@ -15,6 +15,16 @@ export * from './lib/ai-vision';
 export * from './lib/block-content-schemas';
 export * from './lib/cortex-widget-registry';
 export * from './lib/cortex-widget-schema';
+// Named, not `export *`: ai-global-agent-tools re-exports `isBlockedFetchHost` too.
+export {
+  GuardedFetchError,
+  createPinnedLookup,
+  guardedFetch,
+  isPrivateAddress,
+  type GuardedFetchErrorReason,
+  type GuardedFetchOptions,
+  type GuardedFetchResponse,
+} from './lib/fetch-host-guard';
 export * from './lib/mcp-server';
 export * from './lib/mcp-tokens';
 export * from './lib/mcp-tool-registry';

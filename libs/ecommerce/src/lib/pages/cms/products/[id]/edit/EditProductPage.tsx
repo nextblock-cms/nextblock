@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { ProductForm } from '../../components/ProductForm';
 import { getProduct, getFreemiusPricingByProductId, getGlobalProductAttributes } from '../../actions';
 import { FreemiusPricingDashboard } from '../../components/FreemiusPricingDashboard';

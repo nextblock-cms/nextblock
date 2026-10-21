@@ -1,3 +1,5 @@
+import 'server-only';
+
 // Generic, server-only secret encryption for values stored in the database
 // (SMTP password, Stripe/Freemius secret keys, ...). Mirrors the AES-256-GCM
 // envelope used by Cortex AI's stored OpenRouter key, but provider-agnostic so

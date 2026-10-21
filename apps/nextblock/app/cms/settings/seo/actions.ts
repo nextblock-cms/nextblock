@@ -1,6 +1,8 @@
 // app/cms/settings/seo/actions.ts
 'use server';
 
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
 
 import {

@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { getCmsActor } from '../../../../lib/auth/cms-actor';
 

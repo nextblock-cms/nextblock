@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 import path from 'path';
 
 export default defineConfig({
@@ -15,6 +15,10 @@ export default defineConfig({
   },
   test: {
     globals: true,
+    // Claude Code session worktrees live inside the repo (git-ignored). A path filter such as
+    // `npx vitest run libs` would otherwise also run every worktree's copy of the tests, at
+    // whatever state that branch is in.
+    exclude: [...configDefaults.exclude, '**/.claude/worktrees/**'],
     alias: [
       { find: 'server-only', replacement: path.resolve(__dirname, './tools/stubs/server-only.js') },
       

@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { getEcomActorRole } from '../../../server-actions/require-ecom-role';
 import { OrderWithDetails } from './types';

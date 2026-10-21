@@ -1,3 +1,5 @@
+import 'server-only';
+
 import React from "react";
 import { createClient } from "@nextblock-cms/db/server";
 import Link from "next/link";

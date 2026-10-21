@@ -3,11 +3,8 @@ import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 import { createClient as createSupabaseJsClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db';
-import {
-  resolveSupabaseAnonKey,
-  resolveSupabaseServiceKey,
-  resolveSupabaseUrl,
-} from '../../lib/setup/env-status';
+import { resolveSupabaseAnonKey, resolveSupabaseUrl } from '../../lib/setup/env-status';
+import { resolveSupabaseServiceKey } from '../../lib/setup/service-key';
 import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo';
 import { resolveMediaUrl } from '../../lib/media/resolveMediaUrl';
 import {

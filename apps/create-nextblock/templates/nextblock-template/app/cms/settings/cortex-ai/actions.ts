@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
 

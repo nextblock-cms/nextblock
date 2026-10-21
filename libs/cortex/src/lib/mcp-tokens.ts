@@ -239,6 +239,73 @@ export async function verifyCortexAiMcpToken(
 }
 
 /**
+ * The account a verified token acts as, re-checked on EVERY request.
+ *
+ * A token carries no role of its own: it acts as the administrator who minted it, so it
+ * must lose its power the moment that account does. Until 2026-10-21 the endpoint took
+ * `created_by` on trust and kept a demoted admin's token fully writable. Returns null
+ * (refuse the request) when the creator is gone (`created_by` is `ON DELETE SET NULL`)
+ * or no longer an ADMIN. Throws when the profile cannot be read, so the endpoint answers
+ * "try again" instead of treating an outage as a bad credential.
+ */
+export async function resolveCortexAiMcpTokenActor(
+  supabase: SupabaseLike,
+  token: Pick<CortexAiMcpTokenRow, 'created_by'>
+): Promise<string | null> {
+  assertServerOnly();
+
+  const createdBy = token.created_by;
+
+  if (!createdBy) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('role')
+    .eq('id', createdBy)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(
+      `Could not verify the MCP token's owner: ${
+        typeof error === 'object' && 'message' in error ? String(error.message) : String(error)
+      }`
+    );
+  }
+
+  return data?.role === 'ADMIN' ? createdBy : null;
+}
+
+/**
+ * Revoke every live token a user minted. Called when that user's role changes or the
+ * account is deleted (app/cms/users/actions.ts): the per-request owner check above
+ * already refuses those tokens, and this makes the dashboard list say so and keeps them
+ * dead if the account is promoted again later.
+ */
+export async function revokeCortexAiMcpTokensForUser(
+  supabase: SupabaseLike,
+  userId: string,
+  now: Date = new Date()
+): Promise<{ error: string | null }> {
+  assertServerOnly();
+
+  const { error } = await supabase
+    .from(CORTEX_AI_MCP_TOKENS_TABLE)
+    .update({ revoked_at: now.toISOString() })
+    .eq('created_by', userId)
+    .is('revoked_at', null);
+
+  if (error) {
+    return {
+      error: typeof error === 'object' && 'message' in error ? String(error.message) : String(error),
+    };
+  }
+
+  return { error: null };
+}
+
+/**
  * Stamp `last_used_at` so an admin can spot a token that is still live but unused.
  *
  * Fire-and-forget: a failed bookkeeping write must never fail the MCP call that

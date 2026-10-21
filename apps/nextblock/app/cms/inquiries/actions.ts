@@ -1,24 +1,11 @@
 'use server';
 
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
-import { createClient } from '@nextblock-cms/db/server';
 
+import { requireCmsAdmin } from '../../../lib/auth/cms-actor';
 import { STORE_CONTACT_SETTINGS_KEY } from '../../../lib/commerce/seller-contact';
-
-async function assertAdmin() {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) throw new Error('Unauthorized');
-
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-  if (!profile || profile.role !== 'ADMIN') throw new Error('Forbidden');
-}
 
 export interface InquiryActionState {
   success: boolean;
@@ -26,23 +13,29 @@ export interface InquiryActionState {
 }
 
 /**
- * Set where storefront enquiries are emailed. Stored in the public settings row — it is
- * a business address, not a credential — but never rendered to the storefront: the
- * public form posts a product id and the server resolves the recipient.
+ * Set where storefront enquiries are emailed. Stored in site_settings — it is a business
+ * address, not a credential — but never rendered to the storefront: the public form posts a
+ * product id and the server resolves the recipient.
+ *
+ * Written with the service-role client after requireCmsAdmin(): `store_contact` is above the
+ * staff read tier, so the cookie client's upsert (INSERT ... ON CONFLICT DO UPDATE checks the
+ * read policy on the existing row) failed for an admin on an aal1 session, and since migration
+ * 02028 the key's write tier needs public.is_admin_mfa() as well. A redirected address would
+ * receive every future enquiry, so the in-code ADMIN check (second factor included) is the
+ * boundary.
  */
 export async function saveStoreContactEmail(
   _prevState: unknown,
   formData: FormData
 ): Promise<InquiryActionState> {
   try {
-    await assertAdmin();
+    const { supabase } = await requireCmsAdmin();
 
     const contactEmail = String(formData.get('contact_email') ?? '').trim();
     if (contactEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
       return { success: false, message: "That doesn't look like a valid email address." };
     }
 
-    const supabase = createClient();
     const { error } = await supabase
       .from('site_settings')
       .upsert({ key: STORE_CONTACT_SETTINGS_KEY, value: { contactEmail } });

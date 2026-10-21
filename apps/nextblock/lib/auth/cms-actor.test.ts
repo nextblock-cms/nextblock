@@ -11,9 +11,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   user: null as { id: string } | null,
   role: null as string | null,
+  twoFactor: 'satisfied' as 'not_required' | 'satisfied' | 'totp_required' | 'email_required',
   profileFrom: vi.fn(),
   getServiceRoleSupabaseClient: vi.fn(),
 }));
+
+vi.mock('./twoFactor', () => ({
+  evaluateTwoFactor: async () => ({ status: mocks.twoFactor, userId: mocks.user?.id ?? null, mfaType: null }),
+}));
+vi.mock('./second-factor-gate', () => ({ registerSecondFactorGate: () => undefined }));
 
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => ({
@@ -41,6 +47,7 @@ describe('getCmsActor', () => {
     vi.clearAllMocks();
     mocks.user = null;
     mocks.role = null;
+    mocks.twoFactor = 'satisfied';
     mocks.getServiceRoleSupabaseClient.mockReturnValue(SERVICE);
   });
 
@@ -69,6 +76,7 @@ describe('requireCmsAdmin / requireCmsStaff', () => {
     vi.clearAllMocks();
     mocks.user = null;
     mocks.role = null;
+    mocks.twoFactor = 'satisfied';
     mocks.getServiceRoleSupabaseClient.mockReturnValue(SERVICE);
   });
 
@@ -96,6 +104,30 @@ describe('requireCmsAdmin / requireCmsStaff', () => {
 
     await expect(requireCmsStaff()).resolves.toEqual({ supabase: SERVICE, userId: 'w-1', role: 'WRITER' });
     expect(mocks.getServiceRoleSupabaseClient).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['totp_required', 'email_required'] as const)(
+    'refuse an ADMIN whose session has not passed the enrolled second factor (%s)',
+    async (status) => {
+      // 2026-10-21: a stolen password (first factor only) reached the service role here, because
+      // a server action never passes through the CMS layout's 2FA redirect.
+      mocks.user = { id: 'a-1' };
+      mocks.role = 'ADMIN';
+      mocks.twoFactor = status;
+
+      await expect(getCmsActor()).resolves.toBeNull();
+      await expect(requireCmsAdmin()).rejects.toThrow('Unauthorized');
+      await expect(requireCmsStaff()).rejects.toThrow('Unauthorized');
+      expect(mocks.getServiceRoleSupabaseClient).not.toHaveBeenCalled();
+    },
+  );
+
+  it('admits an ADMIN with no factor enrolled', async () => {
+    mocks.user = { id: 'a-1' };
+    mocks.role = 'ADMIN';
+    mocks.twoFactor = 'not_required';
+
+    await expect(requireCmsAdmin()).resolves.toEqual({ supabase: SERVICE, userId: 'a-1' });
   });
 
   it('hands an ADMIN the service-role client from both helpers', async () => {

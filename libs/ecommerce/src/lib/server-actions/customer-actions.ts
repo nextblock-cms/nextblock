@@ -58,13 +58,24 @@ export async function updateProfile(data: ProfileUpdateData) {
   return { success: true };
 }
 
-export async function validateCheckoutEligibility(userId: string) {
+/**
+ * Is the signed-in customer's profile complete enough to check out? Always the session's
+ * user: a server action never takes a user id from the caller. The old `userId` argument is
+ * still accepted so existing callers compile, and ignored.
+ */
+export async function validateCheckoutEligibility(..._ignoredArgs: unknown[]) {
+  void _ignoredArgs;
   const supabase = createClient();
-  
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) {
+    return { ready: false, missingFields: ['profile_not_found'] };
+  }
+
   const { data: profile, error } = await supabase
     .from('profiles')
     .select('full_name')
-    .eq('id', userId)
+    .eq('id', user.id)
     .single();
 
   if (error || !profile) {

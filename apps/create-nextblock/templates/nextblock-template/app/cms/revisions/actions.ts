@@ -1,6 +1,8 @@
 // apps/nextblock/app/cms/revisions/actions.ts
 "use server";
 
+import "server-only";
+
 import { revalidatePath } from "next/cache";
 import { createClient } from "@nextblock-cms/db/server";
 import { requireCmsStaff } from "../../../lib/auth/cms-actor";

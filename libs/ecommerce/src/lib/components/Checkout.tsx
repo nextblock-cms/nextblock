@@ -33,7 +33,7 @@ import { countries, normalizeCountryCode } from '../countries';
 import { usePaymentReadiness } from '../PaymentReadinessProvider';
 import { getShippingEstimates } from '../server-actions/shipping-actions';
 import { getTaxEstimate } from '../server-actions/tax-actions';
-import { ResolvedShippingMethod } from '../shipping/resolver';
+import type { ResolvedShippingMethod } from '../shipping/resolver';
 import { type CartItem, isDigitalItem } from '../types';
 import { countryUsesStructuredStates, getStatesForCountry, getSubdivisionLabel } from '../states';
 import {
@@ -924,6 +924,8 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 orderId: cp.order_id,
+                // The sync route only accepts the order's own access token.
+                token: cp.success_token,
                 checkoutResponse,
               }),
             }).then(async (syncResponse) => {

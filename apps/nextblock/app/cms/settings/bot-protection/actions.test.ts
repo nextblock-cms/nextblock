@@ -25,6 +25,10 @@ const mocks = vi.hoisted(() => ({
 
 // The real @nextblock-cms/db/server barrel (kept for its crypto) wraps a helper in
 // unstable_cache at module scope, so the stub has to provide a pass-through for it too.
+// The caller has passed any enrolled second factor; 2FA itself is covered by lib/auth/cms-actor.test.ts.
+vi.mock('../../../../lib/auth/twoFactor', () => ({
+  evaluateTwoFactor: async () => ({ status: 'satisfied', userId: null, mfaType: null }),
+}));
 vi.mock('next/cache', () => ({
   revalidatePath: mocks.revalidatePath,
   unstable_cache: (fn: unknown) => fn,

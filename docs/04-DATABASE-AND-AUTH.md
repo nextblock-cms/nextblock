@@ -31,6 +31,33 @@ Practical usage in the app is split by trust level:
 - public static-ish reads often use `getSsgSupabaseClient()`
 - admin or system workflows use `getServiceRoleSupabaseClient()`
 
+### Service-role boundary
+
+The service-role / secret key bypasses every RLS policy, so the code that holds it stays on
+the server, enforced at three levels:
+
+- **`import 'server-only'` in every module that builds, hands out or keys a service-role
+  client**: `libs/db/src/lib/supabase/server.ts` (the factory), the verified-role-then-service-
+  role helpers (`lib/auth/cms-actor.ts`, `require-ecom-role.ts`, the `require-admin.ts` gates),
+  every server action, page and route that calls them, and the ecommerce providers that build
+  their own client from `SUPABASE_SERVICE_ROLE_KEY`. Next.js fails the build the moment such a
+  module lands in a client graph. A `'use server'` module may carry it too: a client component
+  that imports an action receives a reference, never the module body.
+- **One secret resolver, server-only.** `resolveSupabaseServiceKey()` and
+  `isFullyConfigured()` live in `apps/nextblock/lib/setup/service-key.ts`.
+  `lib/setup/env-status.ts` resolves only the public names, because the proxy, `next.config.js`
+  and client modules (the language REST client, the app-icon context) import it.
+- **`tools/scripts/service-role-boundary.test.ts`** (`tools/scripts/lib/service-role-boundary.js`)
+  fails when a module that uses the service role lacks `'server-only'`; when any `'use client'`
+  file or client-safe library entry (`@nextblock-cms/db`, `/ecommerce`, `/cortex/client`, `/ui`,
+  `/editor`, `/utils`, `/sdk`) reaches server-only or service-role code through value imports
+  (it stops at `'use server'` modules and skips `import type`); and when a secret is named
+  `NEXT_PUBLIC_*` or appears in `next.config.js` `env` (both are inlined into the browser
+  bundle). The library entries matter because Vite builds them without Next's check, so a leak
+  there would only fail in a downstream install. Import a type from a server module with
+  `import type`; a plain import that happens to name only a type is a value import to the check
+  and one edit away from a real one.
+
 ## Auth Flow
 
 ### Session exchange
@@ -165,19 +192,28 @@ The high-level access model is:
   read every row, the public key reads nothing. Public review, comment and staff-reply cards
   get the author's name and avatar through `author()`, a computed relationship on
   `cms_interactions` (`select=*,author(full_name,avatar_url)`) that answers only for approved
-  rows. `role` changes are `ADMIN` or service-role only: the update policy's `WITH CHECK`
-  pins the column and the `protect_profile_role` trigger backs it; the users screen already
-  writes through the service role.
+  rows. `role` changes are service-role only: since `02025` `authenticated` holds INSERT and
+  UPDATE on every `profiles` column except `role` (and `id` on UPDATE), so the update
+  policy's `WITH CHECK` and the `protect_profile_role` trigger (`02021`) are the second and
+  third layer, not the only one; the users screen writes roles through the service role.
 - authenticated self-service access for user addresses and customer-owned orders.
   `user_security_settings` is read by its owner but written only by the server: the
-  security actions verify the factor first, then upsert with the service role.
+  security actions verify the factor first, then upsert with the service role (since `02026`
+  `authenticated` holds no INSERT, UPDATE or DELETE grant on it).
 - `ADMIN` or `WRITER` write access for most CMS authoring tables, and staff-only reads of
   revisions and drafts
 - `site_settings` reads tiered by key (public / signed-in / staff / `ADMIN`, see "Important
-  Site Settings in Active Use" below); writes tiered since `02022` (the sensitive keys are
-  `ADMIN`-only); since `02023` the `ADMIN` tier of both requires a satisfied second factor
-  (`is_admin_mfa()`), so the CMS reads and writes it with the service role after its own
-  role check
+  Site Settings in Active Use" below); writes tiered since `02022`, and since `02028` a
+  `WRITER` writes only an allow-list of keys; since `02023` the `ADMIN` tier of both requires a
+  satisfied second factor (`is_admin_mfa()`), so the CMS reads and writes it with the service
+  role after its own role check
+- `media` is readable by the public key on purpose (`media_read_policy USING (true)`, decision
+  recorded in `02028`): the bucket is public-read and every rendered image carries its object
+  URL, so a row adds only its file name, description and uploader id. Scoping it to media that
+  live content references would have to follow every reference (blocks, sections, posts,
+  products, logos, settings) and would break images on any path it missed. Inserts pin
+  `uploader_id` to the caller (ADMIN excepted) since `02028`; updates and deletes are bound to
+  the uploader since `02022`
 - `ADMIN`-only write access for higher-risk configuration surfaces
 - `service_role` full access where background jobs or system syncs need it
 
@@ -202,6 +238,14 @@ change):
   a `FOR SELECT` editor policy; a "Public read active" policy `TO anon, authenticated`
   overlaps an "Admins read all" policy `TO authenticated`. Split by role (`TO anon` /
   `TO authenticated USING (is_active OR admin)`) or by command instead.
+- `SECURITY DEFINER` functions never live in `public` except the two legacy trigger functions
+  below; a new one goes in `private` behind a `SECURITY INVOKER` wrapper (`02021`). The lint
+  refuses a forward migration that creates (or ALTERs to) a definer function in `public`
+  without `REVOKE EXECUTE ... FROM PUBLIC, anon, authenticated` in the same file, or that grants
+  it back: Postgres grants EXECUTE to PUBLIC on every new function and Supabase's default
+  privileges grant it to `anon` and `authenticated` by name, so revoking from PUBLIC alone
+  leaves it callable over `/rpc`. `security-verify.sql` section 19 fails on any definer
+  function in `public` outside its allowlist or executable by either API role.
 - `SECURITY DEFINER` trigger functions (`handle_new_user()`, `update_product_ratings()`)
   must not be executable by `anon` or `authenticated`. Triggers fire regardless of the
   caller's EXECUTE privilege, so revoke it. Note that a database which recorded the
@@ -209,7 +253,7 @@ change):
   forward migration revokes them. Both apply paths end with a blanket
   `grant execute on all functions in schema public` to the API roles, so each path must
   take it back in the same pass: `TRIGGER_FUNCTION_REVOKE_SQL` (every `RETURNS trigger`
-  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`) in
+  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02027`) in
   `lib/setup/schema-apply.ts` (`/setup`) and `tools/lib/migrate-core.mjs` (the build-time
   hook). The hook lacked both until 2026-10-20, so every production deploy re-granted the
   triggers and the advisor flagged them again; `02024` repairs the databases that were
@@ -243,8 +287,18 @@ change):
   RPC them. Never create a `SECURITY DEFINER` function in `public`.
 - Row-level security does not govern `TRUNCATE`; `02021` revokes it from `anon` and
   `authenticated` on every table that exists at that point, and `/setup`'s grant pass repeats
-  the revoke. A later migration that grants on a new table grants `SELECT, INSERT, UPDATE,
-  DELETE` rather than `ALL` (the lint accepts either; the convention is the guard).
+  the revoke. A later migration that grants on a new table grants `SELECT` to `anon` (only if
+  the table is publicly readable) and `SELECT, INSERT, UPDATE, DELETE` to `authenticated,
+  service_role`, never `ALL`; since `02025` the lint refuses a write grant to `anon` or PUBLIC.
+  Since `02026` `authenticated` gets only the writes a policy lets it use: a table (or command)
+  written only by the service role revokes the rest from `authenticated` in the same migration
+  and in both copies of `API_ROLE_REVOKE_SQL` (the post-apply pass grants `ALL` on every table
+  to `authenticated` on each deploy); `security-verify.sql` section 26 fails otherwise.
+  Since `02027` the same holds for SELECT: `anon` reads only tables a policy lets it read, and a
+  service-role-only table revokes SELECT from `authenticated` too. The pass grants `anon` SELECT
+  on every table, so a new table or view whose migration grants less than the pass (a
+  service-role-only table, a staff-only view) needs its revoke in both copies of
+  `API_ROLE_REVOKE_SQL`; `findGrantsWidenedByGrantPass` and section 28 fail otherwise.
 - `ADMIN` and `WRITER` read every `profiles` row, phone and website included, and staff are
   trusted with the customer contact data the CMS already shows them. Customers never read
   another account's row. Since `02023` the `ADMIN` half of that read (and the admin
@@ -270,7 +324,9 @@ check inside RLS:
   `ADMIN` profile exists, and always self-heals the flag to `true`. A reset flag or a concurrent
   first-boot can no longer mint a second administrator.
 - **Second factor inside RLS.** `private.meets_aal_requirement()` (owner-privileged, in `private`)
-  is true unless the caller has a verified MFA factor but the session is not `aal2`;
+  is true unless the caller has a verified MFA factor but the session is not `aal2` (since
+  `02028` an enabled factor in `user_security_settings` counts too, which covers the app's
+  email codes: see `02028` below);
   `public.is_admin_mfa()` is the `SECURITY INVOKER` wrapper (`is_admin()` AND the aal check). A
   no-MFA admin is never locked out. Applied to `mcp_access_tokens` (self-minting a bearer is a
   persistence primitive) and `package_activations` (plaintext license keys, now ADMIN-only read),
@@ -300,6 +356,21 @@ still works because the provider mints a capability token (HMAC of the order id,
 `libs/ecommerce/src/lib/order-access-token.ts`) into the success redirect, which the action
 accepts as a third authorization path alongside owner / staff.
 
+**A server action takes no principal from its arguments.** The actor is the cookie session's
+user; an argument naming one (`actorUserId`, `authorId`, `uploaderId`, `userId`) or handing in
+the database client lets any caller choose who they are. Until 2026-10-21 `recordMediaUpload`
+and `importExternalImageToMedia` took `actorUserId`, wrote with the service role, and checked the
+session only when one existed, so a cookieless POST naming a staff id (public via approved
+comments) wrote media as that admin. Routes that authenticate another way (the MCP bearer token)
+call a helper that is not a server action and pass the actor they verified:
+`recordMediaUploadAsActor` (`@nextblock-cms/db/server`), `importExternalImageAsActor`
+(`lib/media/external-image-import.ts`). Helpers that take an author id or a client, like
+`app/cms/revisions/service.ts`, are `server-only` modules, never `'use server'`. A target id an
+admin acts on goes under a name that says so (`userIdToUpdate`).
+`tools/scripts/server-action-actors.test.ts` (in `security:check`) parses every `'use server'`
+module and inline action, follows each parameter's type into the module that declares it, and
+fails on an identity or client name.
+
 `02022` also carries these DB-level hardenings (second red-team pass):
 
 - **`media` is owner-scoped for staff.** `media_update_policy` / `media_delete_policy` let a WRITER
@@ -321,7 +392,10 @@ accepts as a third authorization path alongside owner / staff.
 - **`ucp_cart_sessions.access_token_hash`** holds the sha256 of a per-cart capability token the app
   now requires on every read/modify/cancel, closing the cart IDOR.
 - **`cortex_request_log`** (service-role only, RLS on, no API-role policy) backs a per-role hourly
-  quota on the AI routes so a WRITER cannot drain the operator's model key.
+  quota on the AI routes so a WRITER cannot drain the operator's model key. Until `02025` the
+  post-apply grant pass re-granted it to `anon` and `authenticated` on every deploy (RLS still
+  returned nothing, but a WRITER could issue DELETEs against their own counter); both apply
+  paths now revoke it again.
 - **aal2 reaches the app's own reads correctly.** Because `is_admin_mfa()` requires an `aal2`
   session for a factor-enrolled admin, the CMS pages that read `package_activations` /
   `mcp_access_tokens` now read with the service-role client behind the existing `/cms` 2FA gate, so
@@ -345,8 +419,14 @@ otherwise see their own screens empty. `apps/nextblock/lib/auth/cms-actor.ts` is
 `getCmsActor()` reads the caller's own profile row (the one branch no aal check touches) and is
 memoised per request with React `cache`, so the layout, the page and every helper they call
 resolve the actor once; `requireCmsAdmin()` / `requireCmsStaff()` throw `Unauthorized` /
-`Forbidden` and return the service-role client. `getEcomActorRole()` / `requireEcomAdmin()` in
-`libs/ecommerce/.../server-actions/require-ecom-role.ts` are the lib equivalents. Users: the
+`Forbidden` and return the service-role client. Since 2026-10-21 `getCmsActor()` is also null for
+a session that has not passed an enrolled second factor (`evaluateTwoFactor()`; trusted devices
+pass): the service role ignores every aal2 policy and a server action never goes through the CMS
+layout's 2FA redirect, so the helper itself must enforce it. `getEcomActorRole()` /
+`requireEcomAdmin()` in `libs/ecommerce/.../server-actions/require-ecom-role.ts` are the lib
+equivalents; they apply the same rule through the gate the app registers
+(`lib/auth/second-factor-gate.ts`, from `cms-actor.ts` and `instrumentation.ts`) and, with no gate
+registered, fail closed for any enrolled account that is not a TOTP session at aal2. Users: the
 dashboard (orders and the ledger profiles for ADMIN, the user count and recent-post authors for
 staff), the orders list, order detail and report export, the revision lists and the inbox (author
 names), the users screen's last-admin count, the Cortex and SEO admin gates (`require-admin.ts`
@@ -363,9 +443,10 @@ Explicit grants on every new table, view and sequence. Supabase no longer grants
 created since 2026-05-30 and for every existing project from 2026-10-30 (changelog 45329:
 "new tables in the public schema are no longer automatically exposed to the Data API";
 existing tables "keep their current grants and stay reachable"). A forward migration that
-creates a table, view or sequence ships its `GRANT ... ON TABLE public.x TO anon,
-authenticated, service_role` (and `ON SEQUENCE`, including the implicit sequence of a serial or
-identity column) plus `ENABLE ROW LEVEL SECURITY` and policies in the same file, exactly as
+creates a table, view or sequence ships its `GRANT SELECT ON TABLE public.x TO anon` (only
+for a publicly readable table) and `GRANT SELECT, INSERT, UPDATE, DELETE ... TO authenticated,
+service_role` (and `ON SEQUENCE`, including the implicit sequence of a serial or identity
+column, to `authenticated, service_role`) plus `ENABLE ROW LEVEL SECURITY` and policies in the same file, exactly as
 `02003` does for the baseline; without the grant PostgREST answers 42501 whatever the policies
 say. `npm run db:migrate:check` and `npm run generate:migrations-bundle` refuse a forward
 migration that creates such an object without granting on it to an API role, and (since `02022`)
@@ -373,8 +454,172 @@ without an `ALTER TABLE … ENABLE ROW LEVEL SECURITY` for each new table in the
 API-reachable table with RLS off exposes every row to the public key
 (`tools/scripts/lib/migration-grants.js`: `findUngrantedObjects` + `findTablesWithoutRls`). Two places still apply blanket grants afterwards:
 the sandbox reset (`ALTER DEFAULT PRIVILEGES ... GRANT ALL` in `generate-sandbox-reset.ts`) and
-`/setup`'s post-apply pass (`lib/setup/schema-apply.ts`, which then re-applies the `02021`
-revokes so a wizard-installed database matches a CLI-migrated one).
+the post-apply pass of both apply paths (`lib/setup/schema-apply.ts` for `/setup`,
+`tools/lib/migrate-core.mjs` for the build hook on every deploy), which then re-applies the
+revokes in `API_ROLE_REVOKE_SQL` so a deployed or wizard-installed database matches a
+CLI-migrated one.
+
+`02025` (2026-10-21, grant-level hardening after review of `02021`–`02024`) removes three places
+where RLS had become the only barrier, without changing any row a legitimate request reaches:
+
+- **`anon` is read-only at the grant level.** The baseline and Supabase's historical default
+  privileges gave `anon` INSERT/UPDATE/DELETE/REFERENCES/TRIGGER on every table, and no policy
+  lets `anon` write anything (every anonymous write path runs server-side with the service
+  role). Those grants, and `anon`'s USAGE/UPDATE on sequences, are revoked; one permissive
+  policy added by mistake can no longer publish a table for writing to the public key.
+- **`cortex_request_log` is service-role only again** (see `02022` above).
+- **`profiles.role` is pinned by column grants** (see `profiles` above). The column list is
+  read from the catalog, so a column added later stays owner-editable as before; add a new
+  sensitive column to the exclusions in the migration that creates it and in both copies of
+  `API_ROLE_REVOKE_SQL`.
+
+`02026` (2026-10-21, the follow-up `02025` left open) does the same for `authenticated`, which
+still held SELECT, INSERT, UPDATE, DELETE, REFERENCES and TRIGGER on every table:
+
+- **No write grant that no policy uses.** Where no permissive policy for `authenticated` or
+  PUBLIC covers a command, the grant goes: INSERT/UPDATE/DELETE on `cortex_ai_db_mutation_audit`,
+  `coupon_redemptions`, `email_2fa_challenges`, `freemius_plans`, `freemius_pricing`,
+  `package_activations`, `privacy_consent_logs`, `thread_messages`, `ucp_cart_sessions` and
+  `user_security_settings`; INSERT/DELETE on `message_threads`, `product_inquiries` and
+  `system_alerts` (their ADMIN UPDATE stays); UPDATE/DELETE on `site_script_revisions` (append-only;
+  the ADMIN INSERT stays); INSERT/UPDATE on `user_trusted_devices` (the owner DELETE stays). SELECT
+  is untouched everywhere. Every app write to these runs server-side with the service role, so
+  the only visible change is that such a statement over the cookie client now fails with
+  "permission denied" instead of RLS matching no row. One CMS action did that silently:
+  `updateFreemiusOverride` (`libs/ecommerce/.../products/actions.ts`) had always reported success
+  while RLS dropped its UPDATE, and now reports the error.
+- **REFERENCES and TRIGGER** are revoked on every table (DDL-only; no API request uses them).
+- Foreign-key actions are unaffected: `ON DELETE CASCADE` / `SET NULL` run as the owner of the
+  referencing table, so deleting a product or an order still removes its Freemius plans, prices
+  and coupon redemptions.
+- The migration opens with a pre-flight that re-reads `pg_policies` and aborts, changing
+  nothing, if a policy now covers any command it would revoke. The tables `currencies`,
+  `inventory_items`, `form_endpoints`, `coupon_freemius_mappings` and `system_configuration` are
+  not on the list: they carry ADMIN write policies for `authenticated`, so they keep their
+  grants.
+
+`02027` (2026-10-21, the read side) does the same for SELECT, which both roles still held on every
+table:
+
+- **No SELECT that no policy uses.** `anon` loses SELECT on the 29 tables no permissive policy lets
+  it read: `content_drafts`, `cortex_ai_db_mutation_audit`, `coupon_freemius_mappings`,
+  `coupon_products`, `coupon_redemptions`, `coupons`, `email_2fa_challenges`, `form_endpoints`,
+  `mcp_access_tokens`, `message_threads`, `order_items`, `orders`, `package_activations`,
+  `page_revisions`, `post_revisions`, `privacy_consent_logs`, `product_drafts`,
+  `product_freemius_sale_coupons`, `product_inquiries`, `product_revisions`, `profiles`,
+  `site_script_revisions`, `system_alerts`, `system_configuration`, `thread_messages`,
+  `ucp_cart_sessions`, `user_addresses`, `user_security_settings` and `user_trusted_devices`.
+  `authenticated` loses it on `email_2fa_challenges` and `ucp_cart_sessions` (service role only).
+  The public site keeps every table it renders (pages, posts, blocks, navigation, products and
+  their variants, media, Freemius plans, currencies, shipping and tax, site settings and themes).
+- **A read reaches tables the request never names.** A policy subquery (`EXISTS (SELECT … FROM
+  x)`), a `security_invoker` view, an invoker function and a PostgREST embed
+  (`select=*,x(...)`) read `x` as the calling role, and fail with 42501 once its SELECT is gone,
+  where RLS used to return no row or a null embed (a failed embed fails the whole request). The
+  census before the revoke found one such policy (`order_items`' owner policy reads `orders`; it
+  is `TO authenticated`, which keeps SELECT on `orders`), one view (`profile_cards`), one
+  invoker RPC (`apply_order_inventory_deduction`, service role only in the app), no anonymous
+  embed of a listed table, and a few signed-out cookie-client reads (draft lookups in draft mode
+  or with `NEXTBLOCK_VISUAL_EDITING_ENABLED`, `verifyPackageOnline` without a service key, the
+  MCP route's revision capture, a custom block's `profiles` relation) that already got no row
+  and handle the error the same way.
+- **The author card needs no SELECT on `profiles`.** `author()` returns `profile_cards` rows from
+  `private.author_card()` (`SECURITY DEFINER`), so `cms_interactions?select=*,author(...)` keeps
+  working for `anon` (checked through PostgREST). `profile_cards` itself is a `security_invoker`
+  view over `profiles`, so it loses `anon` SELECT and `authenticated` INSERT/UPDATE/DELETE. A direct
+  `profiles(...)` embed as `anon` now answers 42501 instead of `null`: use `author()`.
+- The pre-flight aborts, changing nothing, if a policy lets the role read a listed table, a
+  policy the role is subject to reads one, or a view the role can read depends on one. Function
+  bodies are not in the catalog's dependency graph; check invoker functions by hand when adding
+  a table to the list.
+
+`API_ROLE_REVOKE_SQL` lists these tables by name, not from `pg_policies`: computed from the
+policies, the pass would hand a table back on the deploy after a permissive policy was added
+by mistake, which is exactly the failure grant-level hardening exists to stop. To open one of
+these privileges to a role, add the policy and the GRANT in a migration and remove the table
+from both copies of the list.
+
+Both apply paths repeat these revokes after their blanket grants. A revoke a forward migration
+makes from `anon` or `authenticated` that the blanket grants hand back must be added to
+`API_ROLE_REVOKE_SQL` in both files; `tools/scripts/migration-grants.test.ts`
+(`findRevokesUndoneByGrantPass`) fails until it is, and replays the `cortex_request_log` case
+against the pre-`02025` pass to prove it would have caught it. A table or view a forward
+migration creates with narrower grants than the pass (granted to `service_role` alone, say) is
+widened without any revoke to undo; `findGrantsWidenedByGrantPass` compares what the migrations
+grant `anon` and `authenticated` on it with what is left after `GRANTS_SQL`, and replays
+`02021`'s `profile_cards` (whose writes the pass handed `authenticated` until `02027`) against the
+pre-`02027` pass. `security-verify.sql` sections
+18–25 are catalog-level assertions run on top of the behavioural ones: RLS on every `public`
+table, no `SECURITY DEFINER` function in `public` callable by an API role or outside the
+allowlist, no `USING (true)` / `WITH CHECK (true)` policy for `anon`, `authenticated` or
+PUBLIC on the sensitive tables (profiles, orders, order items, coupons, license activations, MCP
+tokens, revision history, 2FA, addresses, carts, consent and AI logs, site settings, messages),
+`anon` write grants, the `cortex_request_log` grants and the `profiles` column grants. Sections
+26–27 (`02026`) assert that `authenticated` holds an INSERT/UPDATE/DELETE only where a policy
+lets it use it, that every such policy has its grant (a table left in `API_ROLE_REVOKE_SQL`
+after its policy was added), and no REFERENCES/TRIGGER, then check the behaviour (grant-level
+denials even for an `aal2` ADMIN, the kept policies, FK cascades, service-role writes). Sections
+28–29 (`02027`) do the same for SELECT (no grant without a SELECT/ALL policy, or for
+`authenticated` an UPDATE/DELETE policy whose WHERE reads columns; no read policy without its
+grant; every view `security_invoker` and readable only by roles that can read its tables), then
+check that the public site's tables, a product page's embeds and the `author()` card still read
+for `anon` while orders, profiles, coupons, revisions, drafts, tokens and 2FA do not. Run the
+script on a database that went through the post-apply pass (a deployed one, or a replay followed
+by `GRANTS_SQL`): that is where grant regressions appear.
+
+`02028` (2026-10-21 audit, each hole reproduced over PostgREST on a local replay) closes five
+more:
+
+- **`site_settings` writes: `WRITER` on an allow-list.** The `WRITER` branch of the three write
+  policies was a deny-list, so a `WRITER` could `PATCH site_settings?key=eq.email_public` to
+  point SMTP at their own server; `lib/config/email-settings.ts` pairs that host with the
+  decrypted ADMIN-only `email_secret`, so the SMTP password and every outgoing mail (ADMIN email
+  2FA codes included) went to them. Captcha, payment, invoice, notification-address,
+  `migration_baseline_generation` and Cortex keys were open the same way. Writes now have three
+  tiers (see "Important Site Settings in Active Use"): the `WRITER` allow-list, two `ADMIN`
+  keys, and every other key, new ones included, behind `is_admin_mfa()`. The three ADMIN
+  actions that still upserted an above-staff key with the cookie client moved to the service
+  role after `requireCmsAdmin()` (`saveInvoiceSettings`, `saveStoreContactEmail`, the
+  interactions notification addresses); two of them had failed for an `aal1` admin since
+  `02023`, because an upsert's `ON CONFLICT` path checks the read policy.
+- **The email second factor counts in RLS.** `meets_aal_requirement()` treated "no verified
+  `auth.mfa_factors` row" as "no factor", but the app's email factor never creates one (only
+  TOTP does), so for an email-2FA ADMIN every `is_admin_mfa()` policy was a plain role check:
+  a stolen password and an `aal1` JWT minted MCP tokens and read license keys, secrets and
+  other profiles. The no-factor branch now also requires that no `user_security_settings` row
+  has `mfa_enabled AND mfa_type IS NOT NULL`. An email factor never yields an `aal2` Supabase
+  session, so for those admins the `is_admin_mfa()` rows are reachable only through the service
+  role after `getCmsActor()` (which refuses a session whose factor is pending). Every CMS screen
+  reads them that way (the "remember this device" TOTP admin needed the same since `02023`).
+- **The remaining ADMIN branches need the second factor:** `site_scripts` and
+  `site_script_revisions` writes (scripts carry the CSP nonce on every route, `/cms` included),
+  `cms_redirects` writes, every command on `system_configuration`, and the reads and updates of
+  `product_inquiries`, `message_threads` and `thread_messages`. Their CMS actions run on the
+  service role after `requireCmsAdmin()` / `getCmsActor()` (site scripts,
+  `updateSystemConfiguration`, the SEO redirects, `app/cms/messages/require-admin.ts`).
+- **`media` keys.** `media_insert_policy` pins `uploader_id` to the caller (ADMIN may attribute
+  a row to anyone). Nothing pins `object_key` or `variants`, so the delete and move actions in
+  `app/cms/media/actions.ts` only touch the keys derived from the row's own `object_key`
+  (`lib/storage/media-object-keys.ts`: same folder and base name, as the upload pipeline writes
+  them) and never delete a key another row still references
+  (`public.media_storage_keys_in_use(keys, exclude_id)`, `SECURITY INVOKER`, service-role only;
+  the actions keep every key if the check cannot run). Before, a `WRITER` could insert a decoy
+  row listing another uploader's keys and delete their files.
+- **`package_activations.license_key` and `.meta`** are no longer readable by `authenticated`
+  (the public demo signs visitors in as a factor-less ADMIN). Table SELECT goes and comes back
+  per column, from the catalog, like `profiles` in `02025`; `meta` holds the Freemius activation
+  response (install API token). Every app read uses the service role.
+
+`security-verify.sql` sections 30–34 cover these. Their hole checks print FAIL on a replay
+through `02027` when the script runs under `psql`; under `npm run security:db-posture` the
+post-apply pass already carries the `package_activations` revoke, so section 34 passes there
+before the migration.
+
+Left open by `02028`: `enabled_payment_providers` and `ecommerce_inventory_settings` are still
+written with the cookie client (`libs/ecommerce` payments, shipping and taxes actions); moving
+those writes to the service role lets them join the `is_admin_mfa()` tier. A `WRITER` can still
+delete an unreferenced media-extension object whose key they guess, by inserting a row that
+names it and deleting the row.
 
 ## Migration Structure
 
@@ -760,3 +1005,18 @@ key). The two policies on `site_settings` are the only place the tiers live, so 
 Server code that reads a key for the public site with the service role is unaffected; code that
 reads one with the cookie or SSG client for a visitor must use a public-tier key, or the loader
 caches its fallback value (`unstable_cache` keeps whatever the first read returned).
+
+Writes are tiered separately (`02028`; the three write policies are the only place these lists
+live, and a key on neither list is in the last tier):
+
+- `ADMIN` and `WRITER`: `site_title`, `site_description`, `site_keywords`, `site_social_image`,
+  `active_logo_id`, `footer_copyright`, `footer_show_attribution`, `onboarding_state` — the keys
+  staff code writes with the cookie client (site identity, footer, the dashboard's dismiss).
+- `ADMIN`: `enabled_payment_providers`, `ecommerce_inventory_settings` — the keys ADMIN code
+  still writes with the cookie client (`libs/ecommerce`).
+- `is_admin_mfa()`: everything else, the secrets and `email_public`, `bot_protection_public`,
+  `payment_public`, `invoice_settings`, `store_contact`, `forms_contact`,
+  `interactions_notification_emails`, `migration_baseline_generation`, `privacy_settings`,
+  `global_css`, `security_settings` and the `cortex_ai_*` keys among them. The app writes all of
+  these with the service role after its own ADMIN check; a key a `WRITER` must write through the
+  cookie client goes on the first list in a migration, never by widening the default.

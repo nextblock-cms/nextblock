@@ -1,3 +1,5 @@
+import 'server-only';
+
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { Bot, CheckCircle2 } from 'lucide-react';

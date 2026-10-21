@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { PaymentProvider } from '../types';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
@@ -6,7 +8,7 @@ import { hydrateFreemiusEnvFromDb } from '../payment-config';
 import { CheckoutSessionInput, normalizeOrderCustomerDetails } from '../customer';
 import { getCouponQuote, recordCouponRedemption } from '../coupon-server';
 import { mintOrderAccessToken } from '../order-access-token';
-import type { CouponQuote } from '../coupons';
+import { reconcileCouponContextItems, type CouponQuote } from '../coupons';
 import {
   fillMissingUserProfileCheckoutDetails,
   upsertDefaultUserAddresses,
@@ -14,9 +16,13 @@ import {
 import {
   getDefaultCurrency,
   isSaleWindowActive,
-  resolveEffectivePriceForCurrency,
 } from '../currency';
-import { normalizeCheckoutItems } from './checkout-items';
+import {
+  FREEMIUS_PRICED_PRODUCT_COLUMNS,
+  resolveFreemiusUnitAmount,
+  type FreemiusUnitAmountResolution,
+} from '../freemius-pricing-server';
+import { createInvalidCheckoutItemsError, normalizeCheckoutItems } from './checkout-items';
 
 export type FreemiusCheckoutCredentialEntry = {
     publicKey?: string;
@@ -295,7 +301,11 @@ export class FreemiusProvider implements PaymentProvider {
               return { url: null, ...normalizedContextItems.error };
           }
 
-          couponContextItems = normalizedContextItems.items;
+          // The cart's own lines keep the cart's quantities; the context may only add lines.
+          couponContextItems = reconcileCouponContextItems(
+            normalizedCartItems.items,
+            normalizedContextItems.items
+          );
       }
 
       const { data: currenciesResult, error: currenciesError } = await supabase
@@ -319,7 +329,7 @@ export class FreemiusProvider implements PaymentProvider {
       const item = normalizedCartItems.items[0];
       const { data: product, error: productError } = await supabase
         .from('products')
-        .select('id, title, price, prices, sale_price, sale_prices, sale_start_at, sale_end_at, scheduled_price, scheduled_prices, scheduled_price_at, freemius_plan_id, freemius_product_id, trial_period_days, trial_requires_payment_method')
+        .select(`${FREEMIUS_PRICED_PRODUCT_COLUMNS}, title, freemius_plan_id, freemius_product_id, trial_period_days, trial_requires_payment_method`)
         .eq('id', item.product_id)
         .single();
 
@@ -334,20 +344,29 @@ export class FreemiusProvider implements PaymentProvider {
           return { error: 'Product is not configured for Freemius checkout (missing Plan ID or Product ID)', url: null };
       }
 
-      const resolvedPrice = resolveEffectivePriceForCurrency({
-        prices: product.prices || {},
-        salePrices: product.sale_prices || {},
-        fallbackPrice: product.price,
-        fallbackSalePrice: product.sale_price,
-        saleStartAt: product.sale_start_at,
-        saleEndAt: product.sale_end_at,
-        scheduledPrice: product.scheduled_price,
-        scheduledPrices: product.scheduled_prices || {},
-        scheduledPriceAt: product.scheduled_price_at,
-        currencyCode: selectedCurrency.code,
-        currencies,
-      });
-      const unitAmount = resolvedPrice.sale_price ?? resolvedPrice.price;
+      // Freemius charges its plan price for the cycle the checkout opens on, so the order
+      // records that price, and the cycle sent to Freemius is the one validated here.
+      let pricing: FreemiusUnitAmountResolution;
+
+      try {
+        pricing = await resolveFreemiusUnitAmount({
+          client: supabase as any,
+          product,
+          billingCycle: item.billing_cycle,
+          currencyCode: selectedCurrency.code,
+          currencies,
+        });
+      } catch (pricingError) {
+        console.error('Failed to resolve Freemius pricing:', pricingError);
+        return { error: 'Failed to resolve product pricing', url: null };
+      }
+
+      if (!pricing.ok) {
+        return { url: null, ...createInvalidCheckoutItemsError() };
+      }
+
+      const unitAmount = pricing.unitAmount;
+      const billingCycle = pricing.billingCycle;
       // The locally recorded order price reflects the sale; the real Freemius
       // charge is enforced by an auto-generated, time-bounded coupon (see
       // syncProductSaleCouponToFreemius) appended to the checkout URL below.
@@ -363,7 +382,12 @@ export class FreemiusProvider implements PaymentProvider {
           const quoteResult = await getCouponQuote({
               client: supabase as any,
               code: couponCode,
-              items: couponContextItems,
+              // Quote this product on the cycle validated above, not on the context's copy.
+              items: couponContextItems.map((line) =>
+                  line.product_id === product.id
+                      ? { ...line, billing_cycle: billingCycle ?? undefined }
+                      : line
+              ),
               currencyCode: selectedCurrency.code,
           });
 
@@ -603,8 +627,8 @@ export class FreemiusProvider implements PaymentProvider {
           url.searchParams.append('user_lastname', freemiusCustomerName.lastName);
       }
       url.searchParams.append('currency', selectedCurrency.code.toLowerCase());
-      if (item.billing_cycle) {
-          url.searchParams.append('billing_cycle', item.billing_cycle);
+      if (billingCycle) {
+          url.searchParams.append('billing_cycle', billingCycle);
       }
       if (trialMode) {
           url.searchParams.append('trial', trialMode);
@@ -644,7 +668,7 @@ export class FreemiusProvider implements PaymentProvider {
               user_lastname: freemiusCustomerName.lastName,
               credential_source: checkoutCredentials.source,
               sandbox: sandboxPayload,
-              billing_cycle: item.billing_cycle,
+              billing_cycle: billingCycle,
               trial: trialMode,
               trial_period_days: trialPeriodDays,
               trial_requires_payment_method: product.trial_requires_payment_method,

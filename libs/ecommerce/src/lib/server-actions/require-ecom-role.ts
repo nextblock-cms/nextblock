@@ -33,6 +33,40 @@ export async function getEcomActorRole(): Promise<EcomActorRole | null> {
   return resolveActorRole();
 }
 
+/**
+ * Process-wide key under which the app publishes its CMS second-factor check
+ * (apps/nextblock/lib/auth/second-factor-gate.ts). The lib cannot import the app.
+ */
+const SECOND_FACTOR_GATE_KEY = Symbol.for('nextblock.cms.secondFactorGate');
+
+type ClientLike = ReturnType<typeof createClient>;
+
+/**
+ * Has this session passed the account's second factor (or is none enrolled)? These helpers
+ * return the service-role client, which no aal2 policy can stop, so before 2026-10-21 a stolen
+ * password alone reached payments, coupons and orders through them. With the app's gate
+ * registered, its decision is final (trusted devices and the email factor included). Without
+ * it, fail closed: an enrolled account passes only as a TOTP session already at aal2.
+ */
+async function secondFactorSatisfied(supabase: ClientLike, userId: string): Promise<boolean> {
+  const gate = (globalThis as Record<symbol, unknown>)[SECOND_FACTOR_GATE_KEY];
+  if (typeof gate === 'function') {
+    return Boolean(await (gate as () => Promise<boolean>)());
+  }
+
+  const { data: settings } = await supabase
+    .from('user_security_settings')
+    .select('mfa_enabled, mfa_type')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (!settings?.mfa_enabled || !settings?.mfa_type) return true;
+  if (settings.mfa_type === 'totp') {
+    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    return aal?.currentLevel === 'aal2';
+  }
+  return false;
+}
+
 async function resolveActorRole(): Promise<EcomActorRole | null> {
   const supabase = createClient();
   const {
@@ -47,7 +81,9 @@ async function resolveActorRole(): Promise<EcomActorRole | null> {
     .single();
 
   const role = profile?.role;
-  return role === 'ADMIN' || role === 'WRITER' ? role : null;
+  if (role !== 'ADMIN' && role !== 'WRITER') return null;
+  if (!(await secondFactorSatisfied(supabase, user.id))) return null;
+  return role;
 }
 
 /**

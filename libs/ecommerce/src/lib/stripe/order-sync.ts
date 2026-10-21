@@ -1,3 +1,5 @@
+import 'server-only';
+
 import Stripe from 'stripe';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db';

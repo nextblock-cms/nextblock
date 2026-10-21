@@ -8,6 +8,7 @@ import {
   type BlockContentValidator,
   type CustomBlockDefinitionLike,
 } from './block-content-schemas';
+import { requireActorRole } from './ai-global-agent-theming-tools';
 import { cortexSiteBriefSchema } from './site-brief';
 import { z } from './zod-config';
 
@@ -16,6 +17,8 @@ type SupabaseLike = {
 };
 
 type ToolExecutionContext = {
+  /** See ai-global-agent-theming-tools.ts: an orphaned MCP token never passes a role check. */
+  actorFromOrphanedToken?: boolean;
   actorUserId?: string | null;
   latestUserMessage?: string | null;
   skipAudit?: boolean;
@@ -79,6 +82,10 @@ const PROTECTED_SITE_SETTING_KEY_PATTERN =
 
 function isProtectedSiteSettingKey(key: string) {
   return PROTECTED_SITE_SETTING_KEYS.has(key) || PROTECTED_SITE_SETTING_KEY_PATTERN.test(key);
+}
+
+function isWriteProtectedSiteSettingKey(key: string) {
+  return WRITE_PROTECTED_SITE_SETTING_KEYS.has(key);
 }
 
 /**
@@ -742,10 +749,19 @@ type DatabaseMutationOperation = 'delete' | 'insert' | 'update' | 'upsert';
  * name. Reads always fetch that column, whatever the caller projects, decide
  * redaction from it, and only then trim the row back to the requested columns, so
  * `columns: ['value']` cannot sidestep the check. Mutations refuse any target row
- * whose key is protected, however the filter reached it.
+ * whose key is protected or write-protected, however the filter reached it.
  */
-const ROW_KEY_PROTECTIONS: Partial<Record<TableName, { column: string; isProtected: (key: string) => boolean }>> = {
-  site_settings: { column: 'key', isProtected: isProtectedSiteSettingKey },
+const ROW_KEY_PROTECTIONS: Partial<
+  Record<
+    TableName,
+    { column: string; isProtected: (key: string) => boolean; isWriteProtected: (key: string) => boolean }
+  >
+> = {
+  site_settings: {
+    column: 'key',
+    isProtected: isProtectedSiteSettingKey,
+    isWriteProtected: isWriteProtectedSiteSettingKey,
+  },
 };
 type AuditWriteResult = {
   auditError?: string;
@@ -913,8 +929,13 @@ function getTableConfig(table: TableName): TableConfig {
   return tableConfigs[table];
 }
 
+/**
+ * Credential-shaped column and JSON property names. `license_key` is listed because
+ * `package_activations.license_key` is a paid license an agent has no use for, and an
+ * MCP token with read scope could otherwise copy it off the install.
+ */
 function isSensitiveKey(key: string) {
-  return /(?:password|token|secret|api[_-]?key|private[_-]?key|credential)/i.test(key);
+  return /(?:password|token|secret|api[_-]?key|private[_-]?key|license[_-]?key|credential)/i.test(key);
 }
 
 function assertSafeColumn(table: TableName, column: string) {
@@ -1059,10 +1080,16 @@ function assertNoProtectedSiteSetting(table: TableName, input: z.infer<typeof ex
 
 /**
  * A filter that never names a protected key can still reach its row (`key ilike '%'`,
- * `key neq 'x'`). The preview fetches every target's primary key, so this is where a
- * protected row is caught before an update or delete touches it.
+ * `key neq 'x'`, `key in [...]`). The preview fetches every target's primary key, so this
+ * is where a protected or write-protected row is caught before an update or delete
+ * touches it, whatever operator selected it. An update that sets `value` is also checked
+ * against the shape of every row it reaches, not only a key named by an `eq` filter.
  */
-function assertNoProtectedTargetRows(table: TableName, rows: Array<Record<string, unknown>>) {
+function assertNoProtectedTargetRows(
+  table: TableName,
+  rows: Array<Record<string, unknown>>,
+  input: z.infer<typeof executeDatabaseMutationInputSchema>
+) {
   const protection = ROW_KEY_PROTECTIONS[table];
 
   if (!protection) {
@@ -1072,8 +1099,20 @@ function assertNoProtectedTargetRows(table: TableName, rows: Array<Record<string
   for (const row of rows) {
     const key = row[protection.column];
 
-    if (typeof key === 'string' && protection.isProtected(key)) {
+    if (typeof key !== 'string') {
+      continue;
+    }
+
+    if (protection.isProtected(key)) {
       throw new Error(`The "${key}" site setting is protected.`);
+    }
+
+    if (protection.isWriteProtected(key)) {
+      assertValidSiteSettingValue(key, undefined);
+    }
+
+    if (input.operation === 'update' && input.values && 'value' in input.values) {
+      assertValidSiteSettingValue(key, input.values.value);
     }
   }
 }
@@ -1138,7 +1177,7 @@ function getTargetId(row: Record<string, unknown>, primaryKey: readonly string[]
 async function fetchMutationTargets(
   supabase: SupabaseLike,
   table: TableName,
-  filters: Array<z.infer<typeof databaseFilterSchema>>
+  input: z.infer<typeof executeDatabaseMutationInputSchema>
 ) {
   const config = getTableConfig(table);
   let query = supabase
@@ -1146,7 +1185,7 @@ async function fetchMutationTargets(
     .select(config.primaryKey.join(','))
     .limit(MAX_MUTATION_TARGETS + 1);
 
-  query = applyFilters(table, query, filters);
+  query = applyFilters(table, query, input.filters ?? []);
 
   const { data, error } = await query;
 
@@ -1160,9 +1199,30 @@ async function fetchMutationTargets(
     throw new Error(`Refusing to mutate more than ${MAX_MUTATION_TARGETS} rows.`);
   }
 
-  assertNoProtectedTargetRows(table, rows);
+  assertNoProtectedTargetRows(table, rows, input);
 
   return rows;
+}
+
+/**
+ * Exact protected `site_settings` keys excluded from the update or delete statement
+ * itself, so a row that starts to match between the preview and the write is still
+ * never touched. The preview check above is the one that reports the refusal.
+ */
+function excludeProtectedSiteSettingRows(table: TableName, query: any) {
+  if (table !== 'site_settings') {
+    return query;
+  }
+
+  let nextQuery = query;
+
+  for (const key of [...PROTECTED_SITE_SETTING_KEYS, ...WRITE_PROTECTED_SITE_SETTING_KEYS]) {
+    if (key !== PROTECTED_CORTEX_KEY) {
+      nextQuery = nextQuery.neq('key', key);
+    }
+  }
+
+  return nextQuery;
 }
 
 function validateMutationInput(input: z.infer<typeof executeDatabaseMutationInputSchema>) {
@@ -1291,10 +1351,12 @@ async function executePreparedMutation(
   } else if (input.operation === 'update') {
     query = supabase.from(table).update(input.values);
     query = applyFilters(table, query, input.filters ?? []);
+    query = excludeProtectedSiteSettingRows(table, query);
     query = query.select(select);
   } else {
     query = supabase.from(table).delete();
     query = applyFilters(table, query, input.filters ?? []);
+    query = excludeProtectedSiteSettingRows(table, query);
     query = query.select(select);
   }
 
@@ -1385,12 +1447,15 @@ export async function executeDatabaseMutation(
   context?: ToolExecutionContext
 ) {
   const parsed = executeDatabaseMutationInputSchema.parse(input);
+  // The service-role client bypasses RLS, so this is the authorization: the dashboard
+  // reserves raw table writes to administrators, and MCP must not be wider.
+  await requireActorRole(context, ['ADMIN'], 'Changing database records');
   const table = validateMutationInput(parsed);
   const supabase = getSupabase(context);
   await validateMutationPayloads(parsed, table, context);
   const targetRows =
     parsed.operation === 'update' || parsed.operation === 'delete'
-      ? await fetchMutationTargets(supabase, table, parsed.filters ?? [])
+      ? await fetchMutationTargets(supabase, table, parsed)
       : [];
   const preview = buildMutationPreview({ input: parsed, table, targetRows });
   const confirmationPayload = {
@@ -1468,6 +1533,7 @@ export async function executeDatabaseActionPlan(
   context?: ToolExecutionContext
 ) {
   const parsed = executeDatabaseActionPlanInputSchema.parse(input);
+  await requireActorRole(context, ['ADMIN'], 'Changing database records');
   const prepared: Array<{
     input: z.infer<typeof executeDatabaseMutationInputSchema>;
     preview: ReturnType<typeof buildMutationPreview>;
@@ -1479,7 +1545,7 @@ export async function executeDatabaseActionPlan(
     await validateMutationPayloads(action, table, context);
     const targetRows =
       action.operation === 'update' || action.operation === 'delete'
-        ? await fetchMutationTargets(getSupabase(context), table, action.filters ?? [])
+        ? await fetchMutationTargets(getSupabase(context), table, action)
         : [];
     prepared.push({
       input: action,

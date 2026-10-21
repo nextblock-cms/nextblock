@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/tools/scripts/claude-security-stop-hook.mjs\"",
+            "timeout": 180,
+            "statusMessage": "Running security checks on changed code"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { headers } from 'next/headers';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 

@@ -1,3 +1,5 @@
+import 'server-only';
+
 // Server-only trusted-device ("Remember this device") helpers.
 //
 // Trust is server-validated: the cookie holds only a random token, and a bypass

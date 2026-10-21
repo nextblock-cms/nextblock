@@ -86,6 +86,10 @@ vi.mock('@supabase/supabase-js', () => ({
 }));
 
 vi.mock('server-only', () => ({}));
+// The caller has passed any enrolled second factor; 2FA itself is covered by lib/auth/cms-actor.test.ts.
+vi.mock('../../../lib/auth/twoFactor', () => ({
+  evaluateTwoFactor: async () => ({ status: 'satisfied', userId: null, mfaType: null }),
+}));
 
 import { getOrders, markOrderAsPaid } from './actions';
 

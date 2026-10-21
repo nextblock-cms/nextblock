@@ -1,4 +1,7 @@
+import 'server-only';
+
 import { createClient } from '@nextblock-cms/db/server';
+import { getCmsActor } from '../../../lib/auth/cms-actor';
 
 /**
  * Admin gate shared by the Messages server actions.
@@ -8,30 +11,32 @@ import { createClient } from '@nextblock-cms/db/server';
  * exported from there.
  *
  * This is the check standing between a WRITER and every private conversation on the
- * site: visitor names, addresses, and free text. RLS enforces the same rule
- * independently, so a bug here fails closed rather than open, but the redundancy is the
- * point.
+ * site: visitor names, addresses, and free text. The actions read and write the message
+ * tables with the service-role client after it, so this check IS the authorization: since
+ * migration 02028 the ADMIN policies on message_threads, thread_messages and
+ * product_inquiries need public.is_admin_mfa(), which an admin on a "remember this device"
+ * session or on the email second factor never passes over PostgREST. The role comes from
+ * getCmsActor(), which also refuses a session whose second factor is still pending (a
+ * stolen password alone must not reach the inbox through a server action).
  */
 export async function requireAdminSupabaseClient() {
-  const supabase = createClient();
-  const {
-    data: { user },
-    error: userError,
-  } = await supabase.auth.getUser();
+  const actor = await getCmsActor();
 
-  if (userError || !user) {
+  if (!actor) {
     throw new Error('You must be logged in to manage messages.');
   }
 
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role, full_name')
-    .eq('id', user.id)
-    .single();
-
-  if (profileError || !profile || profile.role !== 'ADMIN') {
+  if (actor.role !== 'ADMIN') {
     throw new Error('You do not have permission to manage messages.');
   }
 
-  return { supabase, userId: user.id, fullName: profile.full_name as string | null };
+  // The admin's own profile row: the owner branch of profiles_read_policy, never aal-gated.
+  const supabase = createClient();
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('full_name')
+    .eq('id', actor.userId)
+    .maybeSingle();
+
+  return { supabase, userId: actor.userId, fullName: (profile?.full_name as string | null) ?? null };
 }

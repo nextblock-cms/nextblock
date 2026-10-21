@@ -7,7 +7,7 @@ import { Label } from '@nextblock-cms/ui/label';
 import { Truck, Calculator, Loader2 } from 'lucide-react';
 import { countries } from '../countries';
 import { getShippingEstimates } from '../server-actions/shipping-actions';
-import { ResolvedShippingMethod } from '../shipping/resolver';
+import type { ResolvedShippingMethod } from '../shipping/resolver';
 import { useTranslations } from '@nextblock-cms/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import { countryUsesStructuredStates, getStatesForCountry, getSubdivisionLabel } from '../states';

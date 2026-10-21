@@ -254,8 +254,9 @@ export async function executeUpdateGlobalCss(
   context?: ThemingToolContext
 ) {
   const parsed = updateGlobalCssInputSchema.parse(input);
-  // Matches the CMS action for global CSS, which allows ADMIN or WRITER.
-  await requireActorRole(context, ['ADMIN', 'WRITER'], 'Editing the global stylesheet');
+  // ADMIN only, matching the CMS action and the ADMIN-only write tier 02022 put
+  // `global_css` in: the stylesheet is injected on every page, /cms included.
+  await requireActorRole(context, ['ADMIN'], 'Editing the global stylesheet');
   const supabase = requireSupabase(context);
 
   const { data: existingRow } = await supabase

@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import {
   applyOrderInventoryDeduction,
@@ -11,7 +13,8 @@ import {
   verifyOrderAccessToken,
 } from '@nextblock-cms/ecommerce/server';
 import { createClient } from '@nextblock-cms/db/server';
-import { resolveSupabaseServiceKey, resolveSupabaseUrl } from '../../../lib/setup/env-status';
+import { resolveSupabaseUrl } from '../../../lib/setup/env-status';
+import { resolveSupabaseServiceKey } from '../../../lib/setup/service-key';
 
 function getServiceRoleSupabaseClient() {
   const supabaseUrl = resolveSupabaseUrl();
@@ -104,7 +107,9 @@ export async function fulfillOrderAction(sessionId: string, accessToken?: string
               .select('role')
               .eq('id', sessionUser.id)
               .single();
-            if (profile?.role === 'ADMIN' || profile?.role === 'WRITER') authorized = true;
+            // Orders are ADMIN-only data (02023), and this page reveals the buyer's details and
+            // license key, so staff access is ADMIN only; a WRITER is not a support role here.
+            if (profile?.role === 'ADMIN') authorized = true;
           }
         }
       }

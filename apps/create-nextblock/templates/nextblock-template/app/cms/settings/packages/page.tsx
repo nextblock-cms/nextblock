@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { ActivationForm } from './activation-form';

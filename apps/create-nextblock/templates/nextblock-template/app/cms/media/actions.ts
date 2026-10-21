@@ -1,7 +1,9 @@
 // app/cms/media/actions.ts
 "use server";
 
-import { createClient } from "@nextblock-cms/db/server";
+import "server-only";
+
+import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { revalidatePath } from "next/cache";
 import type { Database } from "@nextblock-cms/db";
 import { encodedRedirect } from "@nextblock-cms/utils/server";
@@ -9,16 +11,64 @@ import { DeleteObjectCommand, DeleteObjectsCommand, CopyObjectCommand, ListObjec
 import { getS3Client } from "@nextblock-cms/utils/server";
 import { getStorageBackend, getStorageBucket } from "../../../lib/storage/provider";
 import { supabaseRemoveObjects } from "../../../lib/storage/supabase-storage";
+import { mediaKeyStem, ownedMediaStorageKeys, withoutKeysInUse } from "../../../lib/storage/media-object-keys";
 
 type Media = Database['public']['Tables']['media']['Row'];
+
+/**
+ * The subset of `keys` that a media row other than `excludeMediaId` still references, as
+ * `object_key`, `file_path` or a `variants[].objectKey` (public.media_storage_keys_in_use,
+ * migration 02028). A row only lists keys, it does not own them: a WRITER can create a row
+ * whose variants name another uploader's objects, so a delete or move must never remove a key
+ * some other row points at (lib/storage/media-object-keys.ts). Read with the service role,
+ * after the caller's own role check, so the answer does not depend on what RLS lets the caller
+ * see. Fails closed: if the check cannot run, every key counts as in use and no object is
+ * deleted (an orphaned object can be reclaimed, a deleted one cannot).
+ */
+async function storageKeysStillInUse(keys: string[], excludeMediaId?: string): Promise<Set<string>> {
+  if (keys.length === 0) return new Set();
+  try {
+    // The function arrives with migration 02028; cast past the generated types until
+    // `npm run db:types` is regenerated.
+    const service = getServiceRoleSupabaseClient() as unknown as {
+      rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: { message: string } | null }>;
+    };
+    const { data, error } = await service.rpc("media_storage_keys_in_use", {
+      p_keys: keys,
+      p_exclude_id: excludeMediaId ?? null,
+    });
+    if (error || !Array.isArray(data)) {
+      console.error("Media: could not check which storage keys are still in use:", error?.message ?? "no data");
+      return new Set(keys);
+    }
+    return new Set(data.filter((key): key is string => typeof key === "string"));
+  } catch (error) {
+    console.error("Media: could not check which storage keys are still in use:", error);
+    return new Set(keys);
+  }
+}
 
 // --- recordMediaUpload and updateMediaItem functions to be updated similarly ---
 
 
 
-import { recordMediaUpload as sharedRecordMediaUpload } from "@nextblock-cms/db";
+import { recordMediaUpload as sharedRecordMediaUpload, type MediaUploadPayload } from "@nextblock-cms/db";
+import { requireCmsStaff } from "../../../lib/auth/cms-actor";
 
-export async function recordMediaUpload(payload: any, returnJustData?: boolean) {
+/**
+ * Record an upload as the signed-in staff member. Takes no actor: this checks the session
+ * first (`requireCmsStaff()`, second factor included), and the shared action reads the
+ * uploader from that same session, ignoring anything else in the payload. Server routes
+ * with no session use `recordMediaUploadAsActor` from `@nextblock-cms/db/server`.
+ */
+export async function recordMediaUpload(payload: MediaUploadPayload, returnJustData?: boolean) {
+  try {
+    await requireCmsStaff();
+  } catch {
+    if (returnJustData) return { error: "Forbidden: Insufficient permissions to record media." };
+    return encodedRedirect("error", "/cms/media", "Forbidden: Insufficient permissions to record media.");
+  }
+
   return sharedRecordMediaUpload(payload, returnJustData);
 }
 
@@ -74,7 +124,9 @@ export async function updateMediaItem(
 }
 
 
-export async function deleteMediaItem(mediaId: string, objectKey: string) {
+// `_objectKey` stays in the signature for existing callers; the keys to delete come from the
+// row that was actually deleted, never from the client.
+export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
     const supabase = createClient();
     const { data: { user } } = await supabase.auth.getUser();
 
@@ -120,16 +172,16 @@ export async function deleteMediaItem(mediaId: string, objectKey: string) {
         return encodedRedirect("error", "/cms/media", "Media item not found or you do not have permission to delete it.");
     }
 
-    const deletedRow = deletedRows[0];
-    const keysToDelete = [deletedRow.object_key ?? objectKey];
-    if (deletedRow.variants && Array.isArray(deletedRow.variants)) {
-        deletedRow.variants.forEach((v: any) => {
-            if (v?.objectKey) keysToDelete.push(v.objectKey);
-        });
-    }
+    // Only the objects this row owns (its object_key and the variants of that same upload), and
+    // none another row still references: never the caller's `objectKey`, never whatever keys
+    // the row happens to list (lib/storage/media-object-keys.ts).
+    const ownedKeys = ownedMediaStorageKeys(deletedRows[0]);
+    const keysToDelete = withoutKeysInUse(ownedKeys, await storageKeysStillInUse(ownedKeys));
 
     try {
-        if (backend === 'supabase') {
+        if (keysToDelete.length === 0) {
+            // Nothing this row owns is left to remove.
+        } else if (backend === 'supabase') {
             await supabaseRemoveObjects(keysToDelete);
         } else {
             await s3Client!.send(new DeleteObjectsCommand({
@@ -200,16 +252,10 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
   }
 
   // Build the storage key list from the rows that were actually deleted — never from the
-  // caller-supplied object keys, which could name objects for rows RLS refused to delete.
-  const allKeysToDelete: string[] = [];
-  deletedRows.forEach(item => {
-    if (item.object_key) allKeysToDelete.push(item.object_key);
-    if (item.variants && Array.isArray(item.variants)) {
-      item.variants.forEach((v: any) => {
-        if (v?.objectKey) allKeysToDelete.push(v.objectKey);
-      });
-    }
-  });
+  // caller-supplied object keys, which could name objects for rows RLS refused to delete — and
+  // from each row only the objects it owns, minus any another row still references.
+  const ownedKeys = [...new Set(deletedRows.flatMap((item) => ownedMediaStorageKeys(item)))];
+  const allKeysToDelete = withoutKeysInUse(ownedKeys, await storageKeysStillInUse(ownedKeys));
 
   const r2ObjectsToDelete = allKeysToDelete.map(key => ({ Key: key }));
   let r2DeletionError = null;
@@ -340,15 +386,33 @@ export async function moveMultipleMediaItems(
       const oldVariants: Variant[] = Array.isArray(mediaRow.variants) ? (mediaRow.variants as Variant[]) :
         (typeof mediaRow.variants === 'object' && mediaRow.variants !== null ? (mediaRow.variants as any) : []);
 
-      const variantMoves = (oldVariants || []).map((v) => ({
-        oldKey: v.objectKey,
-        newKey: `${folder}${getFilename(v.objectKey)}`,
-      }));
+      // Move only the objects this row owns (the variants of its own upload); a listed variant
+      // that names another upload's object is dropped from the row instead of moved. A source
+      // key another media row still references is copied but never deleted, so moving a decoy
+      // row cannot pull an object out from under the row that really owns it.
+      const ownedKeys = new Set(ownedMediaStorageKeys(mediaRow));
+      if (ownedKeys.size === 0) {
+        // The row's object_key is not a media path (a row written over the API can name any
+        // object), so it owns nothing this action may relocate.
+        results.push({ id: item.id, ok: false, error: 'This media item does not point at a media file' });
+        continue;
+      }
+      const variantMoves = (oldVariants || [])
+        .filter((v) => ownedKeys.has(v.objectKey))
+        .map((v) => ({
+          oldKey: v.objectKey,
+          newKey: `${folder}${getFilename(v.objectKey)}`,
+        }));
 
       const objectsToMove = [
         { oldKey: mediaRow.object_key, newKey: newMainKey, isMain: true },
         ...variantMoves.map(v => ({ ...v, isMain: false })),
       ];
+      const sharedKeys = await storageKeysStillInUse(objectsToMove.map((o) => o.oldKey), item.id);
+      const deleteSource = async (key: string) => {
+        if (sharedKeys.has(key)) return;
+        await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: key }));
+      };
 
       // Copy then delete each object; tolerate missing variant keys, but main object must exist
       const movedKeys = new Set<string>();
@@ -370,9 +434,7 @@ export async function moveMultipleMediaItems(
             mainMoved = true;
             newMainKey = newKey;
           }
-          await s3Client
-            .send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: oldKey }))
-            .catch(() => undefined);
+          await deleteSource(oldKey).catch(() => undefined);
           continue;
         }
 
@@ -380,7 +442,7 @@ export async function moveMultipleMediaItems(
         const copySource = `/${R2_BUCKET_NAME}/${encodedSourceKey}`; // S3/R2 expects a leading slash
         try {
           await s3Client.send(new CopyObjectCommand({ Bucket: R2_BUCKET_NAME, CopySource: copySource, Key: newKey }));
-          await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: oldKey }));
+          await deleteSource(oldKey);
           movedKeys.add(oldKey);
           if (isMain) mainMoved = true;
         } catch (err: any) {
@@ -394,7 +456,7 @@ export async function moveMultipleMediaItems(
                 const encVar = encodeURIComponent(vm.oldKey).replace(/%2F/g, '/');
                 const srcVar = `/${R2_BUCKET_NAME}/${encVar}`;
                 await s3Client.send(new CopyObjectCommand({ Bucket: R2_BUCKET_NAME, CopySource: srcVar, Key: vm.newKey }));
-                await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: vm.oldKey }));
+                await deleteSource(vm.oldKey);
                 movedKeys.add(vm.oldKey);
                 newMainKey = vm.newKey; // promote this variant as new main
                 mainMoved = true;
@@ -414,7 +476,10 @@ export async function moveMultipleMediaItems(
               const prefixGuess = basePrefix;
               try {
                 const listed = await s3Client.send(new ListObjectsV2Command({ Bucket: R2_BUCKET_NAME, Prefix: prefixGuess }));
-                const keys = (listed.Contents || []).map(o => o.Key).filter(Boolean) as string[];
+                // Only objects of this row's own upload (same folder and base name) qualify.
+                const rowStem = mediaKeyStem(mediaRow.object_key);
+                const keys = ((listed.Contents || []).map(o => o.Key).filter(Boolean) as string[])
+                  .filter((k) => rowStem !== null && mediaKeyStem(k) === rowStem);
                 // Prefer common image extensions if present
                 const preferred = keys.find(k => /\.(avif|png|jpe?g|webp|gif|svg)$/i.test(k)) || keys[0];
                 if (preferred) {
@@ -422,7 +487,9 @@ export async function moveMultipleMediaItems(
                   const src = `/${R2_BUCKET_NAME}/${enc}`;
                   const targetKey = `${folder}${getFilename(preferred)}`;
                   await s3Client.send(new CopyObjectCommand({ Bucket: R2_BUCKET_NAME, CopySource: src, Key: targetKey }));
-                  await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: preferred }));
+                  if (!(await storageKeysStillInUse([preferred], item.id)).has(preferred)) {
+                    await s3Client.send(new DeleteObjectCommand({ Bucket: R2_BUCKET_NAME, Key: preferred }));
+                  }
                   movedKeys.add(preferred);
                   newMainKey = targetKey;
                   mainMoved = true;

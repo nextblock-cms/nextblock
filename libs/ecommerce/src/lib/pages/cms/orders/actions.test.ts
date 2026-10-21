@@ -62,6 +62,10 @@ vi.mock('@nextblock-cms/db/server', () => ({
 
 vi.mock('server-only', () => ({}));
 
+// The app's second-factor gate, as registered at server start: this caller has passed it.
+// 2FA itself is covered by server-actions/require-ecom-role.test.ts.
+(globalThis as Record<symbol, unknown>)[Symbol.for('nextblock.cms.secondFactorGate')] = async () => true;
+
 import { getOrderDetails, getOrders } from './actions';
 
 const UUID = 'DDDDDDDD-0000-4000-8000-00000000000A';

@@ -2,6 +2,12 @@ import 'server-only';
 
 import { cache } from 'react';
 import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { registerSecondFactorGate } from './second-factor-gate';
+import { evaluateTwoFactor } from './twoFactor';
+
+// The ecommerce lib's role helpers cannot import this app; give them the same second-factor
+// check (also registered at server start by instrumentation.ts).
+registerSecondFactorGate();
 
 /**
  * Who is calling a CMS server component or server action, and with which role — resolved
@@ -41,6 +47,13 @@ export function isCmsStaffRole(role: string | null | undefined): role is CmsStaf
  * The signed-in user and their CMS role, or null without a session. An account whose
  * profile row is missing or carries an unknown role is reported as `USER`.
  *
+ * Null also when the account has a second factor enrolled and this session has not passed it
+ * (`evaluateTwoFactor()` → `totp_required` / `email_required`). The helpers below hand out the
+ * service-role client, which no aal2 policy can stop, and a server action is reachable without
+ * the CMS layout's 2FA redirect, so before 2026-10-21 a stolen password alone (the first factor)
+ * could mint MCP tokens or read orders through them. A trusted device, a satisfied factor, or no
+ * factor enrolled all pass, exactly as in the layout and in lib/full-backup/server.ts.
+ *
  * Memoised per request with React `cache`: the layout, the page and every helper they call
  * resolve the actor once instead of each re-running `auth.getUser()` (a round trip to the
  * auth server) and the profile read. Outside a React request — a unit test, a script — the
@@ -52,6 +65,9 @@ export const getCmsActor = cache(async (): Promise<CmsActor | null> => {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return null;
+
+  const twoFactor = await evaluateTwoFactor();
+  if (twoFactor.status === 'totp_required' || twoFactor.status === 'email_required') return null;
 
   const { data: profile } = await supabase
     .from('profiles')

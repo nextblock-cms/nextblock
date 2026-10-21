@@ -1,3 +1,5 @@
+import 'server-only';
+
 import React from 'react';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { 

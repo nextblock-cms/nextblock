@@ -16526,6 +16526,609 @@ begin
 end $nb_pg_net$;
 
 
+-- >>> FROM: 02025_api_role_grant_hardening.sql <<<
+-- 02025: grant-level hardening for the API roles (2026-10-21 posture review of 02021-02024).
+--
+-- Grants decide whether a role may touch a table at all; RLS decides which rows. This file
+-- removes three places where RLS had become the only barrier. It changes no row a legitimate
+-- request can reach: every statement below takes away a privilege that no RLS policy lets the
+-- role use.
+--
+-- 1. anon is read-only at the grant level.
+--    Supabase's historical default privileges, and the baseline (02003), granted anon
+--    INSERT/UPDATE/DELETE/REFERENCES/TRIGGER on every table in \`public\`. No policy in the
+--    schema lets anon write anything (checked against pg_policies on 2026-10-21: zero
+--    INSERT/UPDATE/DELETE/ALL policies reach anon or PUBLIC), so those grants only meant that
+--    a single permissive policy added by mistake would publish a table for writing to anyone
+--    with the public key. Every anonymous write path in the app (forms, consent, comments,
+--    checkout) already goes through a server route with the service role. Sequence USAGE and
+--    UPDATE go too: without INSERT, anon never draws a value.
+--
+-- 2. cortex_request_log is service-role only again.
+--    02022 created it with REVOKE ALL FROM anon, authenticated and no API policy. The
+--    post-apply pass of both apply paths (lib/setup/schema-apply.ts and the build hook in
+--    tools/lib/migrate-core.mjs) then ran \`grant all on all tables ... to authenticated\` and
+--    \`grant select ... to anon\` on every deploy, handing the table back to both roles. RLS
+--    still returned no row, but a signed-in WRITER could issue DELETEs against the counter
+--    that rate-limits the AI routes, and tools/scripts/security-verify.sql failed three checks
+--    on any deployed database. Both apply paths now repeat this revoke (API_ROLE_REVOKE_SQL).
+--
+-- 3. profiles.role is pinned by grants, not only by policy and trigger.
+--    The column was protected by profiles_update_policy's WITH CHECK and the
+--    protect_profile_role trigger (02021). authenticated now holds INSERT and UPDATE on every
+--    profiles column EXCEPT \`role\` (and \`id\` on UPDATE), so a policy regression can no longer
+--    reopen self-promotion to ADMIN. User-session writes only ever touch full_name,
+--    avatar_url, website, phone and updated_at (account page, checkout autofill); role changes
+--    go through the service role in app/cms/users/actions.ts, which these grants do not
+--    affect. DELETE, REFERENCES and TRIGGER on profiles are revoked from the API roles: no
+--    policy grants DELETE to them and account deletion runs through auth.admin. The column
+--    list is read from the catalog so a column added later keeps today's behaviour.
+--
+-- Both apply paths repeat all three after their blanket grants, so a deploy cannot undo
+-- them; tools/scripts/security-verify.sql asserts them. Idempotent: safe to re-run.
+
+-- 1. anon: read-only at the grant level
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM anon;
+REVOKE USAGE, UPDATE ON ALL SEQUENCES IN SCHEMA public FROM anon;
+
+-- 2. cortex_request_log: service_role only (its SELECT, INSERT, DELETE grant from 02022 stays)
+REVOKE ALL ON TABLE public.cortex_request_log FROM PUBLIC, anon, authenticated;
+
+-- 3. profiles: every column but \`role\` (and \`id\` on UPDATE) for authenticated
+DO $nb_profiles$
+DECLARE
+  v_insert_cols text;
+  v_update_cols text;
+BEGIN
+  SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) FILTER (WHERE a.attname <> 'role'),
+         string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum) FILTER (WHERE a.attname NOT IN ('id', 'role'))
+    INTO v_insert_cols, v_update_cols
+    FROM pg_attribute a
+   WHERE a.attrelid = 'public.profiles'::regclass AND a.attnum > 0 AND NOT a.attisdropped;
+
+  -- Revoking the table-level privilege also revokes every column-level grant of that kind,
+  -- so the column grants below are the complete list afterwards.
+  REVOKE INSERT, UPDATE, DELETE, REFERENCES, TRIGGER ON TABLE public.profiles FROM PUBLIC, anon, authenticated;
+  EXECUTE format('GRANT INSERT (%s) ON TABLE public.profiles TO authenticated', v_insert_cols);
+  EXECUTE format('GRANT UPDATE (%s) ON TABLE public.profiles TO authenticated', v_update_cols);
+END
+$nb_profiles$;
+
+
+-- >>> FROM: 02026_authenticated_write_grant_hardening.sql <<<
+-- 02026: authenticated holds no table write privilege that no RLS policy lets it use
+-- (2026-10-21, the follow-up 02025 left open).
+--
+-- 02025 made anon read-only at the grant level. authenticated still held SELECT, INSERT,
+-- UPDATE, DELETE, REFERENCES and TRIGGER on every table in \`public\` (the baseline 02003, then
+-- \`grant all on all tables in schema public to authenticated\` in the post-apply pass on every
+-- deploy). On the tables below RLS was the only barrier between a signed-in session and a
+-- write: no permissive policy for authenticated or PUBLIC covers the listed commands, only a
+-- \`TO service_role\` policy or none at all. Every app write to them runs server-side with the
+-- service role after its own checks: 2FA challenges, trusted devices and security settings
+-- (lib/auth, settings/security), consent logs, contact-seller enquiries and message threads,
+-- UCP carts, coupon redemptions (checkout providers), license activations (lib/packages),
+-- the Freemius catalog sync, the update checker's alerts and Cortex's mutation audit.
+--
+-- Behaviour-neutral by construction: authenticated could never use a revoked privilege. Its
+-- INSERT failed the RLS check and its UPDATE or DELETE matched no row; now the grant refuses
+-- the statement before RLS is consulted, and no row any request reaches changes. (One CMS
+-- action, updateFreemiusOverride in libs/ecommerce, updates freemius_pricing through the
+-- cookie client: RLS has always discarded that UPDATE while the action reported success, and
+-- it now reports the permission error instead.) Every command that has a policy keeps its
+-- grant: the ADMIN UPDATE on message_threads, product_inquiries and system_alerts, the ADMIN
+-- INSERT on site_script_revisions, the owner DELETE on user_trusted_devices, and every SELECT.
+-- The pre-flight block re-checks that against pg_policies on the target database and aborts
+-- without changing anything if a policy has appeared since this list was taken (a replay
+-- through 02025 plus the post-apply pass, 2026-10-21).
+--
+-- REFERENCES and TRIGGER go from every table, as 02025 did for anon: they only let a role
+-- create a foreign key or a trigger, and no API request runs DDL. Foreign-key actions are not
+-- affected by any of this: ON DELETE CASCADE / SET NULL run as the owner of the referencing
+-- table, so an ADMIN deleting a product still removes its freemius_plans and freemius_pricing
+-- rows, and deleting an order still removes its coupon_redemptions.
+--
+-- Both apply paths repeat these revokes after their blanket grants (API_ROLE_REVOKE_SQL). To
+-- give authenticated one of these privileges later, add the policy and the GRANT in the same
+-- migration and take the table out of both copies of that list, or the next deploy revokes it
+-- again. tools/scripts/security-verify.sql sections 26-27 fail on a write grant no policy uses
+-- and on a write policy whose grant is missing. Idempotent: safe to re-run.
+
+DO $nb_preflight$
+DECLARE
+  offenders text;
+BEGIN
+  SELECT string_agg(format('%s %s (policy %s)', l.tbl, r.cmd, p.policyname), ', ' ORDER BY l.tbl, r.cmd, p.policyname)
+    INTO offenders
+    FROM (VALUES
+      ('cortex_ai_db_mutation_audit', ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('coupon_redemptions',          ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('email_2fa_challenges',        ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('freemius_plans',              ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('freemius_pricing',            ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('package_activations',         ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('privacy_consent_logs',        ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('thread_messages',             ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('ucp_cart_sessions',           ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('user_security_settings',      ARRAY['INSERT', 'UPDATE', 'DELETE']),
+      ('message_threads',             ARRAY['INSERT', 'DELETE']),
+      ('product_inquiries',           ARRAY['INSERT', 'DELETE']),
+      ('system_alerts',               ARRAY['INSERT', 'DELETE']),
+      ('site_script_revisions',       ARRAY['UPDATE', 'DELETE']),
+      ('user_trusted_devices',        ARRAY['INSERT', 'UPDATE'])
+    ) AS l(tbl, cmds)
+    CROSS JOIN LATERAL unnest(l.cmds) AS r(cmd)
+    JOIN pg_policies p
+      ON p.schemaname = 'public' AND p.tablename = l.tbl
+     AND p.permissive = 'PERMISSIVE' AND p.cmd IN (r.cmd, 'ALL')
+     AND p.roles && ARRAY['authenticated', 'public']::name[];
+  IF offenders IS NOT NULL THEN
+    RAISE EXCEPTION '02026 would revoke a privilege that an RLS policy lets authenticated use: %. Nothing was changed; drop that table/command from this file and from API_ROLE_REVOKE_SQL, or drop the policy.', offenders;
+  END IF;
+END
+$nb_preflight$;
+
+-- 1. writes that no policy lets authenticated use
+REVOKE INSERT, UPDATE, DELETE ON TABLE
+  public.cortex_ai_db_mutation_audit,
+  public.coupon_redemptions,
+  public.email_2fa_challenges,
+  public.freemius_plans,
+  public.freemius_pricing,
+  public.package_activations,
+  public.privacy_consent_logs,
+  public.thread_messages,
+  public.ucp_cart_sessions,
+  public.user_security_settings
+  FROM authenticated;
+REVOKE INSERT, DELETE ON TABLE public.message_threads, public.product_inquiries, public.system_alerts FROM authenticated;
+REVOKE UPDATE, DELETE ON TABLE public.site_script_revisions FROM authenticated;
+REVOKE INSERT, UPDATE ON TABLE public.user_trusted_devices FROM authenticated;
+
+-- 2. REFERENCES / TRIGGER: DDL-only, unused by every API request
+REVOKE REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM authenticated;
+
+
+-- >>> FROM: 02027_api_role_select_grant_hardening.sql <<<
+-- 02027: anon and authenticated hold SELECT only where an RLS policy lets them read
+-- (2026-10-21, the read side of 02025/02026).
+--
+-- 02025 made anon read-only and 02026 left authenticated only the writes some policy uses.
+-- SELECT was still granted to both roles on every table in \`public\` (the baseline 02003, then
+-- \`grant select on all tables in schema public to anon\` and \`grant all ... to authenticated\` in
+-- the post-apply pass on every deploy). On the tables below no permissive SELECT or ALL policy
+-- reaches the role (or PUBLIC), so RLS was the only barrier between the public key and orders,
+-- profiles, coupons, licenses, MCP tokens, revisions, drafts, 2FA challenges, carts and
+-- messages: one permissive policy added by mistake, or a table created with RLS off, would
+-- have published it to anyone holding that key.
+--
+--   anon: every table that only staff, an owner or the service role reads (29, listed below).
+--   authenticated: email_2fa_challenges and ucp_cart_sessions, whose only policy is TO
+--     service_role (lib/auth/twoFactor and the UCP routes read them with the service role;
+--     02026 already took authenticated's writes on both).
+--   profile_cards (02021): anon loses SELECT, authenticated loses INSERT/UPDATE/DELETE. It is a
+--     security_invoker view over profiles, so anon could only ever read it through a SELECT on
+--     profiles, which goes here. The public author card does not read the view: author()
+--     returns its row type from private.author_card(), a SECURITY DEFINER function, so
+--     \`cms_interactions?select=*,author(full_name,avatar_url)\` keeps working for anon (checked
+--     through PostgREST on 2026-10-21). The view is a read card; nothing writes through it.
+--
+-- Unlike a write, a SELECT can be needed on a table the request never names: a policy
+-- subquery (\`EXISTS (SELECT ... FROM x)\`), a security_invoker view, an invoker function or a
+-- PostgREST embed (\`select=*,x(...)\`) all read x as the calling role, and they fail with 42501
+-- once the grant is gone, where RLS used to return no row (or a null embed). The census behind
+-- this list (a replay through 02026 plus the post-apply pass, 2026-10-21) found:
+--   - one policy that reads another of these tables, order_items' owner policy (orders): it is
+--     TO authenticated, which keeps SELECT on orders;
+--   - one view, profile_cards (above);
+--   - invoker functions reading them: apply_order_inventory_deduction (orders, order_items),
+--     called by the app only with the service role and already refused to anon by its
+--     SELECT ... FOR UPDATE since 02025 (FOR UPDATE needs UPDATE), and the trigger functions of
+--     site_script_revisions / thread_messages, which fire only on writes anon cannot make;
+--   - no anonymous query in the app (getSsgSupabaseClient, the browser client, the cookie client
+--     on signed-out paths) embeds a listed table; the public author card goes through author().
+--     The anonymous paths that need one of these tables (checkout success, order access tokens,
+--     contact seller, threads, consent, forms, UCP, MCP tokens, the sign-up read of
+--     system_configuration) read it with the service role after their own checks. The few
+--     cookie-client reads a signed-out request can reach (a draft lookup in draft mode or with
+--     NEXTBLOCK_VISUAL_EDITING_ENABLED, verifyPackageOnline on an install with no service key,
+--     the MCP route's revision capture, a custom block's \`profiles\` relation) already got no
+--     row and handle the error the same way: no draft, not licensed, no revision, no record.
+-- Behaviour-neutral for every request that worked: an anon or authenticated read of a listed
+-- table returned no row before and is refused by the grant now. The pre-flight block re-checks
+-- the catalog side on the target database and aborts without changing anything if a policy
+-- lets the role read a listed table, if a policy the role is subject to reads one, or if a view
+-- the role can read depends on one.
+--
+-- Both apply paths repeat these revokes after their blanket grants (API_ROLE_REVOKE_SQL). To let
+-- one of these roles read a listed table later, add the policy and GRANT SELECT in the same
+-- migration and take the table out of both copies of that list, or the next deploy revokes it
+-- again. tools/scripts/security-verify.sql sections 28-29 fail on a SELECT grant no policy uses
+-- and on a read policy whose grant is missing. Idempotent: safe to re-run.
+
+DO $nb_preflight$
+DECLARE
+  offenders text;
+BEGIN
+  WITH l(role, tbl) AS (
+    SELECT 'anon'::name, t
+      FROM unnest(ARRAY[
+        'content_drafts', 'cortex_ai_db_mutation_audit', 'coupon_freemius_mappings',
+        'coupon_products', 'coupon_redemptions', 'coupons', 'email_2fa_challenges',
+        'form_endpoints', 'mcp_access_tokens', 'message_threads', 'order_items', 'orders',
+        'package_activations', 'page_revisions', 'post_revisions', 'privacy_consent_logs',
+        'product_drafts', 'product_freemius_sale_coupons', 'product_inquiries',
+        'product_revisions', 'profile_cards', 'profiles', 'site_script_revisions',
+        'system_alerts', 'system_configuration', 'thread_messages', 'ucp_cart_sessions',
+        'user_addresses', 'user_security_settings', 'user_trusted_devices']::name[]) AS t
+    UNION ALL
+    SELECT 'authenticated'::name, t
+      FROM unnest(ARRAY['email_2fa_challenges', 'ucp_cart_sessions']::name[]) AS t
+  ), r AS (
+    SELECT l.role, l.tbl, to_regclass('public.' || quote_ident(l.tbl)) AS oid FROM l
+  ), hits(what) AS (
+    -- a policy that lets the role read a listed table
+    SELECT format('%s reads %s through policy %s', r.role, r.tbl, p.policyname)
+      FROM r
+      JOIN pg_policies p
+        ON p.schemaname = 'public' AND p.tablename = r.tbl
+       AND p.permissive = 'PERMISSIVE' AND p.cmd IN ('SELECT', 'ALL')
+       AND p.roles && ARRAY[r.role, 'public']::name[]
+    UNION ALL
+    -- a policy the role is subject to, on any other table, whose expression reads a listed table
+    SELECT format('policy %s on %s reads %s as %s', pol.polname, pol.polrelid::regclass, r.tbl, r.role)
+      FROM r
+      JOIN pg_depend d
+        ON d.classid = 'pg_policy'::regclass AND d.refclassid = 'pg_class'::regclass AND d.refobjid = r.oid
+      JOIN pg_policy pol ON pol.oid = d.objid
+     WHERE pol.polrelid <> r.oid
+       AND (0::oid = ANY (pol.polroles) OR (SELECT oid FROM pg_roles WHERE rolname = r.role) = ANY (pol.polroles))
+    UNION ALL
+    -- a view the role keeps SELECT on that reads a listed table
+    SELECT format('view %s reads %s and stays readable by %s', rw.ev_class::regclass, r.tbl, r.role)
+      FROM r
+      JOIN pg_depend d
+        ON d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass AND d.refobjid = r.oid
+      JOIN pg_rewrite rw ON rw.oid = d.objid
+     WHERE rw.ev_class <> r.oid
+       AND has_table_privilege(r.role, rw.ev_class, 'SELECT')
+       AND NOT EXISTS (SELECT 1 FROM r r2 WHERE r2.role = r.role AND r2.oid = rw.ev_class)
+  )
+  SELECT string_agg(DISTINCT what, '; ') INTO offenders FROM hits;
+  IF offenders IS NOT NULL THEN
+    RAISE EXCEPTION '02027 would revoke a SELECT that a request still needs: %. Nothing was changed; drop that table from this file and from API_ROLE_REVOKE_SQL, or change the policy or view.', offenders;
+  END IF;
+END
+$nb_preflight$;
+
+-- 1. anon: SELECT on every table no policy lets anon read
+REVOKE SELECT ON TABLE
+  public.content_drafts,
+  public.cortex_ai_db_mutation_audit,
+  public.coupon_freemius_mappings,
+  public.coupon_products,
+  public.coupon_redemptions,
+  public.coupons,
+  public.email_2fa_challenges,
+  public.form_endpoints,
+  public.mcp_access_tokens,
+  public.message_threads,
+  public.order_items,
+  public.orders,
+  public.package_activations,
+  public.page_revisions,
+  public.post_revisions,
+  public.privacy_consent_logs,
+  public.product_drafts,
+  public.product_freemius_sale_coupons,
+  public.product_inquiries,
+  public.product_revisions,
+  public.profiles,
+  public.site_script_revisions,
+  public.system_alerts,
+  public.system_configuration,
+  public.thread_messages,
+  public.ucp_cart_sessions,
+  public.user_addresses,
+  public.user_security_settings,
+  public.user_trusted_devices
+  FROM anon;
+
+-- 2. authenticated: the two tables only the service role reads
+REVOKE SELECT ON TABLE public.email_2fa_challenges, public.ucp_cart_sessions FROM authenticated;
+
+-- 3. profile_cards: a read card for staff and owners (through profiles' policies)
+REVOKE SELECT ON TABLE public.profile_cards FROM anon;
+REVOKE INSERT, UPDATE, DELETE ON TABLE public.profile_cards FROM authenticated;
+
+
+-- >>> FROM: 02028_writer_settings_allowlist_email_factor_aal_and_media_keys.sql <<<
+-- 02028: close the database holes the 2026-10-21 audit confirmed on a local replay (each one
+-- reproduced over PostgREST: SET LOCAL ROLE authenticated + request.jwt.claims, rolled back).
+-- Append-only, forward-only, idempotent: every policy is dropped by name and recreated, every
+-- function is CREATE OR REPLACE, every grant is safe to repeat. 02022/02023 are the model.
+--
+--  1. site_settings: the WRITER write branch becomes an allow-list (HIGH).
+--     02022/02023 let ADMIN *or WRITER* write every key outside a 13-key deny-list. A WRITER
+--     could therefore PATCH \`email_public\` to point SMTP at their own server, and
+--     lib/config/email-settings.ts combines that host with the decrypted ADMIN-only
+--     \`email_secret\` credentials: the SMTP password and every outgoing mail (ADMIN email-2FA
+--     codes included) went to the attacker. The same branch let a WRITER turn the captcha off
+--     (\`bot_protection_public\`), rewrite payment and invoice settings, redirect the store,
+--     form and moderation notification addresses, change \`migration_baseline_generation\`
+--     (which 02000 trusts) and the Cortex agent settings. An unfiltered PATCH updated 13 rows.
+--     Writes now fall into three tiers, and a key in none of the first two is in the third:
+--       * WRITER tier (ADMIN or WRITER, first factor): exactly the keys staff code writes
+--         through the cookie client — site identity (site_title, site_description,
+--         site_keywords, site_social_image, active_logo_id: app/cms/settings/logos/actions.ts),
+--         the footer (footer_copyright, footer_show_attribution: settings/copyright/actions.ts)
+--         and onboarding_state (lib/onboarding/actions.ts, the dashboard's dismiss button).
+--       * ADMIN tier (ADMIN, first factor): the two keys an ADMIN still writes through the
+--         cookie client, enabled_payment_providers and ecommerce_inventory_settings
+--         (libs/ecommerce payments, shipping, taxes). Moving those writes to the service role
+--         lets them drop into the tier below (docs/04 lists it as a follow-up).
+--       * everything else: ADMIN with a satisfied second factor (public.is_admin_mfa()). That
+--         is the old deny-list plus email_public, bot_protection_public, payment_public,
+--         invoice_settings, store_contact, forms_contact, interactions_notification_emails,
+--         migration_baseline_generation, the cortex_ai_* settings and any key added later.
+--         The app writes all of them with the service role after requireCmsAdmin() /
+--         requireEcomAdmin(), Cortex too (its context is the service client); the three that
+--         still used the cookie client move in the same change (logos/actions.ts
+--         saveInvoiceSettings, cms/inquiries saveStoreContactEmail, the interactions
+--         notification-address actions). The last two were already broken for an aal1 admin:
+--         an upsert's ON CONFLICT path checks the read policy, and both keys sit above the
+--         staff read tier. Reads are untouched (02021/02023 tiers).
+--
+--  2. The email second factor counts in RLS (HIGH).
+--     private.meets_aal_requirement() passed whenever the caller had no verified row in
+--     auth.mfa_factors. The app's email factor never creates one (only TOTP does), so for an
+--     email-2FA ADMIN every is_admin_mfa() policy was a plain role check: a stolen password and
+--     an aal1 JWT reached mcp_access_tokens (a persistent MCP bearer), package_activations,
+--     the secret tier of site_settings and other accounts' profiles. The no-factor branch now
+--     also requires that the caller has no enrolled factor in public.user_security_settings
+--     (\`mfa_enabled AND mfa_type IS NOT NULL\`, written only by the service role since 02026).
+--     An email factor never yields an aal2 Supabase session, so for those admins every
+--     is_admin_mfa() row is now reachable only through the service role, after the app's own
+--     check (lib/auth/cms-actor.ts getCmsActor() refuses a session whose factor is pending).
+--     A TOTP admin keeps aal2, and an admin who enrolled nothing is never locked out.
+--
+--  3. ADMIN branches that skipped the second factor (MEDIUM).
+--     site_scripts / site_script_revisions writes (scripts render with the CSP nonce on every
+--     route, /cms included, so this was script injection into a real admin's session),
+--     cms_redirects writes (an open redirect on any path), system_configuration (sign-up
+--     policy) and the PII reads and updates on product_inquiries, message_threads and
+--     thread_messages now use is_admin_mfa(). The CMS actions for all of them run on the
+--     service role after requireCmsAdmin() (site scripts, redirects, registration/security,
+--     messages); the public thread page and the contact paths already did. The public read
+--     policies (active scripts, active redirects) are unchanged.
+--
+--  4. media: uploader_id is pinned on insert, and storage keys in use are visible (MEDIUM).
+--     media_insert_policy only checked the role, so a WRITER could insert a row attributed to
+--     anyone; nothing pins object_key or variants either, and app/cms/media/actions.ts deleted
+--     every variants[].objectKey of a deleted row with server credentials. A WRITER could
+--     insert a decoy row listing other uploaders' keys and delete their files. Insert now pins
+--     uploader_id to the caller (ADMIN keeps any). The delete and move actions keep only the
+--     keys derived from the row's own object_key (lib/storage/media-object-keys.ts) and ask
+--     public.media_storage_keys_in_use() which keys another row still references, so a shared
+--     key is never deleted. The function is SECURITY INVOKER and service-role only: the app
+--     calls it after its own role check, and the API roles have no use for it.
+--
+--  5. package_activations: license keys are not readable over the API (MEDIUM, sandbox).
+--     The public demo signs every visitor in as an ADMIN with no factor, so is_admin_mfa()
+--     passes and "Staff read package activations" handed out the plaintext license key.
+--     authenticated now holds SELECT on every column except license_key and meta (meta keeps
+--     the Freemius activation response, install API token included). Every app read of the
+--     table already uses the service role (packages page, dashboard, verifyPackageOnline,
+--     revalidation, activation). Both apply paths repeat the column grant after their blanket
+--     grants (API_ROLE_REVOKE_SQL), the same shape as profiles in 02025.
+--
+--  6. media_read_policy stays USING (true) for anon (LOW, decision recorded).
+--     The bucket is public-read and every rendered image carries its object URL, so a media
+--     row discloses nothing the object URL does not, beyond its file name, description and
+--     uploader id. Scoping it to "media referenced by live content" would have to follow every
+--     reference (image blocks, section backgrounds, posts, products, logos, site_settings) and
+--     would break images on any path it missed. docs/04 records the decision.
+--
+-- tools/scripts/security-verify.sql sections 30-34 check every item above, before and after.
+
+-- ---------------------------------------------------------------------------
+-- 1. site_settings: three write tiers, WRITER on an allow-list
+-- ---------------------------------------------------------------------------
+DROP POLICY IF EXISTS site_settings_insert_policy ON public.site_settings;
+CREATE POLICY site_settings_insert_policy ON public.site_settings
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+DROP POLICY IF EXISTS site_settings_update_policy ON public.site_settings;
+CREATE POLICY site_settings_update_policy ON public.site_settings
+  FOR UPDATE TO authenticated
+  USING (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  )
+  WITH CHECK (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+DROP POLICY IF EXISTS site_settings_delete_policy ON public.site_settings;
+CREATE POLICY site_settings_delete_policy ON public.site_settings
+  FOR DELETE TO authenticated
+  USING (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+-- ---------------------------------------------------------------------------
+-- 2. meets_aal_requirement(): an enrolled email factor counts as a factor
+-- ---------------------------------------------------------------------------
+-- True when the session is aal2, or when the caller enrolled no second factor at all: no
+-- verified Supabase factor (TOTP) AND no enabled factor in user_security_settings (TOTP or the
+-- app's email codes). Same signature, owner and grants as 02022; CREATE OR REPLACE keeps the
+-- is_admin_mfa() wrapper and every policy that calls it.
+CREATE OR REPLACE FUNCTION private.meets_aal_requirement()
+    RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+  SELECT COALESCE((auth.jwt() ->> 'aal'), 'aal1') = 'aal2'
+    OR (
+      NOT EXISTS (
+        SELECT 1 FROM auth.mfa_factors f
+        WHERE f.user_id = auth.uid() AND f.status = 'verified'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM public.user_security_settings s
+        WHERE s.user_id = auth.uid() AND s.mfa_enabled AND s.mfa_type IS NOT NULL
+      )
+    );
+$$;
+REVOKE ALL ON FUNCTION private.meets_aal_requirement() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION private.meets_aal_requirement() TO anon, authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. Second factor on the remaining ADMIN branches
+-- ---------------------------------------------------------------------------
+-- site_scripts: INSERT / UPDATE / DELETE (the two read policies of 02013 are unchanged)
+DROP POLICY IF EXISTS "Admins insert site scripts" ON public.site_scripts;
+CREATE POLICY "Admins insert site scripts" ON public.site_scripts
+  FOR INSERT TO authenticated WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS "Admins update site scripts" ON public.site_scripts;
+CREATE POLICY "Admins update site scripts" ON public.site_scripts
+  FOR UPDATE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE)) WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS "Admins delete site scripts" ON public.site_scripts;
+CREATE POLICY "Admins delete site scripts" ON public.site_scripts
+  FOR DELETE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- site_script_revisions: INSERT (UPDATE / DELETE have no policy and no grant since 02026)
+DROP POLICY IF EXISTS "Admins insert site script revisions" ON public.site_script_revisions;
+CREATE POLICY "Admins insert site script revisions" ON public.site_script_revisions
+  FOR INSERT TO authenticated WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- cms_redirects: INSERT / UPDATE / DELETE (the two read policies of 02013 are unchanged)
+DROP POLICY IF EXISTS "Admins insert redirects" ON public.cms_redirects;
+CREATE POLICY "Admins insert redirects" ON public.cms_redirects
+  FOR INSERT TO authenticated WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS "Admins update redirects" ON public.cms_redirects;
+CREATE POLICY "Admins update redirects" ON public.cms_redirects
+  FOR UPDATE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE)) WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS "Admins delete redirects" ON public.cms_redirects;
+CREATE POLICY "Admins delete redirects" ON public.cms_redirects
+  FOR DELETE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- system_configuration: every command (the sign-up path reads it with the service role)
+DROP POLICY IF EXISTS system_configuration_admin_select ON public.system_configuration;
+CREATE POLICY system_configuration_admin_select ON public.system_configuration
+  FOR SELECT TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS system_configuration_admin_insert ON public.system_configuration;
+CREATE POLICY system_configuration_admin_insert ON public.system_configuration
+  FOR INSERT TO authenticated WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS system_configuration_admin_update ON public.system_configuration;
+CREATE POLICY system_configuration_admin_update ON public.system_configuration
+  FOR UPDATE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE)) WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS system_configuration_admin_delete ON public.system_configuration;
+CREATE POLICY system_configuration_admin_delete ON public.system_configuration
+  FOR DELETE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- product_inquiries / message_threads: ADMIN read and update (INSERT / DELETE revoked in 02026)
+DROP POLICY IF EXISTS product_inquiries_admin_read_policy ON public.product_inquiries;
+CREATE POLICY product_inquiries_admin_read_policy ON public.product_inquiries
+  FOR SELECT TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS product_inquiries_admin_update_policy ON public.product_inquiries;
+CREATE POLICY product_inquiries_admin_update_policy ON public.product_inquiries
+  FOR UPDATE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE)) WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS message_threads_admin_read_policy ON public.message_threads;
+CREATE POLICY message_threads_admin_read_policy ON public.message_threads
+  FOR SELECT TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+DROP POLICY IF EXISTS message_threads_admin_update_policy ON public.message_threads;
+CREATE POLICY message_threads_admin_update_policy ON public.message_threads
+  FOR UPDATE TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE)) WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- thread_messages: ADMIN read (every write is the service role's, 02026)
+DROP POLICY IF EXISTS thread_messages_admin_read_policy ON public.thread_messages;
+CREATE POLICY thread_messages_admin_read_policy ON public.thread_messages
+  FOR SELECT TO authenticated USING (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- ---------------------------------------------------------------------------
+-- 4. media: pin uploader_id on insert; which storage keys a row still references
+-- ---------------------------------------------------------------------------
+-- Same shape as 02022's update/delete policies: a WRITER inserts rows attributed to
+-- themselves, an ADMIN may attribute a row to anyone (imports, restores).
+DROP POLICY IF EXISTS media_insert_policy ON public.media;
+CREATE POLICY media_insert_policy ON public.media
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    (SELECT public.is_admin()) IS TRUE
+    OR (uploader_id = (SELECT auth.uid())
+        AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+  );
+
+-- The keys of p_keys that some media row other than p_exclude_id references as its object_key,
+-- its file_path or a variants[].objectKey. The CMS delete and move actions call it (service
+-- role) after removing or claiming their own rows, and keep every key it returns.
+CREATE OR REPLACE FUNCTION public.media_storage_keys_in_use(p_keys text[], p_exclude_id uuid DEFAULT NULL)
+    RETURNS SETOF text
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  SELECT DISTINCT k.key
+    FROM unnest(p_keys) AS k(key)
+   WHERE EXISTS (
+     SELECT 1
+       FROM public.media m
+      WHERE m.id IS DISTINCT FROM p_exclude_id
+        AND (m.object_key = k.key
+             OR m.file_path = k.key
+             OR m.variants @> jsonb_build_array(jsonb_build_object('objectKey', k.key)))
+   );
+$$;
+REVOKE ALL ON FUNCTION public.media_storage_keys_in_use(text[], uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.media_storage_keys_in_use(text[], uuid) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. package_activations: no license_key / meta for authenticated
+-- ---------------------------------------------------------------------------
+-- Table-level SELECT goes (revoking it also drops any column grant), then SELECT comes back on
+-- every column except the two secrets. The column list is read from the catalog so the
+-- statement matches API_ROLE_REVOKE_SQL; a new column is readable by an aal2 ADMIN, add it to
+-- the exclusions there and here if it is sensitive.
+DO $nb_package_activations$
+DECLARE
+  v_cols text;
+BEGIN
+  SELECT string_agg(quote_ident(a.attname), ', ' ORDER BY a.attnum)
+    INTO v_cols
+    FROM pg_attribute a
+   WHERE a.attrelid = 'public.package_activations'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+     AND a.attname NOT IN ('license_key', 'meta');
+  REVOKE SELECT ON TABLE public.package_activations FROM authenticated;
+  IF v_cols IS NOT NULL THEN
+    EXECUTE format('GRANT SELECT (%s) ON TABLE public.package_activations TO authenticated', v_cols);
+  END IF;
+END
+$nb_package_activations$;
+
+-- ---------------------------------------------------------------------------
+-- 6. media_read_policy: unchanged on purpose (see the header)
+-- ---------------------------------------------------------------------------
+
+
   -- Step C2: Take the API roles' EXECUTE back off every trigger function. Step B's
   -- DEFAULT PRIVILEGES hand anon/authenticated EXECUTE on each function the migrations
   -- create; trigger functions never need it (EXECUTE is only checked at CREATE TRIGGER
@@ -16571,7 +17174,11 @@ end $nb_pg_net$;
     ('02021', 'profiles_staff_read_and_role_guard'),
     ('02022', 'security_hardening_writer_boundary_and_aal'),
     ('02023', 'aal2_for_orders_profiles_site_settings'),
-    ('02024', 'advisor_trigger_grants_and_pg_net_schema')
+    ('02024', 'advisor_trigger_grants_and_pg_net_schema'),
+    ('02025', 'api_role_grant_hardening'),
+    ('02026', 'authenticated_write_grant_hardening'),
+    ('02027', 'api_role_select_grant_hardening'),
+    ('02028', 'writer_settings_allowlist_email_factor_aal_and_media_keys')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles

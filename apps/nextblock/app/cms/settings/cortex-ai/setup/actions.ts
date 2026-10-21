@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import type { Json } from '@nextblock-cms/db';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {

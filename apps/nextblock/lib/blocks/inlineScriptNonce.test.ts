@@ -34,6 +34,36 @@ describe('sanitizeAuthoredBlockHtml', () => {
     expect(sanitizeAuthoredBlockHtml(html)).toBe(html);
   });
 
+  describe('bypasses found in the 2026-10-21 review', () => {
+    it('does not reassemble a script from a nested tag', () => {
+      const out = sanitizeAuthoredBlockHtml('<scr<script>ipt src="https://www.google.com/x.js"></scr<script>ipt>');
+      expect(out.toLowerCase()).not.toContain('<script');
+    });
+
+    it('strips handlers that follow a slash instead of whitespace', () => {
+      const out = sanitizeAuthoredBlockHtml('<img src="x"/onerror=alert(1)>');
+      expect(out).not.toMatch(/onerror/i);
+    });
+
+    it('neutralises unquoted javascript: URLs', () => {
+      const out = sanitizeAuthoredBlockHtml('<a href=javascript:alert(1)>x</a>');
+      expect(out).not.toMatch(/javascript:/i);
+    });
+
+    it('removes elements that act without script (meta refresh, base, plugins)', () => {
+      const out = sanitizeAuthoredBlockHtml(
+        '<meta http-equiv=refresh content="0;url=https://evil.test"><base href="https://evil.test/"><object data="x.swf"></object><embed src="x.swf"><p>ok</p>',
+      );
+      expect(out).not.toMatch(/<meta|<base|<object|<embed/i);
+      expect(out).toContain('<p>ok</p>');
+    });
+
+    it('strips srcdoc, which renders an inline same-origin document', () => {
+      const out = sanitizeAuthoredBlockHtml('<iframe srcdoc="<script>alert(1)</script>"></iframe>');
+      expect(out).not.toMatch(/srcdoc/i);
+    });
+  });
+
   it('empty input yields empty string', () => {
     expect(sanitizeAuthoredBlockHtml('')).toBe('');
   });

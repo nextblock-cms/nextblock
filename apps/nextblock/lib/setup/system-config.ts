@@ -2,8 +2,9 @@ import 'server-only';
 // Server-only read/write for the `system_configuration` singleton table.
 // Mirrors lib/privacy/settings.ts, but the data lives in a dedicated ADMIN-only
 // table (migration 00000000000030) rather than the public site_settings store.
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import type { Json } from '@nextblock-cms/db';
+import { requireCmsAdmin } from '../auth/cms-actor';
 import { DEFAULT_SYSTEM_CONFIGURATION, type SystemConfiguration } from './types';
 
 function asBool(value: unknown, fallback: boolean): boolean {
@@ -71,12 +72,15 @@ export async function getSystemConfiguration(): Promise<SystemConfiguration> {
 }
 
 /**
- * Persist a partial update via the request-scoped client. RLS enforces ADMIN — used
- * by the CMS security settings page. The wizard (which runs before any admin exists)
- * uses setSystemConfigurationServiceRole instead.
+ * Persist a partial update for the signed-in ADMIN — used by the CMS security and
+ * registration settings. The write uses the service-role client after requireCmsAdmin():
+ * migration 02028 puts system_configuration behind public.is_admin_mfa(), which an admin on a
+ * "remember this device" session or on the email second factor never passes over PostgREST, so
+ * the in-code check is the authorization boundary. Throws `Unauthorized` / `Forbidden`. The
+ * wizard (which runs before any admin exists) uses setSystemConfigurationServiceRole instead.
  */
 export async function updateSystemConfiguration(patch: ConfigPatch): Promise<void> {
-  const supabase = createClient();
+  const { supabase } = await requireCmsAdmin();
   const { error } = await supabase
     .from('system_configuration')
     .update(toRow(patch))

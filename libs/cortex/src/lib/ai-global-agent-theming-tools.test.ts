@@ -153,16 +153,27 @@ describe('theming tool role enforcement', () => {
     ).rejects.toThrow(/requires the ADMIN role/);
   });
 
-  it('lets a WRITER edit global CSS, matching the CMS action', async () => {
-    const { supabase, writes } = stubSupabase({ role: 'WRITER' });
+  // 2026-10-21: 02022 made global CSS ADMIN-only, but this tool still let a WRITER
+  // (or a token minted by one) restyle every page, /cms included.
+  it('keeps global CSS ADMIN-only, matching the CMS action', async () => {
+    const writer = stubSupabase({ role: 'WRITER' });
 
+    await expect(
+      executeUpdateGlobalCss({ css: '.a{color:red}', mode: 'append' } as any, {
+        actorUserId: 'writer-1',
+        supabase: writer.supabase,
+      })
+    ).rejects.toThrow(/requires the ADMIN role/);
+    expect(writer.writes).not.toContainEqual({ op: 'upsert', table: 'site_settings' });
+
+    const admin = stubSupabase({ role: 'ADMIN' });
     const result = await executeUpdateGlobalCss({ css: '.a{color:red}', mode: 'append' } as any, {
-      actorUserId: 'writer-1',
-      supabase,
+      actorUserId: 'admin-1',
+      supabase: admin.supabase,
     });
 
     expect(result).toMatchObject({ success: true });
-    expect(writes).toContainEqual({ op: 'upsert', table: 'site_settings' });
+    expect(admin.writes).toContainEqual({ op: 'upsert', table: 'site_settings' });
   });
 
   it('hides unpublished script code from a role with no CMS access', async () => {

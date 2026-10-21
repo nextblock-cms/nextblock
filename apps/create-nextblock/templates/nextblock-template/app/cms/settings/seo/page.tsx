@@ -1,3 +1,5 @@
+import 'server-only';
+
 // app/cms/settings/seo/page.tsx
 import { hasResolvedSiteUrl, resolveSiteUrl } from '../../../../lib/site-url';
 import { getRedirects, getRobotsSettings } from './actions';

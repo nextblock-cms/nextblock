@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { revalidatePath } from 'next/cache';
 
 import { requireEcomAdmin } from '../../../../server-actions/require-ecom-role';

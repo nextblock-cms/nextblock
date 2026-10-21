@@ -1,2 +1,8 @@
 [mcp_servers.nextblock]
 url = "http://localhost:4200/api/mcp"
+
+[mcp_servers.cortex]
+url = "https://cortex-landingpage.vercel.app/api/mcp"
+
+[mcp_servers.cortex.http_headers]
+Authorization = "Bearer nbmcp_IDYvheKu4BPzYSNrGYBiZE0DjygRHxXNMMFJhhe1fN8"

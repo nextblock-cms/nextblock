@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { isStepCount, streamText } from 'ai';
 import { NextResponse } from 'next/server';
 
@@ -6,6 +8,7 @@ import {
   getServiceRoleSupabaseClient,
   verifyPackageOnline,
 } from '@nextblock-cms/db/server';
+import { evaluateTwoFactor } from '../../../../lib/auth/twoFactor';
 import {
   CORTEX_MCP_TOOL_KINDS,
   buildCortexAiRoutingPolicy,
@@ -419,7 +422,19 @@ async function requireAdminAccess() {
     .eq('id', userId)
     .single();
 
-  return !profileError && profile?.role === 'ADMIN' ? { userId } : null;
+  if (profileError || profile?.role !== 'ADMIN') {
+    return null;
+  }
+
+  // The agent's tools run with the service role, so the role alone is not enough: an admin who
+  // enrolled a second factor must have passed it in this session (a stolen password is only the
+  // first factor). Same rule as lib/auth/cms-actor.ts; trusted devices still pass.
+  const twoFactor = await evaluateTwoFactor();
+  if (twoFactor.status === 'totp_required' || twoFactor.status === 'email_required') {
+    return null;
+  }
+
+  return { userId };
 }
 
 function jsonError(message: string, status: number) {

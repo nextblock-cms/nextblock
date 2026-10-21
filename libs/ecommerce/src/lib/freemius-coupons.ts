@@ -2,6 +2,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { minorUnitAmountToMajor } from '@nextblock-cms/utils';
 
 import type { CouponDiscountType, CouponProviderScope } from './coupons';
+import { computeFreemiusSaleDiscountPercent } from './freemius-pricing';
 import {
   readFreemiusEnvValue,
   resolveFreemiusCheckoutCredentials,
@@ -329,23 +330,6 @@ function buildSaleCouponCode(input: { sku?: string | null; productId: string }) 
   return `SALE${fromId}`.slice(0, 32);
 }
 
-function computeSaleDiscountPercent(
-  price?: number | null,
-  salePrice?: number | null
-) {
-  if (typeof price !== 'number' || price <= 0) {
-    return null;
-  }
-  if (typeof salePrice !== 'number' || salePrice < 0 || salePrice >= price) {
-    return null;
-  }
-  const percent = Math.round((1 - salePrice / price) * 100);
-  if (percent <= 0 || percent > 100) {
-    return null;
-  }
-  return percent;
-}
-
 /**
  * Reconciles the auto-generated, time-bounded Freemius sale coupon for a single
  * product with the product's current scheduled-sale configuration. Creating the
@@ -376,7 +360,7 @@ export async function syncProductSaleCouponToFreemius(input: {
     return { success: true, skipped: true, reason: 'not_a_freemius_product' };
   }
 
-  const discountPercent = computeSaleDiscountPercent(row.price, row.sale_price);
+  const discountPercent = computeFreemiusSaleDiscountPercent(row.price, row.sale_price);
   const saleConfigured = discountPercent !== null;
 
   const { data: existing } = await (input.client as any)

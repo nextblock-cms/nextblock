@@ -10,7 +10,8 @@ import {
 } from '@nextblock-cms/cortex';
 
 import { ensureEnvLicenseActivation } from '../packages/env-license';
-import { detectChannel, isFullyConfigured } from './env-status';
+import { detectChannel } from './env-status';
+import { isFullyConfigured } from './service-key';
 import { getProvisioningStatus } from './provisioning';
 import { buildReadinessReport, type ReadinessReport } from './readiness';
 

@@ -15,6 +15,7 @@ import {
 import { usePriceFormatter } from '../use-price-formatter';
 import { useCurrency } from '../CurrencyProvider';
 import { convertMinorUnitAmount } from '../currency';
+import { pickFreemiusPricingTier } from '../freemius-pricing';
 import { getTrialSummary } from '../trials';
 
 interface SubscriptionSelectorProps {
@@ -30,8 +31,6 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
   const [plans, setPlans] = useState<ResolvedPlanWithPricing[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedCycle, setSelectedCycle] = useState<BillingCycle>('annual');
-  // For simplicity, we just use the first plan and first pricing tier (1 license) by default.
-  // A dual-engine setup could expand this to include plan & license selectors.
 
   useEffect(() => {
     async function loadPricing() {
@@ -54,14 +53,13 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
 
   const { addItem } = store;
 
-  // We find the first plan that has pricing, and the first pricing config
-  const plan = plans[0];
-  const pricing = plan?.pricing?.[0];
+  // The tier checkout charges and records (lowest license quota, see freemius-pricing.ts),
+  // across every plan of the product's translation group.
+  const pricing = pickFreemiusPricingTier(plans.flatMap((plan) => plan.pricing ?? []));
 
   const handleAddToCart = () => {
     let basePriceMinor = product.price;
-    let planId = product.freemius_plan_id;
-    
+
     if (pricing) {
         if (selectedCycle === 'monthly' && pricing.monthly_price != null) {
           basePriceMinor = majorUnitAmountToMinor(pricing.monthly_price, defaultCurrency.code);
@@ -85,11 +83,6 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
       return accumulator;
     }, {});
     const finalPrice = allCurrencyPrices[activeCurrencyCode] ?? basePriceMinor;
-    
-    // Fallbacks if logic is weird
-    if (plan && plan.id) {
-        planId = plan.id;
-    }
 
     const { success, error } = addItem({
       id: product.id,
@@ -107,7 +100,8 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
       provider: 'freemius',
       billing_cycle: selectedCycle,
       freemius_product_id: product.freemius_product_id,
-      freemius_plan_id: planId, // Overwrite if we got a real plan id
+      // The Freemius plan id, never the local freemius_plans uuid.
+      freemius_plan_id: product.freemius_plan_id,
       trial_period_days: product.trial_period_days ?? 0,
       trial_requires_payment_method: product.trial_requires_payment_method ?? false,
       is_taxable: product.is_taxable,
@@ -125,7 +119,7 @@ export const SubscriptionSelector = ({ product }: SubscriptionSelectorProps) => 
      return <Skeleton className="h-32 w-full" />;
   }
 
-  if (!plan || !pricing) {
+  if (!pricing) {
      return (
         <div className="p-4 border border-dashed rounded-lg text-center text-muted-foreground">
             {t('ecommerce.pricing_unavailable')}

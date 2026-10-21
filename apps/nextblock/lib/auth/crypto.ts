@@ -1,3 +1,5 @@
+import 'server-only';
+
 // Server-only crypto helpers for 2FA tokens, trusted-device hashing, and the
 // signed "second factor satisfied" session marker. Uses Node's crypto module.
 import crypto from 'node:crypto';

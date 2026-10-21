@@ -16,6 +16,7 @@ import { cn } from '@nextblock-cms/utils';
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
 import { SimpleTiptapRenderer } from '@nextblock-cms/ecommerce';
 import { CustomBlockEditorPreview } from './CustomBlockEditorPreview';
+import { sanitizeAuthoredBlockHtml } from '../../../../lib/blocks/inlineScriptNonce';
 
 export interface EditableBlockProps {
   block: Block;
@@ -146,7 +147,7 @@ export default function EditableBlock({
                          <SimpleTiptapRenderer content={htmlContent} className="prose prose-sm max-w-none [&>p]:my-0 [&>h1]:my-0 [&>h2]:my-0 [&>h3]:my-0 dark:prose-invert" />
                        ) : (
                          <div 
-                           dangerouslySetInnerHTML={{ __html: htmlContent }} 
+                           dangerouslySetInnerHTML={{ __html: sanitizeAuthoredBlockHtml(htmlContent) }} 
                            className={cn(
                              "prose prose-sm max-w-none [&>p]:my-0 [&>h1]:my-0 [&>h2]:my-0 [&>h3]:my-0 dark:prose-invert",
                              isCentered && "[&_*]:text-center",

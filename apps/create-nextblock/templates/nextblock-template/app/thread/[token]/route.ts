@@ -1,3 +1,5 @@
+import 'server-only';
+
 import { NextResponse } from 'next/server';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 

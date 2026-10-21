@@ -130,7 +130,10 @@ repo expects at least:
 > injects: `SUPABASE_URL` (non-prefixed), `SUPABASE_PUBLISHABLE_KEY` /
 > `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (anon-equivalent), and `SUPABASE_SECRET_KEY`
 > (service-role-equivalent). Resolution lives in `apps/nextblock/lib/setup/env-status.ts`
-> (`resolveSupabaseUrl` / `resolveSupabaseAnonKey` / `resolveSupabaseServiceKey`); read
+> (`resolveSupabaseUrl` / `resolveSupabaseAnonKey`) and, for the secret key, the
+> server-only `apps/nextblock/lib/setup/service-key.ts` (`resolveSupabaseServiceKey`; client
+> modules import env-status, so the secret is never named there, see docs/04 →
+> "Service-role boundary"); read
 > Supabase env through those (or the same inline alias chain in published libs) rather
 > than a single raw name. `DRAFT_MODE_SECRET` / `REVALIDATE_SECRET_TOKEN` are optional in
 > production — when unset they are derived from the service-role key (see

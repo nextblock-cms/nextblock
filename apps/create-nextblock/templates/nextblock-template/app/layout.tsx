@@ -22,6 +22,7 @@ import {
   type SiteTheme,
 } from '../lib/themes/buildThemeCss';
 import { getCachedSiteThemes } from '../lib/themes/cached-site-themes';
+import { escapeStyleElementText } from '../lib/themes/style-element-text';
 import { SITE_SCRIPT_COLUMNS, type SiteScript } from '../lib/site-scripts/types';
 import SiteScripts from '../components/SiteScripts';
 import { DeferredSpeedInsights } from '../components/DeferredSpeedInsights';
@@ -611,7 +612,8 @@ export default async function RootLayout({
     <html lang={serverDeterminedLocale} suppressHydrationWarning>
       <head>
         {themeCss && <style id="nb-theme-tokens" dangerouslySetInnerHTML={{ __html: themeCss }} />}
-        {globalCss && <style dangerouslySetInnerHTML={{ __html: globalCss }} />}
+        {/* Author CSS: `</style` is neutralised so the stylesheet cannot close the element. */}
+        {globalCss && <style dangerouslySetInnerHTML={{ __html: escapeStyleElementText(globalCss) }} />}
         <SiteScripts nonce={nonce} placement="head" scripts={siteScripts} />
       </head>
       <body className="min-h-screen">

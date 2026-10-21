@@ -1,3 +1,5 @@
+import 'server-only';
+
 // app/cms/users/[id]/edit/page.tsx
 import UserForm from "../../components/UserForm";
 import { updateUserProfile } from "../../actions";

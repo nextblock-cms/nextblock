@@ -1,5 +1,7 @@
 'use server';
 
+import 'server-only';
+
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { executeSaveSiteBrief, readCortexSiteBrief, type CortexSiteBrief } from '@nextblock-cms/cortex';
 

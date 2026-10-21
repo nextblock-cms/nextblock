@@ -1,11 +1,12 @@
 import "server-only";
 
+import { getCmsActor } from "../auth/cms-actor";
+
 import { revalidatePath, revalidateTag } from "next/cache";
 import { v4 as uuidv4 } from "uuid";
 import { revalidatePublicContent } from "../public-content-cache";
 import type { Json } from "@nextblock-cms/db";
 import {
-  createClient,
   getServiceRoleSupabaseClient,
   verifyPackageOnline,
 } from "@nextblock-cms/db/server";
@@ -266,34 +267,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * The caller must be signed in as staff (ADMIN for `adminOnly`), with any enrolled second factor
+ * passed: the returned client is the service role, so this check is the whole authorization.
+ * Resolved through getCmsActor() so it follows the same 2FA rule as every CMS helper (2026-10-21:
+ * this helper checked the role only).
+ */
 async function requireTransferUser(adminOnly = false): Promise<TransferAuth> {
-  const authClient = createClient();
-  const {
-    data: { user },
-  } = await authClient.auth.getUser();
+  const actor = await getCmsActor();
 
-  if (!user) {
+  if (!actor) {
     throw new Error("User not authenticated.");
   }
 
-  const { data: profile, error } = await authClient
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-
-  if (error || !profile) {
-    throw new Error("Could not verify CMS permissions.");
-  }
-
-  const role = profile.role;
+  const role = actor.role;
   const allowed = adminOnly ? role === "ADMIN" : role === "ADMIN" || role === "WRITER";
   if (!allowed) {
     throw new Error(adminOnly ? "Admin role required." : "Writer or admin role required.");
   }
 
   return {
-    userId: user.id,
+    userId: actor.userId,
     role,
     supabase: getServiceRoleSupabaseClient(),
   };
@@ -1516,7 +1510,8 @@ export async function dryRunCsvImport(params: {
   csv: string;
   options: CmsImportOptions;
 }) {
-  const auth = await requireTransferUser(false);
+  // Products (prices, stock, status) are ADMIN-only data; RLS gives WRITER no write on them.
+  const auth = await requireTransferUser(params.contentType === "products");
   const parsed = parseCsv(params.csv);
   const { summary } = await prepareImports({
     supabase: auth.supabase,
@@ -1537,7 +1532,8 @@ export async function applyCsvImport(params: {
   csv: string;
   options: CmsImportOptions;
 }) {
-  const auth = await requireTransferUser(false);
+  // Products (prices, stock, status) are ADMIN-only data; RLS gives WRITER no write on them.
+  const auth = await requireTransferUser(params.contentType === "products");
   const parsed = parseCsv(params.csv);
   const { summary, prepared } = await prepareImports({
     supabase: auth.supabase,
@@ -1839,7 +1835,8 @@ export async function exportCsv(params: {
   contentType: CmsContentType;
   languageId?: number;
 }) {
-  const auth = await requireTransferUser(false);
+  // Products (prices, stock, status) are ADMIN-only data; RLS gives WRITER no write on them.
+  const auth = await requireTransferUser(params.contentType === "products");
   const records =
     params.contentType === "pages"
       ? await exportPages(auth.supabase, params.languageId)

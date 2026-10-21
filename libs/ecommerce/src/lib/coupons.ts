@@ -75,6 +75,35 @@ export function getCartLineCouponKey(item: Pick<CartItem, 'product_id' | 'varian
   return `${item.product_id}:${item.variant_id || 'base'}`;
 }
 
+/**
+ * The lines a coupon is quoted on at checkout. The browser sends a "coupon context" (the whole
+ * cart, both providers) so a cart-wide coupon is priced on the whole cart, but it never decides
+ * the quantity of a line that is being paid for here: every line of `cartItems` replaces its
+ * context twin, and a cart line the context left out is added back. Context lines for other
+ * products are kept (the other provider's half of the cart). 2026-10-21: a context quantity of
+ * 10 on a one-unit cart line made a 10 % coupon take 100 % off that line.
+ */
+export function reconcileCouponContextItems<T extends Pick<CartItem, 'product_id' | 'variant_id'>>(
+  cartItems: T[],
+  contextItems: T[]
+): T[] {
+  const cartByKey = new Map(cartItems.map((item) => [getCartLineCouponKey(item), item] as const));
+  const seen = new Set<string>();
+  const reconciled: T[] = [];
+
+  for (const item of contextItems) {
+    const key = getCartLineCouponKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    reconciled.push(cartByKey.get(key) ?? item);
+  }
+  for (const [key, item] of cartByKey) {
+    if (!seen.has(key)) reconciled.push(item);
+  }
+
+  return reconciled;
+}
+
 export function emptyProviderDiscounts(): Record<EcommercePaymentProvider, number> {
   return {
     stripe: 0,

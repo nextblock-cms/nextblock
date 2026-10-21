@@ -1,4 +1,5 @@
 import { redirect } from 'next/navigation';
+import { isSafeInternalPath } from '../../../lib/auth-redirects';
 import { createClient } from '@nextblock-cms/db/server';
 import {
   evaluateTwoFactor,
@@ -6,8 +7,10 @@ import {
 } from '../../../lib/auth/twoFactor';
 import TwoFactorForm from './components/TwoFactorForm';
 
+// One shared rule for redirect targets: `/\evil.com` (from `/%5Cevil.com`) passed the old
+// startsWith('/') check and sent the user off-site after their second factor (2026-10-21).
 function safeRedirect(path?: string): string {
-  return path && path.startsWith('/') && !path.startsWith('//') ? path : '/cms/dashboard';
+  return path && isSafeInternalPath(path) ? path : '/cms/dashboard';
 }
 
 export default async function TwoFactorPage({

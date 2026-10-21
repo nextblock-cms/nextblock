@@ -1,141 +1,86 @@
 "use server";
 
-import { createClient, getServiceRoleSupabaseClient } from "./supabase/server";
-import { revalidatePath } from "next/cache";
-import type { Database } from "./supabase/types";
+import "server-only";
+
+import { createClient } from "./supabase/server";
 import { encodedRedirect } from "@nextblock-cms/utils/server";
+import { insertMediaRecord, type MediaRecordResult, type MediaUploadPayload } from "./media-record";
 
-type Media = Database['public']['Tables']['media']['Row'];
+export type { ImageVariant, MediaRecordResult, MediaUploadPayload } from "./media-record";
 
-// Define the structure for a single variant, mirroring what /api/process-image returns
-export interface ImageVariant {
-  objectKey: string;
-  url: string;
-  width: number;
-  height: number;
-  fileType: string;
-  sizeBytes: number;
-  variantLabel: string;
+/**
+ * Process-wide key under which the app publishes its CMS second-factor check
+ * (apps/nextblock/lib/auth/second-factor-gate.ts). This lib cannot import the app.
+ */
+const SECOND_FACTOR_GATE_KEY = Symbol.for('nextblock.cms.secondFactorGate');
+
+type SessionClient = ReturnType<typeof createClient>;
+
+/**
+ * Has this session passed the account's second factor (or is none enrolled)? With the
+ * app's gate registered its decision is final; without it, fail closed: an enrolled
+ * account passes only as a TOTP session already at aal2 (as require-ecom-role.ts does).
+ */
+async function secondFactorSatisfied(supabase: SessionClient, userId: string): Promise<boolean> {
+  const gate = (globalThis as Record<symbol, unknown>)[SECOND_FACTOR_GATE_KEY];
+  if (typeof gate === 'function') {
+    return Boolean(await (gate as () => Promise<boolean>)());
+  }
+
+  const { data: settings } = await supabase
+    .from('user_security_settings')
+    .select('mfa_enabled, mfa_type')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (!settings?.mfa_enabled || !settings?.mfa_type) return true;
+  if (settings.mfa_type === 'totp') {
+    const { data: aal } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    return aal?.currentLevel === 'aal2';
+  }
+  return false;
 }
 
-export async function recordMediaUpload(payload: {
-  fileName: string;
-  description?: string;
-  r2OriginalKey: string;
-  r2Variants: ImageVariant[];
-  originalImageDetails: ImageVariant;
-  blurDataUrl?: string;
-  /**
-   * Uploader for callers that have no cookie session — the MCP server, which
-   * authenticates by bearer token instead. When set, the row is written with the
-   * service-role client and attributed to this user rather than to `auth.getUser()`.
-   *
-   * This grants no new authority: the role check below still runs against the
-   * supplied id, so a non-ADMIN/WRITER actor is rejected exactly as a cookie
-   * session would be. The caller is responsible for having authenticated them.
-   */
-  actorUserId?: string;
-}, returnJustData?: boolean): Promise<{ success: true; data: Media } | { error: string } | void>  {
-  const actorUserId = payload.actorUserId;
-  const supabase = actorUserId ? getServiceRoleSupabaseClient() : createClient();
-  let uploaderId: string;
+/**
+ * Record an upload as the signed-in ADMIN or WRITER.
+ *
+ * A server action is a public POST endpoint, so the uploader is always the cookie
+ * session's user, never anything in the payload. Until 2026-10-21 the payload could name
+ * one (`actorUserId`, for the MCP server) and the session cross-check ran only when a
+ * session existed, so a cookieless POST naming an admin's id recorded media as that admin
+ * with the service role. Server routes without a session use `recordMediaUploadAsActor`
+ * (`@nextblock-cms/db/server`), which is not a server action.
+ */
+export async function recordMediaUpload(
+  payload: MediaUploadPayload,
+  returnJustData?: boolean
+): Promise<MediaRecordResult | void> {
+  const supabase = createClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
 
-  if (actorUserId) {
-    uploaderId = actorUserId;
-  } else {
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
-
-    if (authError || !user) {
-      if (returnJustData) return { error: "User not authenticated for media record." };
-      return encodedRedirect("error", "/cms/media", "User not authenticated for media record.");
-    }
-
-    uploaderId = user.id;
+  if (authError || !user) {
+    if (returnJustData) return { error: "User not authenticated for media record." };
+    return encodedRedirect("error", "/cms/media", "User not authenticated for media record.");
   }
 
   const { data: profile } = await supabase
     .from("profiles")
     .select("role")
-    .eq("id", uploaderId)
+    .eq("id", user.id)
     .single();
-  if (!profile || !["ADMIN", "WRITER"].includes(profile.role)) {
+  if (!profile || !["ADMIN", "WRITER"].includes(profile.role) || !(await secondFactorSatisfied(supabase, user.id))) {
     if (returnJustData) return { error: "Forbidden: Insufficient permissions to record media." };
     return encodedRedirect("error", "/cms/media", "Forbidden: Insufficient permissions to record media.");
   }
 
-  // Determine the primary variant
-  let primaryVariant =
-    payload.r2Variants.find(v => v.variantLabel === 'original_avif') ||
-    payload.r2Variants.find(v => v.variantLabel === 'xlarge_avif') ||
-    payload.r2Variants[0] ||
-    payload.originalImageDetails;
+  const result = await insertMediaRecord(supabase, user.id, payload);
 
-  if (!primaryVariant) {
-    primaryVariant = payload.originalImageDetails || {
-        objectKey: payload.r2OriginalKey,
-        url: ``, 
-        width: 0,
-        height: 0,
-        fileType: 'application/octet-stream',
-        sizeBytes: 0,
-        variantLabel: 'fallback_original'
-    };
-  }
-  
-  const allVariantsToStore = [
-    ...(payload.originalImageDetails && payload.originalImageDetails.objectKey !== primaryVariant.objectKey ? [payload.originalImageDetails] : []),
-    ...payload.r2Variants,
-  ].filter((variant, index, self) =>
-    index === self.findIndex((v) => v.objectKey === variant.objectKey)
-  );
-
-  const deriveAltFromFilename = (name: string) => {
-    const lastDot = name.lastIndexOf('.');
-    const base = lastDot > 0 ? name.substring(0, lastDot) : name;
-    const spaced = base.replace(/[-+_\\]+/g, ' ').replace(/\s+/g, ' ').trim();
-    return spaced.replace(/\b\w+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1));
-  };
-
-  const computedDescription = payload.description
-    ?? ((primaryVariant.fileType?.startsWith('image/') || payload.originalImageDetails?.fileType?.startsWith('image/'))
-      ? deriveAltFromFilename(payload.fileName)
-      : null);
-
-  const mediaData: Omit<Media, 'id' | 'created_at' | 'updated_at'> & { uploader_id: string } = {
-    uploader_id: uploaderId,
-    file_name: payload.fileName,
-    object_key: primaryVariant.objectKey,
-    file_path: primaryVariant.objectKey,
-    folder: (() => {
-      const match = primaryVariant.objectKey.match(/^(.*\/)?.*$/);
-      const path = match && match[1] ? match[1] : null;
-      return path;
-    })(),
-    file_type: primaryVariant.fileType,
-    size_bytes: primaryVariant.sizeBytes,
-    description: computedDescription,
-    width: primaryVariant.width,
-    height: primaryVariant.height,
-    variants: allVariantsToStore as any,
-    blur_data_url: payload.blurDataUrl || null,
-  };
-
-  const { data: newMedia, error } = await supabase
-    .from("media")
-    .insert(mediaData)
-    .select()
-    .single();
-
-  if (error) {
-    console.error("Error recording media upload:", error);
-    if (returnJustData) return { error: `Failed to record media: ${error.message}` };
-    return encodedRedirect("error", "/cms/media", `Failed to record media: ${error.message}`);
+  if ("error" in result) {
+    if (returnJustData) return result;
+    return encodedRedirect("error", "/cms/media", result.error);
   }
 
-  revalidatePath("/cms/media");
   if (returnJustData) {
-    return { success: true, data: newMedia as Media };
-  } else {
-    encodedRedirect("success", "/cms/media", "Media recorded successfully.");
+    return result;
   }
+  encodedRedirect("success", "/cms/media", "Media recorded successfully.");
 }

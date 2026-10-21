@@ -52,8 +52,14 @@ class MockQuery {
   }
 
   ilike(column: string, value: string) {
-    const normalized = String(value).toLowerCase();
-    this.filters.push((row) => String(row[column] || '').toLowerCase() === normalized);
+    // Real ILIKE semantics: `%` and `_` are wildcards (PostgREST also maps `*` to `%`), so a
+    // lookup that slips back to ilike fails the wildcard-code test below.
+    const pattern = String(value)
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+      .replace(/[%*]/g, '.*')
+      .replace(/_/g, '.');
+    const re = new RegExp(`^${pattern}$`, 'i');
+    this.filters.push((row) => re.test(String(row[column] || '')));
     return this;
   }
 
@@ -311,6 +317,17 @@ describe('commerce coupon validation', () => {
       detailedKey: 'ecommerce.coupon_not_applicable',
     },
   ];
+
+  it('treats LIKE wildcards in a shopper code literally (2026-10-21)', async () => {
+    // `%`, `S%`, `SAVE1_` used to match (and so apply and enumerate) a secret code.
+    const { client } = createMockClient({ coupons: [coupon({})] });
+    for (const probe of ['%', 'S%', 'SAVE1_', '*']) {
+      const result = await getCouponQuote({ client: client as any, code: probe, items: mixedCart, currencyCode: 'USD' });
+      expect(result, probe).toMatchObject({ success: false, errorKey: COUPON_INVALID_ERROR_KEY });
+    }
+    const exact = await getCouponQuote({ client: client as any, code: 'save10', items: mixedCart, currencyCode: 'USD' });
+    expect(exact.success).toBe(true);
+  });
 
   it('answers every unusable code exactly like a code that does not exist', async () => {
     // The public validation action is unauthenticated, so any difference between these

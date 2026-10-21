@@ -1298,7 +1298,7 @@ Two tools power the "rewrite my home page based on `<url>`" use case. Both live 
 
 - Input: `{ url: string (http/https), maxChars?: number (500-20000, default 8000) }`.
 - Fetches an external page and returns `{ title, description, headings[], text, finalUrl, truncated }` (scripts/styles/svg stripped, HTML reduced to readable text).
-- Safety: rejects non-http(s) URLs and blocks local/loopback/private/link-local hosts and cloud metadata endpoints (`isBlockedFetchHost`), re-checks the host after redirects, enforces a 12s timeout and a ~2MB read cap, and only processes `text/html`/`text/plain` responses.
+- Safety: fetches through `guardedFetch` (`libs/cortex/src/lib/fetch-host-guard.ts`, see "SSRF" below): non-http(s) URLs and local/private/reserved hosts are refused before every redirect hop against a pinned DNS answer, a refused hop reports no status, the body streams under a ~2MB cap (truncated, not buffered whole), a 12s timeout applies, and only `text/html`/`text/plain` responses are processed.
 - No confirmation, no DB access. The agent calls it FIRST when a prompt references an external site, then writes new sections from the returned material.
 
 ### rewrite_page_draft (mutating, staged into Live Draft Mode)
@@ -1344,7 +1344,7 @@ Unsplash has strict usage rules; Pexels' license is permissive (attribution opti
 
 ### Persist to media library
 
-- `importExternalImageToMedia` (`apps/nextblock/app/cms/media/import-external-image.ts`, ADMIN/WRITER) downloads an external image (SSRF-guarded, 15MB/15s caps), measures it with `sharp`, generates a blur placeholder, uploads to R2/Supabase Storage via the shared storage provider, and records it with `recordMediaUpload`. Returns `{ media_id, object_key, width, height, url, blur_data_url }`.
+- `importExternalImageToMedia` (`apps/nextblock/app/cms/media/import-external-image.ts`, a server action) imports as the signed-in ADMIN/WRITER (`requireCmsStaff()`) and takes no actor argument. It delegates to `importExternalImageAsActor` (`apps/nextblock/lib/media/external-image-import.ts`, server-only, not an action), which `/api/mcp` calls directly after authenticating its token. That function downloads the image through `guardedFetch` (15MB/15s caps), measures it with `sharp`, generates a blur placeholder, uploads to R2/Supabase Storage via the shared storage provider, and records it with `recordMediaUploadAsActor` (`@nextblock-cms/db/server`). Returns `{ media_id, object_key, width, height, url, blur_data_url }`. The `recordMediaUpload` action takes its uploader from the cookie session only.
 - Editor UX: `ImageBlockEditor` and `BackgroundSelector` accept a pasted image URL and show a **Save to media library** action that swaps the external URL for a permanent optimized media reference (or the author can replace it with their own uploaded asset).
 
 ## MCP Server (external client access)
@@ -1397,7 +1397,7 @@ Deliberate behaviours, each of which breaks a real client if changed:
   fail, and it carries no tool inventory (that stays on the server card, which is gated
   on the operator switching MCP on). Several crawlers scored the old blanket 405 as down.
 - **Never 500 to an unauthenticated caller.** The readiness gate checks
-  `isFullyConfigured()` (service role, not just URL + anon key) because every path below
+  `isFullyConfigured()` (`lib/setup/service-key.ts`: service role, not just URL + anon key) because every path below
   it — token lookup, the tool context — goes through `getServiceRoleSupabaseClient()`,
   which throws without the secret key; and `authenticateMcpRequest` is wrapped so a
   database outage answers `503` + `Retry-After` rather than a 500 (dropped as broken) or a
@@ -1747,6 +1747,8 @@ site_settings row is `{ key, value }` — neither name trips it, so the stock-ph
 payment/email secret rows passed through. That was low-risk while the tool was
 dashboard-only; exposing it to remote MCP clients widened it. `ai-global-agent-db-tools.ts`
 now carries `PROTECTED_SITE_SETTING_KEYS`, redacted on read and refused on write.
+`isSensitiveKey` also matches `license_key` (since 2026-10-21), so
+`package_activations.license_key` is never returned, filtered on or written.
 
 `mcp_access_tokens` is deliberately **absent** from `tableConfigs`, so the generic DB
 tools cannot read token hashes or insert rows.
@@ -2151,7 +2153,11 @@ user and an open editor. MCP has neither, so every new tool must be checked agai
 all four of these:
 
 1. **Cookie-session auth.** `createClient()` + `auth.getUser()` returns nobody over
-   MCP. Pass a pre-authorized `actorUserId` instead and keep the role check.
+   MCP. Pass the route's pre-authorized `actorUserId` to a server-only function and
+   keep the role check. Never add an actor parameter to a `'use server'` export: every
+   export is a public POST endpoint, so the caller would choose who it acts as (the
+   media importer did until 2026-10-21; its actor variant now lives in
+   `lib/media/external-image-import.ts`).
 2. **`pageContext` dependence.** The route sets it to `null`. A tool that edits
    "the current item" must accept an explicit `cmsTarget`.
 3. **Untyped `z.any()` parameters.** They serialize to `{}` in JSON Schema, so hosts
@@ -2167,15 +2173,23 @@ Privileged tools must re-check the actor's CMS role themselves — see
 `requireActorRole` in `ai-global-agent-theming-tools.ts`.
 
 MCP token scopes are only `read` / `write` and carry no role, so the role is resolved
-from the acting user at call time. Two related rules:
+from the acting user at call time:
 
+- A minted token acts as its creator, and the route re-reads that account's role on
+  **every request** (`resolveCortexAiMcpTokenActor`): a creator who is no longer an
+  ADMIN, or who was deleted (`created_by` is `ON DELETE SET NULL`), gets a 401. No
+  stand-in admin is substituted: a credential must not gain authority by outliving its
+  owner. `app/cms/users/actions.ts` also revokes a user's tokens when their role changes
+  or the account is deleted (`revokeCortexAiMcpTokensForUser`, before the delete).
+- `createCortexGlobalAgentTools` wraps every tool not classified `read` in
+  `CORTEX_MCP_TOOL_KINDS` (`mcp-tool-kinds.ts`) in `requireActorRole(['ADMIN'])`,
+  before the executor runs; executors with narrower rules still check their own
+  (`update_global_css` is ADMIN-only like the CMS action, since 02022). The generic DB
+  mutation tools also check it themselves. Before 2026-10-21 only the site and theming
+  tools re-checked the role, so a demoted admin's token kept every other write.
 - Keep privileged tables (`site_scripts`, `site_script_revisions`) **out of** the
   `execute_database_mutation` allowlist, or that generic tool becomes a way around
   every per-tool guard.
-- When a token's creator has been deleted, the route substitutes a stand-in admin so
-  a revision can still be attributed. That substitution is flagged
-  (`actorFromOrphanedToken`) and refused for role-gated operations: a credential must
-  not gain authority by outliving its owner.
 
 ### Prompt injection
 
@@ -2239,13 +2253,28 @@ Patterns that are actually safe:
 
 ### SSRF
 
-`fetch_url_content` and the media importer perform server-side HTTP on a
-caller-supplied URL, and `fetch_url_content` is a **read**-scoped tool — so its
-blocklist is what stops a read-only token from reaching internal services. The
-blocklist is duplicated (`isBlockedFetchHost` in cortex, `isBlockedImportHost` in the
-app) because a published lib cannot import from the app: **fix both together.**
-Regression tests live in `ai-global-agent-ssrf.test.ts`; IPv4-mapped IPv6
-(`::ffff:127.0.0.1`) previously bypassed both.
+`fetch_url_content`, the alt-text image download and the media importer perform
+server-side HTTP on a caller-supplied URL, and `fetch_url_content` is a **read**-scoped
+tool, so its guard is what stops a read-only token from reaching internal services.
+All three go through one function, `guardedFetch` in
+`libs/cortex/src/lib/fetch-host-guard.ts` (the app imports it from
+`@nextblock-cms/cortex`):
+
+- The host is checked before **every** hop (`isBlockedFetchHost`: local names plus the
+  `BlockList` of private and reserved ranges, CGNAT `100.64.0.0/10`, benchmarking
+  `198.18.0.0/15` and NAT64 `64:ff9b::/96` included), and the DNS lookup is pinned
+  (`createPinnedLookup`): the answer that is checked is the address the socket connects
+  to, so a rebinding name cannot swap a private address in afterwards.
+- Redirects are followed by hand with a hop cap. A refused hop throws
+  `GuardedFetchError('blocked')` before anything from that host is read, so callers
+  never report an internal status code.
+- The body streams under a byte cap instead of being buffered whole first.
+
+Before 2026-10-21 the tool and the importer used `redirect: 'follow'` and checked only
+the final host, after the internal hop had been requested and its status reported, and
+the importer kept a duplicate blocklist. Regression tests: `ai-global-agent-ssrf.test.ts`
+(against a local server); IPv4-mapped IPv6 (`::ffff:127.0.0.1`) bypassed both blocklists
+earlier.
 
 ### Building a whole site in one pass
 
@@ -2379,8 +2408,12 @@ The Pydantic-shaped layer here is Zod. Every layer a payload crosses:
    known `site_settings` values against `SITE_SETTING_VALUE_SCHEMAS`; the
    `WRITE_PROTECTED_SITE_SETTING_KEYS` (`cortex_ai_build_session`,
    `is_admin_created`, `migration_baseline_generation`, `security_settings`) are
-   readable but never writable there. Unknown `site_settings` keys stay open, as the
-   bag is by design.
+   readable but never writable there. They are checked against the rows an update or
+   delete actually reaches (`fetchMutationTargets`), whatever filter operator selected
+   them, and excluded from the statement itself; until 2026-10-21 only `rows[].key`,
+   `values.key` and the first `eq` filter were checked, so `delete key in
+   ['is_admin_created']` sent every request to /setup. Both tools require an ADMIN
+   actor. Unknown `site_settings` keys stay open, as the bag is by design.
 7. Database. Postgres enforces `check_exactly_one_parent` on `blocks`, the JSONB
    type checks on `content_drafts`, and the custom block definition checks above.
    There is no CHECK on `blocks.content` itself: the application layers above are

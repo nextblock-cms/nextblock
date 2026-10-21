@@ -1,11 +1,15 @@
 'use server'
 
+import 'server-only'
+
 import { createClient } from '@nextblock-cms/db/server'
 import { INVOICE_SETTINGS_KEY, serializeInvoiceSettings, type InvoiceSettings } from '@nextblock-cms/ecommerce'
 import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo'
 import { revalidatePath, updateTag } from 'next/cache'
 import { redirect } from 'next/navigation'
+import type { Json } from '@nextblock-cms/db'
 import type { Logo } from './types'
+import { requireCmsAdmin } from '../../../../lib/auth/cms-actor'
 import { SITE_SETTINGS_CACHE_TAG } from '../../../lib/site-settings'
 import {
   ACTIVE_LOGO_SETTING_KEY,
@@ -138,11 +142,20 @@ export async function setActiveLogo(
   return { success: true }
 }
 
+/**
+ * The seller block printed on every invoice. ADMIN-only, written with the service-role
+ * client after requireCmsAdmin(): since migration 02028 `invoice_settings` is in the
+ * second-factor write tier of site_settings, which an admin on an aal1 session (a "remember
+ * this device" login, or the email second factor) does not pass over PostgREST.
+ */
 export async function saveInvoiceSettings(payload: InvoiceSettings) {
-  const supabase = createClient()
-  const { error } = await supabase.from('site_settings').upsert({
+  const admin = await requireCmsAdmin().catch(() => null)
+  if (!admin) {
+    return { success: false, error: 'Only administrators can change the invoice settings.' }
+  }
+  const { error } = await admin.supabase.from('site_settings').upsert({
     key: INVOICE_SETTINGS_KEY,
-    value: serializeInvoiceSettings(payload),
+    value: serializeInvoiceSettings(payload) as unknown as Json,
   })
 
   if (error) {

@@ -1,7 +1,18 @@
+import 'server-only';
+
 import crypto from 'crypto';
 import { Freemius } from '@freemius/sdk';
 import { createClient as createSupabaseClient, type SupabaseClient } from '@supabase/supabase-js';
 
+import {
+  evaluateFreemiusLicenseClaim,
+  parseFreemiusTimestamp,
+  retrieveFreemiusLicenseRecords,
+  type FreemiusLicenseClaimRejection,
+  type FreemiusLicenseRecordLike,
+  type FreemiusLicenseRecords,
+  type FreemiusUserRecordLike,
+} from './freemius-license-claim';
 import { assignInvoiceMetadata } from './invoice-server';
 import { applyOrderInventoryDeduction } from './order-inventory';
 import {
@@ -79,6 +90,7 @@ type FreemiusOrderRow = {
   id: string;
   status: FreemiusTrackedOrderStatus | string;
   provider: string | null;
+  created_at?: string | null;
   freemius_product_id?: string | null;
   freemius_plan_id?: string | null;
   freemius_license_id?: string | null;
@@ -413,7 +425,7 @@ async function getFreemiusOrderById(client: SupabaseLikeClient, orderId: string)
   const { data, error } = await (client as any)
     .from('orders')
     .select(
-      'id, status, provider, freemius_product_id, freemius_plan_id, freemius_license_id, freemius_subscription_id, freemius_trial_id, freemius_user_id, freemius_trial_ends_at'
+      'id, status, provider, created_at, freemius_product_id, freemius_plan_id, freemius_license_id, freemius_subscription_id, freemius_trial_id, freemius_user_id, freemius_trial_ends_at'
     )
     .eq('id', orderId)
     .single();
@@ -429,7 +441,7 @@ async function getFreemiusOrderByLicenseId(client: SupabaseLikeClient, licenseId
   const { data, error } = await (client as any)
     .from('orders')
     .select(
-      'id, status, provider, freemius_product_id, freemius_plan_id, freemius_license_id, freemius_subscription_id, freemius_trial_id, freemius_user_id, freemius_trial_ends_at'
+      'id, status, provider, created_at, freemius_product_id, freemius_plan_id, freemius_license_id, freemius_subscription_id, freemius_trial_id, freemius_user_id, freemius_trial_ends_at'
     )
     .eq('freemius_license_id', licenseId)
     .order('created_at', { ascending: false })
@@ -481,10 +493,108 @@ async function applyFreemiusOrderState(input: {
   return nextStatus;
 }
 
+/** Clock skew tolerated between Freemius and this server when ordering timestamps. */
+const FREEMIUS_CLOCK_SKEW_MS = 5 * 60_000;
+
+/** What a refused checkout sync tells the browser, whatever the reason (logged server-side). */
+export const FREEMIUS_CHECKOUT_SYNC_REFUSED_MESSAGE =
+  'This checkout could not be verified with Freemius. Your license key is in your purchase email.';
+
+export type FreemiusCheckoutLicenseRejection =
+  | FreemiusLicenseClaimRejection
+  | 'license_linked_to_other_order'
+  | 'license_predates_order'
+  | 'missing_order_product'
+  | 'no_license_in_callback'
+  | 'order_has_other_license';
+
+/**
+ * Pure decision for the browser checkout sync: may this order be linked to the license the
+ * checkout callback named? The callback is attacker-controlled (anyone holding an order can
+ * POST it with any license id), and the success page and the order history reveal the linked
+ * license's key, so a link is accepted only when Freemius itself says the license is the
+ * buyer's fresh, never-activated license for THIS order's product (the vendor claim rules),
+ * it was created after the order, and no other order holds it. Product and plan ids always
+ * come from the order or from Freemius, never from the callback.
+ */
+export function evaluateFreemiusCheckoutLicense(input: {
+  callbackEmail: string | null | undefined;
+  callbackUserId: string | null | undefined;
+  license: FreemiusLicenseRecordLike | null | undefined;
+  licenseId: string | null | undefined;
+  linkedToOtherOrder: boolean;
+  now?: Date;
+  order: Pick<FreemiusOrderRow, 'created_at' | 'freemius_license_id' | 'freemius_product_id'>;
+  user: FreemiusUserRecordLike | null | undefined;
+}): { ok: true } | { ok: false; reason: FreemiusCheckoutLicenseRejection } {
+  const licenseId = toStringOrNull(input.licenseId);
+  const productId = toStringOrNull(input.order.freemius_product_id);
+
+  if (!licenseId) {
+    return { ok: false, reason: 'no_license_in_callback' };
+  }
+  if (!productId) {
+    return { ok: false, reason: 'missing_order_product' };
+  }
+  const linked = toStringOrNull(input.order.freemius_license_id);
+  if (linked && linked !== licenseId) {
+    return { ok: false, reason: 'order_has_other_license' };
+  }
+  if (input.linkedToOtherOrder) {
+    return { ok: false, reason: 'license_linked_to_other_order' };
+  }
+
+  const claim = evaluateFreemiusLicenseClaim({
+    license: input.license,
+    now: input.now,
+    request: {
+      email: input.callbackEmail ?? '',
+      kind: 'purchase',
+      licenseId,
+      productId,
+      userId: toStringOrNull(input.callbackUserId) ?? '',
+    },
+    user: input.user,
+  });
+  if (!claim.ok) {
+    return claim;
+  }
+
+  const orderCreated = input.order.created_at ? Date.parse(input.order.created_at) : Number.NaN;
+  const licenseCreated = parseFreemiusTimestamp(input.license?.created);
+  if (
+    !Number.isFinite(orderCreated) ||
+    licenseCreated === null ||
+    licenseCreated < orderCreated - FREEMIUS_CLOCK_SKEW_MS
+  ) {
+    return { ok: false, reason: 'license_predates_order' };
+  }
+
+  return { ok: true };
+}
+
+async function isLicenseLinkedToAnotherOrder(client: SupabaseLikeClient, licenseId: string, orderId: string) {
+  const { data, error } = await (client as any)
+    .from('orders')
+    .select('id')
+    .eq('freemius_license_id', licenseId)
+    .neq('id', orderId)
+    .limit(1);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return Array.isArray(data) && data.length > 0;
+}
+
 export async function syncFreemiusCheckoutOrder(input: {
   orderId: string;
   checkoutResponse?: FreemiusCheckoutResponse | null;
   client?: SupabaseLikeClient;
+  /** Freemius lookup; injectable for tests. */
+  retrieveLicense?: (productId: string, licenseId: string) => Promise<FreemiusLicenseRecords>;
+  now?: Date;
 }) {
   const client = input.client ?? getServiceRoleSupabaseClient();
   const order = await getFreemiusOrderById(client, input.orderId);
@@ -497,14 +607,70 @@ export async function syncFreemiusCheckoutOrder(input: {
   }
 
   const checkoutMetadata = extractFreemiusCheckoutMetadata(input.checkoutResponse);
+  const licenseId = checkoutMetadata.freemius_license_id ?? null;
+  const productId = toStringOrNull(order.freemius_product_id);
+  const alreadyLinked = Boolean(licenseId) && toStringOrNull(order.freemius_license_id) === licenseId;
+
+  // A license already linked to this order was verified when it was linked (or linked by a
+  // signed webhook); re-syncing it only re-applies the callback state. Anything else is
+  // verified against Freemius before a single field is written.
+  let verifiedLicense: FreemiusLicenseRecordLike | null = null;
+  if (!alreadyLinked) {
+    let decision: ReturnType<typeof evaluateFreemiusCheckoutLicense>;
+    if (!licenseId || !productId) {
+      decision = evaluateFreemiusCheckoutLicense({
+        callbackEmail: null,
+        callbackUserId: null,
+        license: null,
+        licenseId,
+        linkedToOtherOrder: false,
+        order,
+        user: null,
+      });
+    } else {
+      const records = await (input.retrieveLicense ?? retrieveFreemiusLicenseRecords)(productId, licenseId);
+      if (!records.ok) {
+        console.error(
+          `[Freemius Checkout Sync] Could not verify license ${licenseId} for order ${order.id}: ${records.reason}`
+        );
+        return { success: false, error: FREEMIUS_CHECKOUT_SYNC_REFUSED_MESSAGE };
+      }
+      decision = evaluateFreemiusCheckoutLicense({
+        callbackEmail: input.checkoutResponse?.user?.email ?? null,
+        callbackUserId: checkoutMetadata.freemius_user_id ?? null,
+        license: records.license,
+        licenseId,
+        linkedToOtherOrder: await isLicenseLinkedToAnotherOrder(client, licenseId, order.id),
+        now: input.now,
+        order,
+        user: records.user,
+      });
+      verifiedLicense = records.license;
+    }
+
+    if (!decision.ok) {
+      console.warn(
+        `[Freemius Checkout Sync] Refused license ${licenseId ?? '(none)'} for order ${order.id}: ${decision.reason}`
+      );
+      return { success: false, error: FREEMIUS_CHECKOUT_SYNC_REFUSED_MESSAGE };
+    }
+  }
+
+  // Ids Freemius vouched for (or the order already holds) replace the callback's.
+  const trustedMetadata: FreemiusOrderMetadata = {
+    ...checkoutMetadata,
+    freemius_product_id: productId,
+    freemius_plan_id:
+      toStringOrNull(verifiedLicense?.plan_id) ?? toStringOrNull(order.freemius_plan_id) ?? null,
+    freemius_license_id: licenseId,
+    freemius_user_id:
+      toStringOrNull(verifiedLicense?.user_id) ?? toStringOrNull(order.freemius_user_id) ?? null,
+  };
   let purchaseData: Record<string, any> | null = null;
 
-  if (checkoutMetadata.freemius_license_id) {
+  if (licenseId) {
     try {
-      purchaseData = await retrieveFreemiusPurchaseData(
-        checkoutMetadata.freemius_product_id ?? order.freemius_product_id,
-        checkoutMetadata.freemius_license_id
-      );
+      purchaseData = await retrieveFreemiusPurchaseData(productId, licenseId);
     } catch (error) {
       console.error('[Freemius Checkout Sync] Failed to retrieve purchase data:', error);
     }
@@ -516,8 +682,11 @@ export async function syncFreemiusCheckoutOrder(input: {
     objects: {},
   };
   const metadata = {
-    ...checkoutMetadata,
+    ...trustedMetadata,
     ...getEventMetadata(event, purchaseData),
+    // Purchase data is fetched for this order's product; keep the order's product id
+    // authoritative whatever it reports.
+    freemius_product_id: productId,
   };
   const callbackStatus = resolveFreemiusStatusFromCheckoutResponse(
     input.checkoutResponse,

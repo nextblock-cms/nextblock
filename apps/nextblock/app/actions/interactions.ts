@@ -1,8 +1,11 @@
 "use server";
 
+import "server-only";
+
 import { createClient, getServiceRoleSupabaseClient, getProfileWithRoleServerSide } from "@nextblock-cms/db/server";
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
+import { requireCmsAdmin } from "../../lib/auth/cms-actor";
 import { resolveSiteUrl } from "../../lib/site-url";
 import { sendEmail } from "./email";
 
@@ -470,19 +473,29 @@ export async function updateInteractionStatus(interactionId: string, status: "ap
 }
 
 /**
+ * The service-role client for a signed-in ADMIN whose second factor is satisfied, or the
+ * error to return. `interactions_notification_emails` sits above the staff read tier of
+ * site_settings and, since migration 02028, behind public.is_admin_mfa() for writes, so the
+ * cookie client misses it for an admin on an aal1 session (a "remember this device" login,
+ * or the email second factor); a redirected address would receive every moderation notice.
+ */
+async function requireNotificationSettingsAdmin() {
+  try {
+    const { supabase } = await requireCmsAdmin();
+    return { supabase, error: null };
+  } catch (err) {
+    const forbidden = err instanceof Error && err.message === "Forbidden";
+    return { supabase: null, error: forbidden ? "Unauthorized. Admin role required." : "Not authenticated" };
+  }
+}
+
+/**
  * Fetches the interactions notification emails from site_settings.
  */
 export async function getNotificationEmails() {
-  const supabase = createClient();
-  
-  // Authenticate & authorize
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { error: "Not authenticated" };
-
-  const profile = await getProfileWithRoleServerSide(user.id);
-  if (!profile || profile.role !== "ADMIN") {
-    return { error: "Unauthorized. Admin role required." };
-  }
+  const auth = await requireNotificationSettingsAdmin();
+  if (auth.error !== null) return { error: auth.error };
+  const { supabase } = auth;
 
   try {
     const { data, error } = await supabase
@@ -504,16 +517,9 @@ export async function getNotificationEmails() {
  * Saves the interactions notification emails to site_settings.
  */
 export async function saveNotificationEmails(emails: string) {
-  const supabase = createClient();
-
-  // Authenticate & authorize
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return { error: "Not authenticated" };
-
-  const profile = await getProfileWithRoleServerSide(user.id);
-  if (!profile || profile.role !== "ADMIN") {
-    return { error: "Unauthorized. Admin role required." };
-  }
+  const auth = await requireNotificationSettingsAdmin();
+  if (auth.error !== null) return { error: auth.error };
+  const { supabase } = auth;
 
   // Validate every address, dedupe (case-insensitive), and normalize to lowercase.
   // Mirrors the client-side check so a crafted/legacy payload can't persist junk.
