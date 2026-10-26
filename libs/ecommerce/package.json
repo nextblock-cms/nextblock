@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/ecom",
-  "version": "0.22.3",
+  "version": "0.22.4",
   "license": "AGPL-3.0-or-later",
   "publishConfig": {
     "access": "public"
@@ -22,20 +22,20 @@
     "@nextblock-cms/utils": "workspace:*",
     "@freemius/checkout": "^1.5.1",
     "@freemius/sdk": "^0.5.0",
-    "@hookform/resolvers": "^5.9.1",
-    "@supabase/supabase-js": "^2.116.0",
-    "lucide-react": "^1.47.0",
+    "@hookform/resolvers": "^5.9.2",
+    "@supabase/supabase-js": "^2.118.0",
+    "lucide-react": "^1.61.0",
     "papaparse": "^5.7.0",
     "postgres": "^3.4.9",
-    "react-hook-form": "^7.88.0",
+    "react-hook-form": "^7.91.0",
     "server-only": "^0.0.1",
     "sonner": "^2.0.8",
-    "stripe": "^22.6.2",
-    "zod": "^4.6.5",
-    "zustand": "^5.0.15"
+    "stripe": "^23.0.1",
+    "zod": "^4.6.7",
+    "zustand": "^5.0.16"
   },
   "peerDependencies": {
-    "next": "^16.3.5",
+    "next": "^16.4.3",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   }

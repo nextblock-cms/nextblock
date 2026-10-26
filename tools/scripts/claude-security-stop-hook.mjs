@@ -12,11 +12,14 @@
 
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+// realpathSync.native returns the on-disk casing. A session opened as `d:\...` passes the lowercase
+// drive letter through $CLAUDE_PROJECT_DIR, and Vitest started from it loads a second copy of
+// itself ("Cannot read properties of undefined (reading 'config')"), failing every check.
+const repoRoot = realpathSync.native(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'));
 const PATHSPECS = ['apps/nextblock', 'libs', 'tools', '.github/workflows', 'package.json'];
 const CHECK_FILES = [
   'tools/scripts/service-role-boundary.test.ts',

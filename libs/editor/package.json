@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/editor",
-  "version": "0.22.3",
+  "version": "0.22.4",
   "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
@@ -10,7 +10,7 @@
   "main": "./index.js",
   "typings": "./index.d.ts",
   "dependencies": {
-    "use-sync-external-store": "^1.6.0"
+    "use-sync-external-store": "^1.7.0"
   },
   "exports": {
     ".": {

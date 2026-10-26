@@ -71,6 +71,7 @@ nextblock-cms
 .claude/scheduled_tasks.lock
 .nx/polygraph
 .nx/self-healing
+.nx/migrate-runs
 
 .vercel
 .mcp.json
