@@ -12,6 +12,7 @@ import { getS3Client } from "@nextblock-cms/utils/server";
 import { getStorageBackend, getStorageBucket } from "../../../lib/storage/provider";
 import { supabaseRemoveObjects } from "../../../lib/storage/supabase-storage";
 import { isPartnerUploadKey, mediaKeyStem, ownedMediaStorageKeys, withoutKeysInUse } from "../../../lib/storage/media-object-keys";
+import { getPublicMediaBaseUrl, resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
 
 type Media = Database['public']['Tables']['media']['Row'];
 
@@ -344,7 +345,7 @@ export async function moveMultipleMediaItems(
 
   const s3Client = await getS3Client();
   const R2_BUCKET_NAME = getStorageBucket();
-  const R2_PUBLIC_URL_BASE = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
+  const R2_PUBLIC_URL_BASE = getPublicMediaBaseUrl();
 
   if (!R2_BUCKET_NAME) {
     return { error: "R2 Bucket not configured for move." };
@@ -528,7 +529,7 @@ export async function moveMultipleMediaItems(
           const filename = getFilename(v.objectKey);
           const updatedKey = `${folder}${filename}`;
           const updated = { ...v, objectKey: updatedKey } as any;
-          if (R2_PUBLIC_URL_BASE) updated.url = `${R2_PUBLIC_URL_BASE}/${updatedKey}`;
+          if (R2_PUBLIC_URL_BASE) updated.url = resolveMediaUrl(updatedKey, R2_PUBLIC_URL_BASE);
           return updated;
         });
 

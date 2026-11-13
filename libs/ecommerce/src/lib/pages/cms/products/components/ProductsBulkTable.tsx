@@ -24,6 +24,7 @@ import {
   TableRow,
 } from '@nextblock-cms/ui';
 import { formatPrice } from '@nextblock-cms/utils';
+import { resolveMediaUrl } from '@nextblock-cms/utils/media-url';
 
 import { DeleteProductButton } from './DeleteProductButton';
 
@@ -59,24 +60,6 @@ interface ProductsBulkTableProps {
   deleteProductAction: (id: string) => Promise<void>;
   bulkDeleteProductsAction: (productIds: string[]) => BulkActionResult;
   bulkDraftProductsAction: (productIds: string[]) => BulkActionResult;
-}
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
-
-function resolveMediaUrl(path?: string | null) {
-  if (!path) {
-    return null;
-  }
-
-  if (path.startsWith('http')) {
-    return path;
-  }
-
-  if (!R2_BASE_URL) {
-    return path;
-  }
-
-  return `${R2_BASE_URL.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
 }
 
 export function ProductsBulkTable({

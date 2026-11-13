@@ -7,20 +7,7 @@ import { isDigitalItem, type CartItem } from '@nextblock-cms/ecommerce/types';
 import { useIsCartHydrated } from '@nextblock-cms/ecommerce/use-cart';
 import { mapRawVariantRelations } from '@nextblock-cms/ecommerce/variation-utils';
 import { getTranslatedProductsForCart } from '@nextblock-cms/ecommerce/server-actions/product-actions';
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
-
-function resolveMediaUrl(filePath?: string | null) {
-  if (!filePath) {
-    return null;
-  }
-
-  if (filePath.startsWith('http')) {
-    return filePath;
-  }
-
-  return R2_BASE_URL ? `${R2_BASE_URL}/${filePath}` : filePath;
-}
+import { resolveMediaUrl } from '../lib/media/resolveMediaUrl';
 
 function resolveProductImageUrl(product: any, fallback?: string | null) {
   const firstMedia = product?.product_media?.[0]?.media;

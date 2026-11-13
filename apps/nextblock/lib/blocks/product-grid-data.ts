@@ -4,6 +4,7 @@ import { getVariantEffectivePriceRange } from '@nextblock-cms/ecommerce/variatio
 import type { Product } from '@nextblock-cms/ecommerce/types';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
 
+import { resolveMediaUrlWithSupabaseFallback } from '../media/resolveMediaUrl';
 import { PRODUCT_GRID_MAX_LIMIT } from './ecommerce-block-schemas';
 
 type SupabaseClientLike = ReturnType<typeof getSsgSupabaseClient>;
@@ -30,19 +31,11 @@ export interface ProductGridPage {
 /** Turn a `getProducts` row into the shape `<ProductGrid />` renders. */
 export function mapProductRowToUiProduct(p: any): Product {
   const productRecord = p as any;
-  let imageUrl = undefined;
   // Accessing the nested media object correctly (array of objects with media property)
   // The type from getProducts select is: product_media: { media: { file_path: string | null } | null }[]
+  // A bundled key (images/…) resolves to the app's /images, any other key to the media bucket.
   const mediaItem = p.product_media?.[0]?.media;
-  if (mediaItem?.file_path) {
-    if (mediaItem.file_path.startsWith('http')) {
-      imageUrl = mediaItem.file_path;
-    } else if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-      imageUrl = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${mediaItem.file_path}`;
-    } else {
-      imageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/storage/v1/object/public/media/${mediaItem.file_path}`;
-    }
-  }
+  const imageUrl = resolveMediaUrlWithSupabaseFallback(mediaItem?.file_path) ?? undefined;
 
   const variantPriceRange = getVariantEffectivePriceRange(
     (p.product_variants || []).map((variant: any) => ({

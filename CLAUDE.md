@@ -163,6 +163,11 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - Cortex's package id is `cortex-ai`, never `ai`. Cortex calls OpenRouter via the Vercel AI SDK
   and the operator picks the model; never assume a provider.
 - Renaming a custom block `slug` orphans every block instance that references it.
+- Media display URLs come from `resolveMediaUrl` (`@nextblock-cms/utils/media-url`; app-side
+  `lib/media/resolveMediaUrl.ts`), never `${NEXT_PUBLIC_R2_BASE_URL}/${key}`: seeded and 02032
+  media rows point at bundled `public/images` files, served from `/images/…`, and a hand-built URL
+  breaks them wherever the base is set. `tools/scripts/media-url-builders.test.ts` fails on one
+  outside its config allowlist (CSP, setup, storage provider, backups).
 - A new `libs/utils` directory barrel needs its own build entry + `exports` key in
   `vite.config.mts` (see `./seo`); the published `./*` wildcard only maps files.
 - Lib declarations fail silently (the build exits 0, scaffolds use `skipLibCheck`, the type

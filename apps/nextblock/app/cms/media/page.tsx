@@ -12,6 +12,7 @@ import MediaUploadForm from "./components/MediaUploadForm";
 // MediaImage and DeleteMediaButtonClient are used by MediaGridClient, not directly here anymore.
 import MediaGridClient from "./components/MediaGridClient"; // Import the new client component
 import FolderNavigator from "./components/FolderNavigator";
+import { getPublicMediaBaseUrl } from "../../../lib/media/resolveMediaUrl";
 
 async function getMediaItems(folder?: string, folderPrefix?: string, search?: string): Promise<Media[]> {
   const supabase = createClient();
@@ -87,9 +88,9 @@ async function getFolderCounts(): Promise<Record<string, number>> {
   return counts;
 }
 
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || "";
-
 export default async function CmsMediaLibraryPage(props: { searchParams?: Promise<{ folder?: string; folderPrefix?: string; q?: string }> }) {
+  // Read on the server, where process.env is current, and handed to the grid's resolveMediaUrl().
+  const mediaBaseUrl = getPublicMediaBaseUrl();
   const searchParams = (await props.searchParams) || {};
   const selectedFolder = searchParams.folder;
   const selectedFolderPrefix = searchParams.folderPrefix;
@@ -114,7 +115,7 @@ export default async function CmsMediaLibraryPage(props: { searchParams?: Promis
       </div>
 
       {/* The media grid and empty state are now handled by MediaGridClient */}
-      <MediaGridClient initialMediaItems={mediaItems} r2BaseUrl={R2_BASE_URL} />
+      <MediaGridClient initialMediaItems={mediaItems} r2BaseUrl={mediaBaseUrl} />
     </div>
   );
 }

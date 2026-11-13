@@ -8,6 +8,7 @@ import {
   type TranslationMap,
 } from './types';
 import { isSaleWindowActive, normalizePriceMap, normalizeSalePriceMap } from './currency';
+import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
 
 type AttributeAccumulator = ProductAttribute & {
   terms: ProductAttributeTerm[];
@@ -71,26 +72,6 @@ export function resolveAttributeName(attribute: ProductAttribute, languageCode?:
 
 export function resolveTermValue(term: ProductAttributeTerm, languageCode?: string | null) {
   return resolveTranslatedText(term.value, term.value_translations, languageCode);
-}
-
-function resolveMediaUrl(filePath?: string | null) {
-  if (!filePath) {
-    return null;
-  }
-
-  if (filePath.startsWith('http')) {
-    return filePath;
-  }
-
-  if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-    return `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${filePath}`;
-  }
-
-  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
-    return `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${filePath}`;
-  }
-
-  return filePath;
 }
 
 function slugifyToken(value: string) {
@@ -446,7 +427,7 @@ export function mapRawVariantRelations(rawVariants: any[] = [], languageCode?: s
         scheduled_price_at: variant.scheduled_price_at ?? null,
         stock_quantity: variant.stock_quantity ?? 0,
         main_media_id: variant.main_media_id ?? null,
-        image_url: resolveMediaUrl(
+        image_url: resolveMediaUrlWithSupabaseFallback(
           variant.media?.file_path ?? variant.media?.object_key ?? null
         ),
         attribute_term_ids: attributeTermIds,

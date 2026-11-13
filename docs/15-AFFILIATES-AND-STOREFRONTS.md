@@ -71,8 +71,9 @@ anywhere in `app`, `lib` or `components`, since that check would skip Commerce P
     `lg` up; compact at `md`) and the footer row gets the same badge.
   - Operators edit or delete the rows in /cms/navigation (a delete removes both languages).
   - Rows that Cortex's footer or navigation tools recreate lose the group and become plain links.
-- **The home-page section of 02034** (after the Cortex AI section, sentinel class
-  `nb-partner-program`) is seeded content, not code: it stays visible.
+- **The home-page section of 02034** (below "More Than a CMS. An Ecosystem." since 02040, which
+  moved it from right after the Cortex AI section; sentinel class `nb-partner-program`) is seeded
+  content, not code: it stays visible.
   - Its buttons are absolute `https://nextblock.dev` links, like the other seeded promos, so they
     work on every install.
   - It shipped to every install that still had the seeded Cortex AI section. A customized home
@@ -382,6 +383,16 @@ And two on 2026-11-11:
   hands it back; locked and service-role only), and refund-after-payout advice that follows the
   payout's method and status (see "Paying partners manually"). Its section 7 seeds the partner
   portal and terms copy of the partner side.
+
+And one on 2026-11-13:
+
+- **`02040_home_partner_section_after_ecosystem.sql`** moves the home-page partner section (EN
+  `home`, FR `accueil`) one section down, below "More Than a CMS. An Ecosystem." (the light section
+  that also holds "Join Our Community."), so it no longer sits back to back with the Cortex AI
+  section's identical dark layout and leads into the FAQ instead. It swaps the order
+  of the partner and Ecosystem sections only on the layout 02034 left (found by content signature),
+  makes the same swap in the page's Live Draft rows, and leaves a rearranged home page alone with a
+  NOTICE.
 
 **Roles are compared as text in SQL.** The sandbox reset replays every migration in one
 transaction, where the `RTL` label is never committed before 02030 runs. Policies use

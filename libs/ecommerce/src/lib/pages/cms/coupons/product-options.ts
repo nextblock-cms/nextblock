@@ -1,3 +1,5 @@
+import { resolveMediaUrl } from '@nextblock-cms/utils/media-url';
+
 import type { CouponProductOption } from './ProductScopePicker';
 
 type JoinedLanguage =
@@ -18,24 +20,6 @@ function normalizeJoinedLanguage(language: JoinedLanguage) {
   }
 
   return language ?? null;
-}
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
-
-function resolveMediaUrl(path?: string | null) {
-  if (!path) {
-    return null;
-  }
-
-  if (path.startsWith('http')) {
-    return path;
-  }
-
-  if (!R2_BASE_URL) {
-    return path;
-  }
-
-  return `${R2_BASE_URL.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
 }
 
 function resolveProductThumbnail(product: any) {

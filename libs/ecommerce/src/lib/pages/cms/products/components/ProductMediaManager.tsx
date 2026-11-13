@@ -3,25 +3,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { X, GripVertical, Image as ImageIcon } from 'lucide-react';
 import type { Database } from '@nextblock-cms/db';
+import { resolveMediaUrl } from '@nextblock-cms/utils/media-url';
 import Image from 'next/image';
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
-const resolveMediaUrl = (path: string) => {
-  // Guard empty paths so we never build "<base>/" (which 404s).
-  if (!path) {
-    return '';
-  }
-
-  if (path.startsWith('http')) {
-    return path;
-  }
-
-  if (!R2_BASE_URL) {
-    return path;
-  }
-
-  return `${R2_BASE_URL.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
-};
 
 type MediaItem = {
   id: string; // This is the product_media ID, or temp ID
@@ -117,7 +100,10 @@ export const ProductMediaManager = ({ initialMedia, onUpdate, mediaPickerNode }:
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-4">
-        {mediaItems.map((item, index) => (
+        {mediaItems.map((item, index) => {
+          // Bundled keys (images/…) come from the app's /images, every other key from the bucket.
+          const previewSrc = resolveMediaUrl(item.file_path);
+          return (
           <div
             key={item.id} // Use unique ID
             className="group relative aspect-square bg-muted/40 rounded-lg border overflow-hidden cursor-move transition-all hover:shadow-md"
@@ -150,9 +136,9 @@ export const ProductMediaManager = ({ initialMedia, onUpdate, mediaPickerNode }:
                  <GripVertical className="w-4 h-4 text-white drop-shadow-md" />
             </div>
 
-            {resolveMediaUrl(item.file_path) ? (
+            {previewSrc ? (
               <Image
-                src={resolveMediaUrl(item.file_path)}
+                src={previewSrc}
                 alt={item.alt}
                 fill
                 className="object-cover"
@@ -164,7 +150,8 @@ export const ProductMediaManager = ({ initialMedia, onUpdate, mediaPickerNode }:
               </div>
             )}
           </div>
-        ))}
+          );
+        })}
 
         {mediaPickerNode ? (
           React.cloneElement(mediaPickerNode as React.ReactElement<any>, { 

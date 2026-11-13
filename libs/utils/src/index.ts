@@ -16,4 +16,5 @@ export * from './lib/color';
 export * from './lib/publishing';
 export * from './lib/seo';
 export * from './lib/media-variants';
+export * from './lib/media-url';
 export * from './lib/authored-html';

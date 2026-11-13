@@ -14,30 +14,17 @@ import {
 } from "@nextblock-cms/ui";
 import { Search, CheckCircle } from "lucide-react";
 import Image from "next/image";
+import { resolveMediaUrl } from "@nextblock-cms/utils/media-url";
 import MediaUploadForm from "./MediaUploadForm";
 
 type Media = Database["public"]["Tables"]["media"]["Row"];
 
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || "";
 const MEDIA_REQUEST_TIMEOUT_MS = 8000;
 const MEDIA_LIBRARY_LIMIT = 50;
 
-function resolveMediaPreviewPath(media: Media) {
-  return media.file_path || media.object_key || null;
-}
-
-function resolveMediaPreviewSrc(path: string) {
-  if (path.startsWith("http")) {
-    return path;
-  }
-
-  if (!R2_BASE_URL) {
-    return path;
-  }
-
-  const normalizedBaseUrl = R2_BASE_URL.replace(/\/+$/, "");
-  const normalizedPath = path.replace(/^\/+/, "");
-  return `${normalizedBaseUrl}/${normalizedPath}`;
+/** The preview URL of an image row: bundled keys from the app's /images, the rest from the bucket. */
+function resolveMediaPreviewSrc(media: Media) {
+  return resolveMediaUrl(media.file_path || media.object_key);
 }
 
 interface MediaPickerDialogProps {
@@ -210,17 +197,19 @@ export default function MediaPickerDialog({
             </div>
           ) : (
             <div className="flex flex-wrap gap-3 overflow-y-auto min-h-0 pr-2 pb-2">
-              {filtered.map((media: Media) => (
+              {filtered.map((media: Media) => {
+                const previewSrc = media.file_type?.startsWith("image/") ? resolveMediaPreviewSrc(media) : null;
+                return (
                 <button
                   key={media.id}
                   type="button"
                   className="relative aspect-square border rounded-md overflow-hidden group focus:outline-none focus:ring-2 focus:ring-primary min-w-0 w-1/3 sm:w-1/4 md:w-1/5 lg:w-1/6"
                   onClick={() => handleSelect(media)}
                 >
-                  {media.file_type?.startsWith("image/") && resolveMediaPreviewPath(media) ? (
+                  {previewSrc ? (
                     <>
                       <Image
-                        src={resolveMediaPreviewSrc(resolveMediaPreviewPath(media) as string)}
+                        src={previewSrc}
                         alt={media.description || media.file_name || "Media library image"}
                         fill
                         className="absolute inset-0 w-full h-full object-cover"
@@ -241,7 +230,8 @@ export default function MediaPickerDialog({
                     {media.file_name}
                   </p>
                 </button>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

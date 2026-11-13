@@ -31,24 +31,7 @@ import {
   majorUnitAmountToMinor,
   minorUnitAmountToMajor,
 } from '@nextblock-cms/utils';
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || '';
-const SUPABASE_PUBLIC_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-const resolveMediaUrl = (path: string) => {
-  if (path.startsWith('http')) {
-    return path;
-  }
-
-  if (R2_BASE_URL) {
-    return `${R2_BASE_URL.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
-  }
-
-  if (SUPABASE_PUBLIC_URL) {
-    return `${SUPABASE_PUBLIC_URL.replace(/\/+$/, '')}/storage/v1/object/public/media/${path.replace(/^\/+/, '')}`;
-  }
-
-  return path;
-};
+import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
 
 interface VariationsEditorProps {
   globalAttributes: ProductAttribute[];
@@ -366,7 +349,7 @@ export function VariationsEditor({
     }
 
     const filePath = selectedMedia.file_path;
-    const imageUrl = resolveMediaUrl(filePath);
+    const imageUrl = resolveMediaUrlWithSupabaseFallback(filePath);
 
     setVariantDrafts((currentDrafts) =>
       currentDrafts.map((variant) =>

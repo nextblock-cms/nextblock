@@ -1,6 +1,7 @@
 import React from "react";
 import Image from "next/image";
 import type { VisualEditAttributes } from "../../../lib/visual-editing/types";
+import { resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
 import { StockPhotoCredit, isStockPhotoCreditCaption, type StockPhotoAttribution } from "./StockPhotoCredit";
 
 export type ImageBlockContent = {
@@ -18,8 +19,6 @@ export type ImageBlockContent = {
 function isRenderableExternalImageUrl(value: unknown): value is string {
   return typeof value === "string" && /^https?:\/\//i.test(value.trim());
 }
-
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || "";
 
 interface ImageBlockRendererProps {
   content: ImageBlockContent;
@@ -129,8 +128,10 @@ const ImageBlockRenderer: React.FC<ImageBlockRendererProps> = ({
     );
   }
 
-  const displayImageUrl = `${R2_BASE_URL}/${content.object_key}`;
-  
+  // A bundled key (images/…) is served by the app from /images, any other key from the bucket.
+  const displayImageUrl = resolveMediaUrl(content.object_key);
+  if (!displayImageUrl) return null; // unreachable: object_key was checked above
+
   return (
     <div className="w-full" {...visualEditAttributes}>
       <figure

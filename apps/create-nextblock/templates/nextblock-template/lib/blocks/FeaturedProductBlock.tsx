@@ -5,6 +5,7 @@ import { getVariantEffectivePriceRange } from '@nextblock-cms/ecommerce/variatio
 
 import type { FeaturedProductBlockContent } from './ecommerce-block-schemas';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
+import { resolveMediaUrlWithSupabaseFallback } from '../media/resolveMediaUrl';
 
 // Component (Server Component)
 export const FeaturedProductBlock = async ({ content }: { content: FeaturedProductBlockContent }) => {
@@ -16,18 +17,9 @@ export const FeaturedProductBlock = async ({ content }: { content: FeaturedProdu
       return null; // Or render placeholder in edit mode
   }
 
-  // Image Resolution
-  let imageUrl = undefined;
+  // Image Resolution: a bundled key (images/…) from the app's /images, any other from the bucket.
   const mediaItem = productRecord.product_media?.[0]?.media;
-  if (mediaItem?.file_path) {
-     if (mediaItem.file_path.startsWith('http')) {
-       imageUrl = mediaItem.file_path;
-     } else if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-       imageUrl = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${mediaItem.file_path}`;
-     } else {
-       imageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''}/storage/v1/object/public/media/${mediaItem.file_path}`;
-     }
-  }
+  const imageUrl = resolveMediaUrlWithSupabaseFallback(mediaItem?.file_path) ?? undefined;
 
   const variantPriceRange = getVariantEffectivePriceRange(
     ((product as any).product_variants || []).map((variant: any) => ({

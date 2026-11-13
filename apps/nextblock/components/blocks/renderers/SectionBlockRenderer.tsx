@@ -13,6 +13,7 @@ import { getCachedCustomBlockDefinitionBySlug } from "../../../lib/custom-block-
 import { CachedDynamicLayoutEngine } from "../../renderers/CachedDynamicLayoutEngine";
 import { getCachedLanguageCode } from "../../../lib/languages/cached-language-code";
 import { resolveBlockRelations } from "../../../lib/resolve-block-relations";
+import { resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
 
 // Static imports for core block renderers for LCP/performance optimization
 import TextBlockRenderer from "./TextBlockRenderer";
@@ -21,7 +22,6 @@ import ImageBlockRenderer from "./ImageBlockRenderer";
 import ButtonBlockRenderer from "./ButtonBlockRenderer";
 import { StockPhotoCredit } from "./StockPhotoCredit";
 
-const R2_BASE_URL = process.env.NEXT_PUBLIC_R2_BASE_URL || "";
 const BACKGROUND_COMPOSITING_CLASSES =
   "isolate transform-gpu [backface-visibility:hidden] [transform-style:preserve-3d]";
 
@@ -83,13 +83,15 @@ function renderBackgroundImageElement(image: SectionBackgroundImage, priority: b
     );
   }
 
-  if (!image.object_key) {
+  // A bundled key (images/…) is served by the app from /images, any other key from the bucket.
+  const src = resolveMediaUrl(image.object_key);
+  if (!src) {
     return null;
   }
 
   return (
     <Image
-      src={`${R2_BASE_URL}/${image.object_key}`}
+      src={src}
       alt={image.alt_text || ""}
       fill
       priority={priority}

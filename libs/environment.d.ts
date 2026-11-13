@@ -2,6 +2,12 @@ declare namespace NodeJS {
   interface ProcessEnv {
     NEXT_PUBLIC_SUPABASE_URL: string;
     NEXT_PUBLIC_SUPABASE_ANON_KEY: string;
+    /**
+     * Public media base URL (R2, MinIO, or Supabase Storage's public endpoint). Declared so that
+     * `@nextblock-cms/utils/media-url` can read it with dot access, the form Next.js inlines into
+     * client bundles, under libs/db's noPropertyAccessFromIndexSignature.
+     */
+    NEXT_PUBLIC_R2_BASE_URL?: string;
     R2_ACCOUNT_ID: string;
     R2_ACCESS_KEY_ID: string;
     R2_SECRET_ACCESS_KEY: string;

@@ -193,6 +193,40 @@ The editor integrates with a pluggable image picker bridge:
 This keeps the editor package reusable while still supporting CMS media
 selection.
 
+## Media URLs and the bundled images
+
+A media row's `object_key` (`file_path` on older rows) is a storage key, and every
+screen turns it into a URL with `resolveMediaUrl` (`@nextblock-cms/utils/media-url`,
+re-exported app-side as `lib/media/resolveMediaUrl.ts`):
+
+- an absolute `http(s)` URL or a root-relative path is used as it is;
+- a key in `BUNDLED_PUBLIC_MEDIA_KEYS` resolves to `/images/…`. Those are files that
+  ship with the app in `apps/nextblock/public/images`, not objects in the bucket: the
+  seeded demo content, the sandbox reset and the Affiliates license covers from
+  migration 02032 (`images/affiliates-square.webp`) point media rows at them;
+- any other key is joined to the public media base, `NEXT_PUBLIC_R2_BASE_URL` (R2,
+  MinIO, or Supabase Storage's public endpoint, which `next.config.js` inlines on a
+  zero-key Supabase deploy). In the browser, a bundle built without that variable
+  falls back to the runtime value `<PublicEnvBootstrap>` injects. With no base at all
+  the result is the relative `/${key}`.
+
+`resolveMediaUrlWithSupabaseFallback` is the same resolver with Supabase Storage's
+public `media` bucket as the base when none is configured. The storefront product
+pages, the shop grid, variant images, invoice logos and the customer avatar use it.
+
+Never join the base to a key by hand. Through 0.23.1 the shop's CMS screens, the
+product page, the product grid, the cart and the image and section renderers did,
+so a bundled key showed a broken image wherever the base was set (the two
+Affiliates license products on nextblock.dev). `tools/scripts/media-url-builders.test.ts`
+now fails on any module in `apps/nextblock` or `libs` that reads
+`NEXT_PUBLIC_R2_BASE_URL` / `NEXT_PUBLIC_R2_PUBLIC_URL` or builds a Supabase Storage
+public URL, unless `MEDIA_BASE_READERS` lists it as configuration (the CSP, setup,
+the storage provider, backups, the Affiliates image-origin allow-lists). A new
+bundled image goes into `BUNDLED_PUBLIC_MEDIA_KEYS`;
+`apps/nextblock/lib/media/resolveMediaUrl.test.ts` fails on a listed key with no file
+behind it, and on a bundled key that a forward migration or the sandbox reset writes
+without listing it.
+
 ## Feature images and the social preview image
 
 Two different images decide what a page shows at the top and what a shared link

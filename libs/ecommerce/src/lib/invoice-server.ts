@@ -2,6 +2,7 @@ import 'server-only';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
 
 import { normalizeOrderCustomerDetails } from './customer';
 import type { InvoiceLogo, InvoiceOrder, InvoicePresentationData } from './invoice';
@@ -13,30 +14,6 @@ import {
 import { normalizeOrderTaxDetails } from './order-tax-details';
 
 type SupabaseLikeClient = SupabaseClient<any>;
-
-function resolveMediaUrl(filePath?: string | null) {
-  if (!filePath) {
-    return null;
-  }
-
-  if (filePath.startsWith('http')) {
-    return filePath;
-  }
-
-  if (filePath.startsWith('/')) {
-    return filePath;
-  }
-
-  if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-    return `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${filePath}`;
-  }
-
-  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
-    return `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${filePath}`;
-  }
-
-  return filePath;
-}
 
 function getSupabaseClient(client?: SupabaseLikeClient) {
   return client ?? (getServiceRoleSupabaseClient() as SupabaseLikeClient);
@@ -52,7 +29,7 @@ function mapLogo(row: any): InvoiceLogo | null {
   return {
     id: row.id,
     name: row.name ?? null,
-    url: resolveMediaUrl(objectKey),
+    url: resolveMediaUrlWithSupabaseFallback(objectKey),
     width: row.media?.width ?? null,
     height: row.media?.height ?? null,
   };

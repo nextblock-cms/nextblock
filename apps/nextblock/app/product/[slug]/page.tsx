@@ -1,5 +1,6 @@
 import { getProductBySlug, getProducts, getProviderReadiness } from '@nextblock-cms/ecommerce/server';
 import { pickOriginalUploadObjectKey } from '../../../lib/media/original-upload';
+import { resolveMediaUrlWithSupabaseFallback } from '../../../lib/media/resolveMediaUrl';
 import {
   ProductProvider,
   mapRawVariantRelations,
@@ -148,19 +149,11 @@ export async function generateMetadata({ params }: ProductPageProps): Promise<Me
   // pipeline makes the AVIF derivative the row's primary key, so the preview uses the
   // untouched upload when the row kept one. See lib/media/original-upload.ts. The
   // storefront gallery further down is unaffected and still renders the AVIF.
-  let imageUrl = undefined;
   const mediaItem = productRecord.product_media?.[0]?.media;
   const socialKey: string | undefined =
     pickOriginalUploadObjectKey(mediaItem) ?? mediaItem?.file_path ?? undefined;
-  if (socialKey) {
-     if (socialKey.startsWith('http')) {
-        imageUrl = socialKey;
-     } else if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-        imageUrl = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${socialKey}`;
-     } else {
-        imageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${socialKey}`;
-     }
-  }
+  // A bundled key (images/…) is served by the app itself, from /images.
+  const imageUrl = resolveMediaUrlWithSupabaseFallback(socialKey) ?? undefined;
 
   const siteUrl = process.env.NEXT_PUBLIC_URL || "";
   const [languagesResult, productTranslationsResult] = await Promise.all([
@@ -345,16 +338,9 @@ export default async function ProductPage({ params }: ProductPageProps) {
       const sortedMedia = [...productRecord.product_media].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
       
       sortedMedia.forEach(pm => {
-          if (pm.media?.file_path) {
-              let url = '';
-              if (pm.media.file_path.startsWith('http')) {
-                  url = pm.media.file_path;
-              } else if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-                  url = `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${pm.media.file_path}`;
-              } else {
-                  url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${pm.media.file_path}`;
-              }
-              
+          // A bundled key (images/…) from the app's /images, any other key from the media bucket.
+          const url = resolveMediaUrlWithSupabaseFallback(pm.media?.file_path);
+          if (url) {
               images.push({
                 url,
                 alt: productRecord.title,

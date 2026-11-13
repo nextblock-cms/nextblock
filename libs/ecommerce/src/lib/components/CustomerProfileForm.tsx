@@ -35,25 +35,10 @@ import { addressesMatch, emptyCustomerAddress, normalizeCustomerAddress } from '
 import { createClient, type Database } from '@nextblock-cms/db';
 import { Globe, Phone, User as UserIcon, Upload } from 'lucide-react';
 import { useTranslations } from '@nextblock-cms/utils';
+import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
 import { countries, normalizeCountryCode } from '../countries';
 
 type UserRole = Database['public']['Enums']['user_role'];
-
-// Resolve a media row's storage key to a usable URL across either storage backend
-// (Cloudflare R2 or native Supabase Storage). Mirrors the resolver used elsewhere
-// in libs/ecommerce (variation-utils, invoice-server). NEXT_PUBLIC_SUPABASE_URL is
-// always set in a working deployment, so avatars resolve even without R2.
-function resolveMediaUrl(path?: string | null): string | null {
-  if (!path) return null;
-  if (path.startsWith('http')) return path;
-  if (process.env.NEXT_PUBLIC_R2_BASE_URL) {
-    return `${process.env.NEXT_PUBLIC_R2_BASE_URL}/${path}`;
-  }
-  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
-    return `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/media/${path}`;
-  }
-  return path;
-}
 
 export interface ExtendedProfileUpdateData extends ProfileUpdateData {
   role?: UserRole;
@@ -249,7 +234,8 @@ export function CustomerProfileForm({
   }, [getValues, setValue]);
 
   const handleMediaSelect = (media: any) => {
-    const url = resolveMediaUrl(media?.object_key ?? media?.file_path);
+    // Either storage backend (R2 or native Supabase Storage); a bundled key resolves to /images/….
+    const url = resolveMediaUrlWithSupabaseFallback(media?.object_key ?? media?.file_path);
     if (url) {
       setValue('avatar_url', url);
     }
