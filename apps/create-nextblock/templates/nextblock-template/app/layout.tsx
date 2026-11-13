@@ -46,6 +46,8 @@ import { getCachedActiveLogo, type HeaderLogo } from '../lib/logos/cached-active
 import { appIconHref, brandNameFromTitle } from '../lib/branding/app-icon';
 import { loadAppIconContext } from '../lib/branding/app-icon-context';
 import { compactTranslationsForLocale } from '../lib/i18n/slim-translations';
+import { getCachedTranslations } from '../lib/i18n/cached-translations';
+import { excludeAffiliateTranslationRows } from '../lib/i18n/affiliate-translation-rows';
 import {
   isSupabaseConfigured,
   resolveSupabaseAnonKey,
@@ -59,6 +61,8 @@ import {
   normalizeLanguageDetectionSettings,
   type LanguageDetectionSettings,
 } from '../lib/i18n/detection';
+import { isAffiliatesProgramActive } from '../lib/affiliates/package-state';
+import { hideDormantPartnerProgramNav } from '../lib/affiliates/partner-program-nav';
 
 const defaultUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
 
@@ -217,27 +221,9 @@ const getCachedSiteScripts = unstable_cache(
   { revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS, tags: ['public-layout-site-scripts'] }
 );
 
-const getCachedTranslations = unstable_cache(
-  async () => {
-    const supabase = createStaticSupabaseClient();
-    const { data, error } = await supabase
-      .from('translations')
-      .select('key, translations, created_at, updated_at')
-      .order('key');
-
-    if (error) {
-      console.error('Error fetching cached translations:', error.message);
-      return [];
-    }
-
-    return data || [];
-  },
-  ['public-layout-translations'],
-  {
-    revalidate: PUBLIC_LAYOUT_REVALIDATE_SECONDS,
-    tags: ['public-layout-translations'],
-  }
-);
+// getCachedTranslations lives in lib/i18n/cached-translations.ts: the site-wide keys only (never
+// `affiliates.*`), read page by page past PostgREST's 1000-row cap. The partner pages read the
+// `affiliates.*` keys through their own cached entry under the same eviction tag.
 
 const getCachedCurrencies = unstable_cache(
   async (): Promise<StoreCurrency[]> => {
@@ -314,6 +300,7 @@ async function loadLayoutData() {
     return {
       user: null,
       profile: null,
+      isPartnerPortalActive: false,
       serverDeterminedLocale: DEFAULT_LOCALE_FOR_LAYOUT,
       availableCurrencies: [] as StoreCurrency[],
       serverCurrencyCode: null,
@@ -424,18 +411,30 @@ async function loadLayoutData() {
   const hasSupabaseEnv = isSupabaseConfigured();
 
   // Second wave: only what genuinely depends on the validated locale or the user.
-  const [profile, headerNavItems, footerNavItems] = await Promise.all([
+  const [profile, headerNavRows, footerNavRows, isAffiliatesActive] = await Promise.all([
     user ? getProfileWithRoleServerSide(user.id) : Promise.resolve(null),
     getCachedNavigationMenu('HEADER', serverDeterminedLocale).catch(() => []),
     getCachedNavigationMenu('FOOTER', serverDeterminedLocale).catch(() => []),
+    // Every visitor: both menus' partner program links (02034) depend on it, and so does the
+    // account menu's partner portal link. In this wave it adds no sequential hop; React cache
+    // shares the answer with the /partners pages, and each package check is cached 60 s.
+    isAffiliatesProgramActive(),
   ]);
+
+  // While the program is inactive, /partners is not served: drop the seeded links (and anything
+  // nested under them) rather than link a 404.
+  const headerNavItems = hideDormantPartnerProgramNav(headerNavRows, isAffiliatesActive);
+  const footerNavItems = hideDormantPartnerProgramNav(footerNavRows, isAffiliatesActive);
 
   const role = profile?.role ?? null;
   const canAccessCms = role === 'ADMIN' || role === 'WRITER';
+  // The portal sends partners home while the package is inactive: the header hides its link then.
+  const isPartnerPortalActive = Boolean(user) && isAffiliatesActive === true;
 
   return {
     user,
     profile,
+    isPartnerPortalActive,
     serverDeterminedLocale,
     availableCurrencies,
     serverCurrencyCode,
@@ -544,6 +543,7 @@ export default async function RootLayout({
   const {
     user,
     profile,
+    isPartnerPortalActive,
     serverDeterminedLocale,
     availableCurrencies,
     serverCurrencyCode,
@@ -635,6 +635,7 @@ export default async function RootLayout({
         <Providers
           serverUser={user}
           serverProfile={profile}
+          isPartnerPortalActive={isPartnerPortalActive}
           serverLocale={serverDeterminedLocale}
           initialCurrencies={availableCurrencies}
           initialCurrencyCode={serverCurrencyCode}
@@ -645,8 +646,13 @@ export default async function RootLayout({
           // every public page. The client only reads the active locale plus the 'en'
           // fallback, and a language switch goes through router.refresh(), which
           // re-runs this layout for the new locale. Shipped as `[key, value]` tuples:
-          // the row objects cost another ~12 KB of JSON scaffolding.
-          translations={compactTranslationsForLocale(translations, serverDeterminedLocale)}
+          // the row objects cost another ~12 KB of JSON scaffolding. The Affiliates
+          // package's `affiliates.*` strings are dropped: only the partner pages use them,
+          // and their own layouts load just the areas they render.
+          translations={compactTranslationsForLocale(
+            excludeAffiliateTranslationRows(translations),
+            serverDeterminedLocale
+          )}
           nonce={nonce}
           themeSlugs={themeSlugs}
           initialTheme={initialTheme}

@@ -12,7 +12,7 @@ import {
   PutObjectCommand,
   type S3Client,
 } from "@aws-sdk/client-s3";
-import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
+import { createClient, getServiceRoleSupabaseClient, isSandboxEnvironment } from "@nextblock-cms/db/server";
 import { getS3Client } from "@nextblock-cms/utils/server";
 import { evaluateTwoFactor } from "../auth/twoFactor";
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
@@ -119,6 +119,9 @@ export interface FullBackupArchiveExport {
 
 const ARCHIVE_MIME_TYPE = "application/zip";
 
+/** What every entry point throws on the sandbox; the full-backup routes answer it with 403. */
+export const FULL_BACKUP_SANDBOX_MESSAGE = "Full-site backup and restore are disabled in the sandbox.";
+
 function dateStamp() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -161,6 +164,16 @@ async function requireAdminUser() {
   const twoFactor = await evaluateTwoFactor();
   if (twoFactor.status !== "satisfied" && twoFactor.status !== "not_required") {
     throw new Error("Two-factor authentication is required for this operation.");
+  }
+
+  // The public sandbox publishes this admin login and always satisfies its second factor
+  // (2026-11-03). An export hands out the whole database and every account's password hash; a
+  // restore creates live accounts and updates (email, password hash, ban) or deletes the shared
+  // demo ones through GoTrue. Only pg_dump/psql missing from the host stopped either there. Every
+  // entry point comes through here before it parses an archive, reaches R2, spawns a process or
+  // calls GoTrue.
+  if (isSandboxEnvironment()) {
+    throw new Error(FULL_BACKUP_SANDBOX_MESSAGE);
   }
 
   return { id: user.id, email: user.email ?? null };

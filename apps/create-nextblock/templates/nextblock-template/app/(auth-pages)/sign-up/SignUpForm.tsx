@@ -3,7 +3,7 @@
 import { signUpAction } from "../../actions";
 import { FormMessage, Message } from "../../../components/form-message";
 import { SubmitButton } from "../../../components/submit-button";
-import { Button, Input, Label } from "@nextblock-cms/ui";
+import { Alert, AlertDescription, Button, Input, Label } from "@nextblock-cms/ui";
 import Link from "next/link";
 import { useTranslations } from "@nextblock-cms/utils";
 import { useSearchParams } from "next/navigation";
@@ -11,12 +11,19 @@ import { ArrowRight, CheckCircle2, Mail } from "lucide-react";
 
 import { SandboxCredentialsAlert } from "../../../components/SandboxCredentialsAlert";
 import { AuthBotProtection } from "../../../components/auth/AuthBotProtection";
+import { useLabel } from "../../../lib/i18n/use-label";
 
 type BotProtectionProvider = 'none' | 'turnstile' | 'recaptcha';
+
+/** signUpAction's answer on the sandbox, which creates no accounts (a global key, seeded by 02031). */
+const SANDBOX_SIGNUP_DISABLED = 'sandbox_signup_disabled';
+const SANDBOX_NOTICE_ID = 'sandbox-signup-disabled';
 
 interface SignUpFormProps {
   botProtection: { provider: BotProtectionProvider; siteKey: string };
   scriptNonce?: string;
+  /** The sandbox banner lists the demo partner (resolved on the server by page.tsx). */
+  showDemoPartner?: boolean;
 }
 
 function getMessage(searchParams: URLSearchParams): Message | undefined {
@@ -35,10 +42,20 @@ function getMessage(searchParams: URLSearchParams): Message | undefined {
     return undefined;
 }
 
-export default function SignUpForm({ botProtection, scriptNonce }: SignUpFormProps) {
+export default function SignUpForm({ botProtection, scriptNonce, showDemoPartner = false }: SignUpFormProps) {
   const { t } = useTranslations();
+  const label = useLabel();
   const searchParams = useSearchParams();
-  const formMessage = getMessage(searchParams);
+  // The public sandbox creates no accounts (signUpAction refuses there): the form stays on screen
+  // with its button disabled under a notice that points at the demo accounts.
+  const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+  const requestedMessage = getMessage(searchParams);
+  // That refusal comes back as ?error=sandbox_signup_disabled. The notice already says it, so the
+  // form neither repeats it nor shows the bare key on an install that has not seeded it yet.
+  const formMessage =
+    isSandbox && requestedMessage && 'error' in requestedMessage && requestedMessage.error === SANDBOX_SIGNUP_DISABLED
+      ? undefined
+      : requestedMessage;
   const successKey = searchParams.get('success');
 
   if (successKey) {
@@ -86,7 +103,18 @@ export default function SignUpForm({ botProtection, scriptNonce }: SignUpFormPro
   return (
     <div className="flex-1 flex flex-col w-full max-w-160 mx-auto">
       <form className="flex flex-col">
-        <SandboxCredentialsAlert />
+        {isSandbox ? (
+          <Alert id={SANDBOX_NOTICE_ID} variant="warning" role="note" className="mt-6">
+            <AlertDescription>
+              {label(
+                SANDBOX_SIGNUP_DISABLED,
+                'Sign-up is turned off in this demo. Sign in with a demo account below instead.',
+                "L'inscription est désactivée dans cette démo. Connectez-vous plutôt avec un compte de démonstration ci-dessous."
+              )}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+        <SandboxCredentialsAlert showDemoPartner={showDemoPartner} />
         <h1 className="text-2xl font-medium">{t('sign_up')}</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
           {t('auth.signup_form_description')}
@@ -125,7 +153,12 @@ export default function SignUpForm({ botProtection, scriptNonce }: SignUpFormPro
               siteKey={botProtection.siteKey}
               scriptNonce={scriptNonce}
             />
-            <SubmitButton formAction={signUpAction} pendingText={t('signing_up_pending')}>
+            <SubmitButton
+              formAction={signUpAction}
+              pendingText={t('signing_up_pending')}
+              disabled={isSandbox}
+              aria-describedby={isSandbox ? SANDBOX_NOTICE_ID : undefined}
+            >
               {t('sign_up')}
             </SubmitButton>
             <FormMessage message={formMessage} />

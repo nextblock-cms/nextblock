@@ -8,12 +8,17 @@ import { Alert, AlertDescription, Spinner } from '@nextblock-cms/ui';
 import { Message } from '../../../../../components/form-message';
 import { useHotkeys } from '../../../../../hooks/use-hotkeys';
 import { BotProtectionSettings, updateBotProtectionSettings } from '../actions';
+import { SANDBOX_SECRET_NOTE_ID, SANDBOX_SECRET_REFUSED } from '../sandbox';
 
 interface BotProtectionFormProps {
   initialSettings: BotProtectionSettings;
 }
 
 export default function BotProtectionForm({ initialSettings }: BotProtectionFormProps) {
+  // The public sandbox stores no captcha secret and never shows the stored one, so its secret
+  // field stays empty: disabled and optional there (required would block every provider or site
+  // key save), beside the reason. Read inline, as SandboxCredentialsAlert does.
+  const sandboxLocked = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
   const [isPending, startTransition] = useTransition();
   const [message, setMessage] = useState<Message | null>(null);
   
@@ -94,11 +99,18 @@ export default function BotProtectionForm({ initialSettings }: BotProtectionForm
                 value={secretKey}
                 onChange={(e) => setSecretKey(e.target.value)}
                 placeholder="••••••••••••••••••••••••••••••••"
-                required
+                required={!sandboxLocked}
+                disabled={sandboxLocked}
+                aria-describedby={sandboxLocked ? SANDBOX_SECRET_NOTE_ID : undefined}
               />
               <p className="text-xs text-slate-500">
                 The private key used to sign server-to-server validation requests. Stored securely on the server.
               </p>
+              {sandboxLocked && (
+                <p id={SANDBOX_SECRET_NOTE_ID} className="text-xs text-slate-500">
+                  {SANDBOX_SECRET_REFUSED}
+                </p>
+              )}
             </div>
           </>
         )}

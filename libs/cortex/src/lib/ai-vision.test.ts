@@ -139,17 +139,64 @@ describe('isKnownVisionCapableCortexAiModelId', () => {
 });
 
 describe('buildCortexAiVisionRoutingPolicy', () => {
-  it('falls back to the vision registry when nothing is requested or selected', () => {
-    expect(buildCortexAiVisionRoutingPolicy({ credentialSource: 'env' }).modelIds).toEqual([
-      ...CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY,
-    ]);
+  const freeVisionModelIds = CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY.filter((modelId) =>
+    modelId.endsWith(':free')
+  );
+  const paidVisionModelIds = CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY.filter(
+    (modelId) => !modelId.endsWith(':free')
+  );
+
+  it('keeps a free head and a paid tail in the vision registry', () => {
+    // An env credential routes to the free head alone, so without one it has nothing to
+    // route to; the paid tail is what stored and manual keys fall back to.
+    expect(freeVisionModelIds.length).toBeGreaterThan(0);
+    expect(paidVisionModelIds.length).toBeGreaterThan(0);
   });
 
-  it('honours a requested vision model even on an env credential', () => {
-    // This is the whole reason the vision policy exists: buildCortexAiRoutingPolicy
-    // would discard this id and route to its text-only registry instead.
+  it('routes an env credential to the free vision models only', () => {
+    // 2026-11-03: the env credential (on the sandbox, the operator's OPENROUTER_API_KEY
+    // behind every visitor) got the whole registry, so a 429 on the free head retried
+    // down the paid tail on the operator's key.
+    const { modelIds } = buildCortexAiVisionRoutingPolicy({ credentialSource: 'env' });
+
+    expect(modelIds).toEqual(freeVisionModelIds);
+
+    for (const modelId of modelIds) {
+      expect(modelId.endsWith(':free'), modelId).toBe(true);
+    }
+  });
+
+  it('drops a requested model on an env credential, paid or free', () => {
+    for (const requestedModelId of [
+      'anthropic/claude-haiku-4.5',
+      'openai/gpt-4o-mini',
+      'meta-llama/llama-4-maverick:free',
+      freeVisionModelIds[freeVisionModelIds.length - 1],
+    ]) {
+      const { modelIds } = buildCortexAiVisionRoutingPolicy({
+        credentialSource: 'env',
+        requestedModelId,
+      });
+
+      expect(modelIds, requestedModelId).toEqual(freeVisionModelIds);
+    }
+  });
+
+  it('gives a manual key the whole registry, paid tail included', () => {
+    const { modelIds } = buildCortexAiVisionRoutingPolicy({ credentialSource: 'manual' });
+
+    expect(modelIds).toEqual([...CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY]);
+
+    for (const modelId of paidVisionModelIds) {
+      expect(modelIds, modelId).toContain(modelId);
+    }
+  });
+
+  it('honours a requested vision model on a manual key, ahead of the whole registry', () => {
+    // buildCortexAiRoutingPolicy would route to its text-only registry instead; here the
+    // caller's own key reaches the model it named, then every registry entry.
     const { modelIds } = buildCortexAiVisionRoutingPolicy({
-      credentialSource: 'env',
+      credentialSource: 'manual',
       requestedModelId: 'anthropic/claude-haiku-4.5',
     });
 
@@ -194,7 +241,7 @@ describe('buildCortexAiVisionRoutingPolicy', () => {
         credentialSource: 'env',
         selectedModel: { modelId: 'google/gemini-3.1-flash' },
       }).modelIds
-    ).toEqual([...CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY]);
+    ).toEqual(freeVisionModelIds);
   });
 
   it('orders a requested model ahead of the stored selection, then the registry tail', () => {

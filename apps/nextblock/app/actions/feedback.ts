@@ -1,7 +1,7 @@
 "use server";
 
 import { createClient } from "@nextblock-cms/db/server";
-import { sendEmail } from "./email";
+import { PRODUCT_FEEDBACK_INBOX, sendEmail } from "./email";
 
 interface FeedbackData {
   subject: string;
@@ -82,7 +82,8 @@ export async function submitFeedback(data: FeedbackData) {
     `;
 
     await sendEmail({
-      to: "feedback@nextblock.dev",
+      // Fixed in code, so the sandbox still delivers it (sendEmail allows no visitor-chosen inbox there).
+      to: PRODUCT_FEEDBACK_INBOX,
       // Newlines in a header would let a caller inject extra headers (Bcc, …).
       subject: `[CMS Feedback] ${subject.replace(/[\r\n]+/g, ' ')}`,
       text: textContent,

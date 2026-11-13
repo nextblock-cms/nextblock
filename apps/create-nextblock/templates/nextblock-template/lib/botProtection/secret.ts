@@ -15,18 +15,27 @@ import 'server-only';
 import {
   encryptWithEnvKey,
   isEncryptedSecretEnvelope,
+  resealWithEnvKey,
+  siteSettingSecretSlot,
   tryDecryptWithEnvKey,
   type EncryptedSecretEnvelope,
 } from '@nextblock-cms/db/server';
 
 export const BOT_PROTECTION_SECRET_SETTING_KEY = 'bot_protection_secret';
+/**
+ * The envelope opens only from this field (libs/db secret-crypto): the CMS form shows the secret
+ * in clear, so an envelope copied in from another row (the Stripe key) must never decrypt here.
+ */
+function botProtectionSecretSlot() {
+  return siteSettingSecretSlot(BOT_PROTECTION_SECRET_SETTING_KEY, 'secretKey');
+}
 
 export type BotProtectionSecretStorage =
   /** Envelope-encrypted and opened with one of the configured keys. */
   | 'encrypted'
   /** Pre-encryption row holding the raw secret; the next save re-encrypts it. */
   | 'legacy-plaintext'
-  /** An envelope none of the configured keys can open (key rotated or missing). */
+  /** An envelope none of the configured keys can open (key rotated or missing, or sealed for another slot). */
   | 'unreadable'
   /** No secret stored. */
   | 'none';
@@ -44,14 +53,17 @@ export type BotProtectionSecretValue = { secretKey: EncryptedSecretEnvelope };
  * Interpret the JSON `value` of the `bot_protection_secret` row: an envelope is decrypted,
  * a bare string is a legacy plaintext row, anything else means no secret. Never logs.
  */
+function storedSecretKeyField(value: unknown): unknown {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)['secretKey']
+    : undefined;
+}
+
 export function readStoredBotProtectionSecret(value: unknown): StoredBotProtectionSecret {
-  const raw =
-    value && typeof value === 'object' && !Array.isArray(value)
-      ? (value as Record<string, unknown>)['secretKey']
-      : undefined;
+  const raw = storedSecretKeyField(value);
 
   if (isEncryptedSecretEnvelope(raw)) {
-    const decrypted = tryDecryptWithEnvKey(raw);
+    const decrypted = tryDecryptWithEnvKey(raw, botProtectionSecretSlot());
     return decrypted !== null
       ? { secretKey: decrypted, storage: 'encrypted' }
       : { secretKey: '', storage: 'unreadable' };
@@ -69,5 +81,17 @@ export function readStoredBotProtectionSecret(value: unknown): StoredBotProtecti
  * message that names the missing env key, not the secret) when no encryption key is set.
  */
 export function buildBotProtectionSecretValue(secretKey: string): BotProtectionSecretValue {
-  return { secretKey: encryptWithEnvKey(secretKey) };
+  return { secretKey: encryptWithEnvKey(secretKey, botProtectionSecretSlot()) };
+}
+
+/**
+ * The row to write back on a save that submits no new secret, when the stored envelope predates
+ * slot binding (0.23.1) and still opens: the same secret, sealed for this field. Null when there
+ * is nothing to re-seal.
+ */
+export function resealStoredBotProtectionSecret(value: unknown): BotProtectionSecretValue | null {
+  const raw = storedSecretKeyField(value);
+  if (!isEncryptedSecretEnvelope(raw)) return null;
+  const resealed = resealWithEnvKey(raw, botProtectionSecretSlot());
+  return resealed !== raw && isEncryptedSecretEnvelope(resealed) ? { secretKey: resealed } : null;
 }

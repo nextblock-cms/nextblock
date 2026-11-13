@@ -15,6 +15,25 @@ const packageJsonPath = resolveFrom('package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
 const { version, dependencies, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// peerDependencies: the sibling libs the bundle imports by name (`@nextblock-cms/*` stays
+// external below), at the versions libs/ui and libs/utils carry when this build runs. release:all
+// bumps both before it builds the editor (LIBS in tools/scripts/release-all.js), so the ranges
+// name the releases that go out with this one. Peers, so the app and the editor share one copy.
+// Through 0.22.5 the manifest declared neither, and the editor now imports
+// sanitizeAuthoredBlockHtml, which utils 0.22.5 lacks: upgrading only the editor would have
+// failed on a missing export. tools/scripts/verify-lib-dist.js check 11 refuses an undeclared
+// sibling import.
+const siblingVersion = (lib: string): string => {
+  const sibling = JSON.parse(fs.readFileSync(resolveFrom('..', lib, 'package.json'), 'utf8')).version;
+  if (typeof sibling !== 'string' || !/^\d+\.\d+\.\d+/.test(sibling)) {
+    throw new Error(`libs/${lib}/package.json has no version for the editor's peerDependencies`);
+  }
+  return sibling;
+};
+const peerDependencies = {
+  '@nextblock-cms/ui': `^${siblingVersion('ui')}`,
+  '@nextblock-cms/utils': `^${siblingVersion('utils')}`,
+};
 
 export default defineConfig({
   root: __dirname,
@@ -36,6 +55,7 @@ export default defineConfig({
           module: 'index.mjs',
           types: 'index.d.ts',
           ...(dependencies ? { dependencies } : {}),
+          peerDependencies,
           exports: {
             '.': {
               types: './index.d.ts',

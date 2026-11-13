@@ -106,6 +106,7 @@ const FRAMEWORK_SCRIPTS = [
   'update:check',
   'deploy:supabase',
   'configure:supabase-auth',
+  'affiliates:schedule-payouts',
   'docker:setup',
   'docker:up',
   'docker:down',

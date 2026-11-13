@@ -14,7 +14,6 @@ export { SlashCommandList } from './lib/components/menus/SlashCommandList';
 export { Toolbar, ToolbarGroup, ToolbarButton, ToolbarSeparator } from './lib/components/ui/Toolbar';
 export { UndoRedoButtons } from './lib/components/ui/UndoRedoButtons';
 export { DragHandle } from './lib/components/DragHandle';
-export { HtmlContent } from './lib/components/HtmlContent';
 
 // Mobile components
 export { MobileToolbar } from './lib/components/mobile/MobileToolbar';

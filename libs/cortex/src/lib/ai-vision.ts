@@ -33,11 +33,14 @@ function assertServerOnly() {
  * call would be dispatched to a model that cannot see the image, and the model
  * would either error on the unsupported content part or, worse, hallucinate a
  * description of an image it never received. Hence a separate registry and a
- * separate policy below.
+ * separate policy below, which applies the same free-only lock to an `env`
+ * credential, but within this list.
  *
  * The order is: free tier first so an install with no billing set up still gets
  * working alt text, then paid models in ascending cost, ending with the most
- * capable one for images the cheaper models fumble.
+ * capable one for images the cheaper models fumble. An `env` credential only ever
+ * reaches the `:free` head; the paid tail is for the operator's own stored key and
+ * for a caller-supplied (`manual`) key.
  *
  * - `google/gemma-4-31b-it:free` — the strongest general-purpose free multimodal
  *   instruct model on OpenRouter; text output, 262k context, no expiry date set.
@@ -57,10 +60,11 @@ function assertServerOnly() {
  * particular churn constantly: they are added, throttled, given an
  * `expiration_date`, or silently promoted to paid, at which point a request to them
  * fails with a message `isOpenRouterRecoverableRoutingError` recognises and the
- * chain simply falls through to the next entry. That fallback keeps the feature
- * working, but a registry whose whole free head has expired means every alt-text
- * generation quietly starts costing money — so treat a persistently paid-only
- * outcome as a signal to refresh this list against
+ * chain simply falls through to the next entry. On a stored or manual key that
+ * fallback keeps the feature working, but a registry whose whole free head has
+ * expired means every such alt-text generation quietly starts costing money, and an
+ * `env` credential, which never leaves the free head, stops producing alt text at
+ * all. Treat either outcome as a signal to refresh this list against
  * `https://openrouter.ai/api/v1/models`, filtering on
  * `architecture.input_modalities` containing `image`.
  */
@@ -198,25 +202,28 @@ export function isKnownVisionCapableCortexAiModelId(modelId: string | null | und
 /**
  * Build the model chain for a vision call.
  *
- * Three rules, each of which differs from the text policy for a reason:
+ * An `env` credential is the shared `OPENROUTER_API_KEY`; on the public sandbox it is
+ * the operator's key behind every visitor who has not pasted their own. It gets the
+ * registry's `:free` entries and nothing else, the vision counterpart of the text
+ * policy's free lock: a requested id, the stored selection and the paid tail are all
+ * dropped, so when the free models answer 429 the call ends with a routing error
+ * instead of retrying on a model the operator pays for.
  *
- * 1. An explicitly requested model is HONOURED regardless of `credentialSource`.
- *    The text policy drops a requested id on an `env` credential so a caller cannot
- *    spend the shared house key on a model the operator did not choose. Applying
- *    that rule here would silently route an image to a text-only model, which is a
- *    correctness failure rather than a cost control. A caller that names a vision
- *    model is making a deliberate choice, and the cost ceiling is already bounded
- *    by the tiny output budget an alt-text call uses.
+ * A `stored` key (the operator's own BYOK) or a `manual` one (supplied by the caller)
+ * gets the full chain, built by three rules:
  *
- * 2. The admin's stored selection participates only when it is `credentialSource`
- *    'stored' or 'manual' — i.e. the operator's own key, exactly as the text policy
- *    treats it — AND the id is recognisably vision-capable. An operator who picked,
- *    say, a text-only reasoning model for the page builder should not have that
- *    choice quietly break every alt-text generation.
+ * 1. An explicitly requested model goes first. The text policy keeps a requested id
+ *    only on `manual`; replacing it here with the text registry would route an image
+ *    to a model that cannot see it, a correctness failure rather than a cost control,
+ *    and the alt-text call's tiny output budget bounds the cost.
  *
- * 3. The vision registry is always appended as a tail, never conditionally. It is
- *    the safety net: whatever the first two rules produce, there is always a known
- *    multimodal model behind it.
+ * 2. The admin's stored selection (the client loads it only for a `stored` key)
+ *    follows, but only when the id is recognisably vision-capable. An operator who
+ *    picked, say, a text-only reasoning model for the page builder should not have
+ *    that choice quietly break every alt-text generation.
+ *
+ * 3. The whole vision registry is the tail, the safety net: whatever the first two
+ *    rules produce, a known multimodal model stands behind it.
  *
  * De-duplication preserves first-occurrence order, so a requested model that also
  * appears in the registry stays at the head instead of being tried twice.
@@ -226,12 +233,18 @@ export function buildCortexAiVisionRoutingPolicy(params: {
   requestedModelId?: string | null;
   selectedModel?: { modelId: string } | null;
 }): { modelIds: string[] } {
+  if (params.credentialSource === 'env') {
+    return {
+      modelIds: CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY.filter((modelId) =>
+        modelId.endsWith(':free')
+      ),
+    };
+  }
+
   const requestedModelId = params.requestedModelId?.trim() || null;
   const storedModelId = params.selectedModel?.modelId?.trim() || null;
   const usableStoredModelId =
-    params.credentialSource !== 'env' &&
-    storedModelId &&
-    isKnownVisionCapableCortexAiModelId(storedModelId)
+    storedModelId && isKnownVisionCapableCortexAiModelId(storedModelId)
       ? storedModelId
       : null;
 

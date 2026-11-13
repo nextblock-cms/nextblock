@@ -265,7 +265,7 @@ The following architectural invariants are enforced at workspace level and must 
 | Content | `text`, `heading`, `image`, `button`, `video_embed`, `section`, `form`, `testimonial`, `posts_grid` |
 | Commerce | `product_grid`, `featured_product`, `cart`, `checkout`, `product_details` |
 
-**Editor Capabilities** — The `@nextblock-cms/editor` library exports `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, `HtmlContent`, and `editorExtensions`. Feature set includes Tiptap StarterKit rich text, syntax-highlighted code blocks, tables, task lists, slash commands, drag handles, image handling, character counting, typography, mathematics, emoji, mentions, inline alert and call-to-action widgets, and custom HTML-preserving extensions for `div`, `style`, `script`, `svg`, `span`, and catch-all attribute preservation. A media-picker bridge is exposed via `setOpenImagePicker()`.
+**Editor Capabilities** — The `@nextblock-cms/editor` library exports `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, and `editorExtensions`. Feature set includes Tiptap StarterKit rich text, syntax-highlighted code blocks, tables, task lists, slash commands, drag handles, image handling, character counting, typography, mathematics, emoji, mentions, inline alert and call-to-action widgets, and custom HTML-preserving extensions for `div`, `style`, `script`, `svg`, `span`, and catch-all attribute preservation. A media-picker bridge is exposed via `setOpenImagePicker()`.
 
 **Translation & Localization** — The set of served locales is the active rows of the `languages` table (managed at `/cms/settings/languages`; the proxy reads them with a 60-second in-memory cache and only falls back to the hardcoded `FALLBACK_LOCALES` `en`/`fr` when the DB is unreadable), backed by `languages` and `translations` tables from migration `02001_baseline_schema.sql`. First-visit language detection is admin-configurable (see F-007): browser `Accept-Language`, IP-country via host geo headers, combined, or always-default — implemented in `apps/nextblock/lib/i18n/detection.ts` and stored in `site_settings.language_detection_settings`. Content revision history is stored as snapshot + JSON Patch diff (enum `revision_type: snapshot, diff`) per migration `02001_baseline_schema.sql`.
 
@@ -566,7 +566,7 @@ The block-based page builder is implemented as a registry in `apps/nextblock/lib
 
 **Description**
 
-The editor is a standalone published library at `libs/editor` exposing `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, `HtmlContent`, and `editorExtensions`. It bundles Tiptap with 40+ extensions including StarterKit, syntax-highlighted code blocks (via `lowlight` and `CodeBlockLowlight`), tables, task lists, link handling, TextStyleKit, highlight, subscript/superscript, typography, character counting, slash commands, drag handles, image handling, KaTeX mathematics (`katex`), emoji, mentions, inline alert and call-to-action widgets, and custom HTML-preserving extensions for `div`, `style`, `script`, `svg`, `span`, and catch-all attribute preservation. Collaborative editing infrastructure is supplied by `yjs`, `y-protocols`, and `y-tiptap`.
+The editor is a standalone published library at `libs/editor` exposing `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, and `editorExtensions`. It bundles Tiptap with 40+ extensions including StarterKit, syntax-highlighted code blocks (via `lowlight` and `CodeBlockLowlight`), tables, task lists, link handling, TextStyleKit, highlight, subscript/superscript, typography, character counting, slash commands, drag handles, image handling, KaTeX mathematics (`katex`), emoji, mentions, inline alert and call-to-action widgets, and custom HTML-preserving extensions for `div`, `style`, `script`, `svg`, `span`, and catch-all attribute preservation. Collaborative editing infrastructure is supplied by `yjs`, `y-protocols`, and `y-tiptap`.
 
 **Business Value:** Eliminates the need for downstream adopters to build or license a separate rich-text editor. **User Benefits:** Notion-class writing experience with slash commands, drag handles, and live collaboration primitives. **Technical Context:** Extension kit assembled in `libs/editor/src/lib/kit.ts`; advanced features catalogued in `libs/editor/ADVANCED_FEATURES.md`.
 
@@ -1291,7 +1291,7 @@ This subsection provides the detailed, testable requirements that operationalize
 | F-004-RQ-001 | Block registry MUST expose 14 built-in block types with Zod schemas, renderers, and editors | Must-Have | High |
 | F-004-RQ-002 | Helper functions `getBlockDefinition`, `getBlockSchema`, `validateBlockContent`, `generateDefaultContent`, `isValidBlockType` MUST be exported | Must-Have | Low |
 | F-004-RQ-003 | Section blocks MUST support nested columns with responsive breakpoints (mobile 1–2, tablet 1–3, desktop 1–4) | Must-Have | Medium |
-| F-005-RQ-001 | Editor library MUST export `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, `HtmlContent`, `editorExtensions` | Must-Have | Medium |
+| F-005-RQ-001 | Editor library MUST export `Editor`, `NotionEditor`, `EditorToolbar`, `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `SlashCommandList`, `DragHandle`, `editorExtensions` | Must-Have | Medium |
 | F-005-RQ-002 | Editor MUST preserve custom HTML constructs (`div`, `style`, `script`, `svg`, `span`) and unrecognized attributes | Must-Have | High |
 | F-006-RQ-001 | Media uploads MUST record metadata (`object_key`, `file_type`, `size_bytes`, `width`, `height`, `blur_data_url`, `variants`) in the `media` table | Must-Have | Medium |
 | F-006-RQ-002 | `recordMediaUpload` MUST reject non-`ADMIN`/non-`WRITER` callers | Must-Have | Low |
@@ -9971,7 +9971,7 @@ The `@nextblock-cms/editor` library exports a rich palette of interaction surfac
 | Category | Components / Hooks |
 |:--|:--|
 | Primary Editor Components | `Editor`, `NotionEditor` |
-| Menus and Toolbars | `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `EditorToolbar`, `SlashCommandList`, `Toolbar`, `ToolbarGroup`, `ToolbarButton`, `ToolbarSeparator`, `UndoRedoButtons`, `DragHandle`, `HtmlContent`, `MobileToolbar` |
+| Menus and Toolbars | `EditorBubbleMenu`, `EditorFloatingMenu`, `EnhancedFloatingMenu`, `EditorToolbar`, `SlashCommandList`, `Toolbar`, `ToolbarGroup`, `ToolbarButton`, `ToolbarSeparator`, `UndoRedoButtons`, `DragHandle`, `MobileToolbar` |
 | Extensions / Behaviors | `editorExtensions`, `SlashCommand`, `TrailingNode`, `AlertWidget`, `CtaWidgetNode`, `DraggableNodes`, `AdvancedPlaceholder`, `EnhancedFocus`, `KeyboardShortcuts` |
 | History Hooks | `useEditorHistory`, `canExecuteHistoryAction`, `executeHistoryAction`, `getHistoryShortcut` |
 

@@ -20,12 +20,14 @@ import {
   CORTEX_AI_UNSPLASH_APP_NAME_SETTING_KEY,
   CORTEX_AI_UNSPLASH_SETTING_KEY,
   createCortexAiStoredModelSelection,
+  encryptStoredCortexAiSecret,
   encryptStoredOpenRouterApiKey,
   getCortexAiEnvConfig,
   getEnvOpenRouterKeyStatus,
   getStoredOpenRouterKeyStatus,
   listCortexAiCompatibleOpenRouterModels,
   normalizeCortexAiAgentSettings,
+  resealStoredCortexAiSecrets,
   safeParseCortexAiModelSelection,
   type CortexAiAgentSettings,
   type CortexAiStoredModelSelection,
@@ -190,6 +192,8 @@ export async function saveOpenRouterApiKeyAction(formData: FormData) {
     if (error) {
       throw new Error(error.message);
     }
+
+    await resealStoredCortexAiSecrets(supabase);
   } catch (error) {
     redirectWithStatus(
       'error',
@@ -250,14 +254,14 @@ export async function saveStockPhotoKeysAction(formData: FormData) {
     if (pexelsKey) {
       rows.push({
         key: CORTEX_AI_PEXELS_SETTING_KEY,
-        value: encryptStoredOpenRouterApiKey(pexelsKey),
+        value: encryptStoredCortexAiSecret(CORTEX_AI_PEXELS_SETTING_KEY, pexelsKey),
       });
     }
 
     if (unsplashKey) {
       rows.push({
         key: CORTEX_AI_UNSPLASH_SETTING_KEY,
-        value: encryptStoredOpenRouterApiKey(unsplashKey),
+        value: encryptStoredCortexAiSecret(CORTEX_AI_UNSPLASH_SETTING_KEY, unsplashKey),
       });
     }
 
@@ -273,6 +277,8 @@ export async function saveStockPhotoKeysAction(formData: FormData) {
     if (error) {
       throw new Error(error.message);
     }
+
+    await resealStoredCortexAiSecrets(supabase);
   } catch (error) {
     redirectWithStatus(
       'error',
@@ -343,6 +349,8 @@ export async function saveCortexAiAgentSettingsAction(formData: FormData) {
     if (error) {
       throw new Error(error.message);
     }
+
+    await resealStoredCortexAiSecrets(supabase);
   } catch (error) {
     redirectWithStatus(
       'error',
@@ -426,6 +434,8 @@ export async function saveCortexAiModelSelectionAction(formData: FormData) {
     if (error) {
       throw new Error(error.message);
     }
+
+    await resealStoredCortexAiSecrets(supabase);
   } catch (error) {
     redirectWithStatus(
       'error',

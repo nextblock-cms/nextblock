@@ -37,6 +37,10 @@ async function adminCheck(): Promise<SettingsActionResult | null> {
 export async function updateRegistrationSettings(
   formData: FormData,
 ): Promise<SettingsActionResult> {
+  // The sandbox's admin login is public: auto-approve there would hand anyone live accounts.
+  if (process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') {
+    return { ok: false, error: 'Sign-up settings are disabled in the sandbox.' };
+  }
   const denied = await adminCheck();
   if (denied) return denied;
 

@@ -1,4 +1,5 @@
 import React from 'react';
+import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
 
 interface TiptapMark {
   type: string;
@@ -322,11 +323,12 @@ export const SimpleTiptapRenderer: React.FC<SimpleTiptapRendererProps> = ({ cont
         // Not valid JSON, treat as HTML
       }
     }
-    // Render as pure HTML
+    // Render as HTML, sanitized like text blocks: a string description_json is ADMIN-authored
+    // (the CMS, the Cortex tools, PostgREST) and the product page shows it to every visitor.
     return (
       <div
         className={className}
-        dangerouslySetInnerHTML={{ __html: toNoCookieEmbedSrc(content) ?? content }}
+        dangerouslySetInnerHTML={{ __html: sanitizeAuthoredBlockHtml(toNoCookieEmbedSrc(content) ?? content) }}
       />
     );
   }

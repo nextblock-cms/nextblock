@@ -5,6 +5,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@nextblock-cms/ui/avatar";
 import { Button } from "@nextblock-cms/ui/button";
 import { signOutAction } from "../app/actions";
 import { useAuth } from "../context/AuthContext";
+import { clearSandboxCortexKey } from "../lib/cortex-ai/sandbox-headers";
 import { useTranslations } from "@nextblock-cms/utils";
 
 import {
@@ -15,10 +16,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@nextblock-cms/ui/dropdown-menu";
-import { User, LogOut, LayoutDashboard } from "lucide-react";
+import { User, LogOut, LayoutDashboard, Store } from "lucide-react";
+
+const PARTNER_PORTAL_PATH = "/portal/retailer";
 
 export default function AuthButton() {
-  const { user, profile, isAdmin, isWriter } = useAuth();
+  const { user, profile, isAdmin, isWriter, isRetailer, isPartnerPortalActive } = useAuth();
   const { lang, t } = useTranslations();
   const displayName = profile?.full_name || user?.email || null;
   // `t()` answers an unseeded key with the key itself, so `t('profile') || 'Profile'` rendered
@@ -31,6 +34,8 @@ export default function AuthButton() {
   const showAdminLink = isAdmin || isWriter;
 
   const handleSignOut = async () => {
+    // The sandbox's demo accounts are shared: forget the visitor's own OpenRouter key first.
+    clearSandboxCortexKey();
     await signOutAction();
   };
 
@@ -72,6 +77,17 @@ export default function AuthButton() {
               <Link href="/cms/dashboard" className="cursor-pointer">
                 <LayoutDashboard className="mr-2 h-4 w-4" />
                 <span>{t('cms_dashboard')}</span>
+              </Link>
+            </DropdownMenuItem>
+          )}
+          {/* Partner portal. Prefetch is off: the portal renders per partner, and a menu item
+              that is mounted while hidden must not make the server render it on every page.
+              Hidden while the Affiliates package is inactive (the portal sends partners home). */}
+          {isRetailer && isPartnerPortalActive && (
+            <DropdownMenuItem asChild>
+              <Link href={PARTNER_PORTAL_PATH} prefetch={false} className="cursor-pointer">
+                <Store className="mr-2 h-4 w-4" aria-hidden="true" />
+                <span>{label('partner_portal', 'Partner portal', 'Portail partenaire')}</span>
               </Link>
             </DropdownMenuItem>
           )}

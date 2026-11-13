@@ -735,3 +735,65 @@ describe('revokes the post-apply grant pass would undo (review cases)', () => {
     expect(grantPassGuardProblems(GRANTS_SQL)).toEqual([]);
   });
 });
+
+describe("'RTL' user_role literals (ADDENDUM A18)", () => {
+  // 02029 adds the label with ALTER TYPE ... ADD VALUE; the sandbox reset replays every migration
+  // in one transaction, where PostgreSQL refuses a label added in that transaction. Only a plpgsql
+  // body (resolved when the function runs) may cast it; everything else compares as text.
+  const { findEnumRtlLiterals } = require('./lib/migration-grants.js');
+  const rtlErrors = (sql: string) => lint(sql).filter((e) => /casts 'RTL' to public\.user_role/.test(e));
+
+  it('refuses the cast at the top level, in a DO block or EXECUTE template, a policy and a SQL function body', () => {
+    for (const sql of [
+      "UPDATE public.profiles SET role = 'RTL'::public.user_role WHERE false;",
+      "UPDATE public.profiles SET role = 'RTL'::user_role WHERE false;",
+      `UPDATE public.profiles SET role = 'RTL'::"public"."user_role" WHERE false;`,
+      "UPDATE public.profiles SET role = 'RTL' :: public . user_role WHERE false;",
+      "UPDATE public.profiles SET role = CAST('RTL' AS public.user_role) WHERE false;",
+      "SELECT '{ADMIN,RTL}'::public.user_role[];",
+      "DO $$ BEGIN UPDATE public.profiles SET role = 'RTL'::public.user_role WHERE false; END $$;",
+      "DO $$ BEGIN EXECUTE 'UPDATE public.profiles SET role = ''RTL''::public.user_role WHERE false'; END $$;",
+      "DO $$ BEGIN EXECUTE format('UPDATE public.profiles SET role = %L::public.user_role WHERE false', 'RTL'); END $$;",
+      "CREATE POLICY p ON public.pages FOR SELECT TO authenticated USING ((SELECT public.get_current_user_role()) = 'RTL'::public.user_role);",
+      "CREATE FUNCTION public.is_rtl() RETURNS boolean LANGUAGE sql STABLE SET search_path = '' AS $$ SELECT (SELECT public.get_current_user_role()) = 'RTL'::public.user_role $$;",
+    ]) {
+      expect(findEnumRtlLiterals(sql), sql).toHaveLength(1);
+      expect(rtlErrors(sql), sql).toEqual([expect.stringMatching(/^02099_review_case\.sql: casts 'RTL' to public\.user_role .*compare as text/)]);
+    }
+  });
+
+  it('accepts the cast inside a plpgsql body, text comparison, other labels and non-code mentions', () => {
+    for (const sql of [
+      "CREATE FUNCTION public.make_rtl(p uuid) RETURNS void LANGUAGE plpgsql SET search_path = '' AS $$ BEGIN UPDATE public.profiles SET role = 'RTL'::public.user_role WHERE id = p; END $$;",
+      "CREATE FUNCTION public.make_rtl() RETURNS void AS $$ BEGIN PERFORM 'RTL'::public.user_role; END $$ LANGUAGE 'plpgsql';",
+      "CREATE FUNCTION public.make_rtl() RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'SELECT ''RTL''::public.user_role'; END $$;",
+      "CREATE FUNCTION public.make_rtl(p uuid) RETURNS void LANGUAGE plpgsql AS $$ BEGIN UPDATE public.profiles SET role = 'RTL' WHERE id = p AND role::text = 'USER'; END $$;",
+      "CREATE POLICY p ON public.pages FOR SELECT TO authenticated USING ((SELECT public.get_current_user_role())::text = 'RTL');",
+      "UPDATE public.profiles SET full_name = full_name WHERE role::text = 'RTL';",
+      "SELECT 'ADMIN'::public.user_role, 'RTL'::text, 'RTL'::public.other_role;",
+      "-- 'RTL'::public.user_role\nSELECT 1;",
+      "COMMENT ON TABLE public.pages IS $c$'RTL'::public.user_role$c$;",
+      "ALTER TYPE public.user_role ADD VALUE IF NOT EXISTS 'RTL';",
+    ]) {
+      expect(findEnumRtlLiterals(sql), sql).toEqual([]);
+      expect(rtlErrors(sql), sql).toEqual([]);
+    }
+  });
+
+  it('runs for forward migrations of generation 02 and later only', () => {
+    const sql = "UPDATE public.profiles SET role = 'RTL'::public.user_role WHERE false;";
+    const files = ['02000_catchup_gen1.sql', '02001_baseline_schema.sql', '02004_baseline_seed.sql', '02031_set_roles.sql', '03005_later.sql'];
+    expect(validateMigrationGrants(files, () => sql).errors).toEqual([
+      expect.stringMatching(/^02031_set_roles\.sql: casts 'RTL'/),
+      expect.stringMatching(/^03005_later\.sql: casts 'RTL'/),
+    ]);
+  });
+
+  it('passes for every forward migration on disk (02029 adds the label, 02030 compares it as text)', () => {
+    const files = readdirSync(MIGRATIONS_DIR).filter((name) => name.endsWith('.sql')).sort();
+    expect(files).toContain('02029_user_role_rtl.sql');
+    for (const file of files.filter((name) => /^\d{2}(?:0(?:0[5-9]|[1-9]\d)|[1-9]\d\d)_/.test(name))) {
+      expect(findEnumRtlLiterals(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8')), file).toEqual([]);
+    }
+  });
+});

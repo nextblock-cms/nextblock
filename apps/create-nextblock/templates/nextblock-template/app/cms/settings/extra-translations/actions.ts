@@ -3,6 +3,7 @@
 import { createClient } from '@nextblock-cms/db/server';
 import { revalidatePath, updateTag } from 'next/cache';
 import { z } from '../../../../lib/zod-config';
+import { readAllTranslationRows } from '../../../../lib/i18n/translation-pages';
 
 import {
   getOrderedTranslationLanguageCodes,
@@ -111,19 +112,31 @@ export async function createTranslation(
   };
 }
 
+/**
+ * Every row of the table, page by page: PostgREST returns at most 1000 rows per request and the
+ * table is past that since 02031, so a single read hid the last keys from this screen and made a
+ * CSV import treat them as new rows. All or nothing (lib/i18n/translation-pages.ts).
+ */
+async function readAllTranslations(supabase: ReturnType<typeof createClient>) {
+  return readAllTranslationRows((from, to) =>
+    supabase
+      .from('translations')
+      .select('key, translations, created_at, updated_at')
+      .order('key')
+      .range(from, to)
+  );
+}
+
 export async function getTranslations() {
   const supabase = createClient();
-  const { data, error } = await supabase
-    .from('translations')
-    .select('key, translations, created_at, updated_at')
-    .order('key');
+  const { data, error } = await readAllTranslations(supabase);
 
   if (error) {
     console.error('Error fetching translations:', error);
     return [];
   }
 
-  return (data ?? []) as TranslationWorkspaceItem[];
+  return data as TranslationWorkspaceItem[];
 }
 
 export async function updateTranslation(
@@ -217,12 +230,25 @@ export async function importTranslationsCsvAction(csvText: string) {
     }
 
     const [existingTranslations, languageCodes] = await Promise.all([
-      getTranslations(),
+      readAllTranslations(supabase),
       getConfiguredLanguageCodes(),
     ]);
+
+    // The merge needs the whole table: a key the read missed would be imported as a new row,
+    // and its upsert would replace that row's other languages.
+    if (existingTranslations.error) {
+      return {
+        success: false as const,
+        createdCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        error: `Failed to read the existing translations: ${existingTranslations.error.message}`,
+      };
+    }
+
     const importResult = prepareTranslationCsvImport({
       csvText,
-      existingItems: existingTranslations,
+      existingItems: existingTranslations.data as TranslationWorkspaceItem[],
       languageCodes,
     });
 

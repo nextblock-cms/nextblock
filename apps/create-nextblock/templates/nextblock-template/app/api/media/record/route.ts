@@ -4,6 +4,7 @@ import { createClient } from '@nextblock-cms/db/server';
 import type { Database } from '@nextblock-cms/db';
 import {
   hasAllowedObjectKeyExtension,
+  isPartnerUploadKey,
   isSafeObjectKey,
 } from '../../../../lib/storage/upload-policy';
 
@@ -127,6 +128,21 @@ export async function POST(request: NextRequest) {
       if (!isSafeObjectKey(key) || !hasAllowedObjectKeyExtension(key)) {
         return NextResponse.json({ error: 'Invalid object key.' }, { status: 400 });
       }
+    }
+
+    // Partner uploads (affiliates/avatars/… and affiliates/pages/…, PARTNER_UPLOAD_NAMESPACES in
+    // lib/storage/upload-policy)
+    // never become media rows, whichever field names them: the /cms/media delete and move
+    // remove the objects their row lists, so a "decoy" row naming a partner's avatar would let
+    // a WRITER delete it (the 2026-10-21 decoy-row hole, for keys outside the media library).
+    const namedKeys = [
+      payload.r2OriginalKey,
+      payload.originalImageDetails?.objectKey,
+      ...recordedKeys,
+      ...variants.map((variant) => variant?.objectKey),
+    ];
+    if (namedKeys.some(isPartnerUploadKey)) {
+      return NextResponse.json({ error: 'Invalid object key.' }, { status: 400 });
     }
 
     const mediaData: Omit<Media, 'id' | 'created_at' | 'updated_at'> & {

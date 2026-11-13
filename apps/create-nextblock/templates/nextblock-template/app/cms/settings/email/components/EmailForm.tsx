@@ -99,94 +99,117 @@ export default function EmailForm({ initialSettings }: EmailFormProps) {
     });
   };
 
+  const readOnly = initialSettings.readOnly;
+
   return (
     <div className="space-y-6">
-      {initialSettings.envFallbackActive && (
+      {readOnly && (
         <Alert className="py-2 px-4">
           <AlertDescription className="text-xs">
-            SMTP is currently read from environment variables (<code>SMTP_*</code>). Saving here
-            moves it into the database and takes precedence.
+            Email settings are read-only in this demo. It sends mail only through the
+            deployment&rsquo;s <code>SMTP_*</code> environment, and test emails are off.
           </AlertDescription>
         </Alert>
       )}
+      {initialSettings.envFallbackActive && (
+        <Alert className="py-2 px-4">
+          <AlertDescription className="text-xs">
+            SMTP is currently read from environment variables (<code>SMTP_*</code>). What you save
+            here takes precedence, except that mail keeps going to <code>SMTP_HOST</code> until a
+            username and password are saved here too (another host saved here then drops its port
+            and TLS setting). With no host saved here, the TLS mode follows the port, and a port
+            other than <code>SMTP_PORT</code> (else 587) must use TLS.
+          </AlertDescription>
+        </Alert>
+      )}
+      {initialSettings.hostPinnedToEnv && (
+        <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+          The username and password still come from <code>SMTP_USER</code> /{' '}
+          <code>SMTP_PASS</code>, so mail goes to <code>SMTP_HOST</code> and the host, port and TLS
+          setting below are not used (the port comes from <code>SMTP_PORT</code>, else 587). Save a
+          username and password here to send through them.
+        </p>
+      )}
 
       <form ref={formRef} onSubmit={handleSubmit} className="space-y-6">
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="host">SMTP host</Label>
-            <Input id="host" value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.example.com" />
+        <fieldset disabled={readOnly} className="space-y-6">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="host">SMTP host</Label>
+              <Input id="host" value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.example.com" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="port">Port</Label>
+              <Input
+                id="port"
+                value={port}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setPort(next);
+                  // The TLS mode is a property of the port, not a preference. Follow it, so
+                  // the impossible combination is never saved in the first place.
+                  const implied = impliedSecureForPort(next);
+                  if (implied !== null) setSecure(implied);
+                }}
+                placeholder="465"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="fromEmail">From email</Label>
+              <Input id="fromEmail" type="email" value={fromEmail} onChange={(e) => setFromEmail(e.target.value)} placeholder="no-reply@example.com" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="fromName">From name</Label>
+              <Input id="fromName" value={fromName} onChange={(e) => setFromName(e.target.value)} placeholder="My Site" />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="user">
+                Username{' '}
+                {initialSettings.hasUser && (
+                  <span className="text-xs text-muted-foreground">
+                    (stored{initialSettings.userLast4 ? ` ••••${initialSettings.userLast4}` : ''} — leave blank to keep)
+                  </span>
+                )}
+              </Label>
+              <Input id="user" autoComplete="off" value={user} onChange={(e) => setUser(e.target.value)} placeholder={initialSettings.hasUser ? '••••••••' : 'smtp username'} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="pass">
+                Password{' '}
+                {initialSettings.hasPass && (
+                  <span className="text-xs text-muted-foreground">(stored — leave blank to keep)</span>
+                )}
+              </Label>
+              <Input id="pass" type="password" autoComplete="new-password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder={initialSettings.hasPass ? '••••••••' : 'smtp password'} />
+            </div>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="port">Port</Label>
-            <Input
-              id="port"
-              value={port}
-              onChange={(e) => {
-                const next = e.target.value;
-                setPort(next);
-                // The TLS mode is a property of the port, not a preference. Follow it, so
-                // the impossible combination is never saved in the first place.
-                const implied = impliedSecureForPort(next);
-                if (implied !== null) setSecure(implied);
-              }}
-              placeholder="465"
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="fromEmail">From email</Label>
-            <Input id="fromEmail" type="email" value={fromEmail} onChange={(e) => setFromEmail(e.target.value)} placeholder="no-reply@example.com" />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="fromName">From name</Label>
-            <Input id="fromName" value={fromName} onChange={(e) => setFromName(e.target.value)} placeholder="My Site" />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="user">
-              Username{' '}
-              {initialSettings.hasUser && (
-                <span className="text-xs text-muted-foreground">
-                  (stored{initialSettings.userLast4 ? ` ••••${initialSettings.userLast4}` : ''} — leave blank to keep)
-                </span>
-              )}
-            </Label>
-            <Input id="user" autoComplete="off" value={user} onChange={(e) => setUser(e.target.value)} placeholder={initialSettings.hasUser ? '••••••••' : 'smtp username'} />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="pass">
-              Password{' '}
-              {initialSettings.hasPass && (
-                <span className="text-xs text-muted-foreground">(stored — leave blank to keep)</span>
-              )}
-            </Label>
-            <Input id="pass" type="password" autoComplete="new-password" value={pass} onChange={(e) => setPass(e.target.value)} placeholder={initialSettings.hasPass ? '••••••••' : 'smtp password'} />
-          </div>
-        </div>
 
-        <label className="flex items-start gap-3">
-          <Checkbox checked={secure} onCheckedChange={(c) => setSecure(c === true)} className="mt-1" />
-          <span className="text-sm">
-            <span className="font-medium">Use implicit TLS (SMTPS)</span>
-            <span className="block text-xs text-muted-foreground">
-              Port 465 needs this on. Ports 25, 587 and 2525 need it off — they upgrade to
-              TLS with STARTTLS instead.
+          <label className="flex items-start gap-3">
+            <Checkbox checked={secure} onCheckedChange={(c) => setSecure(c === true)} className="mt-1" />
+            <span className="text-sm">
+              <span className="font-medium">Use implicit TLS (SMTPS)</span>
+              <span className="block text-xs text-muted-foreground">
+                Port 465 needs this on. Ports 25, 587 and 2525 need it off — they upgrade to
+                TLS with STARTTLS instead.
+              </span>
             </span>
-          </span>
-        </label>
+          </label>
 
-        {tlsMismatch && (
-          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
-            Port {port} expects implicit TLS to be{' '}
-            <strong>{tlsMismatch.expected ? 'on' : 'off'}</strong>. As set, the connection
-            fails during the TLS handshake with a &ldquo;wrong version number&rdquo; error.
-            Saving will correct it.
-          </p>
-        )}
+          {tlsMismatch && (
+            <p className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+              Port {port} expects implicit TLS to be{' '}
+              <strong>{tlsMismatch.expected ? 'on' : 'off'}</strong>. Mail is sent that way
+              whatever this switch says; switch it {tlsMismatch.expected ? 'on' : 'off'} and save
+              to match.
+            </p>
+          )}
 
-        <div className="flex items-center gap-4">
-          <Button type="submit" disabled={isPending}>
-            {isPending ? (<><Spinner className="mr-2 h-4 w-4" /> Saving…</>) : 'Save settings'}
-          </Button>
-        </div>
+          <div className="flex items-center gap-4">
+            <Button type="submit" disabled={isPending || readOnly}>
+              {isPending ? (<><Spinner className="mr-2 h-4 w-4" /> Saving…</>) : 'Save settings'}
+            </Button>
+          </div>
+        </fieldset>
       </form>
 
       <div className="rounded-lg border p-4 space-y-3">
@@ -205,7 +228,7 @@ export default function EmailForm({ initialSettings }: EmailFormProps) {
             placeholder="you@example.com"
             className="sm:max-w-xs"
           />
-          <Button type="button" variant="outline" onClick={handleSendTest} disabled={isTesting || !testTo.trim()}>
+          <Button type="button" variant="outline" onClick={handleSendTest} disabled={isTesting || !testTo.trim() || readOnly}>
             {isTesting ? (<><Spinner className="mr-2 h-4 w-4" /> Sending…</>) : 'Send test email'}
           </Button>
         </div>

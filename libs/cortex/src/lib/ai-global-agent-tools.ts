@@ -6374,16 +6374,21 @@ export async function resolveCortexAiStockPhotoProviders(
 
   if (supabase) {
     try {
-      const { CORTEX_AI_PEXELS_SETTING_KEY, CORTEX_AI_UNSPLASH_SETTING_KEY, decryptStoredOpenRouterApiKey } =
+      const { CORTEX_AI_PEXELS_SETTING_KEY, CORTEX_AI_UNSPLASH_SETTING_KEY, decryptStoredCortexAiSecret } =
         await import('./ai-config');
 
-      const decrypt = (value: unknown): string | null => {
+      // Each key opens only from its own row: the OpenRouter key (or any other secret) copied
+      // into a stock-photo row never reaches that provider's API.
+      const decrypt = (
+        settingKey: typeof CORTEX_AI_PEXELS_SETTING_KEY | typeof CORTEX_AI_UNSPLASH_SETTING_KEY,
+        value: unknown
+      ): string | null => {
         if (!value) {
           return null;
         }
 
         try {
-          const decrypted = decryptStoredOpenRouterApiKey(value);
+          const decrypted = decryptStoredCortexAiSecret(settingKey, value);
           return typeof decrypted === 'string' && decrypted.trim() ? decrypted.trim() : null;
         } catch {
           return null;
@@ -6395,8 +6400,14 @@ export async function resolveCortexAiStockPhotoProviders(
         .select('key, value')
         .in('key', [CORTEX_AI_PEXELS_SETTING_KEY, CORTEX_AI_UNSPLASH_SETTING_KEY]);
       const rows = Array.isArray(data) ? data : [];
-      pexelsKey = decrypt(rows.find((row: any) => row.key === CORTEX_AI_PEXELS_SETTING_KEY)?.value);
-      unsplashKey = decrypt(rows.find((row: any) => row.key === CORTEX_AI_UNSPLASH_SETTING_KEY)?.value);
+      pexelsKey = decrypt(
+        CORTEX_AI_PEXELS_SETTING_KEY,
+        rows.find((row: any) => row.key === CORTEX_AI_PEXELS_SETTING_KEY)?.value
+      );
+      unsplashKey = decrypt(
+        CORTEX_AI_UNSPLASH_SETTING_KEY,
+        rows.find((row: any) => row.key === CORTEX_AI_UNSPLASH_SETTING_KEY)?.value
+      );
     } catch {
       // Fall through to env vars if the settings read/decrypt fails.
     }
@@ -6480,6 +6491,47 @@ function toFiniteOrNull(value: unknown) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+/**
+ * The only Unsplash download triggers pinged with the operator's Unsplash key: https on
+ * `api.unsplash.com` exactly, default port, no userinfo, a path under `/photos/`. That is the
+ * shape of every `links.download_location` the search API returns
+ * (`https://api.unsplash.com/photos/<id>/download?ixid=…`). The block content schema accepts
+ * any string as `attribution.downloadLocation`, and whoever saves the block chooses it (any
+ * visitor on the public sandbox; a WRITER anywhere, whose block a later admin Cortex edit
+ * merges), so any other value would send the key to their host or point the server at an
+ * internal URL. The partner copilot (`UNSPLASH_DOWNLOAD_PREFIX`) and the storefront
+ * sanitizer apply the same rule.
+ */
+const UNSPLASH_DOWNLOAD_HOST = 'api.unsplash.com';
+const UNSPLASH_DOWNLOAD_PATH_PREFIX = '/photos/';
+/** Pings per call. A page save places a handful of photos; the cap bounds a crafted one. */
+const MAX_UNSPLASH_DOWNLOAD_PINGS = 20;
+const UNSPLASH_DOWNLOAD_PING_TIMEOUT_MS = 5000;
+
+/** The normalized trigger URL to ping, or null when the value is not an Unsplash API trigger. */
+function toUnsplashDownloadTriggerUrl(value: string): string | null {
+  let url: URL;
+
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== UNSPLASH_DOWNLOAD_HOST ||
+    url.port !== '' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    !url.pathname.startsWith(UNSPLASH_DOWNLOAD_PATH_PREFIX)
+  ) {
+    return null;
+  }
+
+  return url.href;
+}
+
 function collectUnsplashDownloadLocations(content: unknown, out: Set<string>) {
   if (!isPlainJsonRecord(content)) {
     return;
@@ -6489,10 +6541,13 @@ function collectUnsplashDownloadLocations(content: unknown, out: Set<string>) {
     if (
       isPlainJsonRecord(attribution) &&
       attribution.provider === 'unsplash' &&
-      typeof attribution.downloadLocation === 'string' &&
-      attribution.downloadLocation.trim()
+      typeof attribution.downloadLocation === 'string'
     ) {
-      out.add(attribution.downloadLocation.trim());
+      const triggerUrl = toUnsplashDownloadTriggerUrl(attribution.downloadLocation.trim());
+
+      if (triggerUrl) {
+        out.add(triggerUrl);
+      }
     }
   };
 
@@ -6521,11 +6576,30 @@ function collectUnsplashDownloadLocations(content: unknown, out: Set<string>) {
   }
 }
 
+async function pingUnsplashDownloadTrigger(location: string, apiKey: string) {
+  try {
+    const response = await fetch(location, {
+      headers: { Authorization: `Client-ID ${apiKey}` },
+      // A plain fetch suffices because the host is pinned to api.unsplash.com and no
+      // redirect is followed: the key never travels to a second host.
+      redirect: 'error',
+      signal: AbortSignal.timeout(UNSPLASH_DOWNLOAD_PING_TIMEOUT_MS),
+    });
+
+    // Nothing in the body is needed; release the connection now instead of at GC.
+    await response.body?.cancel();
+  } catch {
+    // Best effort: a refused redirect, a timeout or a network error only skips the ping.
+  }
+}
+
 /**
  * Fire the Unsplash download-trigger endpoint for every Unsplash photo placed in
  * the given blocks. Required by the Unsplash API Guidelines when a photo is used.
  * Best-effort and fire-and-forget: it resolves the Unsplash key, dedupes, and
- * never blocks or fails the mutation.
+ * never blocks or fails the mutation. Only Unsplash API triggers are pinged
+ * (`toUnsplashDownloadTriggerUrl`), at most MAX_UNSPLASH_DOWNLOAD_PINGS per call,
+ * each with redirects refused and a timeout.
  */
 export async function maybeTriggerStockPhotoDownloads(
   blocks: Array<{ content?: unknown } | null | undefined>,
@@ -6550,11 +6624,9 @@ export async function maybeTriggerStockPhotoDownloads(
     }
 
     await Promise.all(
-      [...locations].map((location) =>
-        fetch(location, { headers: { Authorization: `Client-ID ${unsplash.apiKey}` } }).catch(
-          () => undefined
-        )
-      )
+      [...locations]
+        .slice(0, MAX_UNSPLASH_DOWNLOAD_PINGS)
+        .map((location) => pingUnsplashDownloadTrigger(location, unsplash.apiKey))
     );
   } catch {
     // Never let attribution telemetry break a CMS mutation.

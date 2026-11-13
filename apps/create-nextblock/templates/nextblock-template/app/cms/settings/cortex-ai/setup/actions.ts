@@ -11,14 +11,17 @@ import {
   CORTEX_AI_PEXELS_SETTING_KEY,
   CORTEX_AI_UNSPLASH_SETTING_KEY,
   createCortexAiStoredModelSelection,
+  encryptStoredCortexAiSecret,
   encryptStoredOpenRouterApiKey,
   getMaskedOpenRouterKey,
   getStoredOpenRouterKeyStatus,
   listCortexAiCompatibleOpenRouterModels,
+  resealStoredCortexAiSecrets,
   verifyOpenRouterApiKey,
   verifyPexelsApiKey,
   verifyUnsplashAccessKey,
   type CortexAiKeyVerification,
+  type CortexAiSecretSettingKey,
   type CortexAiStoredModelSelection,
 } from '@nextblock-cms/cortex';
 
@@ -111,6 +114,9 @@ export async function connectOpenRouterKeyAction(input: {
     if (error) {
       throw new Error(error.message);
     }
+
+    // Binds the other stored keys to their rows too (a key from before 0.23.1 opens anywhere).
+    await resealStoredCortexAiSecrets(supabase);
 
     return {
       detail: verification.ok ? verification.detail : null,
@@ -236,11 +242,11 @@ export async function saveStockPhotoKeysForSetupAction(input: {
     const rows: Array<{ key: string; value: unknown }> = [];
     const saved: StockProviderId[] = [];
 
-    const consider = (provider: StockProviderId, key: string, verification: CortexAiKeyVerification | null, settingKey: string) => {
+    const consider = (provider: StockProviderId, key: string, verification: CortexAiKeyVerification | null, settingKey: CortexAiSecretSettingKey) => {
       if (!verification) return;
 
       if (verification.ok || (verification.reason === 'unreachable' && input.allowUnverified)) {
-        rows.push({ key: settingKey, value: encryptStoredOpenRouterApiKey(key) });
+        rows.push({ key: settingKey, value: encryptStoredCortexAiSecret(settingKey, key) });
         saved.push(provider);
         return;
       }
@@ -259,6 +265,9 @@ export async function saveStockPhotoKeysForSetupAction(input: {
       if (error) {
         throw new Error(error.message);
       }
+
+      // Binds the keys this step kept to their rows too (a key from before 0.23.1 opens anywhere).
+      await resealStoredCortexAiSecrets(supabase);
     }
 
     return { errors, saved, success: Object.keys(errors).length === 0 };

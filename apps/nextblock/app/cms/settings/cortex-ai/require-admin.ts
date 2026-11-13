@@ -13,12 +13,11 @@ import { getCmsActor } from '../../../../lib/auth/cms-actor';
  * and the MCP access tokens.
  *
  * The client it returns is the service-role client, not the caller's cookie session. The
- * rows these actions read and write (`cortex_ai_*` keys, `cortex_ai_mcp_settings`,
- * `mcp_access_tokens`) are the ADMIN tier of `site_settings`, which migration 02023 (and
- * 02022 for the tokens) gates behind `public.is_admin_mfa()`: an admin who enrolled a second
- * factor must be on an `aal2` session, while the app's own 2FA gate lets a "remember this
- * device" admin in on `aal1`. The role check itself reads the caller's own profile row
- * (never gated); see `lib/auth/cms-actor.ts`.
+ * key rows and `cortex_ai_mcp_settings` are secret rows of `site_settings`, which no API
+ * session reaches since migration 02038; the other `cortex_ai_*` settings and
+ * `mcp_access_tokens` (02022) sit behind `public.is_admin_mfa()`, which a "remember this
+ * device" admin on `aal1` cannot satisfy. The role check itself reads the caller's own profile
+ * row (never gated); see `lib/auth/cms-actor.ts`.
  */
 export async function requireAdminSupabaseClient() {
   const actor = await getCmsActor();

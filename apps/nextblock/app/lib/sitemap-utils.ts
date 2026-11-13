@@ -1,5 +1,7 @@
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
+import { AFFILIATE_PARTNERS_PATH } from '@nextblock-cms/affiliates';
 import { buildPublishedAtOrFilter } from '@nextblock-cms/utils';
+import { listPublishedAffiliateStorefronts } from '../../lib/affiliates/storefront-data';
 import { getHomepageTranslationGroupId } from './homepage';
 
 /**
@@ -155,6 +157,46 @@ function rowsToEntries(
 }
 
 /**
+ * The page entries without the paths a code route answers instead (the partner program's
+ * `/partners` and `/partenaires` while the Affiliates package is active): a CMS page with one of
+ * those slugs is not served there, so it is not advertised either, and its translations stop
+ * pointing at it. Alternates that collapse to a single URL are dropped; an `x-default` that pointed
+ * at a removed path moves to the first remaining language. Pure; returns the same array when no
+ * path is owned.
+ */
+export function excludeCodeRoutePaths(entries: SitemapEntry[], ownedPaths: Iterable<string>): SitemapEntry[] {
+  const owned = new Set(ownedPaths);
+  if (owned.size === 0) return entries;
+
+  const kept: SitemapEntry[] = [];
+  for (const entry of entries) {
+    if (owned.has(entry.path)) continue;
+    if (!entry.alternates) {
+      kept.push(entry);
+      continue;
+    }
+
+    const languages = Object.entries(entry.alternates).filter(
+      ([code, path]) => code !== 'x-default' && !owned.has(path),
+    );
+    if (new Set(languages.map(([, path]) => path)).size < 2) {
+      kept.push({ path: entry.path, lastModified: entry.lastModified });
+      continue;
+    }
+
+    const xDefault = entry.alternates['x-default'];
+    kept.push({
+      ...entry,
+      alternates: {
+        ...Object.fromEntries(languages),
+        'x-default': xDefault && !owned.has(xDefault) ? xDefault : languages[0][1],
+      },
+    });
+  }
+  return kept;
+}
+
+/**
  * Fetches all published pages from Supabase and formats them, with language
  * alternates, for the sitemap.
  */
@@ -257,6 +299,25 @@ export async function fetchAllActiveProducts(): Promise<SitemapEntry[]> {
     );
   } catch (err) {
     console.error('An unexpected error occurred while fetching products:', err);
+    return [];
+  }
+}
+
+/**
+ * Every published partner storefront (`/partners/<handle>`, NextBlock Affiliates). One URL per
+ * storefront: the page follows the visitor's language, so there are no alternates. `lastModified`
+ * is the last approval (`list_affiliate_storefronts.updated_at`), never the partner profile's own
+ * `updated_at`, so clicks and draft autosaves never move it. The caller gates on the package.
+ */
+export async function fetchAllPartnerStorefronts(): Promise<SitemapEntry[]> {
+  try {
+    const storefronts = await listPublishedAffiliateStorefronts();
+    return storefronts.map((storefront) => ({
+      path: `${AFFILIATE_PARTNERS_PATH}/${storefront.handle}`,
+      lastModified: toIsoDate(storefront.updatedAt ?? storefront.publishedAt),
+    }));
+  } catch (err) {
+    console.error('An unexpected error occurred while fetching partner storefronts:', err);
     return [];
   }
 }

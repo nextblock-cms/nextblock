@@ -10,6 +10,10 @@ import 'server-only';
  * reject anything that reads as path traversal. They used to be copied into both upload
  * routes (with small drifts); they live here so there is one definition to audit.
  *
+ * It also owns the partner-upload namespaces (`affiliates/avatars/` and `affiliates/pages/`,
+ * {@link isPartnerUploadKey}): no staff path may create, record, process, move or delete an
+ * object there.
+ *
  * Every helper is pure — it never throws and never does I/O — so each route can map a
  * rejection (`null` / `false`) to its own status and message and keep its existing
  * contract. This module is server-only: the stored key policy must never be reachable
@@ -24,6 +28,43 @@ export const MAX_UPLOAD_FOLDER_LENGTH = 200;
 export const MAX_UPLOAD_BASENAME_LENGTH = 120;
 /** Hard ceiling on a stored object key's length. */
 export const MAX_OBJECT_KEY_LENGTH = 512;
+
+/** The folder that holds the partner upload namespaces ({@link PARTNER_UPLOAD_NAMESPACES}). */
+export const PARTNER_UPLOAD_KEY_PREFIX = 'affiliates/';
+
+/**
+ * The storage namespaces of partner uploads (Affiliates avatars and storefront images, keyed by
+ * lib/affiliates/upload-keys.ts as `affiliates/{avatars|pages}/<affiliateId>/<stamp>-<nonce>.jpg`).
+ * Those objects belong to a partner account, not to the media library, and the partner upload
+ * route counts them against that partner's caps (lib/affiliates/uploads.ts). So no staff path
+ * may touch them: {@link resolveUploadFolder} refuses them for /api/upload/proxy and
+ * /api/upload/presigned-url, /api/process-image refuses such a key, /api/media/record never
+ * records one, and lib/storage/media-object-keys.ts keeps the /cms/media delete and move away
+ * from them. Before 2026-10-27 a WRITER could upload into `affiliates/pages/<id>/` (filling that
+ * partner's upload caps) or point the image processor at a partner's object.
+ *
+ * Only these two are reserved, not the whole `affiliates/` folder: an install may already keep
+ * its own media there (the media library takes free-text folders), and that media keeps its
+ * upload, move and delete paths. A new partner namespace must be added here (the parity test in
+ * media-object-keys.test.ts fails otherwise).
+ */
+export const PARTNER_UPLOAD_NAMESPACES = ['affiliates/avatars/', 'affiliates/pages/'] as const;
+
+/**
+ * True for a key or folder inside one of the {@link PARTNER_UPLOAD_NAMESPACES}, or naming one
+ * (`affiliates/pages`), compared case-insensitively after backslashes become slashes, leading
+ * slashes and whitespace are dropped and repeated slashes collapse, so `/Affiliates//avatars/…`
+ * counts too. Only refuses more: a media-library key never lives there.
+ */
+export function isPartnerUploadKey(key: unknown): boolean {
+  if (typeof key !== 'string') return false;
+  const normalized = key
+    .replace(/\\/g, '/')
+    .replace(/^[\s/]+/, '')
+    .replace(/\/{2,}/g, '/')
+    .toLowerCase();
+  return PARTNER_UPLOAD_NAMESPACES.some((namespace) => normalized.startsWith(namespace) || `${normalized}/` === namespace);
+}
 
 /**
  * Content types the media library accepts, each with the extensions it may be stored
@@ -83,9 +124,10 @@ export function isAllowedContentType(contentType: string): boolean {
 /**
  * Normalizes the optional `folder` field into a `segment/segment/` prefix. Characters
  * outside `[A-Za-z0-9_-]` become `-` (so `pages/<slug>/` keeps working), but anything
- * that reads as path traversal (`.`/`..` segments, backslashes, control characters) or
- * is over-long is refused: this returns `null` and the caller rejects the request.
- * `null` / `undefined` / an empty folder default to `uploads/`.
+ * that reads as path traversal (`.`/`..` segments, backslashes, control characters), is
+ * over-long, or normalizes into a partner upload namespace (`affiliates/avatars/…` or
+ * `affiliates/pages/…`, see {@link PARTNER_UPLOAD_NAMESPACES}) is refused: this returns `null`
+ * and the caller rejects the request. `null` / `undefined` / an empty folder default to `uploads/`.
  */
 export function resolveUploadFolder(raw: unknown): string | null {
   if (raw === null || raw === undefined) return DEFAULT_UPLOAD_FOLDER;
@@ -106,7 +148,10 @@ export function resolveUploadFolder(raw: unknown): string | null {
     const cleaned = segment.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
     if (cleaned) segments.push(cleaned);
   }
-  return segments.length ? `${segments.join('/')}/` : DEFAULT_UPLOAD_FOLDER;
+  if (!segments.length) return DEFAULT_UPLOAD_FOLDER;
+  const folder = `${segments.join('/')}/`;
+  // Checked after normalization, so `Affiliates!/pages` or `/affiliates//x` cannot slip past.
+  return isPartnerUploadKey(folder) ? null : folder;
 }
 
 /**

@@ -24,11 +24,14 @@ would have caught it. CI (`.github/workflows/security.yml`) re-runs the gates on
 - `libs/sdk` — types-only block-authoring contract.
 - `libs/ecommerce` (premium) — Stripe/Freemius checkout, products, orders, shipping, tax.
 - `libs/cortex` (premium) — Cortex AI: OpenRouter routing, agent tools, MCP server.
+- `libs/affiliates` (premium, a Commerce Pro add-on) — Affiliates & Creator Storefronts: partner
+  signup, admin-approved storefronts, commission ledger, Stripe Connect payouts, storefront
+  copilot (docs/15).
 
 Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` → `ecommerce`;
-`db,utils,ecommerce` → `cortex`; the app consumes all; libs never import the app. Import via
-`@nextblock-cms/*` (`tsconfig.base.json` paths; `vitest.config.ts` mirrors all but
-`db/secrets` and `db/types`).
+`db,utils,ecommerce` → `cortex`; `utils,ui` → `affiliates`; the app consumes all; libs never
+import the app. Import via `@nextblock-cms/*` (`tsconfig.base.json` paths; `vitest.config.ts`
+mirrors all but `db/types`).
 
 ## Content model (Postgres JSONB)
 
@@ -63,7 +66,13 @@ Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` →
   `import type`. `tools/scripts/service-role-boundary.test.ts` fails on a missing guard, a client
   graph (any `'use client'` file or client-safe lib entry) reaching service-role code, or a
   secret behind `NEXT_PUBLIC_` / `next.config.js` `env`.
-- Premium gating: `verifyPackageOnline('ecommerce' | 'cortex-ai')` (cached 60 s).
+- Premium gating: `verifyPackageOnline('ecommerce' | 'cortex-ai')` (cached 60 s). Affiliates
+  requires Commerce Pro (`requires` in `NEXTBLOCK_PACKAGES`): gate it with
+  `isAffiliatesProgramActive()` (`lib/affiliates/package-state.ts`, both packages), never
+  `verifyPackageOnline('affiliates')` (`package-state.test.ts` fails on one).
+- Partners (role `RTL`, Affiliates) never enter `/cms`: portal pages, actions and routes call
+  `requireRetailer()` / `requireRetailerPage()` (`lib/affiliates/retailer-actor.ts`), the
+  partner twin of `requireCmsAdmin()`.
 - Headless installs (`create-nextblock --non-interactive`, docs/06): `GET /api/setup/status`
   (public readiness), `POST /api/setup/bootstrap` (first admin, bearer = `MCP_BEARER_TOKEN`),
   `NEXTBLOCK_LICENSE_KEY` activated on first use by `lib/packages/env-license.ts`, and the
@@ -76,7 +85,7 @@ Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` →
 npx nx serve nextblock              # dev on :4200
 npx nx build nextblock              # prebuild migration hook never fails a build
 npm run lint                        # or npx nx lint <project>
-npm run security:check              # service-role boundary + action actors + migration lint + grant-pass lockstep
+npm run security:check              # service-role boundary + action actors + sandbox guards + HTML sinks + migration lint + posture runner guard + grant-pass lockstep
 npm run security:db-posture -- --db-url postgresql://postgres:postgres@127.0.0.1:54322/postgres  # local DB only
 npx vitest run <path>               # ALWAYS pass a path (a bare run also collects the template copy); no per-project nx test targets
 npm run db:migrate:check            # ALWAYS first; read-only by construction
@@ -125,6 +134,11 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   nothing on new objects: projects created since 2026-05-30, every project from 2026-10-30;
   `db:migrate:check` and the bundle generator fail otherwise). Docs/04 → "Row Level Security
   Patterns".
+- The `RTL` role (`02029`) is never cast as an enum outside a plpgsql body: the sandbox replays
+  every migration in one transaction, where the new label is not committed. Compare roles as
+  text (`(SELECT public.get_current_user_role())::text = 'RTL'`, `role::text = 'RTL'`); the
+  migration lint (`findEnumRtlLiterals`) refuses `'RTL'::public.user_role`. In TypeScript the
+  generated type lacks it: compare `String(role) === 'RTL'`.
 - Both apply paths (`/setup` via `lib/setup/schema-apply.ts`, the build hook via
   `tools/lib/migrate-core.mjs`) end with `grant execute on all functions in schema public`
   to the API roles, then revoke it again on trigger functions and on the explicit list in
@@ -167,17 +181,34 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
 - No Nx executors: `nx build <lib>` is the inferred `vite build` after `typecheck`, and the app
   targets are `nx:run-commands` (`next build`/`dev`/`start`, port 4200). So a lib config sets
   `build.outDir` itself (relative, `/`), `emptyOutDir: true`, and copies extra files with
-  `tools/vite/lib-build-plugins.mjs`. A `"type": "module"` lib (cortex, ecom) emits CommonJS as
-  `.cjs`; `verify-lib-dist.js` check 7 enforces that and matching directives in both formats.
+  `tools/vite/lib-build-plugins.mjs`. A `"type": "module"` lib (cortex, ecom, affiliates) emits
+  CommonJS as `.cjs`; `verify-lib-dist.js` check 7 enforces that and matching directives in both
+  formats.
   Each lib's README is its npm page: absolute links only, and check 8 also requires `license`
   and `repository` (github.com/nextblock-cms/nextblock plus `directory`) in every manifest.
+  Check 10 keeps a lib's `sideEffects` list (affiliates) in the dist manifest and refuses an
+  entry the tarball lacks. Check 11 refuses a `@nextblock-cms/*` import in shipped JS that the
+  dist manifest leaves out of dependencies/peerDependencies; editor, ui and db write sibling peers
+  in afterBuild.
 - A scaffold override (`postcss`, `qs`, `uuid`, `glob`) lives in three places: root `overrides`,
   `apps/create-nextblock/bin/lib/fallback-overrides.js`, and `MANAGED_OVERRIDES` in
   `apps/nextblock/tools/lib/managed-overrides.mjs` (old value into `previous`, so `npm run
   update` moves existing projects) plus `SHIPPED` in `fallback-overrides.test.js`, which fails
   until all of them agree.
-- Publish order utils → ui → sdk → db → editor → ecommerce → cortex → CLI; npm 2FA needs
-  an OTP per publish and piping output breaks the prompt (`EOTP`).
+- Publish order utils → ui → sdk → db → editor → ecommerce → cortex → affiliates → CLI
+  (`npm run release:all`, or one lib with `npm run build:<lib>`, e.g. `build:affiliates`); npm
+  2FA needs an OTP per publish and piping output breaks the prompt (`EOTP`).
+- The root layout never reads the `affiliates.` translation rows (`getCachedTranslations`
+  filters `affiliates.%` in the query; `excludeAffiliateTranslationRows` is a second filter), so
+  the global `useTranslations().t('affiliates.…')` returns the key. Affiliates UI reads
+  `useAffiliatesCopy(<area dictionary>)` under the `AffiliatesCopyProvider` that the `/partners`
+  and portal layouts mount with their overrides.
+- PostgREST returns at most `max_rows` = 1000 rows per request and drops the rest without an
+  error. Page any read of a table that can grow past 1000 rows with
+  `.order(<unique column>).range()`. `translations` passed 1000 with 02031 (raw `sign_in` /
+  `theme_switcher` keys on every page): read it with `readAllTranslationRows`
+  (`apps/nextblock/lib/i18n/translation-pages.ts`), which
+  `tools/scripts/translations-pagination.test.ts` enforces.
 - Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`
   (`lib/public-content-cache.ts`, 5 min, evicted by `revalidatePath` + `revalidatePublicContent`)
   wrapped in React `cache()`. `export const fetchCache = 'force-no-store'` on a route segment
@@ -188,7 +219,9 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   install and Hobby fails the deployment on any sub-daily schedule. The sandbox's 15-min
   reset is a pg_cron job in the sandbox DB (`npm run sandbox:schedule`, not a branch:
   every Vercel project builds every branch); FX rates refresh from the CMS layout via
-  `after()` (`lib/commerce/currency-rates-refresh.ts`).
+  `after()` (`lib/commerce/currency-rates-refresh.ts`); affiliate payouts run from the CMS and
+  portal layouts via `after()`, `/api/affiliates/cron/payouts` (fails closed without a 16+
+  character `CRON_SECRET`) or `npm run affiliates:schedule-payouts`.
 - `/robots.txt` is a route handler (`app/robots.txt/route.ts`) serving `buildRobotsTxt`, not an
   `app/robots.ts` metadata route: Next's serialiser drops the per-rule `other` directives the
   SEO screen lets operators add. The two cannot coexist.

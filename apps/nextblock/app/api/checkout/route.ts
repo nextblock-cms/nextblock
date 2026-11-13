@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { getPaymentProvider, getProviderReadiness } from '@nextblock-cms/ecommerce/server';
-import { createClient, verifyPackageOnline } from '@nextblock-cms/db/server';
+import { createClient, isSandboxEnvironment, verifyPackageOnline } from '@nextblock-cms/db/server';
 import { normalizeCustomerAddress } from '@nextblock-cms/ecommerce';
+import { resolveAttributionForCheckout } from '../../../lib/affiliates/attribution';
 import { z } from '../../../lib/zod-config';
 
 // Mirrors MAX_CHECKOUT_LINE_QUANTITY in the ecommerce providers (checkout-items.ts), which
@@ -20,6 +21,10 @@ const checkoutItemsSchema = z.array(checkoutItemSchema).min(1);
 function jsonError(errorKey: string, error: string, status: number) {
   return NextResponse.json({ error, errorKey }, { status });
 }
+
+/** The English text of the seeded `ecommerce.sandbox_notice` translation (02004). */
+const SANDBOX_CHECKOUT_NOTICE =
+  'This is a Sandbox environment. The Freemius checkout is skipped here for demo purposes.';
 
 function resolveProviderFromItem(item: any): 'stripe' | 'freemius' | null {
   if (item?.provider === 'stripe' || item?.provider === 'freemius') {
@@ -46,6 +51,15 @@ function resolveProviderFromItem(item: any): 'stripe' | 'freemius' | null {
 }
 
 export async function POST(req: Request) {
+  // The public sandbox (published admin login, resets every 15 minutes) simulates every
+  // purchase in the storefront's checkout and never calls this route, so a request here is
+  // scripted. Refuse it first: before the package check, the body, attribution, the cookie
+  // client or any provider, so the sandbox never opens a provider session, writes a pending
+  // order or spends a coupon redemption.
+  if (isSandboxEnvironment()) {
+    return jsonError('ecommerce.sandbox_notice', SANDBOX_CHECKOUT_NOTICE, 403);
+  }
+
   try {
     const isOnline = await verifyPackageOnline('ecommerce');
     if (!isOnline) {
@@ -56,6 +70,7 @@ export async function POST(req: Request) {
       );
     }
 
+    const body = await req.json();
     const {
       items,
       customerEmail,
@@ -67,7 +82,7 @@ export async function POST(req: Request) {
       locale,
       couponCode,
       couponContextItems,
-    } = await req.json();
+    } = body;
     
     if (!Array.isArray(items) || !checkoutItemsSchema.safeParse(items).success) {
       return jsonError(
@@ -151,6 +166,11 @@ export async function POST(req: Request) {
     const userId = user?.id;
     const resolvedCustomerEmail = user?.email || customerEmail || null;
 
+    // NextBlock Affiliates: the partner this sale is credited to, from the signed storefront
+    // token in the cart or the referral cookie. Never read from the body as an id; null when
+    // the package is off, nothing applies, or anything fails (checkout goes on unattributed).
+    const attribution = await resolveAttributionForCheckout({ body, user });
+
     const { url, error, errorKey, errorParams, errorStatus, customProps } =
       await provider.createCheckoutSession({
       items,
@@ -171,6 +191,13 @@ export async function POST(req: Request) {
       locale: typeof locale === 'string' ? locale : null,
       couponCode: typeof couponCode === 'string' ? couponCode : null,
       couponContextItems: hasCouponContextItems ? couponContextItems : items,
+      attribution: attribution
+        ? {
+            affiliateId: attribution.affiliateId,
+            source: attribution.source,
+            baseCurrency: attribution.baseCurrency,
+          }
+        : null,
     });
 
     if (error) {

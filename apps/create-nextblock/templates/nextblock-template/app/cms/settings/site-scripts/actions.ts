@@ -3,7 +3,7 @@
 
 import 'server-only';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { revalidatePath, revalidateTag } from 'next/cache';
 
 import type { Json } from '@nextblock-cms/db';
@@ -21,6 +21,7 @@ import {
   type SiteScriptRevision,
   type SiteScriptRevisionType,
 } from '../../../../lib/site-scripts/revisions';
+import { SITE_SCRIPTS_SANDBOX_MESSAGE } from './sandbox-lock';
 
 type SupabaseLike = ServiceRoleClient;
 
@@ -98,6 +99,16 @@ async function requireAdmin(): Promise<
   }
 }
 
+/**
+ * The public sandbox's admin login is published, so a script saved there would run for every
+ * later visitor (./sandbox-lock.ts). Every writer calls this right after `requireAdmin()` (a
+ * non-admin still gets the admin refusal) and before it reads or writes a row. SiteScripts
+ * renders nothing there either, for rows that arrive another way (Cortex, PostgREST).
+ */
+function sandboxRefusal(): SettingsActionResult | null {
+  return isSandboxEnvironment() ? { ok: false, error: SITE_SCRIPTS_SANDBOX_MESSAGE } : null;
+}
+
 function revalidateSiteScripts() {
   revalidateTag('public-layout-site-scripts', 'max');
   revalidatePath('/', 'layout');
@@ -165,6 +176,8 @@ function buildPayload(input: SiteScriptInput): Record<string, unknown> | { error
 export async function createSiteScript(input: SiteScriptInput): Promise<SettingsActionResult> {
   const auth = await requireAdmin();
   if (auth.error !== null) return { ok: false, error: auth.error };
+  const refused = sandboxRefusal();
+  if (refused) return refused;
   const { supabase, userId } = auth;
 
   const payload = buildPayload(input);
@@ -197,6 +210,8 @@ export async function updateSiteScript(
 ): Promise<SettingsActionResult> {
   const auth = await requireAdmin();
   if (auth.error !== null) return { ok: false, error: auth.error };
+  const refused = sandboxRefusal();
+  if (refused) return refused;
   const { supabase, userId } = auth;
 
   const payload = buildPayload(input);
@@ -232,6 +247,8 @@ export async function setSiteScriptActive(
 ): Promise<SettingsActionResult> {
   const auth = await requireAdmin();
   if (auth.error !== null) return { ok: false, error: auth.error };
+  const refused = sandboxRefusal();
+  if (refused) return refused;
   const { supabase, userId } = auth;
 
   const previous = await readScript(supabase, id);
@@ -259,6 +276,8 @@ export async function setSiteScriptActive(
 export async function deleteSiteScript(id: string): Promise<SettingsActionResult> {
   const auth = await requireAdmin();
   if (auth.error !== null) return { ok: false, error: auth.error };
+  const refused = sandboxRefusal();
+  if (refused) return refused;
   const { supabase, userId } = auth;
 
   // Read before deleting: the snapshot is what makes the delete undoable.
@@ -307,6 +326,8 @@ export async function getSiteScriptRevisions(limit = 100): Promise<SiteScriptRev
 export async function revertSiteScript(revisionId: string): Promise<SettingsActionResult> {
   const auth = await requireAdmin();
   if (auth.error !== null) return { ok: false, error: auth.error };
+  const refused = sandboxRefusal();
+  if (refused) return refused;
   const { supabase, userId } = auth;
 
   const { data: revisionRow, error: revisionError } = await supabase

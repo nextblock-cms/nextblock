@@ -18,8 +18,10 @@ import { Alert, AlertTitle, AlertDescription, Spinner } from "@nextblock-cms/ui"
 import { Eye, EyeOff, RefreshCw } from "lucide-react";
 import type { Database } from "@nextblock-cms/db";
 import { createUser } from "../actions";
+import { USERS_LOCKED_IN_SANDBOX, USERS_SANDBOX_NOTE_CLASS, USERS_SANDBOX_NOTE_ID } from "../sandbox-lock";
 
-type UserRole = Database["public"]["Enums"]["user_role"];
+// `RTL` (Affiliates partner, migration 02029) is not in the generated enum type yet.
+type UserRole = Database["public"]["Enums"]["user_role"] | "RTL";
 
 function generatePassword(length = 16): string {
   const charset =
@@ -46,6 +48,10 @@ export default function CreateUserForm() {
 
   // Only errors surface here — the action redirects on success.
   const [formError, setFormError] = useState<string | null>(null);
+
+  // The public sandbox shares every account with every visitor, so createUser refuses there: the
+  // submit renders disabled beside the reason. Read inline, as SandboxCredentialsAlert does.
+  const sandboxLocked = process.env.NEXT_PUBLIC_IS_SANDBOX === "true";
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -82,6 +88,11 @@ export default function CreateUserForm() {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
+      {sandboxLocked && (
+        <p id={USERS_SANDBOX_NOTE_ID} className={USERS_SANDBOX_NOTE_CLASS}>
+          {USERS_LOCKED_IN_SANDBOX}
+        </p>
+      )}
       {formError && (
         <Alert variant="destructive">
           <AlertTitle>Error</AlertTitle>
@@ -166,12 +177,14 @@ export default function CreateUserForm() {
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="USER">User</SelectItem>
+            <SelectItem value="RTL">Partner (RTL)</SelectItem>
             <SelectItem value="WRITER">Writer</SelectItem>
             <SelectItem value="ADMIN">Admin</SelectItem>
           </SelectContent>
         </Select>
         <p className="text-xs text-muted-foreground mt-1">
-          Writers and Admins can access the CMS. Users have public-site access only.
+          Writers and Admins can access the CMS. Users have public-site access only. Partners
+          (RTL) use the partner portal once they have joined the program at /partners.
         </p>
       </div>
 
@@ -202,7 +215,11 @@ export default function CreateUserForm() {
         >
           Cancel
         </Button>
-        <Button type="submit" disabled={isPending}>
+        <Button
+          type="submit"
+          disabled={isPending || sandboxLocked}
+          aria-describedby={sandboxLocked ? USERS_SANDBOX_NOTE_ID : undefined}
+        >
           {isPending ? (
             <>
               <Spinner className="mr-2 h-4 w-4" /> Creating...

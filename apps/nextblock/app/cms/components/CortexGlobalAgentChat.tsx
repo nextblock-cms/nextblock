@@ -28,6 +28,13 @@ import {
   SITE_BUILDER_KICKOFF_PROMPT,
   SITE_BUILDER_KICKOFF_PROMPT_WITH_BRIEF,
 } from "../../../lib/cortex-ai/site-builder-prompt";
+import {
+  CORTEX_AGENT_CHAT_LEGACY_STORAGE_KEY,
+  CORTEX_AGENT_CHAT_THREADS_STORAGE_KEY,
+  CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY,
+  CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY,
+  CORTEX_SANDBOX_SIGN_OUT_EVENT,
+} from "../../../lib/cortex-ai/sandbox-headers";
 
 type ChatRole = "assistant" | "user";
 
@@ -121,8 +128,9 @@ type CortexAgentStreamEvent =
       type: "finish";
     };
 
-const LEGACY_STORAGE_KEY = "nextblock-cortex-global-agent-chat";
-const THREADS_STORAGE_KEY = "nextblock-cortex-global-agent-chat-threads";
+// Shared with clearSandboxCortexKey(), which forgets the chat on sign-out in the sandbox.
+const LEGACY_STORAGE_KEY = CORTEX_AGENT_CHAT_LEGACY_STORAGE_KEY;
+const THREADS_STORAGE_KEY = CORTEX_AGENT_CHAT_THREADS_STORAGE_KEY;
 const MAX_STORED_MESSAGES = 40;
 const MAX_STORED_THREADS = 20;
 // Idle timeout: the request is aborted only after this many ms with NO stream
@@ -973,6 +981,9 @@ export function CortexGlobalAgentChat({
     null
   );
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Set once a sandbox sign-out starts (CORTEX_SANDBOX_SIGN_OUT_EVENT): this chat saves nothing
+  // from then on, so the history clearSandboxCortexKey() removes stays removed.
+  const signedOutRef = useRef(false);
   const pendingRefreshPathRef = useRef<string | null>(null);
   const scrollAreaRef = useRef<HTMLDivElement | null>(null);
   // A site-builder start requested (event or URL) before the threads were loaded.
@@ -989,7 +1000,7 @@ export function CortexGlobalAgentChat({
   }, []);
 
   useEffect(() => {
-    if (!isMounted || threads.length === 0) {
+    if (!isMounted || threads.length === 0 || signedOutRef.current) {
       return;
     }
 
@@ -1015,13 +1026,26 @@ export function CortexGlobalAgentChat({
   }, []);
 
   useEffect(() => {
+    // Sandbox sign-out: signOutAction's redirect lands only after the server round trip, and a
+    // reply still streaming until then would save every thread again. Stop it and save nothing more.
+    const onSandboxSignOut = () => {
+      signedOutRef.current = true;
+      abortControllerRef.current?.abort();
+    };
+
+    window.addEventListener(CORTEX_SANDBOX_SIGN_OUT_EVENT, onSandboxSignOut);
+
+    return () => window.removeEventListener(CORTEX_SANDBOX_SIGN_OUT_EVENT, onSandboxSignOut);
+  }, []);
+
+  useEffect(() => {
     const readSandboxKey = () => {
       if (process.env.NEXT_PUBLIC_IS_SANDBOX !== "true") {
         return;
       }
 
       try {
-        setHasSandboxKey(Boolean(window.localStorage.getItem("cortex_ai_sandbox_openrouter_api_key")));
+        setHasSandboxKey(Boolean(window.localStorage.getItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY)));
       } catch {
         setHasSandboxKey(false);
       }
@@ -1465,8 +1489,8 @@ export function CortexGlobalAgentChat({
       };
 
       if (process.env.NEXT_PUBLIC_IS_SANDBOX === "true") {
-        const sandboxKey = window.localStorage.getItem("cortex_ai_sandbox_openrouter_api_key");
-        const sandboxModel = window.localStorage.getItem("cortex_ai_sandbox_openrouter_model_selection");
+        const sandboxKey = window.localStorage.getItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY);
+        const sandboxModel = window.localStorage.getItem(CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY);
         if (sandboxKey) {
           headers["x-sandbox-openrouter-key"] = sandboxKey;
         }

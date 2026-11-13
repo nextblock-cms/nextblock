@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Refuses to let a broken library build reach npm.
 //
-//   node tools/scripts/verify-lib-dist.js <lib>        (utils | ui | sdk | db | editor | ecommerce | cortex)
+//   node tools/scripts/verify-lib-dist.js <lib>        (utils | ui | sdk | db | editor | ecommerce | cortex | affiliates)
 //   node tools/scripts/verify-lib-dist.js              (every lib that has a dist/libs/<lib> build)
 //
 // release-lib.js calls `verifyLibDist` right after the Nx build and before `npm publish`.
@@ -47,6 +47,24 @@
 //      "This library was generated with Nx" stubs, the READMEs that did exist linked to
 //      `../../docs/...` (a 404 on npmjs.com), five manifests dropped `license`, and cortex and
 //      ecom pointed `repository` at a GitHub repo that does not exist.
+//   9. `workspace:` dependency specs in the manifest. The premium libs' builds copy the raw
+//      source package.json (`"@nextblock-cms/utils": "workspace:*"`); release-lib.js resolves
+//      them to the sibling versions, but only for a lib it finalizes. A new lib without that
+//      step would publish a manifest every `npm install` refuses (EUNSUPPORTEDPROTOCOL), and
+//      the monorepo, which never installs from dist, would not notice.
+//  10. A `sideEffects` list that lost its way to npm. Bundlers drop every module the list does
+//      not name once nothing uses its exports, which keeps /partners free of the storefront
+//      renderer (affiliates). An entry naming a file the tarball lacks (a renamed entry, a new
+//      output extension) would silently drop a real side effect in every scaffold: the server
+//      entry's `import 'server-only'` guard or the jitless zod config.
+//  11. Sibling packages the shipped JavaScript imports but the manifest does not declare. Every
+//      lib leaves `@nextblock-cms/*` external, yet editor, ui and db published none of theirs
+//      through 0.22.5: the editor then began importing sanitizeAuthoredBlockHtml, which utils
+//      0.22.5 lacks, and npm had no way to know, so upgrading only the editor would have failed
+//      on a missing export. Scaffolds never noticed because the app depends on every sibling
+//      itself. Every `@nextblock-cms/<pkg>` a packed JS file imports must be in `dependencies`
+//      or `peerDependencies`; `@nextblock-cms/ecommerce` is the alias of the published
+//      `@nextblock-cms/ecom`, so it is declared under that name with an `npm:` spec.
 
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
@@ -393,20 +411,21 @@ const CODE_FILE = /\.(c|m)?js$/;
 const DECLARATION_FILE = /\.d\.(c|m)?ts$/;
 
 /**
- * Relative specifiers a file really imports: `import`/`export … from`, bare `import`,
- * `import()`, `require()` and, in declarations, `import("./x").T`. Parsed with TypeScript
- * (a root devDependency) rather than matched with a regex, because bundled dependencies keep
- * their comments: highlight.js ships `@typedef { import("./html_renderer").Renderer }` inside
- * the editor bundle, which is not an import.
+ * The module specifiers `accept` keeps, out of every one a file really imports:
+ * `import`/`export … from`, bare `import`, `import()`, `require()` and, in declarations,
+ * `import("./x").T`. Parsed with TypeScript (a root devDependency) rather than matched with a
+ * regex, because bundled dependencies keep their comments and strings: highlight.js ships
+ * `@typedef { import("./html_renderer").Renderer }` inside the editor bundle, and utils throws
+ * "@nextblock-cms/utils server helpers cannot be imported …", and neither is an import.
  */
-function relativeSpecifiersIn(file, text) {
+function moduleSpecifiersIn(file, text, accept) {
   const ts = require('typescript');
   const scriptKind = DECLARATION_FILE.test(file) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, false, scriptKind);
   const specifiers = new Set();
 
   const add = (node) => {
-    if (node && ts.isStringLiteralLike(node) && /^\.{1,2}\//.test(node.text)) specifiers.add(node.text);
+    if (node && ts.isStringLiteralLike(node) && accept(node.text)) specifiers.add(node.text);
   };
 
   const visit = (node) => {
@@ -432,6 +451,11 @@ function relativeSpecifiersIn(file, text) {
   return specifiers;
 }
 
+/** The relative specifiers a file really imports (see moduleSpecifiersIn). */
+function relativeSpecifiersIn(file, text) {
+  return moduleSpecifiersIn(file, text, (specifier) => /^\.{1,2}\//.test(specifier));
+}
+
 /** Every string target in an `exports` map (all conditions), e.g. './index.mjs' or './lib/*.es.js'. */
 function collectExportTargets(entry, targets = new Set()) {
   if (typeof entry === 'string') {
@@ -448,8 +472,7 @@ function collectExportTargets(entry, targets = new Set()) {
  * plus `exports` targets it would not publish. Exported so the check can be exercised on a
  * scratch copy of a dist directory.
  */
-function findUnpackedFiles(library, distDir) {
-  const packed = listPackedFiles(distDir);
+function findUnpackedFiles(library, distDir, packed = listPackedFiles(distDir)) {
   const problems = [];
 
   // Extension-less specifiers resolve the way the consumer's bundler does, with the
@@ -723,24 +746,216 @@ function findPackagePageProblems(library, distDir, packed = listPackedFiles(dist
   return problems;
 }
 
+/* ---------------------------- 9. workspace: dependencies ---------------------------- */
+
+const DEPENDENCY_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies'];
+
+/**
+ * `workspace:` specs left in the dist manifest. Judges the manifest that will ship, like checks
+ * 2, 5 and 7: when `manifestFinalized` is false (a plain `nx build`, before release-lib.js has
+ * run) the `dependencies` of a lib that release-lib.js finalizes (it has a `publishExportsFor`
+ * map) are still to be resolved, so only the sections that step does not rewrite count.
+ * release-lib.js passes `manifestFinalized: true`, and then every `workspace:` spec is a problem.
+ */
+function findWorkspaceProtocolDependencies(library, distDir, { manifestFinalized = false } = {}) {
+  const manifestPath = path.join(distDir, 'package.json');
+  if (!fs.existsSync(manifestPath)) return [];
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const finalizedLater = !manifestFinalized && publishExportsFor(library) !== null;
+  const problems = [];
+
+  for (const section of DEPENDENCY_SECTIONS) {
+    const deps = manifest[section];
+    if (!deps || typeof deps !== 'object') continue;
+    if (finalizedLater && (section === 'dependencies' || section === 'optionalDependencies' || section === 'peerDependencies')) {
+      continue;
+    }
+
+    for (const [name, spec] of Object.entries(deps)) {
+      if (typeof spec === 'string' && spec.trim().startsWith('workspace:')) {
+        problems.push(
+          `${section}["${name}"] is "${spec}": npm cannot install the workspace protocol; resolve it to a published version (release-lib.js finalizes premium manifests through publishExportsFor)`
+        );
+      }
+    }
+  }
+
+  return problems;
+}
+
+/* ------------------------------ 10. sideEffects ------------------------------ */
+
+/** The lib's own manifest (`libs/<lib>/package.json`, the one the build copies), or null. */
+function readSourceManifest(library) {
+  const manifestPath = path.join(workspaceRoot, 'libs', library === 'ecom' ? 'ecommerce' : library, 'package.json');
+  return fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : null;
+}
+
+/** A `sideEffects` wildcard as a RegExp over packed paths (`*` within a segment, `**` across). */
+function sideEffectsWildcard(pattern) {
+  const source = pattern
+    .split('**')
+    .map((part) => part.split('*').map((piece) => piece.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*'))
+    .join('.*');
+  // Without a slash, bundlers match the pattern against the file name in any directory.
+  return new RegExp(`^${pattern.includes('/') ? '' : '(?:.*/)?'}${source}$`);
+}
+
+/**
+ * Problems with the dist manifest's `sideEffects`: it must equal the source manifest's list
+ * (release-lib.js copies the field through), and every entry outside `./src/` (the source form
+ * the monorepo reads) must name a file the tarball contains, or a wildcard matching one.
+ * `packed` and `sourceManifest` are parameters so tests never run `npm pack`.
+ */
+function findSideEffectsProblems(library, distDir, packed = listPackedFiles(distDir), sourceManifest = readSourceManifest(library)) {
+  const manifestPath = path.join(distDir, 'package.json');
+  if (!fs.existsSync(manifestPath)) return [];
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const problems = [];
+
+  if (
+    sourceManifest &&
+    sourceManifest.sideEffects !== undefined &&
+    JSON.stringify(manifest.sideEffects) !== JSON.stringify(sourceManifest.sideEffects)
+  ) {
+    problems.push('"sideEffects" differs from the source package.json; the dist manifest must carry the same list');
+  }
+
+  const list = manifest.sideEffects;
+  if (list === undefined || typeof list === 'boolean') return problems;
+  if (!Array.isArray(list)) return [...problems, '"sideEffects" must be a boolean or an array of paths'];
+
+  for (const entry of list) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      problems.push(`"sideEffects" has an entry that is not a path: ${JSON.stringify(entry)}`);
+      continue;
+    }
+
+    const normalized = path.posix.normalize(entry).replace(/^\.\//, '');
+    if (normalized.startsWith('src/')) continue;
+    if (/[?[\]{}!]/.test(normalized)) continue; // glob syntax this check does not model
+
+    if (normalized.includes('*')) {
+      const pattern = sideEffectsWildcard(normalized);
+      if (![...packed].some((file) => pattern.test(file))) {
+        problems.push(`"sideEffects" pattern ${entry} matches no file in the tarball`);
+      }
+    } else if (!packed.has(normalized)) {
+      problems.push(
+        `"sideEffects" lists ${entry} but the tarball does not contain it, so bundlers may drop the side effect of the module it meant`
+      );
+    }
+  }
+
+  return problems;
+}
+
+/* ---------------------------- 11. undeclared siblings ---------------------------- */
+
+/** The package part of a sibling specifier: `@nextblock-cms/ui` out of `@nextblock-cms/ui/button`. */
+const SIBLING_PACKAGE = /^@nextblock-cms\/[^/]+/;
+/** The import name the app and the libs use for the package npm knows as @nextblock-cms/ecom. */
+const ECOM_IMPORT_NAME = '@nextblock-cms/ecommerce';
+const ECOM_PUBLISHED_NAME = '@nextblock-cms/ecom';
+const ECOM_ALIAS_SPEC = /^npm:@nextblock-cms\/ecom(?:@|$)/;
+/** The sections npm installs a declared sibling from (an optional one may silently be absent). */
+const SIBLING_SECTIONS = ['dependencies', 'peerDependencies'];
+
+/**
+ * Sibling packages (`@nextblock-cms/*`) that a JavaScript file in the tarball imports but the
+ * dist manifest declares in neither `dependencies` nor `peerDependencies`. Judges the manifest
+ * that will ship, like check 9: a `workspace:` spec counts as declared (release-lib.js resolves
+ * it for a lib it finalizes, and check 9 refuses one it leaves behind). A package importing
+ * itself needs no declaration; ecom is imported as @nextblock-cms/ecommerce everywhere, itself
+ * included. `packed` is a parameter so tests never run `npm pack`.
+ */
+function findUndeclaredSiblingImports(library, distDir, packed = listPackedFiles(distDir)) {
+  const manifestPath = path.join(distDir, 'package.json');
+  if (!fs.existsSync(manifestPath)) return []; // checks 2 and 5 report a missing manifest
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const self = new Set([manifest.name, importNameFor(library)]);
+  /** package name -> the first file (sorted) importing it, and the specifier it used */
+  const imported = new Map();
+
+  for (const file of [...packed].sort()) {
+    if (!CODE_FILE.test(file)) continue;
+
+    const text = fs.readFileSync(path.join(distDir, ...file.split('/')), 'utf8');
+    if (!text.includes('@nextblock-cms/')) continue; // nothing to find; spare the parse
+
+    for (const specifier of moduleSpecifiersIn(file, text, (candidate) => SIBLING_PACKAGE.test(candidate))) {
+      const name = specifier.match(SIBLING_PACKAGE)[0];
+      if (!self.has(name) && !imported.has(name)) imported.set(name, { file, specifier });
+    }
+  }
+
+  const problems = [];
+
+  for (const [name, { file, specifier }] of imported) {
+    const declared = SIBLING_SECTIONS.flatMap((section) =>
+      manifest[section] && typeof manifest[section] === 'object' && manifest[section][name] !== undefined
+        ? [{ section, spec: manifest[section][name] }]
+        : []
+    );
+
+    if (declared.length === 0) {
+      const aliasHint =
+        name === ECOM_IMPORT_NAME && SIBLING_SECTIONS.some((section) => manifest[section]?.[ECOM_PUBLISHED_NAME] !== undefined)
+          ? `; declaring ${ECOM_PUBLISHED_NAME} installs it under that name, so declare "${ECOM_IMPORT_NAME}": "npm:${ECOM_PUBLISHED_NAME}@<range>" instead`
+          : '';
+      problems.push(
+        `${file} imports "${specifier}" but neither "dependencies" nor "peerDependencies" declares ${name}, so npm cannot ` +
+          `tell which release this build needs; declare it in the package.json the build writes${aliasHint}`
+      );
+      continue;
+    }
+
+    if (name !== ECOM_IMPORT_NAME) continue;
+
+    for (const { section, spec } of declared) {
+      if (typeof spec === 'string' && (spec.trim().startsWith('workspace:') || ECOM_ALIAS_SPEC.test(spec.trim()))) continue;
+      problems.push(
+        `${section}["${name}"] is ${JSON.stringify(spec)}, which installs a package named ${name}; NextBlock publishes it as ` +
+          `${ECOM_PUBLISHED_NAME}, so the spec must be "npm:${ECOM_PUBLISHED_NAME}@<range>"`
+      );
+    }
+  }
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
-function verifyLibDist(library) {
+/**
+ * @param {string} library
+ * @param {{ manifestFinalized?: boolean }} [options] `manifestFinalized`: the dist package.json
+ *   is the one that will be published (release-lib.js has normalized it).
+ */
+function verifyLibDist(library, options = {}) {
   const distDir = distDirFor(library);
 
   if (!fs.existsSync(distDir)) {
     throw new Error(`Build output not found at ${distDir}`);
   }
 
+  // One `npm pack --dry-run` for every check that reads the tarball's file list.
+  const packed = listPackedFiles(distDir);
+
   const problems = [
     ...findDevelopmentArtifacts(distDir).map((entry) => `development build artifact: ${entry}`),
     ...findUnresolvableSubpaths(library, distDir).map((entry) => `unresolvable subpath: ${entry}`),
     ...findLostExports(library, distDir).map((entry) => `lost export: ${entry}`),
     ...findDanglingDeclarationImports(distDir).map((entry) => `missing declaration: ${entry}`),
-    ...findUnpackedFiles(library, distDir).map((entry) => `not in the npm tarball: ${entry}`),
+    ...findUnpackedFiles(library, distDir, packed).map((entry) => `not in the npm tarball: ${entry}`),
     ...findRequireShims(distDir).map((entry) => `require() shim in ESM: ${entry}`),
     ...findModuleFormatProblems(library, distDir).map((entry) => `module format: ${entry}`),
-    ...findPackagePageProblems(library, distDir).map((entry) => `package page: ${entry}`),
+    ...findPackagePageProblems(library, distDir, packed).map((entry) => `package page: ${entry}`),
+    ...findWorkspaceProtocolDependencies(library, distDir, options).map((entry) => `workspace dependency: ${entry}`),
+    ...findSideEffectsProblems(library, distDir, packed).map((entry) => `side effects: ${entry}`),
+    ...findUndeclaredSiblingImports(library, distDir, packed).map((entry) => `undeclared sibling: ${entry}`),
   ];
 
   if (problems.length > 0) {
@@ -761,16 +976,23 @@ module.exports = {
   findRequireShims,
   findModuleFormatProblems,
   findPackagePageProblems,
+  findWorkspaceProtocolDependencies,
+  findSideEffectsProblems,
+  findUndeclaredSiblingImports,
 };
 
 if (require.main === module) {
   const requested = process.argv[2];
   const libraries = requested
     ? [requested]
-    : ['utils', 'ui', 'sdk', 'db', 'editor', 'ecommerce', 'cortex'].filter((library) => fs.existsSync(distDirFor(library)));
+    : ['utils', 'ui', 'sdk', 'db', 'editor', 'ecommerce', 'cortex', 'affiliates'].filter((library) =>
+        fs.existsSync(distDirFor(library))
+      );
 
   if (libraries.length === 0) {
-    console.error('Usage: node tools/scripts/verify-lib-dist.js [utils|ui|sdk|db|editor|ecommerce|cortex] (no dist/libs/* build found)');
+    console.error(
+      'Usage: node tools/scripts/verify-lib-dist.js [utils|ui|sdk|db|editor|ecommerce|cortex|affiliates] (no dist/libs/* build found)'
+    );
     process.exit(1);
   }
 

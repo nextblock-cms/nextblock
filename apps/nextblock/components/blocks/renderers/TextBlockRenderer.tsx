@@ -3,6 +3,7 @@ import ClientTextBlockRenderer from "./ClientTextBlockRenderer";
 import type { VisualEditAttributes } from "../../../lib/visual-editing/types";
 import { sanitizeAuthoredBlockHtml } from "../../../lib/blocks/inlineScriptNonce";
 import { substitutePrivacyMergeTags } from "../../../lib/privacy/contact-emails";
+import { isTiptapJsonString } from "./tiptap-json-string";
 
 export type TextBlockContent = {
     html_content?: string;
@@ -28,7 +29,9 @@ const TextBlockRenderer: React.FC<TextBlockRendererProps> = async ({
   if (html.includes('{{')) {
     html = await substitutePrivacyMergeTags(html);
   }
-  const safeHtml = html ? sanitizeAuthoredBlockHtml(html) : '';
+  // Tiptap JSON renders through React, which escapes its text (isTiptapJsonString): the HTML
+  // sanitizer would show an authored `a<b` as `a&lt;b`. Everything else is HTML.
+  const safeHtml = isTiptapJsonString(html) ? html : sanitizeAuthoredBlockHtml(html);
   const patchedContent = { ...content, html_content: safeHtml };
   return (
     <ClientTextBlockRenderer

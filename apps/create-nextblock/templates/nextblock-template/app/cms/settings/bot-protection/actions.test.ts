@@ -1,3 +1,4 @@
+import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -11,6 +12,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * every site_settings read and write here must go through the service-role client after the
  * caller's role is verified through the cookie session — the cookie client only ever serves
  * the actor's own profile row.
+ *
+ * 2026-11-03: the public sandbox publishes its admin login, so a secret one visitor saved was put
+ * in the form of every later visitor. There a submitted secret is refused before any settings read
+ * and the stored one never reaches the form. Off the sandbox ('', 'false', 'TRUE', '1') every case
+ * runs unchanged.
  */
 
 const mocks = vi.hoisted(() => ({
@@ -18,6 +24,8 @@ const mocks = vi.hoisted(() => ({
   role: 'ADMIN' as string | null,
   settings: new Map<string, unknown>(),
   upserts: [] as Array<{ key: string; value: unknown }>,
+  /** site_settings keys read through the service role, in order. */
+  serviceReads: [] as string[],
   cookieFrom: vi.fn(),
   serviceFrom: vi.fn(),
   revalidatePath: vi.fn(),
@@ -55,10 +63,13 @@ vi.mock('@nextblock-cms/db/server', async (importOriginal) => ({
       return {
         select: () => ({
           eq: (_column: string, key: string) => ({
-            maybeSingle: async () => ({
-              data: mocks.settings.has(key) ? { value: mocks.settings.get(key) } : null,
-              error: null,
-            }),
+            maybeSingle: async () => {
+              mocks.serviceReads.push(key);
+              return {
+                data: mocks.settings.has(key) ? { value: mocks.settings.get(key) } : null,
+                error: null,
+              };
+            },
           }),
         }),
         upsert: async (row: { key: string; value: unknown }) => {
@@ -71,7 +82,7 @@ vi.mock('@nextblock-cms/db/server', async (importOriginal) => ({
   }),
 }));
 
-import { encryptSecret, isEncryptedSecretEnvelope, tryDecryptWithEnvKey } from '@nextblock-cms/db/server';
+import { encryptSecret, isEncryptedSecretEnvelope, tryDecryptWithEnvKey, siteSettingSecretSlot } from '@nextblock-cms/db/server';
 import { getBotProtectionSettings, updateBotProtectionSettings } from './actions';
 
 const ENV_KEYS = [
@@ -81,6 +92,10 @@ const ENV_KEYS = [
   'SUPABASE_SECRET_KEY',
 ] as const;
 const TEST_KEY = 'bot-protection-actions-test-key';
+/** Where the captcha secret lives; an envelope sealed for any other slot does not open there. */
+const BOT_SLOT = siteSettingSecretSlot('bot_protection_secret', 'secretKey');
+/** NEXT_PUBLIC_IS_SANDBOX values that are not the sandbox: only the exact string 'true' is. */
+const OFF_SANDBOX = ['', 'false', 'TRUE', '1'] as const;
 const SECRET = '0x4AAAAAAABotRedteamTURNSTILE_secret_XYZ';
 
 function submission(secretKey: string): FormData {
@@ -95,33 +110,40 @@ function secretUpserts() {
   return mocks.upserts.filter((row) => row.key === 'bot_protection_secret');
 }
 
-describe('bot protection settings actions', () => {
-  const original: Record<string, string | undefined> = {};
-  let consoleError: ReturnType<typeof vi.spyOn>;
+const original: Record<string, string | undefined> = {};
+let consoleError: ReturnType<typeof vi.spyOn>;
 
+beforeEach(() => {
+  for (const key of ENV_KEYS) {
+    original[key] = process.env[key];
+    delete process.env[key];
+  }
+  process.env['NEXTBLOCK_ENCRYPTION_KEY'] = TEST_KEY;
+  vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
+
+  mocks.user = { id: 'admin-1' };
+  mocks.role = 'ADMIN';
+  mocks.settings.clear();
+  mocks.upserts.length = 0;
+  mocks.serviceReads.length = 0;
+  mocks.cookieFrom.mockReset();
+  mocks.serviceFrom.mockReset();
+  mocks.revalidatePath.mockReset();
+  consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+});
+
+afterEach(() => {
+  consoleError.mockRestore();
+  for (const key of ENV_KEYS) {
+    if (original[key] === undefined) delete process.env[key];
+    else process.env[key] = original[key];
+  }
+  vi.unstubAllEnvs();
+});
+
+describe.each(OFF_SANDBOX)('bot protection settings actions (NEXT_PUBLIC_IS_SANDBOX=%j)', (sandboxValue) => {
   beforeEach(() => {
-    for (const key of ENV_KEYS) {
-      original[key] = process.env[key];
-      delete process.env[key];
-    }
-    process.env['NEXTBLOCK_ENCRYPTION_KEY'] = TEST_KEY;
-
-    mocks.user = { id: 'admin-1' };
-    mocks.role = 'ADMIN';
-    mocks.settings.clear();
-    mocks.upserts.length = 0;
-    mocks.cookieFrom.mockReset();
-    mocks.serviceFrom.mockReset();
-    mocks.revalidatePath.mockReset();
-    consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-  });
-
-  afterEach(() => {
-    consoleError.mockRestore();
-    for (const key of ENV_KEYS) {
-      if (original[key] === undefined) delete process.env[key];
-      else process.env[key] = original[key];
-    }
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', sandboxValue);
   });
 
   it('encrypts a submitted secret at rest and reads it back decrypted', async () => {
@@ -133,7 +155,7 @@ describe('bot protection settings actions', () => {
     const value = row.value as { secretKey: unknown };
     expect(isEncryptedSecretEnvelope(value.secretKey)).toBe(true);
     expect(JSON.stringify(row.value)).not.toContain(SECRET);
-    expect(tryDecryptWithEnvKey(value.secretKey)).toBe(SECRET);
+    expect(tryDecryptWithEnvKey(value.secretKey, BOT_SLOT)).toBe(SECRET);
 
     // The public half is still plain JSON.
     expect(mocks.settings.get('bot_protection_public')).toEqual({
@@ -182,11 +204,11 @@ describe('bot protection settings actions', () => {
     const value = row.value as { secretKey: unknown };
     expect(isEncryptedSecretEnvelope(value.secretKey)).toBe(true);
     expect(JSON.stringify(row.value)).not.toContain(SECRET);
-    expect(tryDecryptWithEnvKey(value.secretKey)).toBe(SECRET);
+    expect(tryDecryptWithEnvKey(value.secretKey, BOT_SLOT)).toBe(SECRET);
   });
 
   it('leaves an already-encrypted secret untouched when the field is submitted empty', async () => {
-    const envelope = encryptSecret({ value: SECRET, encryptionSecret: TEST_KEY });
+    const envelope = encryptSecret({ value: SECRET, encryptionSecret: TEST_KEY, slot: BOT_SLOT });
     mocks.settings.set('bot_protection_secret', { secretKey: envelope });
 
     const result = await updateBotProtectionSettings(submission(''));
@@ -198,15 +220,53 @@ describe('bot protection settings actions', () => {
     expect(mocks.upserts.map((row) => row.key)).toEqual(['bot_protection_public']);
   });
 
+  it('re-seals an envelope from before 0.23.1 for its field when the field is submitted empty', async () => {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', createHash('sha256').update(TEST_KEY).digest(), iv);
+    const ciphertext = Buffer.concat([cipher.update(SECRET, 'utf8'), cipher.final()]);
+    const legacy = {
+      algorithm: 'aes-256-gcm',
+      authTag: cipher.getAuthTag().toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+      iv: iv.toString('base64'),
+      last4: SECRET.slice(-4),
+      updatedAt: '2026-01-02T03:04:05.000Z',
+      version: 1,
+    };
+    mocks.settings.set('bot_protection_secret', { secretKey: legacy });
+
+    const result = await updateBotProtectionSettings(submission(''));
+    expect(result.ok).toBe(true);
+
+    const [row, ...rest] = secretUpserts();
+    expect(rest).toHaveLength(0);
+    const value = row.value as { secretKey: { version: number } };
+    expect(value.secretKey.version).toBe(2);
+    expect(tryDecryptWithEnvKey(value.secretKey, BOT_SLOT)).toBe(SECRET);
+  });
+
+  it('never shows an envelope copied in from another row on the form (2026-11-04)', async () => {
+    mocks.settings.set('bot_protection_public', { provider: 'turnstile', siteKey: 'site-key' });
+    mocks.settings.set('bot_protection_secret', {
+      secretKey: encryptSecret({
+        value: 'sk_live_victim',
+        encryptionSecret: TEST_KEY,
+        slot: siteSettingSecretSlot('payment_secret', 'stripeSecretKey'),
+      }),
+    });
+
+    await expect(getBotProtectionSettings()).resolves.toEqual({ provider: 'turnstile', siteKey: 'site-key', secretKey: '' });
+  });
+
   it('replaces the stored secret when a new one is submitted', async () => {
     mocks.settings.set('bot_protection_secret', {
-      secretKey: encryptSecret({ value: 'old-secret', encryptionSecret: TEST_KEY }),
+      secretKey: encryptSecret({ value: 'old-secret', encryptionSecret: TEST_KEY, slot: BOT_SLOT }),
     });
 
     await updateBotProtectionSettings(submission(SECRET));
 
     const [row] = secretUpserts();
-    expect(tryDecryptWithEnvKey((row.value as { secretKey: unknown }).secretKey)).toBe(SECRET);
+    expect(tryDecryptWithEnvKey((row.value as { secretKey: unknown }).secretKey, BOT_SLOT)).toBe(SECRET);
   });
 
   it('fails the whole save, without logging the secret, when no encryption key is configured', async () => {
@@ -245,5 +305,70 @@ describe('bot protection settings actions', () => {
     expect(mocks.upserts).toHaveLength(0);
     expect(mocks.serviceFrom).not.toHaveBeenCalled();
     await expect(getBotProtectionSettings()).rejects.toThrow('Unauthorized');
+  });
+});
+
+describe('bot protection settings on the public sandbox (NEXT_PUBLIC_IS_SANDBOX=true)', () => {
+  const REFUSED = { ok: false, error: 'The sandbox cannot store captcha secret keys.' };
+
+  beforeEach(() => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+  });
+
+  it('refuses a submitted secret before any settings read or write', async () => {
+    const stored = { secretKey: encryptSecret({ value: 'operator-secret', encryptionSecret: TEST_KEY, slot: BOT_SLOT }) };
+    mocks.settings.set('bot_protection_secret', stored);
+
+    await expect(updateBotProtectionSettings(submission(SECRET))).resolves.toEqual(REFUSED);
+    await expect(updateBotProtectionSettings(submission(`  ${SECRET}  `))).resolves.toEqual(REFUSED);
+
+    expect(mocks.upserts).toHaveLength(0);
+    expect(mocks.serviceFrom).not.toHaveBeenCalled();
+    expect(mocks.revalidatePath).not.toHaveBeenCalled();
+    expect(mocks.settings.get('bot_protection_secret')).toBe(stored);
+  });
+
+  it('still saves the provider and site key with the secret left empty, keeping the stored one', async () => {
+    const stored = { secretKey: encryptSecret({ value: 'operator-secret', encryptionSecret: TEST_KEY, slot: BOT_SLOT }) };
+    mocks.settings.set('bot_protection_secret', stored);
+
+    await expect(updateBotProtectionSettings(submission(''))).resolves.toEqual({ ok: true, message: expect.any(String) });
+
+    expect(mocks.upserts.map((row) => row.key)).toEqual(['bot_protection_public']);
+    expect(mocks.settings.get('bot_protection_public')).toEqual({ provider: 'turnstile', siteKey: '0x4AAAAAAAB-site' });
+    expect(secretUpserts()).toHaveLength(0);
+    expect(mocks.settings.get('bot_protection_secret')).toBe(stored);
+  });
+
+  it.each([
+    ['an encrypted secret', () => ({ secretKey: encryptSecret({ value: SECRET, encryptionSecret: TEST_KEY, slot: BOT_SLOT }) })],
+    ['a pre-encryption plaintext secret', () => ({ secretKey: SECRET })],
+  ])('never returns %s to the form, and never reads the secret row', async (_label, row) => {
+    mocks.settings.set('bot_protection_public', { provider: 'turnstile', siteKey: '0x4AAAAAAAB-site' });
+    mocks.settings.set('bot_protection_secret', row());
+
+    const settings = await getBotProtectionSettings();
+
+    expect(settings).toEqual({ provider: 'turnstile', siteKey: '0x4AAAAAAAB-site', secretKey: '' });
+    expect(JSON.stringify(settings)).not.toContain(SECRET);
+    expect(mocks.serviceReads).toEqual(['bot_protection_public']);
+  });
+
+  it('still answers a non-admin and an anonymous caller with their own refusals', async () => {
+    mocks.role = 'WRITER';
+    await expect(updateBotProtectionSettings(submission(SECRET))).resolves.toEqual({
+      ok: false,
+      error: expect.stringMatching(/permission/i),
+    });
+    await expect(getBotProtectionSettings()).rejects.toThrow('Forbidden');
+
+    mocks.user = null;
+    await expect(updateBotProtectionSettings(submission(SECRET))).resolves.toEqual({
+      ok: false,
+      error: expect.stringMatching(/logged in/i),
+    });
+    await expect(getBotProtectionSettings()).rejects.toThrow('Unauthorized');
+    expect(mocks.upserts).toHaveLength(0);
+    expect(mocks.serviceFrom).not.toHaveBeenCalled();
   });
 });

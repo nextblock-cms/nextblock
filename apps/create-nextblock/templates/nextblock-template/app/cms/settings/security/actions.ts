@@ -103,6 +103,17 @@ async function guard(body: () => Promise<ActionResult>): Promise<ActionResult> {
   }
 }
 
+const SANDBOX_SECURITY_MESSAGE = 'Security settings are disabled in the sandbox environment.';
+
+/**
+ * Every visitor to the public sandbox shares its demo accounts, and a factor enrolled on one would make
+ * the database ask every other visitor for a second factor until the next reset deletes it (the
+ * reset's restoreDemoAdmin): enrolling, disabling and device changes are off.
+ */
+function securityLockedInSandbox(): boolean {
+  return process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+}
+
 export async function getSecurityPanelData(): Promise<SecurityPanelData> {
   const { supabase, user } = await requireUser();
 
@@ -150,6 +161,10 @@ export async function getSecurityPanelData(): Promise<SecurityPanelData> {
 
 export async function updateAutoAcceptSignups(formData: FormData): Promise<ActionResult> {
   return guard(async () => {
+    // The sandbox's admin login is public: auto-approve there would hand anyone live accounts.
+    if (process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') {
+      return { ok: false, error: 'Sign-up settings are disabled in the sandbox.' };
+    }
     const { supabase, user } = await requireUser();
     const { data: profile } = await supabase
       .from('profiles')
@@ -210,6 +225,9 @@ export type EnrollTotpResult =
   | { ok: false; error: string };
 
 export async function startTotpEnrollment(): Promise<EnrollTotpResult> {
+  if (securityLockedInSandbox()) {
+    return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+  }
   const { supabase } = await requireUser();
 
   // Clear any half-finished factors so re-enrolling never hits a name clash.
@@ -245,6 +263,9 @@ export async function startTotpEnrollment(): Promise<EnrollTotpResult> {
 
 export async function verifyTotpEnrollment(formData: FormData): Promise<ActionResult> {
   return guard(async () => {
+    if (securityLockedInSandbox()) {
+      return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+    }
     const { supabase, user } = await requireUser();
     const factorId = formData.get('factorId')?.toString() ?? '';
     const code = (formData.get('code')?.toString() ?? '').trim();
@@ -288,6 +309,9 @@ export async function verifyTotpEnrollment(formData: FormData): Promise<ActionRe
 
 export async function sendEmailEnrollmentCode(): Promise<ActionResult> {
   return guard(async () => {
+    if (securityLockedInSandbox()) {
+      return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+    }
     const { user } = await requireUser();
     if (!user.email) {
       return { ok: false, error: 'Your account has no email address on file.' };
@@ -330,6 +354,9 @@ export async function sendEmailEnrollmentCode(): Promise<ActionResult> {
 
 export async function verifyEmailEnrollment(formData: FormData): Promise<ActionResult> {
   return guard(async () => {
+    if (securityLockedInSandbox()) {
+      return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+    }
     const { user } = await requireUser();
     const code = (formData.get('code')?.toString() ?? '').trim();
 
@@ -359,6 +386,9 @@ export async function verifyEmailEnrollment(formData: FormData): Promise<ActionR
 
 export async function disableMfa(): Promise<ActionResult> {
   return guard(async () => {
+    if (securityLockedInSandbox()) {
+      return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+    }
     const { supabase, user } = await requireUser();
 
     const { data: factors } = await supabase.auth.mfa.listFactors();
@@ -389,6 +419,9 @@ export async function disableMfa(): Promise<ActionResult> {
 
 export async function revokeTrustedDeviceAction(formData: FormData): Promise<ActionResult> {
   return guard(async () => {
+    if (securityLockedInSandbox()) {
+      return { ok: false, error: SANDBOX_SECURITY_MESSAGE };
+    }
     const { user } = await requireUser();
     const id = formData.get('id')?.toString() ?? '';
     if (!id) {

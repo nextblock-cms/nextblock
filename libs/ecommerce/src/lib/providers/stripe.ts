@@ -1,12 +1,13 @@
 import 'server-only';
 
 import Stripe from 'stripe';
-import { getStripeClient } from '../stripe/client';
+import { getStripeClient, resolveStripeKeyLivemode } from '../stripe/client';
 import { createClient } from '@supabase/supabase-js';
 import { countries } from '../countries';
 import {
   CheckoutSessionInput,
   CustomerAddressInput,
+  insertPendingOrderWithAttribution,
   normalizeOrderCustomerDetails,
 } from '../customer';
 import {
@@ -200,6 +201,7 @@ export class StripeProvider implements PaymentProvider {
     locale,
     couponCode,
     couponContextItems: submittedCouponContextItems,
+    attribution,
   }: CheckoutSessionInput): Promise<{
     url: string | null;
     error?: string;
@@ -699,9 +701,18 @@ export class StripeProvider implements PaymentProvider {
     });
     const orderTotal = Math.max(0, totalAmount - discountTotal) + shippingAmount + manualTaxAmount;
 
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .insert({
+    // The attribution columns ride along only when the app resolved a partner; a database
+    // without them (or refusing them) gets the order without attribution, never a failed checkout.
+    // They carry the mode of the key that creates this session, so a test-mode sale can only
+    // ever be paid out by a test-mode transfer.
+    const {
+      result: { data: order, error: orderError },
+      attributed,
+    } = await insertPendingOrderWithAttribution({
+      provider: 'Stripe',
+      attribution,
+      livemode: attribution ? await resolveStripeKeyLivemode() : null,
+      row: {
         status: 'pending',
         total: orderTotal,
         currency,
@@ -726,9 +737,9 @@ export class StripeProvider implements PaymentProvider {
         provider: 'stripe',
         user_id: userId,
         customer_details: initialCustomerDetails,
-      })
-      .select('id')
-      .single();
+      },
+      insert: (row) => supabase.from('orders').insert(row).select('id').single(),
+    });
 
     if (orderError || !order) {
       console.error('Failed to create pending order:', orderError);
@@ -842,6 +853,12 @@ export class StripeProvider implements PaymentProvider {
           taxMode: taxCalculation.mode,
           currencyCode: selectedCurrency.code,
           couponCode: couponQuote?.code || '',
+          ...(attributed ? { affiliateId: attributed.affiliate_id } : {}),
+        },
+        // A refund or a dispute names the PaymentIntent, not the session: its metadata leads
+        // the webhook back to the order even when the order never recorded payment_intent_id.
+        payment_intent_data: {
+          metadata: { orderId },
         },
       });
 

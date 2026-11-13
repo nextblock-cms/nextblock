@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import {
+  FULL_BACKUP_SANDBOX_MESSAGE,
   requireFullBackupAdmin,
   restoreFullBackupArchive,
   reviewFullBackupArchiveForAdmin,
@@ -57,7 +58,8 @@ export async function POST(request: Request) {
         error: error instanceof Error ? error.message : "Failed to restore full ZIP backup.",
         warnings: [],
       },
-      { status: 500 }
+      // The sandbox refuses every review and restore (lib/full-backup/server.ts).
+      { status: error instanceof Error && error.message === FULL_BACKUP_SANDBOX_MESSAGE ? 403 : 500 }
     );
   }
 }

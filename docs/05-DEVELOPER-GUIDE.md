@@ -96,7 +96,10 @@ Every later sign-up gets the `USER` role.
 - `npm run db:push`: alias for `npm run db:migrate`
 - `npm run db:push:sandbox`: legacy sandbox bootstrap path that pushes
   migrations with `--include-all`, pushes Supabase config, seeds sandbox
-  images, and deploys the migration-ingest function
+  images, and deploys the migration-ingest function. The config push turns public
+  sign-ups back on (`config.toml` keeps `enable_signup = true` for local dev): turn
+  "Allow new users to sign up" off again on the sandbox project afterwards (the reset
+  logs an error while it is on; see "Sandbox Reset Operations")
 - `npm run db:reset`: reset the local/linked Supabase database from the db
   workdir
 - `npm run db:types`: regenerate typed Supabase definitions
@@ -108,7 +111,12 @@ Every later sign-up gets the `USER` role.
 
 - `npm run generate:sandbox`: regenerate the checked-in sandbox reset payload
 - `npm run sandbox:reset`: call the app's sandbox reset cron route locally
-- `npm run stripe`: forward Stripe events to the local webhook route
+- `npm run stripe`: forward the store's six Stripe webhook events to the local webhook route
+  (needs the Stripe CLI; it passes `--events`, which current CLI versions require)
+- `npm run affiliates:schedule-payouts -- https://<site>`: install the daily pg_cron job that
+  calls the affiliate payout route (`status`, `remove`, `print-sql`; docs/15 → "Scheduling");
+  also an app script (`apps/nextblock/tools/schedule-affiliate-payouts.js`), so standalone
+  projects have it
 
 ## Environment Expectations
 
@@ -123,7 +131,9 @@ repo expects at least:
 - `POSTGRES_URL` or `DATABASE_URL` for SQL fallback paths and db tooling
 - `NEXT_PUBLIC_URL` — set by the `/setup` wizard
 - `CRON_SECRET`, `DRAFT_MODE_SECRET`, `REVALIDATE_SECRET_TOKEN` — auto-generated
-  by the `/setup` wizard
+  by the `/setup` wizard. `CRON_SECRET` also protects the affiliate payout route
+  (`/api/affiliates/cron/payouts`), which refuses every call (503) while it is unset or shorter
+  than 16 characters (the sandbox reset refuses calls while it is unset; the FX sync stays open)
 
 > **Supabase key aliases.** The names above are the local-dev canon, but the app also
 > accepts the *new-style* names the hosted/Vercel Supabase Marketplace integration
@@ -150,8 +160,20 @@ Captured by the `/setup` wizard and needed for a complete CMS:
 
 Optional, per feature:
 
-- Stripe keys for physical-product checkout
+- Stripe keys for physical-product checkout, entered under CMS → Payments (stored values win);
+  the env fallbacks the code reads are `STRIPE_SECRET_KEY`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`
+  and `STRIPE_WEBHOOK_SECRET`. The secret key also pays affiliate partners (and is all payouts
+  need), so a Freemius-only store that runs the partner program needs it too
 - Freemius keys for digital-product checkout and product sync
+- Stripe Connect (Express) on the platform account for automated affiliate payouts (docs/15;
+  CMS → Affiliates → Stripe payouts tests the setup)
+- PayPal Payouts for affiliate commissions routed to PayPal (02037, docs/15 → "Paying partners with
+  PayPal"): the credentials saved under CMS → Affiliates → PayPal payouts win; the env fallbacks are
+  `PAYPAL_CLIENT_ID` / `PAYPAL_SECRET_KEY` (sandbox), `PAYPAL_LIVE_CLIENT_ID` /
+  `PAYPAL_LIVE_SECRET_KEY` (live) and `PAYPAL_ENVIRONMENT` (`live`, else sandbox). Server-only: never
+  prefix them with `NEXT_PUBLIC_`. The public sandbox never reads them
+- `FREEMIUS_ECOMMERCE_SANDBOX_KEY`, `FREEMIUS_AI_SANDBOX_KEY`, `FREEMIUS_AFFILIATES_SANDBOX_KEY`
+  — the public sandbox only: its reset activates Commerce Pro, Cortex AI and Affiliates with them
 
 ## Dependency install scripts (`allowScripts`)
 
@@ -351,13 +373,54 @@ The sandbox automation is code-driven.
 - reads `NEXT_PUBLIC_URL` and `CRON_SECRET`
 - calls `GET /api/cron/reset-sandbox`
 
-The cron route then:
+The cron route then, in this order:
 
-- returns 404 immediately unless `NEXT_PUBLIC_IS_SANDBOX=true`
-- executes the generated reset SQL
-- reseeds media assets
-- reseeds commerce content
-- triggers Freemius sync helpers for sandbox data
+- returns 404 immediately unless `NEXT_PUBLIC_IS_SANDBOX=true`, 401 without the cron secret, and
+  500 without its env (it requires the `R2_*` env)
+- starts asking GoTrue (`/auth/v1/settings`, with the publishable key) whether public sign-ups are
+  off, alongside the reset; while they are on it logs `[Sandbox Reset] GoTrue accepts public
+  sign-ups` as an error and adds a `warnings` entry to its JSON. It never fails or delays the reset
+  beyond 5 s
+- checks that uploads go to the bucket and endpoint it empties (`getStorageBackend()` is `s3`,
+  `getStorageBucket()` is `R2_BUCKET_NAME`, and `R2_S3_ENDPOINT` / `R2_S3_PUBLIC_ENDPOINT`, when
+  set, share the origin of `https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`), with the same
+  error-and-warning alarm otherwise: one `warnings` entry for a backend or bucket mismatch, and one
+  per endpoint variable whose origin differs
+- empties the R2 bucket, so nothing a visitor uploaded outlives the run, uploads the seed assets,
+  and executes the generated reset SQL (Step A deletes every auth user but the two preserved ids)
+- restores the demo admin right away: re-creates `demo@nextblock.dev` when missing, otherwise
+  re-asserts its published password and deletes every second factor on it (`auth.users` rows and
+  `auth.mfa_factors` survive the SQL, and the demo session is public). A failure is logged, never
+  thrown, and nothing that runs later can skip this step
+- writes the core media rows
+- with `FREEMIUS_ECOMMERCE_SANDBOX_KEY`: activates Commerce Pro, syncs the Freemius products, then
+  dresses the catalog, shop pages and categories (an error here ends the run with a 500, except in
+  the Affiliates product dressing, which runs in its own transaction and only logs)
+- activates Cortex AI when its sandbox key is set, then seeds the store data (branding, the admin
+  profile, demo orders)
+- with `FREEMIUS_AFFILIATES_SANDBOX_KEY`: activates the package and seeds the demo partners
+  (`partner@nextblock.dev` at `/partners/studio-nova`, and Atelier Boréal) in their own transaction
+  after the reset committed (docs/15 → "Sandbox demo")
+
+The app refuses every sign-up on the sandbox (docs/15 → "What a visitor can and cannot do
+there"), but GoTrue itself still accepts one from anyone holding the publishable key and mails the
+address they typed. On the sandbox's Supabase project, keep:
+
+- **Authentication → Sign In / Providers → "Allow new users to sign up" off.** The reset's
+  `auth.admin.createUser` works either way. `npm run db:push:sandbox` turns it back on.
+- **Auth email on Supabase's built-in sender** (it delivers only to the organization's members),
+  not the deployment's SMTP account, so an email change or recovery a visitor asks GoTrue for
+  reaches no one else.
+- **Its own SMTP account, or none.** On the sandbox `sendEmail` delivers only to
+  `SANDBOX_CONTACT_EMAIL` and the product feedback inbox, so its `SMTP_*` env never needs the
+  production login.
+- **Its own stock-photo keys, or none.** The sandbox cannot save stock-photo keys in the CMS, so
+  `PEXELS_API_KEY` and `UNSPLASH_ACCESS_KEY` in its env serve every visitor's Cortex runs. The
+  admin agent's photo search has no per-request cap, the partner copilot runs at most 3 lookups a
+  request, and each Cortex block save pings up to 20 Unsplash download triggers. Use dedicated
+  sandbox apps whose rate limits you can afford to see exhausted, never the production keys.
+- **`OPENROUTER_API_KEY` only if you accept the free-model traffic.** A visitor without their own
+  key falls back to it, locked to free models for text and alt text.
 
 ## Deployment Notes
 
@@ -365,11 +428,17 @@ The repo currently assumes:
 
 - the app is deployed as a Next.js application
 - Supabase remains the database/auth backend
-- cron routes are protected with `Authorization: Bearer ${CRON_SECRET}`; `vercel.json`
+- cron routes are protected with `Authorization: Bearer ${CRON_SECRET}`, checked in constant
+  time by `isCronRequestAuthorized()` (`lib/cron/cron-secret.ts`: SHA-256 of both sides and
+  `timingSafeEqual`, never `===` on the header): `/api/cron/reset-sandbox` fails closed without
+  the secret, `/api/cron/sync-currencies` stays open without it, and
+  `/api/affiliates/cron/payouts` keeps its own 16-character rule; `vercel.json`
   on `master` declares none of them (Hobby 1-click installs fail on sub-daily
   schedules), the sandbox's 15-minute reset is a pg_cron job in the sandbox database
-  (`npm run sandbox:schedule`, see docs/12), and FX rates refresh from the CMS layout
-  without a cron
+  (`npm run sandbox:schedule`, see docs/12), FX rates refresh from the CMS layout
+  without a cron, and affiliate payouts run from the CMS and partner-portal layouts in
+  `after()`, from `/api/affiliates/cron/payouts`, or from a pg_cron job
+  (`npm run affiliates:schedule-payouts`, docs/15)
 - package activation and several system workflows require working server-side
   environment variables, not only public client keys
 
@@ -397,7 +466,15 @@ keep these rules when touching the public surface:
 - **Translations are trimmed per locale.** `app/layout.tsx` passes the `translations`
   table through `lib/i18n/slim-translations.ts` (active locale + `en` fallback, no
   timestamps). A language switch uses `router.refresh()`, which re-runs the layout,
-  so the client never needs the other locales.
+  so the client never needs the other locales. The layout reads only the site-wide rows (never
+  `affiliates.*`, see docs/15 → "i18n"), in pages of 1000: PostgREST returns at most `max_rows`
+  rows per request (1000 in `libs/db/src/supabase/config.toml` and on hosted Supabase) and drops
+  the rest without an error. So every read of many `translations` rows goes through
+  `readAllTranslationRows` (`lib/i18n/translation-pages.ts`, all or nothing), and
+  `tools/scripts/translations-pagination.test.ts` fails on one that does not. A project that
+  lowers `max_rows` below 1000 must lower `TRANSLATIONS_PAGE_SIZE` to match; the guard compares
+  it with `config.toml`. CMS → Extra translations reads the same way, and its CSV import refuses
+  to run when the existing rows cannot be read in full.
 - **Above-the-fold media gets `priority`.** `BlockRenderer` flags the first top-level
   block and `SectionBlockRenderer` flags hero sections; text renderers forward it so
   the first YouTube embed in that HTML preloads its poster instead of lazy-loading it
@@ -437,7 +514,23 @@ keep these rules when touching the public surface:
 
 Seeded marketing copy is content, not code: colour-contrast or markup fixes to it are
 forward-only data migrations scoped by content signature (see `02006`), never edits
-to the baseline seed.
+to the baseline seed. When an operator may have re-saved the block (the CMS editor
+re-serialises the HTML and drops the space after a `<br>`), match it by its visible text
+compared without spaces instead, as `02039` does for the home hero H1.
+
+The home hero H1 (EN `home`, FR `accueil`, since `02039`) is a text block holding
+`<div class='@container'><h1 …>`. Its size is `clamp(2.5rem, 8.5cqi, 3.75rem)` of its column,
+behind a container variant (`@min-[1px]:`) over the old `text-5xl md:text-6xl`, so a stylesheet
+built before the migration, or Safari 15, keeps the old sizes. It breaks the same way in every
+column about 470px and wider (three lines). Narrower columns stay at 2.5rem, and
+`<br class='@md:hidden' />` stacks the two sentences in columns under 28rem (four lines on
+phones and two-column tablets). `mb-0` keeps the gap to the copy below at 16px, because the
+container wrapper stops the H1's margin collapsing. The highlighted word is an inline-block (the
+gradient pill), and CSS allows a line break after an inline-block even right before punctuation,
+so the pill and the period after it share one `whitespace-nowrap` span. Keep a new line to three
+lines in the 668px desktop column (measure it in the browser; the French second sentence fits in
+about 29 characters), and use `&nbsp;` to keep short words with the next word ("The&nbsp;AI")
+and the last two words together.
 
 `/robots.txt` is a route handler (`app/robots.txt/route.ts`) that serves
 `buildRobotsTxt` — the same function the SEO screen previews — with `force-static` and
@@ -445,6 +538,53 @@ an hourly revalidate. It is not an `app/robots.ts` metadata route because Next's
 serialiser has no field for the per-rule `other` directives (`Clean-param`, a per-group
 `Host`, …) the screen lets operators add; the metadata route dropped them silently.
 `lib/seo/robots-txt.test.ts` pins both facts against Next's real serialiser.
+
+## Partner referrals in `proxy.ts`
+
+The proxy stamps the Affiliates referral cookie (`nb_affiliate_ref`, an httpOnly lowercase
+handle) on a document navigation to `/partners/<handle>`, or to any page outside `/cms`, `/api`,
+`/portal` and `/_next` with `?ref=<handle>`. The rules that matter when you touch the proxy
+(the full list is in docs/15 → "Attribution"):
+
+- **Only GET document navigations count.** RSC fetches, router prefetches, speculative loads and
+  bots never set the cookie, so an in-app `<Link>` to a storefront sets nothing; the signed
+  storefront token covers attribution there, including a product the shopper opens from the
+  storefront (or picks options for) before adding it. Storefront links use `prefetch={false}`.
+- **The decision is pure and taken once**, before the first response branch:
+  `decideAffiliateReferral()` in `lib/affiliates/referral-cookie.ts`, which imports nothing.
+  The proxy may not import server-only code, `@nextblock-cms/db/server` or a library barrel, so
+  that file mirrors the lib's handle pattern, reserved handles and cookie name, and
+  `referral-cookie.test.ts` fails when a copy drifts.
+- **Three responses carry it**, through `withAffiliateReferral`: the final page response, the
+  managed 301/302 redirect and the customer-name redirect to `/profile`. Never the intermediate
+  response the Supabase cookie adapter rebuilds, never an auth gate. Each of them also gets
+  `Cache-Control: private, no-store`, overriding the public caching the proxy gives HTML and
+  301s, so a shared cache never stores one visitor's `Set-Cookie`.
+- **The lifetime is the partner tier's `cookie_duration_days`**, read through the anon RPC
+  `get_affiliate_referral_window` on the memoised plain anon client (no visitor JWT, 1.5 s
+  abort) and cached per handle (5 minutes, 60 s for "no partner", 15 s for a failed lookup,
+  which falls back to 30 days). A missing schema counts as "no partner".
+- **A new cookie counts one click** with `record_affiliate_click` in `after()`, off the
+  visitor's critical path. The visitor hash is a daily SHA-256 of the masked IP and the user
+  agent; no IP is stored.
+- **Consent wins.** A visitor whose consent cookie says `marketing: false` gets no cookie, and
+  an existing one expires on their next page view.
+- **It fails open.** Every step is wrapped; a broken referral never costs a page view.
+
+`proxy.test.ts` drives `proxy()` end to end with mocked clients for these cases, and pins
+`'/cms/affiliates': ['ADMIN']` in `cmsRoutePermissions`.
+
+Two more Affiliates rules live in the proxy:
+
+- **`/partenaires` renders in French.** The proxy pins the forwarded `X-User-Locale` to the
+  active French code (as the languages table stores it, `fr-CA` for example) on exactly that
+  path while French is an active language; the language cookie keeps the visitor's choice. The
+  path comes from the import-free `lib/affiliates/partners-paths.ts`; `proxy.test.ts` pins the
+  import list and covers the pinned, French-inactive and `/partners` cases.
+- **The request path and query are forwarded.** Besides `x-nextblock-path`, the proxy sets
+  `x-nextblock-search` (the request's query string), both overwritten on every request the proxy
+  handles, so a client cannot plant either. The partner portal layout builds its sign-in return address from
+  them (`buildAffiliatePortalReturnPath`, kept inside `/portal/retailer`).
 
 ## Bilingual Content Rule
 
@@ -463,6 +603,13 @@ text-to-text map, and the markup regenerated untouched, so the French page rende
 exact same components. Audit parity with the anon REST API (`pages`, `posts`, `products`
 grouped by `translation_group_id`, then `blocks` per row) before shipping a content
 migration — that is how the missing French Cortex posts were found.
+
+The language switcher looks a path up as a CMS document only for `/<slug>`, `/article/<slug>`
+and `/product/<slug>` (`contentLookupForPath` in `components/language-switcher-path.ts`); every
+other code route (storefronts, the partner portal, checkout) refreshes in place. A code route
+with its own address per language declares it with `CurrentContentSetter localePaths` (the
+`/partners` landing page does, for `/partenaires`), and `CurrentContent.localePaths` wins over
+the slug lookup.
 
 ## Public UI Copy and Accessibility
 

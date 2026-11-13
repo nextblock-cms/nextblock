@@ -3,18 +3,30 @@
 import "server-only";
 
 import { encodedRedirect } from "@nextblock-cms/utils/server";
-import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
+import { createClient, getServiceRoleSupabaseClient, isSandboxEnvironment } from "@nextblock-cms/db/server";
 import { headers } from "next/headers";
 import { after } from "next/server";
 import { redirect } from "next/navigation";
-import { resolvePostAuthRedirect } from "../lib/auth-redirects";
+import { isSafeInternalPath, resolvePostAuthRedirect } from "../lib/auth-redirects";
 import { createEmailChallenge, evaluateTwoFactor } from "../lib/auth/twoFactor";
 import { REMEMBER_INTENT_COOKIE, TWO_FACTOR_COOKIE, clearCookie, setSecureCookie } from "../lib/auth/cookies";
 import { sendTwoFactorCodeEmail } from "./actions/twoFactorEmail";
 import { getSystemConfiguration } from "../lib/setup/system-config";
 import { verifyBotProtection } from "../lib/botProtection/verify";
 
+/**
+ * The public sandbox publishes its demo logins and resets every 15 minutes, so it creates no
+ * accounts and sends no account email: signUpAction and forgotPasswordAction answer with this
+ * key before any Supabase call (the reset creates the demo accounts through the admin API).
+ * A global key (lib/i18n/global-affiliate-keys.ts); SignUpForm renders it with label().
+ */
+const SANDBOX_SIGNUP_DISABLED = "sandbox_signup_disabled";
+
 export const signUpAction = async (formData: FormData) => {
+  if (isSandboxEnvironment()) {
+    return encodedRedirect("error", "/sign-up", SANDBOX_SIGNUP_DISABLED);
+  }
+
   const email = formData.get("email")?.toString();
   const password = formData.get("password")?.toString();
   const supabase = await createClient();
@@ -201,6 +213,12 @@ export const signInAction = async (formData: FormData) => {
 };
 
 export const forgotPasswordAction = async (formData: FormData) => {
+  // No reset email leaves the sandbox. Its /forgot-password page answers 404 and /sign-in hides
+  // the link, so only a direct POST reaches this; it gets the same answer as a sign-up there.
+  if (isSandboxEnvironment()) {
+    return encodedRedirect("error", "/forgot-password", SANDBOX_SIGNUP_DISABLED);
+  }
+
   const email = formData.get("email")?.toString();
   const supabase = await createClient();
   const origin = (await headers()).get("origin");
@@ -229,7 +247,9 @@ export const forgotPasswordAction = async (formData: FormData) => {
     );
   }
 
-  if (callbackUrl) {
+  // A form value, so only a site-relative path is followed (no form sets it today; an absolute or
+  // `//host` value made this an open redirect). Anything else gets the normal success message.
+  if (callbackUrl && isSafeInternalPath(callbackUrl)) {
     return redirect(callbackUrl);
   }
 
@@ -241,13 +261,21 @@ export const forgotPasswordAction = async (formData: FormData) => {
 };
 
 export const resetPasswordAction = async (formData: FormData) => {
+  // Every visitor to the public sandbox shares its demo accounts: no password changes there.
+  // The same refusal as its twin, changePasswordAction (app/profile/password/actions.ts).
+  if (isSandboxEnvironment()) {
+    return redirect("/profile");
+  }
+
   const supabase = await createClient();
 
   const password = formData.get("password") as string;
   const confirmPassword = formData.get("confirmPassword") as string;
 
+  // Each redirect is returned: encodedRedirect is async, and an unreturned one let a missing or
+  // mismatched confirmation fall through to updateUser (fixed 2026-11-03).
   if (!password || !confirmPassword) {
-    encodedRedirect(
+    return encodedRedirect(
       "error",
       "/profile/password",
       "Password and confirm password are required",
@@ -255,7 +283,7 @@ export const resetPasswordAction = async (formData: FormData) => {
   }
 
   if (password !== confirmPassword) {
-    encodedRedirect(
+    return encodedRedirect(
       "error",
       "/profile/password",
       "Passwords do not match",
@@ -267,14 +295,14 @@ export const resetPasswordAction = async (formData: FormData) => {
   });
 
   if (error) {
-    encodedRedirect(
+    return encodedRedirect(
       "error",
       "/profile/password",
       "Password update failed",
     );
   }
 
-  encodedRedirect("success", "/profile/password", "Password updated");
+  return encodedRedirect("success", "/profile/password", "Password updated");
 };
 
 export const signOutAction = async () => {

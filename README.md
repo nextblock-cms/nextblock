@@ -36,7 +36,7 @@
 </p>
 
 <p align="center">
-  <sub>Sandbox resets every 15 minutes &nbsp;·&nbsp; <strong>User:</strong> demo@nextblock.dev &nbsp;·&nbsp; <strong>Pass:</strong> password</sub>
+  <sub>Sandbox resets every 15 minutes &nbsp;·&nbsp; <strong>User:</strong> demo@nextblock.dev &nbsp;·&nbsp; <strong>Pass:</strong> password &nbsp;·&nbsp; <strong>Partner portal:</strong> partner@nextblock.dev / password</sub>
 </p>
 
 </div>
@@ -57,8 +57,9 @@ We combined the **flexibility of a Block Editor** with the **raw power of Next.j
 - **⚡ [100/100 Lighthouse](./docs/assets/lighthouse-scores.png)**: Perfect scores across Performance, Accessibility, Best Practices and SEO — 0.3 s FCP, 0.8 s LCP, **0 ms** Total Blocking Time and **0** Cumulative Layout Shift on a production build. AVIF/WebP images with a one-year cache TTL, critical-CSS inlining and tree-shaken imports are the defaults, not plugins.
 - **🤖 Built for AI Agents**: Our codebase is documented and structured specifically to be easily read and extended by AI coding assistants.
 - **🛍️ E-Commerce Ready**: Premium commerce package for digital products, checkout providers, currency, tax, and shipping management.
+- **🤝 Affiliates & Creator Storefronts**: Premium partner program: partners sign up at `/partners`, get one admin-approved storefront page each, earn a commission on the orders they refer, and are paid the way you choose for each kind of sale: automatically through Stripe Connect Express or with PayPal Payouts from your PayPal balance, or by hand (PayPal, Interac e-Transfer, Wise, a bank) and recorded in the CMS ([docs/15](./docs/15-AFFILIATES-AND-STOREFRONTS.md)).
 - **🧱 Visual Block Editor**: A reusable Tiptap-powered Notion-style editor that your clients will actually enjoy using.
-- **🔓 Open-Core Model**: The core is 100% Free & Open Source (AGPL). Premium modules (today Cortex AI and Commerce Pro, with more to come) ship in every install and switch on in the CMS with a free 30-day trial (no credit card) or a license key.
+- **🔓 Open-Core Model**: The core is 100% Free & Open Source (AGPL). Premium modules (today Cortex AI, Commerce Pro and Affiliates & Creator Storefronts, with more to come) ship in every install. Each switches on in the CMS with a free 30-day trial (no credit card) or a license key; Affiliates is an add-on to Commerce Pro ([activation](./docs/15-AFFILIATES-AND-STOREFRONTS.md#package-gating-and-activation)).
 
 ## 🆚 The NextBlock™ Advantage
 
@@ -134,7 +135,7 @@ NextBlock ships as an MCP server (`https://<your-site>/api/mcp`, Streamable HTTP
 
 > **Note:** You are currently looking at the **Nx Monorepo** (The Factory), not the generated product template.
 >
-> NextBlock™ is an Nx monorepo for a Next.js 16 CMS backed by Supabase. The repo contains the canonical application, the `create-nextblock` CLI, shared editor and UI packages, the database and migration layer, and the premium ecommerce module.
+> NextBlock™ is an Nx monorepo for a Next.js 16 CMS backed by Supabase. The repo contains the canonical application, the `create-nextblock` CLI, shared editor and UI packages, the database and migration layer, and the premium modules (commerce, Cortex AI, affiliates).
 
 ### 🧩 Main Surfaces
 
@@ -143,6 +144,8 @@ NextBlock ships as an MCP server (`https://<your-site>/api/mcp`, Streamable HTTP
 - `libs/db`: Supabase clients, package activation checks, migrations, and db types
 - `libs/editor`: reusable Tiptap editor package
 - `libs/ecommerce`: premium commerce package and CMS commerce screens
+- `libs/cortex`: premium Cortex AI package (model routing, agent tools, MCP server)
+- `libs/affiliates`: premium Affiliates & Creator Storefronts package (partner storefronts, commissions, Stripe Connect, PayPal or manual payouts)
 - `libs/sdk`: typed block extensibility contract
 - `libs/ui`, `libs/utils`: shared primitives and helpers
 
@@ -235,6 +238,8 @@ _The template docs are copied from the root docs through the sync pipeline, so t
 | [docs/11-SELF-HOSTED-DOCKER.md](./docs/11-SELF-HOSTED-DOCKER.md)                   | One-click local self-hosted Docker stack: Supabase engines, MinIO storage, migration runner, and how it maps to cloud |
 | [docs/12-VERCEL-DEPLOYMENT.md](./docs/12-VERCEL-DEPLOYMENT.md)                     | One-click cloud deploy, the browser setup wizard, and Supabase env-var aliases            |
 | [docs/13-STAYING-UP-TO-DATE.md](./docs/13-STAYING-UP-TO-DATE.md)                   | `npm run update` for all four installs, the daily upstream-sync Action, and how migrations reach a deployed site |
+| [docs/14-MESSAGES-INBOX.md](./docs/14-MESSAGES-INBOX.md)                           | The unified inbox: enquiries, contact forms, reviews and comments                        |
+| [docs/15-AFFILIATES-AND-STOREFRONTS.md](./docs/15-AFFILIATES-AND-STOREFRONTS.md)   | Premium Affiliates package: partner signup, storefront approval, attribution, commissions, Stripe Connect, PayPal and manual payouts |
 | [docs/README.md](./docs/README.md)                                                 | Audience-based docs index                                                                |
 
 > **Under the hood note:** The migration folder under `libs/db/src/supabase/migrations` is the best source of truth for current platform capabilities.

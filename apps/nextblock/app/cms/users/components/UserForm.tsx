@@ -4,6 +4,7 @@ import { CustomerProfileForm, ExtendedProfileUpdateData, addressesMatch, type Cu
 import MediaPickerDialog from "../../media/components/MediaPickerDialog";
 import type { Database } from "@nextblock-cms/db";
 import { useSearchParams } from "next/navigation";
+import { USERS_LOCKED_IN_SANDBOX, USERS_SANDBOX_NOTE_CLASS, USERS_SANDBOX_NOTE_ID } from "../sandbox-lock";
 
 
 type Profile = Database['public']['Tables']['profiles']['Row'];
@@ -24,6 +25,13 @@ export default function UserForm({ userToEditAuth, userToEditProfile, userToEdit
   const searchParams = useSearchParams();
   const successMsg = searchParams.get('success');
 
+  // The public sandbox shares every account with every visitor, so updateUserProfile refuses
+  // there. Save lives inside CustomerProfileForm (libs/ecommerce), so on the sandbox the whole form
+  // sits in a disabled fieldset described by the visible note: that disables Save and every field
+  // natively. The role select is also locked with the same reason (Radix opens a select on
+  // pointerdown, which a disabled fieldset does not stop). Read inline, as SandboxCredentialsAlert does.
+  const sandboxLocked = process.env.NEXT_PUBLIC_IS_SANDBOX === "true";
+
   const handleAdminSave = async (data: ExtendedProfileUpdateData) => {
       const formData = new FormData();
       // Only append if defined to avoid null string issues if server doesn't handle them, 
@@ -42,9 +50,8 @@ export default function UserForm({ userToEditAuth, userToEditProfile, userToEdit
       return await formAction(formData);
   };
 
-  return (
-    <div className="max-w-4xl mx-auto">
-      <CustomerProfileForm 
+  const profileForm = (
+      <CustomerProfileForm
           initialData={{
               full_name: userToEditProfile?.full_name || '',
               avatar_url: userToEditProfile?.avatar_url || '',
@@ -65,8 +72,25 @@ export default function UserForm({ userToEditAuth, userToEditProfile, userToEdit
           email={userToEditAuth.email}
           onAction={handleAdminSave}
           initialSuccessMessage={successMsg}
-          lockRole={lockRole}
+          lockRole={sandboxLocked ? true : lockRole}
+          {...(sandboxLocked ? { lockRoleReason: USERS_LOCKED_IN_SANDBOX } : {})}
       />
+  );
+
+  return (
+    <div className="max-w-4xl mx-auto">
+      {sandboxLocked ? (
+        <>
+          <p id={USERS_SANDBOX_NOTE_ID} className={USERS_SANDBOX_NOTE_CLASS}>
+            {USERS_LOCKED_IN_SANDBOX}
+          </p>
+          <fieldset disabled aria-describedby={USERS_SANDBOX_NOTE_ID} className="m-0 min-w-0 border-0 p-0">
+            {profileForm}
+          </fieldset>
+        </>
+      ) : (
+        profileForm
+      )}
     </div>
   );
 }

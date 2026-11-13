@@ -12,6 +12,7 @@ import type { VisualEditAttributes } from "../../../lib/visual-editing/types";
 import { SimpleTiptapRenderer } from "@nextblock-cms/ecommerce/components/SimpleTiptapRenderer";
 import { replaceYouTubeIframe } from "../../media/youtube-embed-replace";
 import { rewriteYouTubeHostsInHtml } from "../../../lib/media/youtube";
+import { isTiptapJsonString } from "./tiptap-json-string";
 
 interface ClientTextBlockRendererProps {
   content: TextBlockContent;
@@ -265,7 +266,8 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
   priority = false,
 }) => {
   void languageId;
-  const normalizedHtml = normalizeHtmlEncodingArtifacts(content.html_content || "");
+  const authoredHtml = content.html_content || "";
+  const normalizedHtml = normalizeHtmlEncodingArtifacts(authoredHtml);
   const wrapperClassName =
     renderContext === 'section'
       ? 'w-full min-w-0'
@@ -348,22 +350,18 @@ const ClientTextBlockRenderer: React.FC<ClientTextBlockRendererProps> = ({
     },
   };
 
-  const isJson = normalizedHtml.trim().startsWith('{') || normalizedHtml.trim().startsWith('[');
-
-  if (isJson) {
-    try {
-      JSON.parse(normalizedHtml);
-      return (
-        <div
-          className={wrapperClassName}
-          {...visualEditAttributes}
-        >
-          <SimpleTiptapRenderer content={rewriteYouTubeHostsInHtml(normalizedHtml)} />
-        </div>
-      );
-    } catch {
-      // Fallback to parse as HTML
-    }
+  // Tiptap JSON renders through React, which escapes its text. The callers sanitize only what
+  // is not JSON, with this same predicate, so it is asked of the string exactly as they handed
+  // it over: a string they passed unsanitized must never fall through to the HTML parser below.
+  if (isTiptapJsonString(authoredHtml)) {
+    return (
+      <div
+        className={wrapperClassName}
+        {...visualEditAttributes}
+      >
+        <SimpleTiptapRenderer content={rewriteYouTubeHostsInHtml(normalizedHtml)} />
+      </div>
+    );
   }
 
   return (

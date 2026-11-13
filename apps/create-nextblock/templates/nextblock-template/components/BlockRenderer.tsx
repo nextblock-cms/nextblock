@@ -17,6 +17,7 @@ import { PUBLIC_CONTENT_REVALIDATE_SECONDS } from "../lib/public-content-cache";
 type Block = Database['public']['Tables']['blocks']['Row'];
 import SectionBlockRenderer from "./blocks/renderers/SectionBlockRenderer"; // Static import for LCP
 import ClientTextBlockRenderer from "./blocks/renderers/ClientTextBlockRenderer"; // Static import for client component
+import { isTiptapJsonString } from "./blocks/renderers/tiptap-json-string";
 import { sanitizeAuthoredBlockHtml } from "../lib/blocks/inlineScriptNonce";
 import { getCachedCustomBlockDefinitionBySlug } from "../lib/custom-block-definitions";
 import { getCachedLanguageCode } from "../lib/languages/cached-language-code";
@@ -193,7 +194,9 @@ async function renderLoadedBlock({
     const merged = rawHtml.includes('{{')
       ? await substitutePrivacyMergeTags(rawHtml)
       : rawHtml;
-    const html = sanitizeAuthoredBlockHtml(merged);
+    // Tiptap JSON renders through React, which escapes its text (isTiptapJsonString): the HTML
+    // sanitizer would show an authored `a<b` as `a&lt;b`. Everything else is HTML.
+    const html = isTiptapJsonString(merged) ? merged : sanitizeAuthoredBlockHtml(merged);
     return (
       <ClientTextBlockRenderer
         content={{ ...(textContent as any), html_content: html }}

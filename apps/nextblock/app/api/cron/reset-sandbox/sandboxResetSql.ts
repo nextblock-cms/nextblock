@@ -17129,6 +17129,6668 @@ $nb_package_activations$;
 -- ---------------------------------------------------------------------------
 
 
+-- >>> FROM: 02029_user_role_rtl.sql <<<
+-- 02029: add 'RTL' (retailer, shown as "partner" / "partenaire" in the UI) to public.user_role,
+-- the role held by Affiliates & Creator Storefronts accounts (02030).
+--
+-- Alone in its file on purpose. PostgreSQL refuses to USE an enum value inside the transaction
+-- that added it ("unsafe use of new value"), and every apply path (the Supabase CLI, the build
+-- hook in apps/nextblock/tools/lib/migrate-core.mjs and /setup's lib/setup/schema-apply.ts) runs
+-- one transaction per file, so 02030 and later files see the value committed.
+--
+-- The sandbox reset replays every migration in ONE transaction, where the value is never
+-- committed before 02030 runs. That is why no migration resolves the label at CREATE or apply
+-- time: policies and SQL compare roles as text (\`(SELECT public.get_current_user_role())::text
+-- = 'RTL'\`, \`role::text = 'RTL'\`), and 'RTL' is assigned only inside plpgsql bodies, which
+-- resolve it when the function runs. tools/scripts/lib/migration-grants.js (findEnumRtlLiterals)
+-- refuses an \`'RTL'::public.user_role\` cast anywhere else in a forward migration.
+--
+-- Idempotent: ADD VALUE IF NOT EXISTS is a no-op on a database that already has the label.
+ALTER TYPE public.user_role ADD VALUE IF NOT EXISTS 'RTL';
+
+
+-- >>> FROM: 02030_affiliates_schema.sql <<<
+-- 02030: NextBlock Affiliates & Creator Storefronts (package id \`affiliates\`, lib
+-- @nextblock-cms/affiliates). Partner ("RTL", added by 02029) accounts, one storefront page each,
+-- a commission ledger fed by the orders table, Stripe Connect payouts and the public storefront
+-- reads. Append-only, forward-only, idempotent: types are created in DO/EXCEPTION blocks, tables
+-- and indexes IF NOT EXISTS, functions CREATE OR REPLACE, every policy and trigger dropped by
+-- name before it is created, the tier seed ON CONFLICT DO NOTHING.
+--
+-- Roles. 'RTL' was added to public.user_role by 02029 and is never resolved as an enum literal
+-- at CREATE or apply time (the sandbox reset replays every migration in one transaction, where
+-- the new label is not yet committed): policies compare \`(SELECT public.get_current_user_role())::text
+-- = 'RTL'\`, create_affiliate_account() compares \`role::text\` and assigns 'RTL' inside plpgsql.
+-- The migration lint refuses an 'RTL'::public.user_role cast outside a plpgsql body (A18).
+--
+-- Who writes what. The Data API grants and policies below are defense in depth; the app writes
+-- through server actions on the service role after requireRetailer() / requireCmsAdmin():
+--   * affiliate_tiers: public read of active tiers (the /partners ladder); ADMIN CRUD on a
+--     satisfied second factor (is_admin_mfa()).
+--   * affiliate_profiles / affiliate_pages: the owner (RTL, ACTIVE) reads its row and may UPDATE
+--     only display_name, bio, social_links, preferred_locale / title, meta_description,
+--     draft_content, featured_product_ids (column grants, pinned again by the post-apply pass);
+--     a BEFORE UPDATE guard refuses any other column from a non-admin session. Nobody INSERTs or
+--     DELETEs over the API: accounts are created by create_affiliate_account() only, and deleting
+--     one would erase the ledger. ADMIN reads and updates every row (aal2).
+--   * affiliate_commissions / affiliate_payouts: read-only ledger for the owner and ADMIN;
+--     every write is a service-role RPC below or the orders trigger.
+--   * affiliate_click_events / affiliate_payout_runs: service role only (RLS on, no API policy).
+--
+-- Money. Commissions are recorded in the store base currency (orders.affiliate_base_currency,
+-- snapshotted at checkout, else the current default currency, else the order currency) from
+-- GREATEST(COALESCE(subtotal, total) - discount_total, 0), i.e. without tax and shipping,
+-- converted with orders.exchange_rate_at_purchase. The AFTER UPDATE trigger on orders records
+-- one commission when paid_at goes NULL -> NOT NULL (every "mark paid" path ends in
+-- assign_order_invoice_metadata(), which sets paid_at once under a row lock) and voids it when
+-- the order becomes refunded or cancelled; a BEFORE DELETE trigger voids it when an order is
+-- deleted. Only the paid branch swallows errors (an order update must never fail because of the
+-- affiliate hook; reconcile_affiliate_commissions() repairs a missed commission). Paid or
+-- in-flight money is never voided silently: it is flagged (void_requested_at /
+-- refund_pending_cents) and raises an affiliate_refund_after_payout system alert. Every money
+-- function takes its locks in one order: the order row when it needs one (the orders triggers
+-- already hold it), then the affiliate profile row, then its commission rows, then the payout
+-- row, and never aggregates under FOR UPDATE. A sale is only ever paid by a transfer of its own
+-- key mode (orders.affiliate_livemode -> affiliate_commissions.livemode -> affiliate_payouts.livemode,
+-- matched against the partner's Connect account), and an open payment dispute holds its
+-- commission (affiliate_commissions.disputed_at) until it closes.
+--
+-- Functions: SECURITY DEFINER code lives in \`private\` (never callable over /rpc, advisor lints
+-- 0028/0029) behind SECURITY INVOKER wrappers in public (02021 pattern) for the four anonymous
+-- storefront reads; the service-role RPCs are SECURITY INVOKER in public and revoked from the
+-- API roles here and in BOTH copies of API_ROLE_REVOKE_SQL (apps/nextblock/tools/lib/migrate-core.mjs,
+-- apps/nextblock/lib/setup/schema-apply.ts), which also re-pin the table and column grants after
+-- the post-apply pass. tools/scripts/security-verify.sql sections 35-38 check all of it.
+
+-- 02001 turns body validation off for the session; a one-connection replay would otherwise
+-- create every function below unchecked.
+SET check_function_bodies = on;
+
+-- ---------------------------------------------------------------------------
+-- 1. Enum types
+-- ---------------------------------------------------------------------------
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_onboarding_step AS ENUM ('SIGNED_UP', 'PROFILE_COMPLETED', 'PAYOUT_CONFIGURED', 'PAGE_SUBMITTED', 'ACTIVE_PUBLISHED');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_status AS ENUM ('ACTIVE', 'SUSPENDED');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_page_status AS ENUM ('DRAFT', 'PENDING_REVIEW', 'PUBLISHED', 'CHANGES_REQUESTED');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_gateway AS ENUM ('STRIPE', 'FREEMIUS');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_commission_status AS ENUM ('PENDING_CLEARANCE', 'CLEARED', 'PAID', 'VOIDED_REFUND');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+DO $nb$ BEGIN
+  CREATE TYPE public.affiliate_payout_status AS ENUM ('PROCESSING', 'COMPLETED', 'FAILED');
+EXCEPTION WHEN duplicate_object THEN null; END $nb$;
+
+-- ---------------------------------------------------------------------------
+-- 2. affiliate_tiers (+ the four launch tiers)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_tiers (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  name_translations jsonb NOT NULL DEFAULT '{}'::jsonb,
+  slug text NOT NULL,
+  commission_percentage numeric(5,2) NOT NULL,
+  cookie_duration_days integer NOT NULL DEFAULT 30,
+  clearance_hold_days integer NOT NULL DEFAULT 30,
+  is_default_signup_tier boolean NOT NULL DEFAULT false,
+  is_limited_time_promo boolean NOT NULL DEFAULT false,
+  max_ambassadors_cap integer NULL,
+  member_count integer NOT NULL DEFAULT 0,
+  sort_order integer NOT NULL DEFAULT 0,
+  badge_color text NOT NULL DEFAULT 'violet',
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_tiers_pkey PRIMARY KEY (id),
+  CONSTRAINT affiliate_tiers_slug_key UNIQUE (slug),
+  CONSTRAINT affiliate_tiers_name_check CHECK (char_length(btrim(name)) BETWEEN 1 AND 80),
+  CONSTRAINT affiliate_tiers_name_translations_check CHECK (jsonb_typeof(name_translations) = 'object' AND octet_length(name_translations::text) <= 2000),
+  CONSTRAINT affiliate_tiers_slug_check CHECK (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' AND char_length(slug) <= 64),
+  CONSTRAINT affiliate_tiers_commission_percentage_check CHECK (commission_percentage >= 0 AND commission_percentage <= 100),
+  CONSTRAINT affiliate_tiers_cookie_duration_days_check CHECK (cookie_duration_days BETWEEN 1 AND 365),
+  CONSTRAINT affiliate_tiers_clearance_hold_days_check CHECK (clearance_hold_days BETWEEN 0 AND 365),
+  CONSTRAINT affiliate_tiers_max_ambassadors_cap_check CHECK (max_ambassadors_cap IS NULL OR max_ambassadors_cap >= 0),
+  CONSTRAINT affiliate_tiers_member_count_check CHECK (member_count >= 0),
+  CONSTRAINT affiliate_tiers_badge_color_check CHECK (badge_color IN ('violet', 'indigo', 'blue', 'sky', 'emerald', 'amber', 'orange', 'rose', 'slate'))
+);
+
+INSERT INTO public.affiliate_tiers
+  (name, name_translations, slug, commission_percentage, sort_order, is_default_signup_tier, is_limited_time_promo, max_ambassadors_cap, badge_color)
+VALUES
+  ('Starter Partner', '{"fr": "Partenaire Départ"}'::jsonb, 'starter-partner', 10.00, 1, false, false, NULL, 'slate'),
+  ('Growth Partner', '{"fr": "Partenaire Croissance"}'::jsonb, 'growth-partner', 20.00, 2, false, false, NULL, 'sky'),
+  ('Elite Partner', '{"fr": "Partenaire Élite"}'::jsonb, 'elite-partner', 35.00, 3, false, false, NULL, 'violet'),
+  ('Founding Ambassador', '{"fr": "Ambassadeur fondateur"}'::jsonb, 'founding-ambassador', 50.00, 4, true, true, 50, 'amber')
+ON CONFLICT (slug) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- 3. affiliate_profiles (one per partner account)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_profiles (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  tier_id uuid NOT NULL,
+  handle text NOT NULL,
+  display_name text NOT NULL,
+  bio text NULL,
+  avatar_object_key text NULL,
+  social_links jsonb NOT NULL DEFAULT '{}'::jsonb,
+  preferred_locale text NOT NULL DEFAULT 'en',
+  onboarding_step public.affiliate_onboarding_step NOT NULL DEFAULT 'SIGNED_UP',
+  status public.affiliate_status NOT NULL DEFAULT 'ACTIVE',
+  suspended_reason text NULL,
+  stripe_connect_account_id text NULL,
+  stripe_connect_livemode boolean NULL,
+  stripe_connect_onboarding_complete boolean NOT NULL DEFAULT false,
+  stripe_connect_details_submitted boolean NOT NULL DEFAULT false,
+  stripe_connect_payouts_enabled boolean NOT NULL DEFAULT false,
+  stripe_connect_checked_at timestamptz NULL,
+  total_clicks integer NOT NULL DEFAULT 0,
+  last_click_at timestamptz NULL,
+  total_earned_cents bigint NOT NULL DEFAULT 0,
+  total_paid_cents bigint NOT NULL DEFAULT 0,
+  profile_completed_at timestamptz NULL,
+  payout_configured_at timestamptz NULL,
+  page_submitted_at timestamptz NULL,
+  first_published_at timestamptz NULL,
+  signup_ip_masked text NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_profiles_pkey PRIMARY KEY (id),
+  CONSTRAINT affiliate_profiles_user_id_key UNIQUE (user_id),
+  CONSTRAINT affiliate_profiles_id_user_id_key UNIQUE (id, user_id),
+  CONSTRAINT affiliate_profiles_handle_key UNIQUE (handle),
+  CONSTRAINT affiliate_profiles_stripe_connect_account_id_key UNIQUE (stripe_connect_account_id),
+  CONSTRAINT affiliate_profiles_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users (id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_profiles_tier_id_fkey FOREIGN KEY (tier_id) REFERENCES public.affiliate_tiers (id) ON DELETE RESTRICT,
+  CONSTRAINT affiliate_profiles_handle_check CHECK (handle ~ '^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$'),
+  CONSTRAINT affiliate_profiles_display_name_check CHECK (char_length(btrim(display_name)) BETWEEN 1 AND 80),
+  CONSTRAINT affiliate_profiles_bio_check CHECK (bio IS NULL OR char_length(bio) <= 2000),
+  CONSTRAINT affiliate_profiles_avatar_object_key_check CHECK (
+    avatar_object_key IS NULL
+    OR (char_length(avatar_object_key) <= 512
+        AND avatar_object_key ~ '^(affiliates/avatars/|images/)[A-Za-z0-9._/-]+$'
+        AND avatar_object_key !~ '(\\.\\.|//)')
+  ),
+  CONSTRAINT affiliate_profiles_social_links_check CHECK (jsonb_typeof(social_links) = 'object' AND octet_length(social_links::text) <= 4000),
+  CONSTRAINT affiliate_profiles_preferred_locale_check CHECK (preferred_locale ~ '^[a-z]{2}$'),
+  CONSTRAINT affiliate_profiles_suspended_reason_check CHECK (suspended_reason IS NULL OR char_length(suspended_reason) <= 500),
+  CONSTRAINT affiliate_profiles_stripe_connect_account_id_check CHECK (stripe_connect_account_id IS NULL OR stripe_connect_account_id ~ '^acct_[A-Za-z0-9]+$'),
+  CONSTRAINT affiliate_profiles_signup_ip_masked_check CHECK (signup_ip_masked IS NULL OR char_length(signup_ip_masked) <= 64)
+);
+
+CREATE INDEX IF NOT EXISTS affiliate_profiles_tier_id_idx ON public.affiliate_profiles (tier_id);
+CREATE INDEX IF NOT EXISTS affiliate_profiles_status_idx ON public.affiliate_profiles (status);
+CREATE INDEX IF NOT EXISTS affiliate_profiles_signup_ip_masked_idx ON public.affiliate_profiles (signup_ip_masked, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- 4. affiliate_pages (exactly one storefront per partner)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_pages (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  affiliate_id uuid NOT NULL,
+  user_id uuid NOT NULL,
+  title text NOT NULL DEFAULT '',
+  meta_description text NOT NULL DEFAULT '',
+  draft_content jsonb NOT NULL DEFAULT '{"type":"doc","content":[]}'::jsonb,
+  featured_product_ids uuid[] NOT NULL DEFAULT '{}'::uuid[],
+  published_content jsonb NULL,
+  published_title text NULL,
+  published_meta_description text NULL,
+  published_profile jsonb NULL,
+  published_featured_product_ids uuid[] NOT NULL DEFAULT '{}'::uuid[],
+  approval_status public.affiliate_page_status NOT NULL DEFAULT 'DRAFT',
+  admin_feedback_note text NULL,
+  draft_version integer NOT NULL DEFAULT 1,
+  draft_updated_at timestamptz NOT NULL DEFAULT now(),
+  submitted_at timestamptz NULL,
+  submitted_version integer NULL,
+  reviewed_at timestamptz NULL,
+  reviewed_by uuid NULL,
+  published_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_pages_pkey PRIMARY KEY (id),
+  CONSTRAINT affiliate_pages_affiliate_id_key UNIQUE (affiliate_id),
+  CONSTRAINT affiliate_pages_user_id_key UNIQUE (user_id),
+  -- the page belongs to the same account as its profile (A22); the composite key replaces a
+  -- single-column affiliate_id foreign key
+  CONSTRAINT affiliate_pages_affiliate_owner_fkey FOREIGN KEY (affiliate_id, user_id)
+    REFERENCES public.affiliate_profiles (id, user_id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_pages_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users (id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_pages_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES auth.users (id) ON DELETE SET NULL,
+  CONSTRAINT affiliate_pages_title_check CHECK (char_length(title) <= 120),
+  CONSTRAINT affiliate_pages_meta_description_check CHECK (char_length(meta_description) <= 300),
+  CONSTRAINT affiliate_pages_draft_content_check CHECK (jsonb_typeof(draft_content) = 'object' AND octet_length(draft_content::text) <= 262144),
+  CONSTRAINT affiliate_pages_featured_product_ids_check CHECK (cardinality(featured_product_ids) <= 24),
+  CONSTRAINT affiliate_pages_published_content_check CHECK (
+    published_content IS NULL OR (jsonb_typeof(published_content) = 'object' AND octet_length(published_content::text) <= 262144)
+  ),
+  CONSTRAINT affiliate_pages_published_title_check CHECK (published_title IS NULL OR char_length(published_title) <= 120),
+  CONSTRAINT affiliate_pages_published_meta_description_check CHECK (published_meta_description IS NULL OR char_length(published_meta_description) <= 300),
+  CONSTRAINT affiliate_pages_published_profile_check CHECK (published_profile IS NULL OR jsonb_typeof(published_profile) = 'object'),
+  CONSTRAINT affiliate_pages_published_featured_product_ids_check CHECK (cardinality(published_featured_product_ids) <= 24),
+  CONSTRAINT affiliate_pages_admin_feedback_note_check CHECK (admin_feedback_note IS NULL OR char_length(admin_feedback_note) <= 2000)
+);
+
+CREATE INDEX IF NOT EXISTS affiliate_pages_approval_status_idx ON public.affiliate_pages (approval_status, submitted_at);
+
+-- ---------------------------------------------------------------------------
+-- 5. affiliate_payouts (before the commissions that reference it)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_payouts (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  affiliate_id uuid NOT NULL,
+  amount_cents bigint NOT NULL,
+  currency text NOT NULL,
+  stripe_destination_account text NOT NULL,
+  livemode boolean NOT NULL DEFAULT true,
+  stripe_transfer_id text NULL,
+  status public.affiliate_payout_status NOT NULL DEFAULT 'PROCESSING',
+  attempt_count integer NOT NULL DEFAULT 1,
+  last_attempt_at timestamptz NOT NULL DEFAULT now(),
+  failure_reason text NULL,
+  trigger text NOT NULL DEFAULT 'cron',
+  paid_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_payouts_pkey PRIMARY KEY (id),
+  CONSTRAINT affiliate_payouts_stripe_transfer_id_key UNIQUE (stripe_transfer_id),
+  CONSTRAINT affiliate_payouts_affiliate_id_fkey FOREIGN KEY (affiliate_id) REFERENCES public.affiliate_profiles (id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_payouts_amount_cents_check CHECK (amount_cents > 0),
+  CONSTRAINT affiliate_payouts_currency_check CHECK (currency ~ '^[A-Z]{3}$'),
+  CONSTRAINT affiliate_payouts_attempt_count_check CHECK (attempt_count >= 1),
+  CONSTRAINT affiliate_payouts_failure_reason_check CHECK (failure_reason IS NULL OR char_length(failure_reason) <= 500),
+  CONSTRAINT affiliate_payouts_trigger_check CHECK (trigger IN ('cron', 'admin', 'auto'))
+);
+
+CREATE INDEX IF NOT EXISTS affiliate_payouts_affiliate_created_idx ON public.affiliate_payouts (affiliate_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS affiliate_payouts_status_idx ON public.affiliate_payouts (status);
+
+-- ---------------------------------------------------------------------------
+-- 6. affiliate_commissions (the ledger; base-currency minor units)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_commissions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  affiliate_id uuid NOT NULL,
+  order_id uuid NULL,
+  gateway public.affiliate_gateway NOT NULL,
+  order_currency text NOT NULL,
+  order_net_amount_minor bigint NOT NULL,
+  exchange_rate_snapshot numeric(20,10) NOT NULL DEFAULT 1,
+  net_order_amount_cents bigint NOT NULL,
+  commission_rate_snapshot numeric(5,2) NOT NULL,
+  commission_amount_cents bigint NOT NULL,
+  refunded_amount_cents bigint NOT NULL DEFAULT 0,
+  refund_pending_cents bigint NOT NULL DEFAULT 0,
+  void_requested_at timestamptz NULL,
+  disputed_at timestamptz NULL,
+  currency text NOT NULL DEFAULT 'USD',
+  livemode boolean NOT NULL DEFAULT true,
+  status public.affiliate_commission_status NOT NULL DEFAULT 'PENDING_CLEARANCE',
+  clears_at timestamptz NOT NULL DEFAULT (now() + interval '30 days'),
+  cleared_at timestamptz NULL,
+  paid_at timestamptz NULL,
+  voided_at timestamptz NULL,
+  void_reason text NULL,
+  payout_id uuid NULL,
+  stripe_transfer_id text NULL,
+  notified_at timestamptz NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_commissions_pkey PRIMARY KEY (id),
+  -- order_id first: the orders triggers and the refund RPC look commissions up by order (A9)
+  CONSTRAINT affiliate_commissions_order_gateway_key UNIQUE (order_id, gateway),
+  CONSTRAINT affiliate_commissions_affiliate_id_fkey FOREIGN KEY (affiliate_id) REFERENCES public.affiliate_profiles (id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_commissions_order_id_fkey FOREIGN KEY (order_id) REFERENCES public.orders (id) ON DELETE SET NULL,
+  CONSTRAINT affiliate_commissions_payout_id_fkey FOREIGN KEY (payout_id) REFERENCES public.affiliate_payouts (id) ON DELETE SET NULL,
+  CONSTRAINT affiliate_commissions_order_currency_check CHECK (order_currency ~ '^[A-Z]{3}$'),
+  CONSTRAINT affiliate_commissions_order_net_amount_minor_check CHECK (order_net_amount_minor >= 0),
+  CONSTRAINT affiliate_commissions_exchange_rate_snapshot_check CHECK (exchange_rate_snapshot > 0),
+  CONSTRAINT affiliate_commissions_net_order_amount_cents_check CHECK (net_order_amount_cents >= 0),
+  CONSTRAINT affiliate_commissions_commission_rate_snapshot_check CHECK (commission_rate_snapshot >= 0 AND commission_rate_snapshot <= 100),
+  CONSTRAINT affiliate_commissions_commission_amount_cents_check CHECK (commission_amount_cents >= 0),
+  CONSTRAINT affiliate_commissions_refunded_amount_cents_check CHECK (refunded_amount_cents >= 0 AND refunded_amount_cents <= commission_amount_cents),
+  CONSTRAINT affiliate_commissions_refund_pending_cents_check CHECK (refund_pending_cents >= 0 AND refund_pending_cents <= commission_amount_cents),
+  CONSTRAINT affiliate_commissions_currency_check CHECK (currency ~ '^[A-Z]{3}$'),
+  CONSTRAINT affiliate_commissions_void_reason_check CHECK (void_reason IS NULL OR char_length(void_reason) <= 500)
+);
+
+CREATE INDEX IF NOT EXISTS affiliate_commissions_affiliate_status_idx ON public.affiliate_commissions (affiliate_id, status);
+CREATE INDEX IF NOT EXISTS affiliate_commissions_status_clears_at_idx ON public.affiliate_commissions (status, clears_at);
+CREATE INDEX IF NOT EXISTS affiliate_commissions_payout_id_idx ON public.affiliate_commissions (payout_id);
+CREATE INDEX IF NOT EXISTS affiliate_commissions_unnotified_idx ON public.affiliate_commissions (created_at) WHERE notified_at IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- 7. affiliate_click_events (service role only; 30-day rolling window)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_click_events (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  affiliate_id uuid NOT NULL,
+  visitor_hash text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT affiliate_click_events_pkey PRIMARY KEY (id),
+  CONSTRAINT affiliate_click_events_affiliate_id_fkey FOREIGN KEY (affiliate_id) REFERENCES public.affiliate_profiles (id) ON DELETE CASCADE,
+  CONSTRAINT affiliate_click_events_visitor_hash_check CHECK (char_length(visitor_hash) <= 128)
+);
+
+CREATE INDEX IF NOT EXISTS affiliate_click_events_dedupe_idx ON public.affiliate_click_events (affiliate_id, visitor_hash, created_at DESC);
+CREATE INDEX IF NOT EXISTS affiliate_click_events_visitor_idx ON public.affiliate_click_events (visitor_hash, created_at DESC);
+CREATE INDEX IF NOT EXISTS affiliate_click_events_affiliate_created_idx ON public.affiliate_click_events (affiliate_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS affiliate_click_events_created_at_idx ON public.affiliate_click_events (created_at);
+
+-- ---------------------------------------------------------------------------
+-- 8. affiliate_payout_runs (service role only; one claim per UTC day)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.affiliate_payout_runs (
+  run_date date NOT NULL,
+  trigger text NOT NULL,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz NULL,
+  summary jsonb NOT NULL DEFAULT '{}'::jsonb,
+  CONSTRAINT affiliate_payout_runs_pkey PRIMARY KEY (run_date),
+  CONSTRAINT affiliate_payout_runs_trigger_check CHECK (char_length(trigger) BETWEEN 1 AND 64)
+);
+
+-- ---------------------------------------------------------------------------
+-- 9. orders: attribution columns (no grant change: the table grants cover new columns)
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_id uuid NULL;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_source text NULL;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_base_currency text NULL;
+-- the payment mode of an attributed checkout, written with the attribution (C)
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_livemode boolean NULL;
+-- a partial refund that arrives before the order has a commission (Y): the largest cumulative
+-- refund and the charge total it was measured against, written by apply_affiliate_refund()
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_refunded_minor bigint NULL;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_refund_total_minor bigint NULL;
+
+DO $nb$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_id_fkey' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_id_fkey FOREIGN KEY (affiliate_id) REFERENCES public.affiliate_profiles (id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_source_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_source_check CHECK (affiliate_source IS NULL OR affiliate_source IN ('storefront', 'referral_link'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_base_currency_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_base_currency_check CHECK (affiliate_base_currency IS NULL OR affiliate_base_currency ~ '^[A-Z]{3}$');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_refunded_minor_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_refunded_minor_check CHECK (affiliate_refunded_minor IS NULL OR affiliate_refunded_minor >= 0);
+  END IF;
+  -- written together: a refund is meaningless without the charge it was measured against
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_refund_total_minor_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_refund_total_minor_check CHECK (
+        (affiliate_refund_total_minor IS NULL) = (affiliate_refunded_minor IS NULL)
+        AND (affiliate_refund_total_minor IS NULL OR affiliate_refund_total_minor > 0));
+  END IF;
+END
+$nb$;
+
+CREATE INDEX IF NOT EXISTS orders_affiliate_id_idx ON public.orders (affiliate_id) WHERE affiliate_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS orders_payment_intent_id_idx ON public.orders (payment_intent_id) WHERE payment_intent_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 10. system_alerts: the affiliate alert types
+-- ---------------------------------------------------------------------------
+-- NOT VALID first so the add cannot fail half-way; every existing row holds one of the two
+-- previous types, so the VALIDATE that follows passes.
+ALTER TABLE public.system_alerts DROP CONSTRAINT IF EXISTS system_alerts_alert_type_check;
+ALTER TABLE public.system_alerts
+  ADD CONSTRAINT system_alerts_alert_type_check CHECK (alert_type = ANY (ARRAY[
+    'merge_conflict', 'runtime_update_available',
+    'affiliate_signed_up', 'affiliate_profile_completed', 'affiliate_payout_configured',
+    'affiliate_page_submitted', 'affiliate_payout_failed', 'affiliate_refund_after_payout'
+  ]::text[])) NOT VALID;
+ALTER TABLE public.system_alerts VALIDATE CONSTRAINT system_alerts_alert_type_check;
+
+COMMENT ON TABLE public.system_alerts IS 'System notifications for the CMS: the automated upstream-update architecture (merge conflicts, runtime updates available) and the affiliates package (partner lifecycle, payout failures, refunds after a payout). Written by service-role (and the affiliate SECURITY DEFINER functions); read by ADMINs.';
+COMMENT ON COLUMN public.system_alerts.alert_type IS 'One of: merge_conflict, runtime_update_available, affiliate_signed_up, affiliate_profile_completed, affiliate_payout_configured, affiliate_page_submitted, affiliate_payout_failed, affiliate_refund_after_payout.';
+
+-- ---------------------------------------------------------------------------
+-- 11. updated_at triggers
+-- ---------------------------------------------------------------------------
+DROP TRIGGER IF EXISTS affiliate_tiers_set_updated_at ON public.affiliate_tiers;
+CREATE TRIGGER affiliate_tiers_set_updated_at BEFORE UPDATE ON public.affiliate_tiers FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+DROP TRIGGER IF EXISTS affiliate_profiles_set_updated_at ON public.affiliate_profiles;
+CREATE TRIGGER affiliate_profiles_set_updated_at BEFORE UPDATE ON public.affiliate_profiles FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+DROP TRIGGER IF EXISTS affiliate_pages_set_updated_at ON public.affiliate_pages;
+CREATE TRIGGER affiliate_pages_set_updated_at BEFORE UPDATE ON public.affiliate_pages FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+DROP TRIGGER IF EXISTS affiliate_payouts_set_updated_at ON public.affiliate_payouts;
+CREATE TRIGGER affiliate_payouts_set_updated_at BEFORE UPDATE ON public.affiliate_payouts FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+DROP TRIGGER IF EXISTS affiliate_commissions_set_updated_at ON public.affiliate_commissions;
+CREATE TRIGGER affiliate_commissions_set_updated_at BEFORE UPDATE ON public.affiliate_commissions FOR EACH ROW EXECUTE FUNCTION public.set_current_timestamp_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- 12a. private helpers: currency factor, email normalisation, refund alert
+-- ---------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS private;
+
+-- Minor units per major unit; mirrors getCurrencyMinorUnitFactor() in libs/utils (zero-decimal
+-- currencies are 1, everything else 100).
+CREATE OR REPLACE FUNCTION private.affiliate_currency_factor(p_code text)
+    RETURNS integer
+    LANGUAGE sql IMMUTABLE
+    SET search_path TO ''
+    AS $$
+  SELECT CASE
+    WHEN upper(btrim(coalesce(p_code, ''))) = ANY (ARRAY['BIF', 'CLP', 'DJF', 'GNF', 'JPY', 'KMF', 'KRW', 'MGA', 'PYG', 'RWF', 'UGX', 'VND', 'VUV', 'XAF', 'XOF', 'XPF'])
+      THEN 1
+    ELSE 100
+  END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_currency_factor(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_currency_factor(text) TO service_role;
+
+-- The part of a commission a cumulative refund takes back (finding I), used by
+-- apply_affiliate_refund() and by affiliate_record_commission() for a refund that came first.
+-- The commission was earned on the goods (no tax, no shipping), but a refund carries no
+-- breakdown: shipping is taken to be refunded last and tax with the goods it was charged on.
+-- So the base is the charge minus the order's shipping share (p_total_minor scaled by the
+-- order's own shipping / total ratio, which keeps it unit-agnostic), the share is pro rata on
+-- it, and a refund of everything but shipping takes the whole commission. Without shipping it
+-- is the plain ratio refunded / charge. 0 for a non-positive commission, refund or charge.
+CREATE OR REPLACE FUNCTION private.affiliate_refund_share(
+    p_commission bigint, p_refunded_minor bigint, p_total_minor bigint, p_order_total bigint, p_order_shipping bigint)
+    RETURNS bigint
+    LANGUAGE sql IMMUTABLE
+    SET search_path TO ''
+    AS $$
+  SELECT CASE
+    WHEN coalesce(p_commission, 0) <= 0 OR coalesce(p_refunded_minor, 0) <= 0 OR coalesce(p_total_minor, 0) <= 0 THEN 0::bigint
+    ELSE LEAST(p_commission, round(p_commission::numeric * LEAST(p_refunded_minor, b.base) / b.base)::bigint)
+  END
+  FROM (
+    SELECT GREATEST(p_total_minor - CASE
+             WHEN coalesce(p_order_total, 0) > 0 AND coalesce(p_order_shipping, 0) > 0
+               THEN round(p_total_minor::numeric * LEAST(p_order_shipping, p_order_total) / p_order_total)::bigint
+             ELSE 0
+           END, 1) AS base
+  ) AS b;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_refund_share(bigint, bigint, bigint, bigint, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_refund_share(bigint, bigint, bigint, bigint, bigint) TO service_role;
+
+-- Self-referral comparison key (A13); mirrored by normalizeAffiliateEmail() in the lib: trim,
+-- lower-case, split at the LAST '@', drop a '+tag' from the local part, and for gmail.com /
+-- googlemail.com drop every dot from the local part and use gmail.com. NULL for a blank input;
+-- an input without '@' comes back trimmed and lower-cased.
+CREATE OR REPLACE FUNCTION private.affiliate_normalize_email(p_email text)
+    RETURNS text
+    LANGUAGE plpgsql IMMUTABLE
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_email text := lower(regexp_replace(coalesce(p_email, ''), '^\\s+|\\s+$', '', 'g'));
+  v_at integer;
+  v_local text;
+  v_domain text;
+BEGIN
+  IF v_email = '' THEN
+    RETURN NULL;
+  END IF;
+  IF strpos(v_email, '@') = 0 THEN
+    RETURN v_email;
+  END IF;
+  v_at := length(v_email) - strpos(reverse(v_email), '@') + 1;
+  v_local := left(v_email, v_at - 1);
+  v_domain := substr(v_email, v_at + 1);
+  IF strpos(v_local, '+') > 0 THEN
+    v_local := left(v_local, strpos(v_local, '+') - 1);
+  END IF;
+  IF v_domain IN ('gmail.com', 'googlemail.com') THEN
+    v_local := replace(v_local, '.', '');
+    v_domain := 'gmail.com';
+  END IF;
+  RETURN v_local || '@' || v_domain;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_normalize_email(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_normalize_email(text) TO service_role;
+
+-- One unresolved affiliate_refund_after_payout alert per commission (A19 text and metadata).
+CREATE OR REPLACE FUNCTION private.affiliate_alert_refund_after_payout(
+    p_commission_id uuid, p_affiliate_id uuid, p_order_id uuid, p_payout_id uuid, p_reason text)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF p_commission_id IS NULL THEN
+    RETURN;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.system_alerts a
+     WHERE a.alert_type = 'affiliate_refund_after_payout'
+       AND a.is_resolved = false
+       AND a.metadata ->> 'commission_id' = p_commission_id::text
+  ) THEN
+    RETURN;
+  END IF;
+  INSERT INTO public.system_alerts (alert_type, title, message, metadata)
+  VALUES (
+    'affiliate_refund_after_payout',
+    'Refund after an affiliate payout',
+    CASE
+      WHEN p_reason = 'order_deleted' THEN
+        format('Order %s was deleted after its commission was paid or queued. Reverse the transfer in Stripe if needed.', coalesce(p_order_id::text, 'unknown'))
+      ELSE
+        format('Order %s was refunded after its commission was paid or queued. Reverse the transfer in Stripe if needed.', coalesce(p_order_id::text, 'unknown'))
+    END,
+    jsonb_build_object(
+      'commission_id', p_commission_id,
+      'affiliate_id', p_affiliate_id,
+      'order_id', p_order_id,
+      'payout_id', p_payout_id,
+      'reason', p_reason,
+      'action_url', '/cms/affiliates/payouts',
+      'action_label', 'Review payouts'
+    )
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 12b. trigger functions on affiliate_profiles / affiliate_pages
+-- ---------------------------------------------------------------------------
+-- member_count follows the profiles in each tier (never below 0). Both rows of a tier move are
+-- updated in one statement so two opposite moves lock them in the same order.
+CREATE OR REPLACE FUNCTION private.affiliate_tier_member_count()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE public.affiliate_tiers SET member_count = member_count + 1 WHERE id = NEW.tier_id;
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE public.affiliate_tiers SET member_count = GREATEST(member_count - 1, 0) WHERE id = OLD.tier_id;
+  ELSIF NEW.tier_id IS DISTINCT FROM OLD.tier_id THEN
+    UPDATE public.affiliate_tiers
+       SET member_count = CASE WHEN id = NEW.tier_id THEN member_count + 1 ELSE GREATEST(member_count - 1, 0) END
+     WHERE id IN (OLD.tier_id, NEW.tier_id);
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+-- Trigger functions are never called by API roles (02013, 02021).
+REVOKE ALL ON FUNCTION private.affiliate_tier_member_count() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_tier_member_count() TO service_role;
+
+-- A request that carries a user session (auth.uid() is set) and is not an ADMIN on a satisfied
+-- second factor may not change any column the partner does not own. It keys off the session,
+-- not the SQL role (02021's protect_profile_role reasoning): service_role and postgres carry no
+-- session. total_clicks / last_click_at are not on the list (record_affiliate_click() bumps
+-- them from any session; the column grants already pin them, A15). The same session may not
+-- change display_name, bio or social_links while the partner's page is PENDING_REVIEW either
+-- (finding A): approval snapshots them, and the portal withdraws the submission first. The review
+-- lock is session-scoped on purpose: server writes (portal actions, the upload route, the
+-- sandbox demo) carry no session and are held by the app, whose Approve pins the profile the
+-- reviewer saw. Then, for every writer: the handle is lower-cased and onboarding_step is
+-- recomputed from the lifecycle timestamps.
+CREATE OR REPLACE FUNCTION private.affiliate_profile_guard()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.user_id IS DISTINCT FROM OLD.user_id
+          OR NEW.tier_id IS DISTINCT FROM OLD.tier_id
+          OR NEW.handle IS DISTINCT FROM OLD.handle
+          OR NEW.status IS DISTINCT FROM OLD.status
+          OR NEW.suspended_reason IS DISTINCT FROM OLD.suspended_reason
+          OR NEW.avatar_object_key IS DISTINCT FROM OLD.avatar_object_key
+          OR NEW.onboarding_step IS DISTINCT FROM OLD.onboarding_step
+          OR NEW.stripe_connect_account_id IS DISTINCT FROM OLD.stripe_connect_account_id
+          OR NEW.stripe_connect_livemode IS DISTINCT FROM OLD.stripe_connect_livemode
+          OR NEW.stripe_connect_onboarding_complete IS DISTINCT FROM OLD.stripe_connect_onboarding_complete
+          OR NEW.stripe_connect_details_submitted IS DISTINCT FROM OLD.stripe_connect_details_submitted
+          OR NEW.stripe_connect_payouts_enabled IS DISTINCT FROM OLD.stripe_connect_payouts_enabled
+          OR NEW.stripe_connect_checked_at IS DISTINCT FROM OLD.stripe_connect_checked_at
+          OR NEW.total_earned_cents IS DISTINCT FROM OLD.total_earned_cents
+          OR NEW.total_paid_cents IS DISTINCT FROM OLD.total_paid_cents
+          OR NEW.profile_completed_at IS DISTINCT FROM OLD.profile_completed_at
+          OR NEW.payout_configured_at IS DISTINCT FROM OLD.payout_configured_at
+          OR NEW.page_submitted_at IS DISTINCT FROM OLD.page_submitted_at
+          OR NEW.first_published_at IS DISTINCT FROM OLD.first_published_at
+          OR NEW.signup_ip_masked IS DISTINCT FROM OLD.signup_ip_masked
+          OR NEW.created_at IS DISTINCT FROM OLD.created_at)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_field_protected'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Only an administrator or the server can change this partner field.';
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.display_name IS DISTINCT FROM OLD.display_name
+          OR NEW.bio IS DISTINCT FROM OLD.bio
+          OR NEW.social_links IS DISTINCT FROM OLD.social_links)
+     AND EXISTS (
+       SELECT 1 FROM public.affiliate_pages pg
+        WHERE pg.affiliate_id = OLD.id
+          AND pg.approval_status = 'PENDING_REVIEW'::public.affiliate_page_status)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_pending_review'
+      USING ERRCODE = '55000',
+            HINT = 'Withdraw the submission before editing the public profile.';
+  END IF;
+
+  NEW.handle := lower(NEW.handle);
+  NEW.onboarding_step := CASE
+    WHEN NEW.first_published_at IS NOT NULL THEN 'ACTIVE_PUBLISHED'::public.affiliate_onboarding_step
+    WHEN NEW.page_submitted_at IS NOT NULL THEN 'PAGE_SUBMITTED'::public.affiliate_onboarding_step
+    WHEN NEW.payout_configured_at IS NOT NULL THEN 'PAYOUT_CONFIGURED'::public.affiliate_onboarding_step
+    WHEN NEW.profile_completed_at IS NOT NULL THEN 'PROFILE_COMPLETED'::public.affiliate_onboarding_step
+    ELSE 'SIGNED_UP'::public.affiliate_onboarding_step
+  END;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_profile_guard() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_profile_guard() TO service_role;
+
+-- In this order (A16): (1) a non-admin session changing a review or publication column is
+-- refused, judged on NEW as the statement wrote it; (2) nobody edits the draft while it waits for
+-- review (the portal withdraws the submission first); (3) a draft edit bumps draft_version and
+-- draft_updated_at, and sends a PUBLISHED or CHANGES_REQUESTED page back to DRAFT unless the
+-- statement set the status itself. Approving and requesting changes never write draft columns.
+CREATE OR REPLACE FUNCTION private.affiliate_page_guard()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_draft_changed boolean;
+BEGIN
+  IF (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.affiliate_id IS DISTINCT FROM OLD.affiliate_id
+          OR NEW.user_id IS DISTINCT FROM OLD.user_id
+          OR NEW.published_content IS DISTINCT FROM OLD.published_content
+          OR NEW.published_title IS DISTINCT FROM OLD.published_title
+          OR NEW.published_meta_description IS DISTINCT FROM OLD.published_meta_description
+          OR NEW.published_profile IS DISTINCT FROM OLD.published_profile
+          OR NEW.published_featured_product_ids IS DISTINCT FROM OLD.published_featured_product_ids
+          OR NEW.published_at IS DISTINCT FROM OLD.published_at
+          OR NEW.approval_status IS DISTINCT FROM OLD.approval_status
+          OR NEW.admin_feedback_note IS DISTINCT FROM OLD.admin_feedback_note
+          OR NEW.submitted_at IS DISTINCT FROM OLD.submitted_at
+          OR NEW.submitted_version IS DISTINCT FROM OLD.submitted_version
+          OR NEW.reviewed_at IS DISTINCT FROM OLD.reviewed_at
+          OR NEW.reviewed_by IS DISTINCT FROM OLD.reviewed_by
+          OR NEW.draft_version IS DISTINCT FROM OLD.draft_version
+          OR NEW.draft_updated_at IS DISTINCT FROM OLD.draft_updated_at
+          OR NEW.created_at IS DISTINCT FROM OLD.created_at)
+  THEN
+    RAISE EXCEPTION 'affiliate_page_field_protected'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Only an administrator or the server can change the review and publication fields.';
+  END IF;
+
+  v_draft_changed := NEW.title IS DISTINCT FROM OLD.title
+    OR NEW.meta_description IS DISTINCT FROM OLD.meta_description
+    OR NEW.draft_content IS DISTINCT FROM OLD.draft_content
+    OR NEW.featured_product_ids IS DISTINCT FROM OLD.featured_product_ids;
+
+  IF v_draft_changed THEN
+    IF OLD.approval_status = 'PENDING_REVIEW'::public.affiliate_page_status THEN
+      RAISE EXCEPTION 'affiliate_page_pending_review'
+        USING ERRCODE = '55000',
+              HINT = 'Withdraw the submission before editing the draft.';
+    END IF;
+    NEW.draft_version := OLD.draft_version + 1;
+    NEW.draft_updated_at := now();
+    IF OLD.approval_status IN ('PUBLISHED'::public.affiliate_page_status, 'CHANGES_REQUESTED'::public.affiliate_page_status)
+       AND NEW.approval_status = OLD.approval_status THEN
+      NEW.approval_status := 'DRAFT'::public.affiliate_page_status;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_page_guard() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_page_guard() TO service_role;
+
+DROP TRIGGER IF EXISTS affiliate_profile_guard ON public.affiliate_profiles;
+CREATE TRIGGER affiliate_profile_guard
+  BEFORE INSERT OR UPDATE ON public.affiliate_profiles
+  FOR EACH ROW EXECUTE FUNCTION private.affiliate_profile_guard();
+
+DROP TRIGGER IF EXISTS affiliate_tier_member_count ON public.affiliate_profiles;
+CREATE TRIGGER affiliate_tier_member_count
+  AFTER INSERT OR DELETE OR UPDATE OF tier_id ON public.affiliate_profiles
+  FOR EACH ROW EXECUTE FUNCTION private.affiliate_tier_member_count();
+
+DROP TRIGGER IF EXISTS affiliate_page_guard ON public.affiliate_pages;
+CREATE TRIGGER affiliate_page_guard
+  BEFORE UPDATE ON public.affiliate_pages
+  FOR EACH ROW EXECUTE FUNCTION private.affiliate_page_guard();
+
+-- ---------------------------------------------------------------------------
+-- 12c. the ledger core: void and record (SECURITY DEFINER, service role + the triggers)
+-- ---------------------------------------------------------------------------
+-- Voids every live commission of an order and returns how many it voided. A commission is live
+-- while PENDING_CLEARANCE or CLEARED and not in flight: unattached, or attached to a FAILED
+-- payout (it is detached). A PAID commission, or one attached to a PROCESSING / COMPLETED payout,
+-- keeps its amounts (the money left or is leaving): it gets void_requested_at (applied if that
+-- payout fails) and an affiliate_refund_after_payout alert. Lock order (A2): profile, then the
+-- order's commissions, then each payout's status in its own statement.
+CREATE OR REPLACE FUNCTION private.affiliate_void_order_commissions(p_order_id uuid, p_reason text)
+    RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_reason text := left(coalesce(nullif(btrim(p_reason), ''), 'refunded'), 500);
+  v_affiliate uuid;
+  v_commission record;
+  v_payout_status text;
+  v_voided integer := 0;
+BEGIN
+  IF p_order_id IS NULL THEN
+    RETURN 0;
+  END IF;
+
+  FOR v_affiliate IN
+    SELECT DISTINCT c.affiliate_id FROM public.affiliate_commissions c WHERE c.order_id = p_order_id ORDER BY 1
+  LOOP
+    PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+    PERFORM 1 FROM public.affiliate_commissions c WHERE c.order_id = p_order_id AND c.affiliate_id = v_affiliate FOR UPDATE;
+
+    FOR v_commission IN
+      SELECT c.id, c.status::text AS status, c.payout_id, c.commission_amount_cents, c.refunded_amount_cents
+        FROM public.affiliate_commissions c
+       WHERE c.order_id = p_order_id AND c.affiliate_id = v_affiliate
+       ORDER BY c.created_at, c.id
+    LOOP
+      v_payout_status := NULL;
+      IF v_commission.payout_id IS NOT NULL THEN
+        SELECT po.status::text INTO v_payout_status FROM public.affiliate_payouts po WHERE po.id = v_commission.payout_id;
+      END IF;
+
+      IF v_commission.status IN ('PENDING_CLEARANCE', 'CLEARED')
+         AND (v_commission.payout_id IS NULL OR v_payout_status IS NULL OR v_payout_status = 'FAILED') THEN
+        UPDATE public.affiliate_commissions
+           SET status = 'VOIDED_REFUND', voided_at = now(), void_reason = v_reason, payout_id = NULL
+         WHERE id = v_commission.id;
+        UPDATE public.affiliate_profiles
+           SET total_earned_cents = GREATEST(total_earned_cents - (v_commission.commission_amount_cents - v_commission.refunded_amount_cents), 0)
+         WHERE id = v_affiliate;
+        v_voided := v_voided + 1;
+      ELSIF v_commission.status = 'PAID'
+         OR (v_commission.status IN ('PENDING_CLEARANCE', 'CLEARED') AND v_payout_status IN ('PROCESSING', 'COMPLETED')) THEN
+        UPDATE public.affiliate_commissions
+           SET void_requested_at = coalesce(void_requested_at, now()), void_reason = coalesce(void_reason, v_reason)
+         WHERE id = v_commission.id;
+        PERFORM private.affiliate_alert_refund_after_payout(v_commission.id, v_affiliate, p_order_id, v_commission.payout_id, v_reason);
+      END IF;
+    END LOOP;
+  END LOOP;
+
+  RETURN v_voided;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_void_order_commissions(uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_void_order_commissions(uuid, text) TO service_role;
+
+CREATE OR REPLACE FUNCTION private.affiliate_void_commission_for_order(p_order_id uuid, p_reason text)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  PERFORM private.affiliate_void_order_commissions(p_order_id, p_reason);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_void_commission_for_order(uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_void_commission_for_order(uuid, text) TO service_role;
+
+-- Records the commission of a paid, attributed order (idempotent: one row per order and
+-- gateway, ON CONFLICT DO NOTHING) and returns its id, or NULL when nothing was recorded: the
+-- order is not paid/shipped or not attributed, the partner is not ACTIVE or not approved yet
+-- (first_published_at, A12), the buyer is the partner (same account, or the same normalised
+-- e-mail, A13), or the commission rounds to 0. Amounts are in the base currency (A14). The row
+-- carries the sale's key mode (orders.affiliate_livemode; true when unknown, C), and a partial
+-- refund that arrived before it (kept on the order by apply_affiliate_refund, Y) is taken off
+-- from the start with the same share rule: total_earned_cents grows by the rest only, and a
+-- refund that takes the whole commission records it VOIDED_REFUND ('refunded').
+CREATE OR REPLACE FUNCTION private.affiliate_record_commission(p_order_id uuid)
+    RETURNS uuid
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_order record;
+  v_profile record;
+  v_tier record;
+  v_buyer_email text;
+  v_partner_email text;
+  v_order_currency text;
+  v_base_currency text;
+  v_net_minor bigint;
+  v_net_base bigint;
+  v_rate numeric(20,10);
+  v_commission bigint;
+  v_refunded bigint;
+  v_voided boolean;
+  v_id uuid;
+BEGIN
+  SELECT o.id, o.user_id, o.status, o.total, o.subtotal, o.discount_total, o.shipping_total, o.currency,
+         o.exchange_rate_at_purchase, o.provider, o.paid_at, o.affiliate_id,
+         o.affiliate_base_currency, o.affiliate_livemode, o.affiliate_refunded_minor,
+         o.affiliate_refund_total_minor, o.customer_details
+    INTO v_order
+    FROM public.orders o
+   WHERE o.id = p_order_id;
+
+  IF NOT FOUND OR v_order.affiliate_id IS NULL OR v_order.paid_at IS NULL
+     OR v_order.status IS NULL OR v_order.status NOT IN ('paid', 'shipped') THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT p.id, p.user_id, p.tier_id, p.status::text AS status, p.first_published_at
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = v_order.affiliate_id
+   FOR UPDATE;
+
+  IF NOT FOUND OR v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_order.user_id IS NOT NULL AND v_order.user_id = v_profile.user_id THEN
+    RETURN NULL;
+  END IF;
+  v_buyer_email := private.affiliate_normalize_email(v_order.customer_details ->> 'email');
+  IF v_buyer_email IS NOT NULL THEN
+    SELECT private.affiliate_normalize_email(u.email::text) INTO v_partner_email
+      FROM auth.users u
+     WHERE u.id = v_profile.user_id;
+    IF v_partner_email IS NOT NULL AND v_partner_email = v_buyer_email THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+
+  SELECT t.commission_percentage, t.clearance_hold_days
+    INTO v_tier
+    FROM public.affiliate_tiers t
+   WHERE t.id = v_profile.tier_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  v_order_currency := upper(btrim(coalesce(v_order.currency, 'USD')));
+  v_base_currency := coalesce(
+    nullif(upper(btrim(coalesce(v_order.affiliate_base_currency, ''))), ''),
+    (SELECT upper(c.code) FROM public.currencies c
+      WHERE c.is_default
+      ORDER BY c.updated_at DESC, c.created_at DESC, c.code
+      LIMIT 1),
+    v_order_currency
+  );
+
+  v_net_minor := GREATEST(coalesce(v_order.subtotal, v_order.total)::bigint - coalesce(v_order.discount_total, 0)::bigint, 0);
+  IF v_order_currency = v_base_currency THEN
+    v_net_base := v_net_minor;
+    v_rate := 1;
+  ELSE
+    v_rate := v_order.exchange_rate_at_purchase;
+    IF v_rate IS NULL OR v_rate <= 0 THEN
+      RETURN NULL;
+    END IF;
+    v_net_base := round(
+      (v_net_minor::numeric / private.affiliate_currency_factor(v_order_currency))
+      / v_rate
+      * private.affiliate_currency_factor(v_base_currency)
+    )::bigint;
+  END IF;
+
+  v_commission := round(v_net_base::numeric * v_tier.commission_percentage / 100)::bigint;
+  IF v_commission <= 0 THEN
+    RETURN NULL;
+  END IF;
+  v_refunded := private.affiliate_refund_share(v_commission, v_order.affiliate_refunded_minor,
+                                               v_order.affiliate_refund_total_minor, v_order.total, v_order.shipping_total);
+  v_voided := v_refunded >= v_commission;
+
+  INSERT INTO public.affiliate_commissions (
+    affiliate_id, order_id, gateway, order_currency, order_net_amount_minor, exchange_rate_snapshot,
+    net_order_amount_cents, commission_rate_snapshot, commission_amount_cents, refunded_amount_cents,
+    currency, livemode, status, clears_at, voided_at, void_reason
+  )
+  VALUES (
+    v_profile.id,
+    v_order.id,
+    CASE WHEN coalesce(v_order.provider, 'stripe') = 'freemius'
+      THEN 'FREEMIUS'::public.affiliate_gateway
+      ELSE 'STRIPE'::public.affiliate_gateway
+    END,
+    v_order_currency,
+    v_net_minor,
+    v_rate,
+    v_net_base,
+    v_tier.commission_percentage,
+    v_commission,
+    v_refunded,
+    v_base_currency,
+    coalesce(v_order.affiliate_livemode, true),
+    CASE WHEN v_voided
+      THEN 'VOIDED_REFUND'::public.affiliate_commission_status
+      ELSE 'PENDING_CLEARANCE'::public.affiliate_commission_status
+    END,
+    now() + make_interval(days => v_tier.clearance_hold_days),
+    CASE WHEN v_voided THEN now() END,
+    CASE WHEN v_voided THEN 'refunded' END
+  )
+  ON CONFLICT ON CONSTRAINT affiliate_commissions_order_gateway_key DO NOTHING
+  RETURNING id INTO v_id;
+
+  IF v_id IS NOT NULL AND NOT v_voided THEN
+    UPDATE public.affiliate_profiles SET total_earned_cents = total_earned_cents + (v_commission - v_refunded) WHERE id = v_profile.id;
+  END IF;
+  RETURN v_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_record_commission(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_record_commission(uuid) TO service_role;
+
+-- Work a payout row owes its commissions when it does not complete (A8): a void requested
+-- while it was in flight is applied (the commission is voided and detached), and a partial
+-- refund recorded meanwhile (refund_pending_cents) moves into refunded_amount_cents, with
+-- total_earned_cents following; a pending refund that takes the whole commission voids it like
+-- apply_affiliate_refund() does outside a payout (finding I). Callers hold the profile and
+-- commission locks already.
+CREATE OR REPLACE FUNCTION private.affiliate_apply_pending_payout_work(p_payout_id uuid)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_commission record;
+  v_new bigint;
+BEGIN
+  FOR v_commission IN
+    SELECT c.id, c.affiliate_id, c.status::text AS status, c.commission_amount_cents, c.refunded_amount_cents,
+           c.refund_pending_cents, c.void_requested_at
+      FROM public.affiliate_commissions c
+     WHERE c.payout_id = p_payout_id
+     ORDER BY c.created_at, c.id
+  LOOP
+    IF v_commission.status NOT IN ('PENDING_CLEARANCE', 'CLEARED') THEN
+      CONTINUE;
+    END IF;
+    IF v_commission.void_requested_at IS NOT NULL
+       OR (v_commission.commission_amount_cents > 0
+           AND v_commission.refund_pending_cents >= v_commission.commission_amount_cents) THEN
+      UPDATE public.affiliate_commissions
+         SET status = 'VOIDED_REFUND', voided_at = now(), void_reason = coalesce(void_reason, 'refunded'), payout_id = NULL
+       WHERE id = v_commission.id;
+      UPDATE public.affiliate_profiles
+         SET total_earned_cents = GREATEST(total_earned_cents - (v_commission.commission_amount_cents - v_commission.refunded_amount_cents), 0)
+       WHERE id = v_commission.affiliate_id;
+    ELSIF v_commission.refund_pending_cents > v_commission.refunded_amount_cents THEN
+      v_new := LEAST(v_commission.commission_amount_cents, v_commission.refund_pending_cents);
+      UPDATE public.affiliate_commissions SET refunded_amount_cents = v_new WHERE id = v_commission.id;
+      UPDATE public.affiliate_profiles
+         SET total_earned_cents = GREATEST(total_earned_cents - (v_new - v_commission.refunded_amount_cents), 0)
+       WHERE id = v_commission.affiliate_id;
+    END IF;
+  END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_apply_pending_payout_work(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_apply_pending_payout_work(uuid) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 12d. orders triggers
+-- ---------------------------------------------------------------------------
+-- Runs inside every "mark paid" write (assign_order_invoice_metadata()) and every status change.
+-- Only the paid branch is wrapped (A5): recording can never fail an order update, and
+-- reconcile_affiliate_commissions() repairs a commission it missed. A void that fails fails the
+-- status update (the CMS shows the error; a webhook gets a 5xx and is redelivered).
+CREATE OR REPLACE FUNCTION private.affiliate_on_order_change()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF OLD.paid_at IS NULL AND NEW.paid_at IS NOT NULL AND NEW.affiliate_id IS NOT NULL THEN
+    BEGIN
+      PERFORM private.affiliate_record_commission(NEW.id);
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'affiliate commission hook failed for order %: %', NEW.id, SQLERRM;
+    END;
+  END IF;
+
+  IF NEW.status IN ('refunded', 'cancelled') AND NEW.status IS DISTINCT FROM OLD.status THEN
+    PERFORM private.affiliate_void_order_commissions(NEW.id, NEW.status);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_on_order_change() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_on_order_change() TO service_role;
+
+-- A deleted order takes its live commissions with it (A10); paid or in-flight ones are flagged
+-- and alerted instead. The commissions' order_id then goes NULL (ON DELETE SET NULL).
+CREATE OR REPLACE FUNCTION private.affiliate_on_order_delete()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  PERFORM private.affiliate_void_order_commissions(OLD.id, 'order_deleted');
+  RETURN OLD;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_on_order_delete() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_on_order_delete() TO service_role;
+
+DROP TRIGGER IF EXISTS affiliate_on_order_change ON public.orders;
+CREATE TRIGGER affiliate_on_order_change
+  AFTER UPDATE OF paid_at, status ON public.orders
+  FOR EACH ROW
+  WHEN (OLD.paid_at IS DISTINCT FROM NEW.paid_at OR OLD.status IS DISTINCT FROM NEW.status)
+  EXECUTE FUNCTION private.affiliate_on_order_change();
+
+DROP TRIGGER IF EXISTS affiliate_on_order_delete ON public.orders;
+CREATE TRIGGER affiliate_on_order_delete
+  BEFORE DELETE ON public.orders
+  FOR EACH ROW
+  EXECUTE FUNCTION private.affiliate_on_order_delete();
+
+-- ---------------------------------------------------------------------------
+-- 12e. anonymous storefront reads and the click counter
+--      (definer in private + SECURITY INVOKER wrapper in public, 02021 pattern)
+-- ---------------------------------------------------------------------------
+-- A storefront is public while its partner is ACTIVE and approved (first_published_at, A12)
+-- and an approved document exists. Only the approved snapshot is returned (published_*), never
+-- a draft. updated_at is the last approval (published_at), so a draft autosave or a click never
+-- moves a sitemap lastmod.
+CREATE OR REPLACE FUNCTION private.get_affiliate_storefront(p_handle text)
+    RETURNS TABLE(
+      affiliate_id uuid, handle text, tier_name text, tier_name_translations jsonb, tier_badge_color text,
+      tier_is_limited_time_promo boolean, published_profile jsonb, published_title text,
+      published_meta_description text, published_content jsonb, published_featured_product_ids uuid[],
+      published_at timestamptz, updated_at timestamptz)
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+  SELECT p.id, p.handle, t.name, t.name_translations, t.badge_color, t.is_limited_time_promo,
+         pg.published_profile, pg.published_title, pg.published_meta_description, pg.published_content,
+         pg.published_featured_product_ids, pg.published_at, coalesce(pg.published_at, pg.updated_at)
+    FROM public.affiliate_profiles p
+    JOIN public.affiliate_tiers t ON t.id = p.tier_id
+    JOIN public.affiliate_pages pg ON pg.affiliate_id = p.id
+   WHERE p_handle IS NOT NULL
+     AND lower(p_handle) ~ '^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$'
+     AND p.handle = lower(p_handle)
+     AND p.status = 'ACTIVE'::public.affiliate_status
+     AND p.first_published_at IS NOT NULL
+     AND pg.published_content IS NOT NULL
+   LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION private.get_affiliate_storefront(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.get_affiliate_storefront(text) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.get_affiliate_storefront(p_handle text)
+    RETURNS TABLE(
+      affiliate_id uuid, handle text, tier_name text, tier_name_translations jsonb, tier_badge_color text,
+      tier_is_limited_time_promo boolean, published_profile jsonb, published_title text,
+      published_meta_description text, published_content jsonb, published_featured_product_ids uuid[],
+      published_at timestamptz, updated_at timestamptz)
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  SELECT * FROM private.get_affiliate_storefront(p_handle);
+$$;
+
+REVOKE ALL ON FUNCTION public.get_affiliate_storefront(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_affiliate_storefront(text) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION private.list_affiliate_storefronts(p_limit integer DEFAULT 5000)
+    RETURNS TABLE(handle text, published_at timestamptz, updated_at timestamptz)
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+  SELECT p.handle, pg.published_at, coalesce(pg.published_at, pg.updated_at)
+    FROM public.affiliate_profiles p
+    JOIN public.affiliate_pages pg ON pg.affiliate_id = p.id
+   WHERE p.status = 'ACTIVE'::public.affiliate_status
+     AND p.first_published_at IS NOT NULL
+     AND pg.published_content IS NOT NULL
+   ORDER BY p.handle
+   LIMIT LEAST(GREATEST(coalesce(p_limit, 5000), 1), 5000);
+$$;
+
+REVOKE ALL ON FUNCTION private.list_affiliate_storefronts(integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.list_affiliate_storefronts(integer) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.list_affiliate_storefronts(p_limit integer DEFAULT 5000)
+    RETURNS TABLE(handle text, published_at timestamptz, updated_at timestamptz)
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  SELECT * FROM private.list_affiliate_storefronts(p_limit);
+$$;
+
+REVOKE ALL ON FUNCTION public.list_affiliate_storefronts(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.list_affiliate_storefronts(integer) TO anon, authenticated, service_role;
+
+-- The proxy's referral-cookie lifetime: the tier's cookie_duration_days for an ACTIVE, approved
+-- partner, else NULL (no cookie).
+CREATE OR REPLACE FUNCTION private.get_affiliate_referral_window(p_handle text)
+    RETURNS integer
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+  SELECT t.cookie_duration_days
+    FROM public.affiliate_profiles p
+    JOIN public.affiliate_tiers t ON t.id = p.tier_id
+   WHERE p_handle IS NOT NULL
+     AND lower(p_handle) ~ '^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$'
+     AND p.handle = lower(p_handle)
+     AND p.status = 'ACTIVE'::public.affiliate_status
+     AND p.first_published_at IS NOT NULL
+   LIMIT 1;
+$$;
+
+REVOKE ALL ON FUNCTION private.get_affiliate_referral_window(text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.get_affiliate_referral_window(text) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.get_affiliate_referral_window(p_handle text)
+    RETURNS integer
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  SELECT private.get_affiliate_referral_window(p_handle);
+$$;
+
+REVOKE ALL ON FUNCTION public.get_affiliate_referral_window(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_affiliate_referral_window(text) TO anon, authenticated, service_role;
+
+-- One counted click per visitor hash per partner per 24 h, and the flood limits of A15: at most
+-- 60 events per visitor hash per hour, 500 per partner per day and 2000 overall per minute.
+-- Silently ignores anything else (malformed input, unknown or unapproved partner). Each call
+-- also prunes up to 500 events older than 30 days. VOLATILE (it writes).
+CREATE OR REPLACE FUNCTION private.record_affiliate_click(p_handle text, p_visitor_hash text)
+    RETURNS void
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_handle text := lower(coalesce(p_handle, ''));
+  v_affiliate uuid;
+BEGIN
+  IF v_handle !~ '^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$' THEN
+    RETURN;
+  END IF;
+  IF p_visitor_hash IS NULL OR p_visitor_hash !~ '^[a-f0-9]{16,64}$' THEN
+    RETURN;
+  END IF;
+
+  SELECT p.id INTO v_affiliate
+    FROM public.affiliate_profiles p
+   WHERE p.handle = v_handle
+     AND p.status = 'ACTIVE'::public.affiliate_status
+     AND p.first_published_at IS NOT NULL;
+  IF v_affiliate IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.affiliate_click_events e
+     WHERE e.affiliate_id = v_affiliate AND e.visitor_hash = p_visitor_hash AND e.created_at > now() - interval '24 hours'
+  ) THEN
+    RETURN;
+  END IF;
+  IF (SELECT count(*) FROM (
+        SELECT 1 FROM public.affiliate_click_events e
+         WHERE e.visitor_hash = p_visitor_hash AND e.created_at > now() - interval '1 hour'
+         LIMIT 60) AS recent) >= 60 THEN
+    RETURN;
+  END IF;
+  IF (SELECT count(*) FROM (
+        SELECT 1 FROM public.affiliate_click_events e
+         WHERE e.affiliate_id = v_affiliate AND e.created_at > now() - interval '1 day'
+         LIMIT 500) AS recent) >= 500 THEN
+    RETURN;
+  END IF;
+  IF (SELECT count(*) FROM (
+        SELECT 1 FROM public.affiliate_click_events e
+         WHERE e.created_at > now() - interval '1 minute'
+         LIMIT 2000) AS recent) >= 2000 THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO public.affiliate_click_events (affiliate_id, visitor_hash) VALUES (v_affiliate, p_visitor_hash);
+  UPDATE public.affiliate_profiles SET total_clicks = total_clicks + 1, last_click_at = now() WHERE id = v_affiliate;
+
+  DELETE FROM public.affiliate_click_events
+   WHERE id IN (
+     SELECT e.id FROM public.affiliate_click_events e
+      WHERE e.created_at < now() - interval '30 days'
+      ORDER BY e.created_at
+      LIMIT 500
+   );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.record_affiliate_click(text, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.record_affiliate_click(text, text) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.record_affiliate_click(p_handle text, p_visitor_hash text)
+    RETURNS void
+    LANGUAGE plpgsql VOLATILE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  PERFORM private.record_affiliate_click(p_handle, p_visitor_hash);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.record_affiliate_click(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.record_affiliate_click(text, text) TO anon, authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 12f. service-role RPCs (SECURITY INVOKER in public; revoked from the API roles here and in
+--      both copies of API_ROLE_REVOKE_SQL)
+-- ---------------------------------------------------------------------------
+-- Partner sign-up. Errors (SQLSTATE P0001, message = code): affiliate_role_conflict (the account
+-- is not USER or RTL, or has no profiles row), affiliate_exists, affiliate_handle_invalid,
+-- affiliate_program_full (no active tier has room); a taken handle surfaces as SQLSTATE 23505
+-- (affiliate_profiles_handle_key). The tier is the first active one, default sign-up tiers first
+-- (highest sort_order first among them), then the rest by sort_order, that still has room; the
+-- tier rows are locked so concurrent sign-ups cannot overfill a capped tier.
+CREATE OR REPLACE FUNCTION public.create_affiliate_account(
+    p_user_id uuid, p_handle text, p_display_name text, p_locale text, p_title text,
+    p_meta_description text, p_starter_doc jsonb, p_signup_ip_masked text)
+    RETURNS TABLE(
+      affiliate_id uuid, page_id uuid, tier_id uuid, tier_name text, tier_slug text,
+      commission_percentage numeric, is_limited_time_promo boolean, spots_remaining integer)
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_role text;
+  v_handle text := lower(btrim(coalesce(p_handle, '')));
+  v_locale text := lower(substr(btrim(coalesce(p_locale, '')), 1, 2));
+  v_tier record;
+  v_tier_id uuid;
+  v_affiliate_id uuid;
+  v_page_id uuid;
+  v_chosen record;
+BEGIN
+  SELECT pr.role::text INTO v_role FROM public.profiles pr WHERE pr.id = p_user_id FOR UPDATE;
+  IF v_role IS NULL OR v_role NOT IN ('USER', 'RTL') THEN
+    RAISE EXCEPTION 'affiliate_role_conflict' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM public.affiliate_profiles ap WHERE ap.user_id = p_user_id) THEN
+    RAISE EXCEPTION 'affiliate_exists' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF v_handle !~ '^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$' THEN
+    RAISE EXCEPTION 'affiliate_handle_invalid' USING ERRCODE = 'P0001';
+  END IF;
+
+  FOR v_tier IN
+    SELECT t.id, t.max_ambassadors_cap, t.member_count
+      FROM public.affiliate_tiers t
+     WHERE t.is_active
+     ORDER BY t.is_default_signup_tier DESC,
+              CASE WHEN t.is_default_signup_tier THEN -t.sort_order ELSE t.sort_order END,
+              t.created_at
+       FOR UPDATE
+  LOOP
+    IF v_tier.max_ambassadors_cap IS NULL OR v_tier.member_count < v_tier.max_ambassadors_cap THEN
+      v_tier_id := v_tier.id;
+      EXIT;
+    END IF;
+  END LOOP;
+
+  IF v_tier_id IS NULL THEN
+    RAISE EXCEPTION 'affiliate_program_full' USING ERRCODE = 'P0001';
+  END IF;
+
+  IF v_locale !~ '^[a-z]{2}$' THEN
+    v_locale := 'en';
+  END IF;
+
+  INSERT INTO public.affiliate_profiles (user_id, tier_id, handle, display_name, preferred_locale, status, signup_ip_masked)
+  VALUES (
+    p_user_id, v_tier_id, v_handle, btrim(coalesce(p_display_name, '')), v_locale,
+    'ACTIVE'::public.affiliate_status,
+    left(nullif(btrim(coalesce(p_signup_ip_masked, '')), ''), 64)
+  )
+  RETURNING id INTO v_affiliate_id;
+
+  INSERT INTO public.affiliate_pages (affiliate_id, user_id, title, meta_description, draft_content)
+  VALUES (
+    v_affiliate_id, p_user_id,
+    left(btrim(coalesce(p_title, '')), 120),
+    left(btrim(coalesce(p_meta_description, '')), 300),
+    CASE
+      WHEN jsonb_typeof(p_starter_doc) = 'object' AND octet_length(p_starter_doc::text) <= 262144 THEN p_starter_doc
+      ELSE '{"type":"doc","content":[]}'::jsonb
+    END
+  )
+  RETURNING id INTO v_page_id;
+
+  UPDATE public.profiles SET role = 'RTL' WHERE id = p_user_id AND role::text = 'USER';
+
+  -- member_count already counts this partner (AFTER INSERT trigger)
+  SELECT t.id, t.name, t.slug, t.commission_percentage, t.is_limited_time_promo, t.max_ambassadors_cap, t.member_count
+    INTO v_chosen
+    FROM public.affiliate_tiers t
+   WHERE t.id = v_tier_id;
+
+  affiliate_id := v_affiliate_id;
+  page_id := v_page_id;
+  tier_id := v_chosen.id;
+  tier_name := v_chosen.name;
+  tier_slug := v_chosen.slug;
+  commission_percentage := v_chosen.commission_percentage;
+  is_limited_time_promo := v_chosen.is_limited_time_promo;
+  spots_remaining := CASE
+    WHEN v_chosen.max_ambassadors_cap IS NULL THEN NULL
+    ELSE GREATEST(v_chosen.max_ambassadors_cap - v_chosen.member_count, 0)
+  END;
+  RETURN NEXT;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.create_affiliate_account(uuid, text, text, text, text, text, jsonb, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.create_affiliate_account(uuid, text, text, text, text, text, jsonb, text) TO service_role;
+
+-- PENDING_CLEARANCE commissions whose clears_at has passed become CLEARED; those whose order
+-- is refunded or cancelled are voided instead (A11). A commission an open dispute holds
+-- (disputed_at, finding L) waits, whatever its clears_at. Returns how many were promoted.
+-- Profiles are locked in id order so two concurrent runs cannot deadlock.
+CREATE OR REPLACE FUNCTION public.promote_cleared_affiliate_commissions()
+    RETURNS integer
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_order record;
+  v_promoted integer := 0;
+  v_count integer;
+BEGIN
+  FOR v_affiliate IN
+    SELECT DISTINCT c.affiliate_id
+      FROM public.affiliate_commissions c
+     WHERE c.status = 'PENDING_CLEARANCE'::public.affiliate_commission_status
+       AND c.clears_at <= now()
+       AND c.disputed_at IS NULL
+     ORDER BY 1
+  LOOP
+    PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+    PERFORM 1 FROM public.affiliate_commissions c
+      WHERE c.affiliate_id = v_affiliate
+        AND c.status = 'PENDING_CLEARANCE'::public.affiliate_commission_status
+        AND c.clears_at <= now()
+        AND c.disputed_at IS NULL
+      FOR UPDATE;
+
+    FOR v_order IN
+      SELECT DISTINCT c.order_id, o.status
+        FROM public.affiliate_commissions c
+        JOIN public.orders o ON o.id = c.order_id
+       WHERE c.affiliate_id = v_affiliate
+         AND c.status = 'PENDING_CLEARANCE'::public.affiliate_commission_status
+         AND c.clears_at <= now()
+         AND c.disputed_at IS NULL
+         AND o.status IN ('refunded', 'cancelled')
+    LOOP
+      PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+    END LOOP;
+
+    UPDATE public.affiliate_commissions c
+       SET status = 'CLEARED'::public.affiliate_commission_status, cleared_at = now()
+     WHERE c.affiliate_id = v_affiliate
+       AND c.status = 'PENDING_CLEARANCE'::public.affiliate_commission_status
+       AND c.clears_at <= now()
+       AND c.disputed_at IS NULL;
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    v_promoted := v_promoted + v_count;
+  END LOOP;
+  RETURN v_promoted;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.promote_cleared_affiliate_commissions() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.promote_cleared_affiliate_commissions() TO service_role;
+
+-- Claims a payout for one partner and currency: the partner must be ACTIVE, approved and
+-- onboarded to Stripe Connect with an account of a known key mode; CLEARED, unattached
+-- commissions in p_currency of that mode (finding C: a test-mode sale is only ever paid by a
+-- test-mode transfer, a live one by a live transfer) that no open dispute holds (finding L) are
+-- locked, those whose order is now refunded or cancelled are voided (A11), and the rest are
+-- attached to a new PROCESSING payout of sum(commission - refunded) with a snapshot of the
+-- destination account and its mode. Returns no row when nothing is claimable or the sum is below
+-- p_min_amount.
+CREATE OR REPLACE FUNCTION public.claim_affiliate_payout(p_affiliate_id uuid, p_currency text, p_min_amount bigint, p_trigger text)
+    RETURNS SETOF public.affiliate_payouts
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_currency text := upper(btrim(coalesce(p_currency, '')));
+  v_profile record;
+  v_order record;
+  v_amount bigint;
+  v_payout public.affiliate_payouts%ROWTYPE;
+BEGIN
+  IF v_currency !~ '^[A-Z]{3}$' THEN
+    RETURN;
+  END IF;
+
+  SELECT p.id, p.status::text AS status, p.first_published_at, p.stripe_connect_account_id,
+         p.stripe_connect_onboarding_complete, p.stripe_connect_livemode
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = p_affiliate_id
+   FOR UPDATE;
+  IF NOT FOUND OR v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL
+     OR v_profile.stripe_connect_account_id IS NULL OR NOT v_profile.stripe_connect_onboarding_complete
+     OR v_profile.stripe_connect_livemode IS NULL THEN
+    RETURN;
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_commissions c
+    WHERE c.affiliate_id = p_affiliate_id
+      AND c.status = 'CLEARED'::public.affiliate_commission_status
+      AND c.payout_id IS NULL
+      AND c.currency = v_currency
+      AND c.livemode = v_profile.stripe_connect_livemode
+      AND c.disputed_at IS NULL
+    FOR UPDATE;
+
+  FOR v_order IN
+    SELECT DISTINCT c.order_id, o.status
+      FROM public.affiliate_commissions c
+      JOIN public.orders o ON o.id = c.order_id
+     WHERE c.affiliate_id = p_affiliate_id
+       AND c.status = 'CLEARED'::public.affiliate_commission_status
+       AND c.payout_id IS NULL
+       AND c.currency = v_currency
+       AND c.livemode = v_profile.stripe_connect_livemode
+       AND c.disputed_at IS NULL
+       AND o.status IN ('refunded', 'cancelled')
+  LOOP
+    PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+  END LOOP;
+
+  SELECT coalesce(sum(c.commission_amount_cents - c.refunded_amount_cents), 0)::bigint
+    INTO v_amount
+    FROM public.affiliate_commissions c
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = v_profile.stripe_connect_livemode
+     AND c.disputed_at IS NULL;
+  IF v_amount <= 0 OR v_amount < coalesce(p_min_amount, 0) THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO public.affiliate_payouts (affiliate_id, amount_cents, currency, stripe_destination_account, livemode, status, attempt_count, last_attempt_at, trigger)
+  VALUES (p_affiliate_id, v_amount, v_currency, v_profile.stripe_connect_account_id, v_profile.stripe_connect_livemode,
+          'PROCESSING'::public.affiliate_payout_status, 1, now(), coalesce(p_trigger, 'cron'))
+  RETURNING * INTO v_payout;
+
+  UPDATE public.affiliate_commissions c
+     SET payout_id = v_payout.id
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = v_profile.stripe_connect_livemode
+     AND c.disputed_at IS NULL;
+
+  RETURN NEXT v_payout;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_affiliate_payout(uuid, text, bigint, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_affiliate_payout(uuid, text, bigint, text) TO service_role;
+
+-- PROCESSING (or FAILED, when reconciliation finds the transfer after all, B1; never a payout
+-- whose commissions were handed back: released, nothing_to_pay or below_minimum) -> COMPLETED
+-- with the transfer id; its commissions become PAID and the partner's total_paid_cents grows by
+-- amount_cents. False when the payout cannot complete. Raises affiliate_transfer_id_required
+-- (22023) without a transfer id.
+CREATE OR REPLACE FUNCTION public.complete_affiliate_payout(p_payout_id uuid, p_transfer_id text)
+    RETURNS boolean
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_transfer text := nullif(btrim(coalesce(p_transfer_id, '')), '');
+  v_affiliate uuid;
+  v_payout record;
+BEGIN
+  IF v_transfer IS NULL THEN
+    RAISE EXCEPTION 'affiliate_transfer_id_required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT po.affiliate_id INTO v_affiliate FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+  IF v_affiliate IS NULL THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.amount_cents, po.failure_reason
+    INTO v_payout
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  IF v_payout.status = 'PROCESSING'
+     OR (v_payout.status = 'FAILED' AND coalesce(v_payout.failure_reason, '') NOT IN ('released', 'nothing_to_pay', 'below_minimum')) THEN
+    UPDATE public.affiliate_payouts
+       SET status = 'COMPLETED'::public.affiliate_payout_status, paid_at = now(), stripe_transfer_id = v_transfer, failure_reason = NULL
+     WHERE id = p_payout_id;
+    UPDATE public.affiliate_commissions c
+       SET status = 'PAID'::public.affiliate_commission_status, paid_at = now(), stripe_transfer_id = v_transfer
+     WHERE c.payout_id = p_payout_id
+       AND c.status IN ('PENDING_CLEARANCE'::public.affiliate_commission_status, 'CLEARED'::public.affiliate_commission_status);
+    UPDATE public.affiliate_profiles SET total_paid_cents = total_paid_cents + v_payout.amount_cents WHERE id = v_affiliate;
+    RETURN true;
+  END IF;
+  RETURN false;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.complete_affiliate_payout(uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.complete_affiliate_payout(uuid, text) TO service_role;
+
+-- PROCESSING -> FAILED (reason trimmed to 500 characters) after applying the work the payout
+-- owes its commissions (A8). False when the payout is not PROCESSING.
+CREATE OR REPLACE FUNCTION public.fail_affiliate_payout(p_payout_id uuid, p_reason text)
+    RETURNS boolean
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_status text;
+BEGIN
+  SELECT po.affiliate_id INTO v_affiliate FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+  IF v_affiliate IS NULL THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text INTO v_status FROM public.affiliate_payouts po WHERE po.id = p_payout_id FOR UPDATE;
+  IF v_status IS DISTINCT FROM 'PROCESSING' THEN
+    RETURN false;
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+  UPDATE public.affiliate_payouts
+     SET status = 'FAILED'::public.affiliate_payout_status,
+         failure_reason = left(coalesce(nullif(btrim(coalesce(p_reason, '')), ''), 'failed'), 500)
+   WHERE id = p_payout_id;
+  RETURN true;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.fail_affiliate_payout(uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fail_affiliate_payout(uuid, text) TO service_role;
+
+-- FAILED -> PROCESSING for another attempt. Re-checks the claim conditions (ACTIVE, approved,
+-- Connect onboarding complete, and an account of the payout's key mode: finding C, a payout
+-- claimed in one mode is never re-sent in the other; no row and no change otherwise) and
+-- refreshes the destination account from the profile (B1); applies the pending work (A8), voids
+-- commissions whose order is refunded or cancelled, and detaches every voided one and every one
+-- an open dispute holds (finding L); the new amount is the sum of the attached CLEARED
+-- commissions (commission - refunded). Nothing left: the payout stays FAILED with failure_reason
+-- 'nothing_to_pay'. Less than p_min_amount left (finding Z; the automatic retry passes the
+-- program minimum, an admin Retry the default 0 and sends what is left): it stays FAILED with
+-- 'below_minimum'. Either way attempt_count is unchanged, every commission is detached (back in
+-- the cleared balance for a later claim) and no row is returned. The (uuid) overload of the first
+-- 02030 text is dropped, so a one-argument call resolves to this one (no PGRST203).
+DROP FUNCTION IF EXISTS public.prepare_affiliate_payout_retry(uuid);
+CREATE OR REPLACE FUNCTION public.prepare_affiliate_payout_retry(p_payout_id uuid, p_min_amount bigint DEFAULT 0)
+    RETURNS SETOF public.affiliate_payouts
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_profile record;
+  v_current record;
+  v_order record;
+  v_amount bigint;
+  v_payout public.affiliate_payouts%ROWTYPE;
+BEGIN
+  SELECT po.affiliate_id INTO v_affiliate FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+  IF v_affiliate IS NULL THEN
+    RETURN;
+  END IF;
+  SELECT p.status::text AS status, p.first_published_at, p.stripe_connect_account_id,
+         p.stripe_connect_onboarding_complete, p.stripe_connect_livemode
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = v_affiliate
+   FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.livemode
+    INTO v_current
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id
+   FOR UPDATE;
+  IF v_current.status IS DISTINCT FROM 'FAILED' THEN
+    RETURN;
+  END IF;
+  IF v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL
+     OR v_profile.stripe_connect_account_id IS NULL OR NOT v_profile.stripe_connect_onboarding_complete
+     OR v_profile.stripe_connect_livemode IS DISTINCT FROM v_current.livemode THEN
+    RETURN;
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+
+  FOR v_order IN
+    SELECT DISTINCT c.order_id, o.status
+      FROM public.affiliate_commissions c
+      JOIN public.orders o ON o.id = c.order_id
+     WHERE c.payout_id = p_payout_id
+       AND c.status IN ('PENDING_CLEARANCE'::public.affiliate_commission_status, 'CLEARED'::public.affiliate_commission_status)
+       AND o.status IN ('refunded', 'cancelled')
+  LOOP
+    PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+  END LOOP;
+
+  UPDATE public.affiliate_commissions c
+     SET payout_id = NULL
+   WHERE c.payout_id = p_payout_id
+     AND (c.status = 'VOIDED_REFUND'::public.affiliate_commission_status OR c.disputed_at IS NOT NULL);
+
+  SELECT coalesce(sum(c.commission_amount_cents - c.refunded_amount_cents), 0)::bigint
+    INTO v_amount
+    FROM public.affiliate_commissions c
+   WHERE c.payout_id = p_payout_id AND c.status = 'CLEARED'::public.affiliate_commission_status;
+
+  IF v_amount <= 0 OR v_amount < GREATEST(coalesce(p_min_amount, 0), 0) THEN
+    UPDATE public.affiliate_commissions c SET payout_id = NULL WHERE c.payout_id = p_payout_id;
+    UPDATE public.affiliate_payouts
+       SET failure_reason = CASE WHEN v_amount <= 0 THEN 'nothing_to_pay' ELSE 'below_minimum' END
+     WHERE id = p_payout_id;
+    RETURN;
+  END IF;
+
+  UPDATE public.affiliate_payouts
+     SET status = 'PROCESSING'::public.affiliate_payout_status,
+         attempt_count = attempt_count + 1,
+         last_attempt_at = now(),
+         amount_cents = v_amount,
+         failure_reason = NULL,
+         stripe_destination_account = v_profile.stripe_connect_account_id
+   WHERE id = p_payout_id
+  RETURNING * INTO v_payout;
+  RETURN NEXT v_payout;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.prepare_affiliate_payout_retry(uuid, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.prepare_affiliate_payout_retry(uuid, bigint) TO service_role;
+
+-- FAILED payout given up: pending work applied (A8), every commission detached (claimable by
+-- the next payout), failure_reason 'released'. False when the payout is not FAILED.
+CREATE OR REPLACE FUNCTION public.release_affiliate_payout(p_payout_id uuid)
+    RETURNS boolean
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_status text;
+BEGIN
+  SELECT po.affiliate_id INTO v_affiliate FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+  IF v_affiliate IS NULL THEN
+    RETURN false;
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text INTO v_status FROM public.affiliate_payouts po WHERE po.id = p_payout_id FOR UPDATE;
+  IF v_status IS DISTINCT FROM 'FAILED' THEN
+    RETURN false;
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+  UPDATE public.affiliate_commissions c SET payout_id = NULL WHERE c.payout_id = p_payout_id;
+  UPDATE public.affiliate_payouts SET failure_reason = 'released' WHERE id = p_payout_id;
+  RETURN true;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.release_affiliate_payout(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.release_affiliate_payout(uuid) TO service_role;
+
+-- One payout cycle per day: true for the caller that claims p_run_date (NULL = today in UTC),
+-- false for every later caller.
+CREATE OR REPLACE FUNCTION public.claim_affiliate_payout_run(p_run_date date, p_trigger text)
+    RETURNS boolean
+    LANGUAGE sql VOLATILE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  WITH claimed AS (
+    INSERT INTO public.affiliate_payout_runs (run_date, trigger)
+    VALUES (coalesce(p_run_date, (now() AT TIME ZONE 'UTC')::date), left(coalesce(nullif(btrim(p_trigger), ''), 'cron'), 64))
+    ON CONFLICT (run_date) DO NOTHING
+    RETURNING 1
+  )
+  SELECT EXISTS (SELECT 1 FROM claimed);
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_affiliate_payout_run(date, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_affiliate_payout_run(date, text) TO service_role;
+
+CREATE OR REPLACE FUNCTION public.finish_affiliate_payout_run(p_run_date date, p_summary jsonb)
+    RETURNS void
+    LANGUAGE sql VOLATILE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  UPDATE public.affiliate_payout_runs
+     SET finished_at = now(),
+         summary = CASE WHEN jsonb_typeof(p_summary) = 'object' THEN p_summary ELSE '{}'::jsonb END
+   WHERE run_date = coalesce(p_run_date, (now() AT TIME ZONE 'UTC')::date);
+$$;
+
+REVOKE ALL ON FUNCTION public.finish_affiliate_payout_run(date, jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.finish_affiliate_payout_run(date, jsonb) TO service_role;
+
+-- Claims up to p_limit (1..200, default 50) commissions that still need their "you earned"
+-- e-mail, oldest first, skipping voided rows and zero-amount tombstones (A25); rows locked by a
+-- concurrent sweep are skipped, so two sweeps never claim the same commission.
+CREATE OR REPLACE FUNCTION public.claim_affiliate_commission_notifications(p_limit integer)
+    RETURNS SETOF public.affiliate_commissions
+    LANGUAGE sql VOLATILE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  UPDATE public.affiliate_commissions c
+     SET notified_at = now()
+   WHERE c.id IN (
+     SELECT c2.id
+       FROM public.affiliate_commissions c2
+      WHERE c2.notified_at IS NULL
+        AND c2.status <> 'VOIDED_REFUND'::public.affiliate_commission_status
+        AND c2.commission_amount_cents > 0
+      ORDER BY c2.created_at
+      LIMIT LEAST(GREATEST(coalesce(p_limit, 50), 1), 200)
+      FOR UPDATE SKIP LOCKED
+   )
+  RETURNING c.*;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_affiliate_commission_notifications(integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_affiliate_commission_notifications(integer) TO service_role;
+
+-- Refund handling for both gateways (A7). Returns 'voided' | 'adjusted' | 'alerted' | 'none'.
+--   full (p_full, a non-positive total, or refunded >= total): live commissions of the order are
+--     voided ('voided'); a paid or in-flight one gets void_requested_at and an alert ('alerted');
+--     an attributed order with no commission yet gets a zero-amount VOIDED_REFUND tombstone
+--     (void_reason 'refunded_before_commission') so the paid trigger never records one later.
+--   partial: refunded_amount_cents rises to private.affiliate_refund_share() of the cumulative
+--     refund (pro rata on the charge minus the order's shipping share, finding I) and never falls
+--     (out-of-order events cannot raise earnings), total_earned_cents follows ('adjusted', or
+--     'none' when nothing changes); a share that takes the whole commission (everything but
+--     shipping came back) voids it ('voided'); a paid or in-flight commission keeps its amounts,
+--     records refund_pending_cents and alerts ('alerted'). An attributed order with no commission
+--     yet keeps the largest cumulative refund (orders.affiliate_refunded_minor and the charge
+--     total, finding Y), and the commission recorded later starts from it ('none').
+-- Lock order: the order row first (the orders triggers hold it while they record or void, so a
+-- refund racing the paid update waits instead of deadlocking), then A2: the profile, the
+-- commission (re-read under the lock), the payout status.
+CREATE OR REPLACE FUNCTION public.apply_affiliate_refund(
+    p_gateway public.affiliate_gateway, p_order_id uuid, p_refunded_minor bigint, p_order_total_minor bigint, p_full boolean)
+    RETURNS text
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_full boolean := coalesce(p_full, false)
+    OR coalesce(p_order_total_minor, 0) <= 0
+    OR coalesce(p_refunded_minor, 0) >= coalesce(p_order_total_minor, 0);
+  v_order record;
+  v_affiliate uuid;
+  v_commission record;
+  v_payout_status text;
+  v_in_flight boolean;
+  v_new bigint;
+  v_tombstone uuid;
+BEGIN
+  IF p_gateway IS NULL OR p_order_id IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  SELECT o.id, o.currency, o.total, o.shipping_total, o.affiliate_id, o.affiliate_base_currency
+    INTO v_order
+    FROM public.orders o
+   WHERE o.id = p_order_id
+   FOR UPDATE;
+
+  SELECT c.affiliate_id INTO v_affiliate
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway;
+  IF v_affiliate IS NULL THEN
+    v_affiliate := v_order.affiliate_id;
+  END IF;
+  IF v_affiliate IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'none';
+  END IF;
+  SELECT c.id, c.affiliate_id, c.status::text AS status, c.payout_id, c.commission_amount_cents, c.refunded_amount_cents
+    INTO v_commission
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway
+   FOR UPDATE;
+
+  IF NOT FOUND THEN
+    IF v_order.id IS NULL OR v_order.affiliate_id IS DISTINCT FROM v_affiliate THEN
+      RETURN 'none';
+    END IF;
+    IF NOT v_full THEN
+      UPDATE public.orders o
+         SET affiliate_refunded_minor = p_refunded_minor,
+             affiliate_refund_total_minor = p_order_total_minor
+       WHERE o.id = p_order_id
+         AND p_refunded_minor > coalesce(o.affiliate_refunded_minor, 0);
+      RETURN 'none';
+    END IF;
+    INSERT INTO public.affiliate_commissions (
+      affiliate_id, order_id, gateway, order_currency, order_net_amount_minor, exchange_rate_snapshot,
+      net_order_amount_cents, commission_rate_snapshot, commission_amount_cents, refunded_amount_cents,
+      currency, status, clears_at, voided_at, void_reason
+    )
+    VALUES (
+      v_affiliate, p_order_id, p_gateway,
+      upper(btrim(coalesce(v_order.currency, 'USD'))), 0, 1, 0, 0, 0, 0,
+      coalesce(
+        nullif(upper(btrim(coalesce(v_order.affiliate_base_currency, ''))), ''),
+        (SELECT upper(cu.code) FROM public.currencies cu
+          WHERE cu.is_default
+          ORDER BY cu.updated_at DESC, cu.created_at DESC, cu.code
+          LIMIT 1),
+        upper(btrim(coalesce(v_order.currency, 'USD')))
+      ),
+      'VOIDED_REFUND'::public.affiliate_commission_status, now(), now(), 'refunded_before_commission'
+    )
+    ON CONFLICT ON CONSTRAINT affiliate_commissions_order_gateway_key DO NOTHING
+    RETURNING id INTO v_tombstone;
+    RETURN CASE WHEN v_tombstone IS NULL THEN 'none' ELSE 'voided' END;
+  END IF;
+
+  IF v_commission.status = 'VOIDED_REFUND' THEN
+    RETURN 'none';
+  END IF;
+
+  v_payout_status := NULL;
+  IF v_commission.payout_id IS NOT NULL THEN
+    SELECT po.status::text INTO v_payout_status FROM public.affiliate_payouts po WHERE po.id = v_commission.payout_id;
+  END IF;
+  v_in_flight := v_commission.status = 'PAID' OR coalesce(v_payout_status IN ('PROCESSING', 'COMPLETED'), false);
+
+  IF v_full THEN
+    -- the shared void path flags and alerts an in-flight commission instead of voiding it
+    PERFORM private.affiliate_void_order_commissions(p_order_id, 'refunded');
+    RETURN CASE WHEN v_in_flight THEN 'alerted' ELSE 'voided' END;
+  END IF;
+
+  v_new := private.affiliate_refund_share(v_commission.commission_amount_cents, p_refunded_minor, p_order_total_minor,
+                                          v_order.total, v_order.shipping_total);
+
+  IF v_in_flight THEN
+    UPDATE public.affiliate_commissions c
+       SET refund_pending_cents = GREATEST(c.refund_pending_cents, v_new)
+     WHERE c.id = v_commission.id;
+    PERFORM private.affiliate_alert_refund_after_payout(v_commission.id, v_affiliate, p_order_id, v_commission.payout_id, 'refunded');
+    RETURN 'alerted';
+  END IF;
+
+  IF v_commission.commission_amount_cents > 0 AND v_new >= v_commission.commission_amount_cents THEN
+    -- nothing of the commission is left to earn: void it now, so a net-zero row is never
+    -- claimed and a later refund of the shipping raises no refund-after-payout alert
+    PERFORM private.affiliate_void_order_commissions(p_order_id, 'refunded');
+    RETURN 'voided';
+  END IF;
+  IF v_new <= v_commission.refunded_amount_cents THEN
+    RETURN 'none';
+  END IF;
+  UPDATE public.affiliate_commissions c SET refunded_amount_cents = v_new WHERE c.id = v_commission.id;
+  UPDATE public.affiliate_profiles p
+     SET total_earned_cents = GREATEST(p.total_earned_cents - (v_new - v_commission.refunded_amount_cents), 0)
+   WHERE p.id = v_affiliate;
+  RETURN 'adjusted';
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean) TO service_role;
+
+-- Payment disputes (finding L). Returns 'held' | 'released' | 'none'.
+--   p_open = true (Stripe charge.dispute.created, Freemius payment.dispute.created): the order's
+--     PENDING_CLEARANCE / CLEARED commission gets disputed_at ('held'; again 'held' on a
+--     redelivery), so promote, claim and retry skip it: it neither clears nor is transferred
+--     while the dispute is open. One already attached to a PROCESSING payout is held too: that
+--     transfer is not stopped (complete_affiliate_payout still marks it PAID), but if it fails
+--     the retry detaches the commission instead of re-sending it. A PAID or voided commission,
+--     or none at all: 'none'.
+--   p_open = false (won, or closed without a loss): the hold is cleared whatever the status
+--     ('released'; 'none' when nothing was held). A lost dispute is a full refund and goes
+--     through apply_affiliate_refund().
+-- Lock order (A2): the profile, then the commission.
+CREATE OR REPLACE FUNCTION public.set_affiliate_commission_dispute(p_gateway public.affiliate_gateway, p_order_id uuid, p_open boolean)
+    RETURNS text
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_commission record;
+BEGIN
+  IF p_gateway IS NULL OR p_order_id IS NULL OR p_open IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  SELECT c.affiliate_id INTO v_affiliate
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway;
+  IF v_affiliate IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  SELECT c.id, c.status::text AS status, c.disputed_at
+    INTO v_commission
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'none';
+  END IF;
+
+  IF NOT p_open THEN
+    IF v_commission.disputed_at IS NULL THEN
+      RETURN 'none';
+    END IF;
+    UPDATE public.affiliate_commissions c SET disputed_at = NULL WHERE c.id = v_commission.id;
+    RETURN 'released';
+  END IF;
+
+  IF v_commission.status NOT IN ('PENDING_CLEARANCE', 'CLEARED') THEN
+    RETURN 'none';
+  END IF;
+  IF v_commission.disputed_at IS NULL THEN
+    UPDATE public.affiliate_commissions c SET disputed_at = now() WHERE c.id = v_commission.id;
+  END IF;
+  RETURN 'held';
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) TO service_role;
+
+-- Repairs what the triggers missed (A11), run first in every payout cycle. (a) Attributed,
+-- paid/shipped orders of the last 120 days, newest first, whose partner is ACTIVE and approved
+-- and is not the buyer, with no commission row: the commission is recorded. (b) Live
+-- commissions (PENDING_CLEARANCE / CLEARED, not yet flagged) whose order is refunded or
+-- cancelled: voided, or flagged and alerted when in flight. Every profile involved is locked
+-- first, in id order. Returns {"recorded": n, "voided": n}.
+CREATE OR REPLACE FUNCTION public.reconcile_affiliate_commissions(p_limit integer DEFAULT 200)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_limit integer := LEAST(GREATEST(coalesce(p_limit, 200), 1), 1000);
+  v_record_orders uuid[];
+  v_void_orders uuid[];
+  v_order_id uuid;
+  v_order record;
+  v_recorded integer := 0;
+  v_voided integer := 0;
+BEGIN
+  SELECT coalesce(array_agg(s.id), '{}'::uuid[]) INTO v_record_orders
+    FROM (
+      SELECT o.id
+        FROM public.orders o
+        JOIN public.affiliate_profiles p ON p.id = o.affiliate_id
+       WHERE o.affiliate_id IS NOT NULL
+         AND o.paid_at IS NOT NULL
+         AND o.status IN ('paid', 'shipped')
+         AND o.created_at >= now() - interval '120 days'
+         AND p.status = 'ACTIVE'::public.affiliate_status
+         AND p.first_published_at IS NOT NULL
+         AND (o.user_id IS NULL OR o.user_id <> p.user_id)
+         AND NOT EXISTS (SELECT 1 FROM public.affiliate_commissions c WHERE c.order_id = o.id)
+       ORDER BY o.created_at DESC
+       LIMIT v_limit
+    ) AS s;
+
+  SELECT coalesce(array_agg(s.order_id), '{}'::uuid[]) INTO v_void_orders
+    FROM (
+      SELECT DISTINCT c.order_id
+        FROM public.affiliate_commissions c
+        JOIN public.orders o ON o.id = c.order_id
+       WHERE c.status IN ('PENDING_CLEARANCE'::public.affiliate_commission_status, 'CLEARED'::public.affiliate_commission_status)
+         AND c.void_requested_at IS NULL
+         AND o.status IN ('refunded', 'cancelled')
+       LIMIT v_limit
+    ) AS s;
+
+  IF cardinality(v_record_orders) = 0 AND cardinality(v_void_orders) = 0 THEN
+    RETURN jsonb_build_object('recorded', 0, 'voided', 0);
+  END IF;
+
+  PERFORM 1
+     FROM public.affiliate_profiles p
+    WHERE p.id IN (
+      SELECT o.affiliate_id FROM public.orders o WHERE o.id = ANY (v_record_orders)
+      UNION
+      SELECT c.affiliate_id FROM public.affiliate_commissions c WHERE c.order_id = ANY (v_void_orders)
+    )
+    ORDER BY p.id
+    FOR UPDATE;
+
+  FOREACH v_order_id IN ARRAY v_record_orders LOOP
+    IF private.affiliate_record_commission(v_order_id) IS NOT NULL THEN
+      v_recorded := v_recorded + 1;
+    END IF;
+  END LOOP;
+
+  FOR v_order IN
+    SELECT o.id, o.status FROM public.orders o WHERE o.id = ANY (v_void_orders)
+  LOOP
+    v_voided := v_voided + private.affiliate_void_order_commissions(v_order.id, v_order.status);
+  END LOOP;
+
+  RETURN jsonb_build_object('recorded', v_recorded, 'voided', v_voided);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.reconcile_affiliate_commissions(integer) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reconcile_affiliate_commissions(integer) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 13. Row-level security: one permissive policy per role and command, helpers as (SELECT ...)
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.affiliate_tiers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_pages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_payouts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_commissions ENABLE ROW LEVEL SECURITY;
+-- service role only: RLS on, no API-role policy (service_role bypasses RLS)
+ALTER TABLE public.affiliate_click_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.affiliate_payout_runs ENABLE ROW LEVEL SECURITY;
+
+-- affiliate_tiers: the active ladder is public; ADMIN (second factor) reads and writes all
+DROP POLICY IF EXISTS affiliate_tiers_anon_read_policy ON public.affiliate_tiers;
+CREATE POLICY affiliate_tiers_anon_read_policy ON public.affiliate_tiers
+  FOR SELECT TO anon
+  USING (is_active);
+
+DROP POLICY IF EXISTS affiliate_tiers_read_policy ON public.affiliate_tiers;
+CREATE POLICY affiliate_tiers_read_policy ON public.affiliate_tiers
+  FOR SELECT TO authenticated
+  USING (is_active OR ((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS affiliate_tiers_insert_policy ON public.affiliate_tiers;
+CREATE POLICY affiliate_tiers_insert_policy ON public.affiliate_tiers
+  FOR INSERT TO authenticated
+  WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS affiliate_tiers_update_policy ON public.affiliate_tiers;
+CREATE POLICY affiliate_tiers_update_policy ON public.affiliate_tiers
+  FOR UPDATE TO authenticated
+  USING (((SELECT public.is_admin_mfa()) IS TRUE))
+  WITH CHECK (((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS affiliate_tiers_delete_policy ON public.affiliate_tiers;
+CREATE POLICY affiliate_tiers_delete_policy ON public.affiliate_tiers
+  FOR DELETE TO authenticated
+  USING (((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- affiliate_profiles: the owner reads its row and, while it is an ACTIVE RTL, edits the granted
+-- columns; ADMIN reads and updates every row. No INSERT / DELETE policy (A6).
+DROP POLICY IF EXISTS affiliate_profiles_read_policy ON public.affiliate_profiles;
+CREATE POLICY affiliate_profiles_read_policy ON public.affiliate_profiles
+  FOR SELECT TO authenticated
+  USING ((user_id = (SELECT auth.uid())) OR ((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS affiliate_profiles_update_policy ON public.affiliate_profiles;
+CREATE POLICY affiliate_profiles_update_policy ON public.affiliate_profiles
+  FOR UPDATE TO authenticated
+  USING (
+    ((user_id = (SELECT auth.uid()))
+      AND ((SELECT public.get_current_user_role())::text = 'RTL')
+      AND (status = 'ACTIVE'::public.affiliate_status))
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  )
+  WITH CHECK (
+    ((user_id = (SELECT auth.uid())) AND (status = 'ACTIVE'::public.affiliate_status))
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+-- affiliate_pages: the owner reads its page and, while it is an ACTIVE RTL and the page is not
+-- waiting for review, edits the draft columns; ADMIN reads and updates every page.
+DROP POLICY IF EXISTS affiliate_pages_read_policy ON public.affiliate_pages;
+CREATE POLICY affiliate_pages_read_policy ON public.affiliate_pages
+  FOR SELECT TO authenticated
+  USING ((user_id = (SELECT auth.uid())) OR ((SELECT public.is_admin_mfa()) IS TRUE));
+
+DROP POLICY IF EXISTS affiliate_pages_update_policy ON public.affiliate_pages;
+CREATE POLICY affiliate_pages_update_policy ON public.affiliate_pages
+  FOR UPDATE TO authenticated
+  USING (
+    ((user_id = (SELECT auth.uid()))
+      AND ((SELECT public.get_current_user_role())::text = 'RTL')
+      AND (approval_status <> 'PENDING_REVIEW'::public.affiliate_page_status)
+      AND EXISTS (
+        SELECT 1 FROM public.affiliate_profiles p
+         WHERE p.id = affiliate_pages.affiliate_id
+           AND p.user_id = (SELECT auth.uid())
+           AND p.status = 'ACTIVE'::public.affiliate_status
+      ))
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  )
+  WITH CHECK ((user_id = (SELECT auth.uid())) OR ((SELECT public.is_admin_mfa()) IS TRUE));
+
+-- affiliate_commissions / affiliate_payouts: the owner's rows and ADMIN, read only (A6)
+DROP POLICY IF EXISTS affiliate_commissions_read_policy ON public.affiliate_commissions;
+CREATE POLICY affiliate_commissions_read_policy ON public.affiliate_commissions
+  FOR SELECT TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.affiliate_profiles p
+       WHERE p.id = affiliate_commissions.affiliate_id AND p.user_id = (SELECT auth.uid())
+    )
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+DROP POLICY IF EXISTS affiliate_payouts_read_policy ON public.affiliate_payouts;
+CREATE POLICY affiliate_payouts_read_policy ON public.affiliate_payouts
+  FOR SELECT TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.affiliate_profiles p
+       WHERE p.id = affiliate_payouts.affiliate_id AND p.user_id = (SELECT auth.uid())
+    )
+    OR ((SELECT public.is_admin_mfa()) IS TRUE)
+  );
+
+-- ---------------------------------------------------------------------------
+-- 14. Grants (Supabase grants nothing on new objects in public; local images and older
+--     projects grant everything by default privilege, so every table is revoked first)
+-- ---------------------------------------------------------------------------
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_tiers FROM PUBLIC, anon;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_tiers FROM authenticated;
+GRANT SELECT ON TABLE public.affiliate_tiers TO anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_tiers TO authenticated, service_role;
+
+-- Revoking the table-level UPDATE also revokes any column grant of it, so the column grant
+-- below is the complete list afterwards (02025).
+REVOKE ALL ON TABLE public.affiliate_profiles FROM PUBLIC, anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_profiles FROM authenticated;
+GRANT SELECT ON TABLE public.affiliate_profiles TO authenticated;
+GRANT UPDATE (display_name, bio, social_links, preferred_locale) ON TABLE public.affiliate_profiles TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_profiles TO service_role;
+
+REVOKE ALL ON TABLE public.affiliate_pages FROM PUBLIC, anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_pages FROM authenticated;
+GRANT SELECT ON TABLE public.affiliate_pages TO authenticated;
+GRANT UPDATE (title, meta_description, draft_content, featured_product_ids) ON TABLE public.affiliate_pages TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_pages TO service_role;
+
+REVOKE ALL ON TABLE public.affiliate_commissions FROM PUBLIC, anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_commissions FROM authenticated;
+GRANT SELECT ON TABLE public.affiliate_commissions TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_commissions TO service_role;
+
+REVOKE ALL ON TABLE public.affiliate_payouts FROM PUBLIC, anon;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.affiliate_payouts FROM authenticated;
+GRANT SELECT ON TABLE public.affiliate_payouts TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_payouts TO service_role;
+
+REVOKE ALL ON TABLE public.affiliate_click_events FROM PUBLIC, anon, authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_click_events TO service_role;
+
+REVOKE ALL ON TABLE public.affiliate_payout_runs FROM PUBLIC, anon, authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.affiliate_payout_runs TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 15. Comments
+-- ---------------------------------------------------------------------------
+COMMENT ON TABLE public.affiliate_tiers IS 'Affiliate commission tiers (the /partners ladder). Active tiers are public; ADMIN CRUD on a satisfied second factor. member_count is maintained by a trigger on affiliate_profiles.';
+COMMENT ON COLUMN public.affiliate_tiers.name_translations IS 'Localised tier names, e.g. {"fr": "Ambassadeur fondateur"}; English lives in name.';
+COMMENT ON COLUMN public.affiliate_tiers.commission_percentage IS 'Share of the net order amount (subtotal minus discount, no tax or shipping), snapshotted onto each commission.';
+COMMENT ON COLUMN public.affiliate_tiers.cookie_duration_days IS 'Referral cookie lifetime set by the proxy (get_affiliate_referral_window).';
+COMMENT ON COLUMN public.affiliate_tiers.clearance_hold_days IS 'Refund-protection hold: a commission clears this many days after the order is paid.';
+COMMENT ON COLUMN public.affiliate_tiers.is_default_signup_tier IS 'Sign-ups land in the first default tier with room (highest sort_order first), then the other tiers by sort_order.';
+COMMENT ON COLUMN public.affiliate_tiers.max_ambassadors_cap IS 'Spots in the tier; NULL = unlimited.';
+COMMENT ON COLUMN public.affiliate_tiers.member_count IS 'Partners currently in the tier (trigger-maintained, never below 0).';
+COMMENT ON COLUMN public.affiliate_tiers.badge_color IS 'Badge colour token, rendered through a literal class map.';
+
+COMMENT ON TABLE public.affiliate_profiles IS 'One per partner (RTL) account. Created only by create_affiliate_account(); the owner may edit display_name, bio, social_links and preferred_locale, everything else is server- or ADMIN-written (column grants + affiliate_profile_guard).';
+COMMENT ON COLUMN public.affiliate_profiles.handle IS 'Storefront slug (/partners/<handle>): lower-case, 3-32 characters, letters, digits and inner hyphens.';
+COMMENT ON COLUMN public.affiliate_profiles.avatar_object_key IS 'Storage key set by the upload route (affiliates/avatars/... or images/...); never a user-supplied URL.';
+COMMENT ON COLUMN public.affiliate_profiles.onboarding_step IS 'Derived from the lifecycle timestamps by affiliate_profile_guard; never written directly.';
+COMMENT ON COLUMN public.affiliate_profiles.stripe_connect_account_id IS 'Stripe Connect Express account (acct_...), set once by the connect action.';
+COMMENT ON COLUMN public.affiliate_profiles.stripe_connect_livemode IS 'Stripe key mode the account was created in; a mismatch with the current key means re-onboarding.';
+COMMENT ON COLUMN public.affiliate_profiles.total_clicks IS 'Counted referral clicks (record_affiliate_click: one per visitor per 24 h).';
+COMMENT ON COLUMN public.affiliate_profiles.total_earned_cents IS 'Recorded commissions net of refunds and voids, base-currency minor units.';
+COMMENT ON COLUMN public.affiliate_profiles.total_paid_cents IS 'Completed payouts, base-currency minor units.';
+COMMENT ON COLUMN public.affiliate_profiles.first_published_at IS 'First storefront approval. A partner earns, counts clicks and gets a referral cookie only once this is set.';
+COMMENT ON COLUMN public.affiliate_profiles.signup_ip_masked IS 'Sign-up IP truncated to /24 (IPv4) or /48 (IPv6) for abuse review; never the full address.';
+
+COMMENT ON TABLE public.affiliate_pages IS 'Exactly one storefront page per partner. draft_content is UNTRUSTED (the owner may PATCH it over the Data API): sanitize before any use. published_* is the approved snapshot the public page renders.';
+COMMENT ON COLUMN public.affiliate_pages.draft_content IS 'Untrusted Tiptap JSON edited by the partner; every reader runs the storefront sanitizer.';
+COMMENT ON COLUMN public.affiliate_pages.published_content IS 'Sanitized document copied from the draft on approval; NULL until the first approval.';
+COMMENT ON COLUMN public.affiliate_pages.published_profile IS 'Approved snapshot of {display_name, bio, avatar_object_key, social_links} shown on the public page.';
+COMMENT ON COLUMN public.affiliate_pages.approval_status IS 'DRAFT -> PENDING_REVIEW (submitted) -> PUBLISHED or CHANGES_REQUESTED; a draft edit sends PUBLISHED / CHANGES_REQUESTED back to DRAFT (affiliate_page_guard).';
+COMMENT ON COLUMN public.affiliate_pages.draft_version IS 'Bumped by affiliate_page_guard on every draft edit; submitted_version records the version under review.';
+
+COMMENT ON TABLE public.affiliate_payouts IS 'Stripe Connect transfers to partners, claimed before the transfer (PROCESSING) for crash safety. Written only by the service-role RPCs.';
+COMMENT ON COLUMN public.affiliate_payouts.stripe_destination_account IS 'Connect account snapshot at claim (refreshed on retry).';
+COMMENT ON COLUMN public.affiliate_payouts.livemode IS 'Stripe key mode of the destination account at claim; the payout holds only commissions of that mode and is retried only to an account of the same mode.';
+COMMENT ON COLUMN public.affiliate_payouts.stripe_transfer_id IS 'Stripe transfer id once COMPLETED; NULL while PROCESSING or FAILED.';
+COMMENT ON COLUMN public.affiliate_payouts.failure_reason IS 'Why the last attempt failed (a Stripe error code, stale, nothing_to_pay, below_minimum, released).';
+
+COMMENT ON TABLE public.affiliate_commissions IS 'Commission ledger, one row per order and gateway, in the store base currency. Written only by the orders triggers and the service-role RPCs.';
+COMMENT ON COLUMN public.affiliate_commissions.order_net_amount_minor IS 'Net order amount (subtotal minus discount) in the order currency, minor units.';
+COMMENT ON COLUMN public.affiliate_commissions.exchange_rate_snapshot IS 'orders.exchange_rate_at_purchase used for the conversion (1 when the order was in the base currency).';
+COMMENT ON COLUMN public.affiliate_commissions.net_order_amount_cents IS 'Net order amount in the base currency, minor units.';
+COMMENT ON COLUMN public.affiliate_commissions.commission_amount_cents IS 'Commission before refunds, base-currency minor units.';
+COMMENT ON COLUMN public.affiliate_commissions.refunded_amount_cents IS 'Portion reversed by partial refunds (monotonic), base-currency minor units.';
+COMMENT ON COLUMN public.affiliate_commissions.refund_pending_cents IS 'Refund recorded while the commission was paid or in flight; applied if that payout fails.';
+COMMENT ON COLUMN public.affiliate_commissions.void_requested_at IS 'Full refund recorded while the commission was paid or in flight; applied if that payout fails.';
+COMMENT ON COLUMN public.affiliate_commissions.disputed_at IS 'Open payment dispute (set_affiliate_commission_dispute): while set, the commission is not promoted, claimed or re-sent by a retry.';
+COMMENT ON COLUMN public.affiliate_commissions.currency IS 'Store base currency when the commission was recorded.';
+COMMENT ON COLUMN public.affiliate_commissions.livemode IS 'Payment mode of the sale (orders.affiliate_livemode; true when unknown): only a payout to a Connect account of the same mode claims it.';
+COMMENT ON COLUMN public.affiliate_commissions.clears_at IS 'End of the refund-protection hold (tier clearance_hold_days after payment).';
+COMMENT ON COLUMN public.affiliate_commissions.notified_at IS 'When the "you earned" e-mail was claimed (claim_affiliate_commission_notifications).';
+
+COMMENT ON TABLE public.affiliate_click_events IS 'Referral click log (service role only): visitor_hash is a daily salted hash of a masked IP and user agent, never a raw IP. Pruned after 30 days.';
+COMMENT ON TABLE public.affiliate_payout_runs IS 'One automated payout cycle per UTC day (service role only).';
+
+COMMENT ON COLUMN public.orders.affiliate_id IS 'Partner credited for the order (resolved at checkout from the signed storefront token or the referral cookie).';
+COMMENT ON COLUMN public.orders.affiliate_source IS 'storefront (signed storefront token) or referral_link (referral cookie).';
+COMMENT ON COLUMN public.orders.affiliate_base_currency IS 'Store default currency at checkout, the commission currency.';
+COMMENT ON COLUMN public.orders.affiliate_livemode IS 'Payment mode of an attributed checkout: false for a Stripe test key or the Freemius sandbox, true for live, NULL when unknown (treated as live).';
+COMMENT ON COLUMN public.orders.affiliate_refunded_minor IS 'Largest cumulative partial refund seen before the order had a commission (apply_affiliate_refund); the commission recorded later starts from it.';
+COMMENT ON COLUMN public.orders.affiliate_refund_total_minor IS 'Charge total that affiliate_refunded_minor was measured against, in the same minor units.';
+
+COMMENT ON FUNCTION public.get_affiliate_storefront(text) IS 'Public storefront read: the approved snapshot of an ACTIVE, approved partner, or nothing.';
+COMMENT ON FUNCTION public.list_affiliate_storefronts(integer) IS 'Public storefront list for the sitemap (at most 5000).';
+COMMENT ON FUNCTION public.get_affiliate_referral_window(text) IS 'Referral cookie lifetime in days for an ACTIVE, approved partner, else NULL.';
+COMMENT ON FUNCTION public.record_affiliate_click(text, text) IS 'Counts one referral click per visitor hash per partner per 24 h (flood-limited).';
+COMMENT ON FUNCTION public.create_affiliate_account(uuid, text, text, text, text, text, jsonb, text) IS 'Service role: partner sign-up (profile, page, tier, role RTL).';
+COMMENT ON FUNCTION public.apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean) IS 'Service role: refund handling; returns voided, adjusted, alerted or none.';
+COMMENT ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) IS 'Service role: holds (open) or releases (closed without a loss) the commission of a disputed order; returns held, released or none.';
+COMMENT ON FUNCTION public.prepare_affiliate_payout_retry(uuid, bigint) IS 'Service role: FAILED -> PROCESSING for another attempt in the payout''s own key mode; a remainder below p_min_amount stays FAILED (below_minimum).';
+COMMENT ON FUNCTION public.reconcile_affiliate_commissions(integer) IS 'Service role: records missed commissions and voids those of refunded or cancelled orders.';
+
+-- ---------------------------------------------------------------------------
+-- 16. cortex_request_log: the partner copilot's shared quota counts one route's rows
+-- ---------------------------------------------------------------------------
+-- evaluateRetailerCopilotGlobalQuota() (apps/nextblock/lib/cortex-ai/request-quota.ts) counts
+-- every account's 'affiliates/cortex' rows of the last hour (route = ... AND created_at >= ...);
+-- 02022's (user_id, created_at) index cannot serve that. The table's grants are unchanged.
+CREATE INDEX IF NOT EXISTS cortex_request_log_route_created_idx ON public.cortex_request_log (route, created_at DESC);
+
+
+-- >>> FROM: 02031_affiliates_ui_translations.sql <<<
+-- Affiliates & Creator Storefronts: the UI copy, in English and French.
+--
+-- GENERATED by tools/scripts/generate-affiliates-translations.ts; do not edit by hand.
+-- Sources, imported by the generator (never parsed):
+--   AFFILIATES_COPY, the package dictionaries (libs/affiliates/src/lib/i18n/copy/<area>.ts):
+--     743 affiliates.* keys (common 64, partners 154, storefront 14, portal 244, editor 99, copilot 70, sandbox 10, terms 88)
+--   AFFILIATE_GLOBAL_TRANSLATIONS (apps/nextblock/lib/i18n/global-affiliate-keys.ts):
+--     7 site-wide keys the feature's app components use
+-- One INSERT per area, in AFFILIATES_COPY_AREAS order (areas without keys skipped), keys sorted.
+--
+-- Data only, and safe to re-run: ON CONFLICT (key) DO NOTHING never overwrites a row that
+-- already exists, so a string an operator edited (CMS > Settings > Extra Translations) stays
+-- theirs. The package dictionaries and the components' inline fallbacks carry the same text, so
+-- an install that has not run this file yet renders that copy, never a raw key. The root layout
+-- leaves the affiliates.* rows out of its global payload (excludeAffiliateTranslationRows); the
+-- partner layouts read their areas back as overrides of the built-in dictionaries.
+--
+-- Changing this copy later: once applied, this file is append-only like every migration, so
+-- never regenerate it. Ship a NEW forward migration: new keys as INSERT ... ON CONFLICT (key)
+-- DO NOTHING; changed text with the 02015 pattern, guarded by the OLD seeded text so copy an
+-- operator edited stays theirs:
+--   UPDATE public.translations AS t
+--   SET translations = jsonb_set(t.translations, '{fr}', to_jsonb(fix.new_fr)), updated_at = now()
+--   FROM (VALUES ('affiliates.<area>.<key>', '<old fr>', '<new fr>')) AS fix(key, old_fr, new_fr)
+--   WHERE t.key = fix.key AND t.translations->>'fr' = fix.old_fr;
+-- libs/affiliates/src/lib/i18n/translations-migration.test.ts replays this file and every later
+-- migration and fails until the seeded copy matches the dictionaries again.
+
+-- affiliates.common.* (64 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.common.account_status_active', jsonb_build_object('en', 'Active', 'fr', 'Actif'), now(), now()),
+  ('affiliates.common.account_status_suspended', jsonb_build_object('en', 'Suspended', 'fr', 'Suspendu'), now(), now()),
+  ('affiliates.common.back', jsonb_build_object('en', 'Back', 'fr', 'Retour'), now(), now()),
+  ('affiliates.common.cancel', jsonb_build_object('en', 'Cancel', 'fr', 'Annuler'), now(), now()),
+  ('affiliates.common.close', jsonb_build_object('en', 'Close', 'fr', 'Fermer'), now(), now()),
+  ('affiliates.common.commission_status_cleared', jsonb_build_object('en', 'Cleared', 'fr', 'Confirmée'), now(), now()),
+  ('affiliates.common.commission_status_paid', jsonb_build_object('en', 'Paid', 'fr', 'Payée'), now(), now()),
+  ('affiliates.common.commission_status_pending_clearance', jsonb_build_object('en', 'Pending clearance', 'fr', 'En attente de confirmation'), now(), now()),
+  ('affiliates.common.commission_status_voided_refund', jsonb_build_object('en', 'Voided (refund)', 'fr', 'Annulée (remboursement)'), now(), now()),
+  ('affiliates.common.continue', jsonb_build_object('en', 'Continue', 'fr', 'Continuer'), now(), now()),
+  ('affiliates.common.copy_link', jsonb_build_object('en', 'Copy link', 'fr', 'Copier le lien'), now(), now()),
+  ('affiliates.common.error_affiliate_exists', jsonb_build_object('en', 'You''re already a partner. Open your partner portal to continue.', 'fr', 'Vous êtes déjà partenaire. Ouvrez votre portail partenaire pour continuer.'), now(), now()),
+  ('affiliates.common.error_forbidden', jsonb_build_object('en', 'You don''t have access to this page.', 'fr', 'Vous n''avez pas accès à cette page.'), now(), now()),
+  ('affiliates.common.error_generic', jsonb_build_object('en', 'Something went wrong. Please try again.', 'fr', 'Une erreur s''est produite. Veuillez réessayer.'), now(), now()),
+  ('affiliates.common.error_handle_invalid', jsonb_build_object('en', 'Use 3 to 32 lowercase letters, numbers or hyphens, starting and ending with a letter or number.', 'fr', 'Utilisez de 3 à 32 lettres minuscules, chiffres ou traits d''union, en commençant et en terminant par une lettre ou un chiffre.'), now(), now()),
+  ('affiliates.common.error_handle_reserved', jsonb_build_object('en', 'That handle is reserved. Try another one.', 'fr', 'Cet identifiant est réservé. Essayez-en un autre.'), now(), now()),
+  ('affiliates.common.error_handle_taken', jsonb_build_object('en', 'That handle is already taken. Try another one.', 'fr', 'Cet identifiant est déjà utilisé. Essayez-en un autre.'), now(), now()),
+  ('affiliates.common.error_network', jsonb_build_object('en', 'We couldn''t reach the server. Check your connection and try again.', 'fr', 'Impossible de joindre le serveur. Vérifiez votre connexion et réessayez.'), now(), now()),
+  ('affiliates.common.error_not_found', jsonb_build_object('en', 'We couldn''t find what you were looking for.', 'fr', 'Nous n''avons pas trouvé ce que vous cherchiez.'), now(), now()),
+  ('affiliates.common.error_package_inactive', jsonb_build_object('en', 'The partner program isn''t available right now.', 'fr', 'Le programme de partenaires n''est pas offert pour le moment.'), now(), now()),
+  ('affiliates.common.error_program_full', jsonb_build_object('en', 'The partner program is full right now. Please check back soon.', 'fr', 'Le programme de partenaires est complet pour le moment. Revenez bientôt.'), now(), now()),
+  ('affiliates.common.error_rate_limited', jsonb_build_object('en', 'Too many requests. Wait a moment, then try again.', 'fr', 'Trop de demandes. Patientez un instant, puis réessayez.'), now(), now()),
+  ('affiliates.common.error_role_conflict', jsonb_build_object('en', 'This account can''t join the partner program. Sign in with a customer account or contact us.', 'fr', 'Ce compte ne peut pas rejoindre le programme de partenaires. Connectez-vous avec un compte client ou communiquez avec nous.'), now(), now()),
+  ('affiliates.common.error_save_failed', jsonb_build_object('en', 'Your changes couldn''t be saved. Please try again.', 'fr', 'Vos modifications n''ont pas pu être enregistrées. Veuillez réessayer.'), now(), now()),
+  ('affiliates.common.error_suspended', jsonb_build_object('en', 'Your partner account is suspended. Contact us if you have questions.', 'fr', 'Votre compte partenaire est suspendu. Communiquez avec nous si vous avez des questions.'), now(), now()),
+  ('affiliates.common.error_unauthorized', jsonb_build_object('en', 'Please sign in to continue.', 'fr', 'Veuillez vous connecter pour continuer.'), now(), now()),
+  ('affiliates.common.error_validation', jsonb_build_object('en', 'Some fields need your attention.', 'fr', 'Certains champs doivent être corrigés.'), now(), now()),
+  ('affiliates.common.learn_more', jsonb_build_object('en', 'Learn more', 'fr', 'En savoir plus'), now(), now()),
+  ('affiliates.common.link_copied', jsonb_build_object('en', 'Link copied', 'fr', 'Lien copié'), now(), now()),
+  ('affiliates.common.loading', jsonb_build_object('en', 'Loading…', 'fr', 'Chargement…'), now(), now()),
+  ('affiliates.common.onboarding_progress_one', jsonb_build_object('en', '{completed} of {total} steps complete', 'fr', '{completed} étape sur {total} terminée'), now(), now()),
+  ('affiliates.common.onboarding_progress_other', jsonb_build_object('en', '{completed} of {total} steps complete', 'fr', '{completed} étapes sur {total} terminées'), now(), now()),
+  ('affiliates.common.optional', jsonb_build_object('en', 'Optional', 'fr', 'Facultatif'), now(), now()),
+  ('affiliates.common.page_status_changes_requested', jsonb_build_object('en', 'Changes requested', 'fr', 'Modifications demandées'), now(), now()),
+  ('affiliates.common.page_status_draft', jsonb_build_object('en', 'Draft', 'fr', 'Brouillon'), now(), now()),
+  ('affiliates.common.page_status_pending_review', jsonb_build_object('en', 'In review', 'fr', 'En révision'), now(), now()),
+  ('affiliates.common.page_status_published', jsonb_build_object('en', 'Published', 'fr', 'Publiée'), now(), now()),
+  ('affiliates.common.partner', jsonb_build_object('en', 'Partner', 'fr', 'Partenaire'), now(), now()),
+  ('affiliates.common.partner_program', jsonb_build_object('en', 'Partner program', 'fr', 'Programme de partenaires'), now(), now()),
+  ('affiliates.common.payout_status_completed', jsonb_build_object('en', 'Sent', 'fr', 'Envoyé'), now(), now()),
+  ('affiliates.common.payout_status_failed', jsonb_build_object('en', 'Failed', 'fr', 'Échec'), now(), now()),
+  ('affiliates.common.payout_status_processing', jsonb_build_object('en', 'Processing', 'fr', 'En traitement'), now(), now()),
+  ('affiliates.common.required', jsonb_build_object('en', 'Required', 'fr', 'Obligatoire'), now(), now()),
+  ('affiliates.common.retry', jsonb_build_object('en', 'Try again', 'fr', 'Réessayer'), now(), now()),
+  ('affiliates.common.save', jsonb_build_object('en', 'Save', 'fr', 'Enregistrer'), now(), now()),
+  ('affiliates.common.saved', jsonb_build_object('en', 'Saved', 'fr', 'Enregistré'), now(), now()),
+  ('affiliates.common.saving', jsonb_build_object('en', 'Saving…', 'fr', 'Enregistrement…'), now(), now()),
+  ('affiliates.common.step_account', jsonb_build_object('en', 'Account created', 'fr', 'Compte créé'), now(), now()),
+  ('affiliates.common.step_done', jsonb_build_object('en', 'Done', 'fr', 'Terminé'), now(), now()),
+  ('affiliates.common.step_payouts', jsonb_build_object('en', 'Bank payouts connected', 'fr', 'Versements bancaires connectés'), now(), now()),
+  ('affiliates.common.step_profile', jsonb_build_object('en', 'Bio and profile completed', 'fr', 'Bio et profil complétés'), now(), now()),
+  ('affiliates.common.step_storefront', jsonb_build_object('en', 'Storefront submitted and published', 'fr', 'Vitrine soumise et publiée'), now(), now()),
+  ('affiliates.common.step_to_do', jsonb_build_object('en', 'To do', 'fr', 'À faire'), now(), now()),
+  ('affiliates.common.tier_commission_rate', jsonb_build_object('en', '{rate}% commission', 'fr', 'Commission de {rate} %'), now(), now()),
+  ('affiliates.common.tier_limited_time', jsonb_build_object('en', 'Limited-time offer', 'fr', 'Offre à durée limitée'), now(), now()),
+  ('affiliates.common.tier_name_elite_partner', jsonb_build_object('en', 'Elite Partner', 'fr', 'Partenaire Élite'), now(), now()),
+  ('affiliates.common.tier_name_fallback', jsonb_build_object('en', 'Partner tier', 'fr', 'Niveau partenaire'), now(), now()),
+  ('affiliates.common.tier_name_founding_ambassador', jsonb_build_object('en', 'Founding Ambassador', 'fr', 'Ambassadeur fondateur'), now(), now()),
+  ('affiliates.common.tier_name_growth_partner', jsonb_build_object('en', 'Growth Partner', 'fr', 'Partenaire Croissance'), now(), now()),
+  ('affiliates.common.tier_name_starter_partner', jsonb_build_object('en', 'Starter Partner', 'fr', 'Partenaire Départ'), now(), now()),
+  ('affiliates.common.tier_sold_out', jsonb_build_object('en', 'No spots left', 'fr', 'Complet'), now(), now()),
+  ('affiliates.common.tier_spots_remaining_one', jsonb_build_object('en', '1 spot left', 'fr', '1 place restante'), now(), now()),
+  ('affiliates.common.tier_spots_remaining_other', jsonb_build_object('en', '{count} spots left', 'fr', '{count} places restantes'), now(), now()),
+  ('affiliates.common.tier_unlimited_spots', jsonb_build_object('en', 'Unlimited spots', 'fr', 'Places illimitées'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.partners.* (154 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.partners.benefit_approval_body', jsonb_build_object('en', 'We check every storefront before it goes live, so shoppers can trust what they see.', 'fr', 'Nous vérifions chaque vitrine avant sa mise en ligne, pour que les clients puissent s''y fier.'), now(), now()),
+  ('affiliates.partners.benefit_approval_title', jsonb_build_object('en', 'Reviewed by our team', 'fr', 'Révisé par notre équipe'), now(), now()),
+  ('affiliates.partners.benefit_cookie_body', jsonb_build_object('en', 'When a shopper clicks your link, each order they place in the next {days} days counts for you.', 'fr', 'Quand un client clique sur votre lien, chaque commande passée dans les {days} jours suivants compte pour vous.'), now(), now()),
+  ('affiliates.partners.benefit_cookie_title', jsonb_build_object('en', 'A {days}-day window for every click', 'fr', 'Une fenêtre de {days} jours pour chaque clic'), now(), now()),
+  ('affiliates.partners.benefit_copilot_body', jsonb_build_object('en', 'Our AI copilot helps you write your bio and build your page in minutes.', 'fr', 'Notre copilote IA vous aide à écrire votre bio et à bâtir votre page en quelques minutes.'), now(), now()),
+  ('affiliates.partners.benefit_copilot_title', jsonb_build_object('en', 'An AI writing helper', 'fr', 'Un assistant de rédaction IA'), now(), now()),
+  ('affiliates.partners.benefit_payouts_body', jsonb_build_object('en', 'Cleared money goes straight to your bank. You never need to ask for a payout.', 'fr', 'L''argent confirmé va directement dans votre compte bancaire. Vous n''avez jamais à demander un versement.'), now(), now()),
+  ('affiliates.partners.benefit_payouts_title', jsonb_build_object('en', 'Automatic Stripe payouts', 'fr', 'Versements Stripe automatiques'), now(), now()),
+  ('affiliates.partners.benefit_refund_body', jsonb_build_object('en', 'Each commission clears after {days} days, once the refund window is over. Then it is yours to keep.', 'fr', 'Chaque commission est confirmée après {days} jours, une fois la période de remboursement terminée. Elle est alors à vous.'), now(), now()),
+  ('affiliates.partners.benefit_refund_title', jsonb_build_object('en', 'A fair refund window', 'fr', 'Une période de remboursement équitable'), now(), now()),
+  ('affiliates.partners.benefit_storefront_body', jsonb_build_object('en', 'Get a page with your name, your photo and your favorite products. Share one link everywhere.', 'fr', 'Obtenez une page à votre nom, avec votre photo et vos produits préférés. Partagez un seul lien partout.'), now(), now()),
+  ('affiliates.partners.benefit_storefront_title', jsonb_build_object('en', 'Your own storefront page', 'fr', 'Votre propre page vitrine'), now(), now()),
+  ('affiliates.partners.benefits_title', jsonb_build_object('en', 'Why partners love it', 'fr', 'Pourquoi nos partenaires adorent le programme'), now(), now()),
+  ('affiliates.partners.calculator_aov_label', jsonb_build_object('en', 'Average order value', 'fr', 'Valeur moyenne d''une commande'), now(), now()),
+  ('affiliates.partners.calculator_aov_value', jsonb_build_object('en', '{amount} per order', 'fr', '{amount} par commande'), now(), now()),
+  ('affiliates.partners.calculator_base_label', jsonb_build_object('en', 'At the standard {rate}% rate', 'fr', 'Au taux standard de {rate} %'), now(), now()),
+  ('affiliates.partners.calculator_bonus_label_now', jsonb_build_object('en', 'Extra you get by joining now', 'fr', 'Le surplus que vous obtenez en vous inscrivant maintenant'), now(), now()),
+  ('affiliates.partners.calculator_compare_label', jsonb_build_object('en', 'Your yearly income at {rate}%', 'fr', 'Votre revenu annuel à {rate} %'), now(), now()),
+  ('affiliates.partners.calculator_intro_monthly', jsonb_build_object('en', 'Move the sliders to see what you could earn each month and each year.', 'fr', 'Déplacez les curseurs pour voir ce que vous pourriez gagner chaque mois et chaque année.'), now(), now()),
+  ('affiliates.partners.calculator_intro_products', jsonb_build_object('en', 'Pick a product, then move the sliders to see what you could earn.', 'fr', 'Choisissez un produit, puis déplacez les curseurs pour voir ce que vous pourriez gagner.'), now(), now()),
+  ('affiliates.partners.calculator_monthly_label', jsonb_build_object('en', 'Your monthly income at {rate}%', 'fr', 'Votre revenu mensuel à {rate} %'), now(), now()),
+  ('affiliates.partners.calculator_note', jsonb_build_object('en', 'Estimates only. Your real earnings depend on the sales you refer.', 'fr', 'Estimation seulement. Vos revenus réels dépendent des ventes que vous recommandez.'), now(), now()),
+  ('affiliates.partners.calculator_product_bundle', jsonb_build_object('en', 'All {count} together', 'fr', 'Les {count} ensemble'), now(), now()),
+  ('affiliates.partners.calculator_product_bundle_two', jsonb_build_object('en', 'Both together', 'fr', 'Les deux ensemble'), now(), now()),
+  ('affiliates.partners.calculator_product_earn', jsonb_build_object('en', 'You earn {amount} a sale', 'fr', 'Vous gagnez {amount} par vente'), now(), now()),
+  ('affiliates.partners.calculator_product_earn_yearly', jsonb_build_object('en', 'You earn {amount} a yearly sale', 'fr', 'Vous gagnez {amount} par vente annuelle'), now(), now()),
+  ('affiliates.partners.calculator_product_price_month', jsonb_build_object('en', '{price} a month', 'fr', '{price} par mois'), now(), now()),
+  ('affiliates.partners.calculator_product_price_year', jsonb_build_object('en', '{price} a year', 'fr', '{price} par année'), now(), now()),
+  ('affiliates.partners.calculator_product_price_year_month', jsonb_build_object('en', '{price} a year or {monthly} a month', 'fr', '{price} par année ou {monthly} par mois'), now(), now()),
+  ('affiliates.partners.calculator_products_label', jsonb_build_object('en', 'What your referrals buy', 'fr', 'Ce que vos clients achètent'), now(), now()),
+  ('affiliates.partners.calculator_products_note_monthly', jsonb_build_object('en', 'You earn on the first payment only, so a monthly plan earns on its first month.', 'fr', 'Vous touchez une commission sur le premier paiement seulement : un forfait mensuel rapporte donc sur son premier mois.'), now(), now()),
+  ('affiliates.partners.calculator_products_note_yearly', jsonb_build_object('en', 'We use yearly prices. You earn on the first payment only, so a monthly plan earns on its first month.', 'fr', 'Nous utilisons les prix annuels. Vous touchez une commission sur le premier paiement seulement : un forfait mensuel rapporte donc sur son premier mois.'), now(), now()),
+  ('affiliates.partners.calculator_referrals_label', jsonb_build_object('en', 'Sales you refer each month', 'fr', 'Ventes recommandées chaque mois'), now(), now()),
+  ('affiliates.partners.calculator_referrals_value_one', jsonb_build_object('en', '1 sale per month', 'fr', '1 vente par mois'), now(), now()),
+  ('affiliates.partners.calculator_referrals_value_other', jsonb_build_object('en', '{count} sales per month', 'fr', '{count} ventes par mois'), now(), now()),
+  ('affiliates.partners.calculator_summary_monthly', jsonb_build_object('en', 'At {compare_rate}%, you could earn {monthly} a month, or {compare} a year. At {base_rate}%, you would earn {base} a year. That is {bonus} more.', 'fr', 'À {compare_rate} %, vous pourriez gagner {monthly} par mois, soit {compare} par année. À {base_rate} %, vous gagneriez {base} par année. C''est {bonus} de plus.'), now(), now()),
+  ('affiliates.partners.calculator_summary_single_monthly', jsonb_build_object('en', 'At {rate}%, you could earn {monthly} a month, or {amount} a year.', 'fr', 'À {rate} %, vous pourriez gagner {monthly} par mois, soit {amount} par année.'), now(), now()),
+  ('affiliates.partners.calculator_title', jsonb_build_object('en', 'Estimate your earnings', 'fr', 'Estimez vos revenus'), now(), now()),
+  ('affiliates.partners.cta_body', jsonb_build_object('en', 'It takes about a minute, and joining is free.', 'fr', 'Ça prend environ une minute, et l''inscription est gratuite.'), now(), now()),
+  ('affiliates.partners.cta_body_offer', jsonb_build_object('en', 'Join today to get the {tier} rate while spots last.', 'fr', 'Inscrivez-vous aujourd''hui pour obtenir le taux {tier} pendant qu''il reste des places.'), now(), now()),
+  ('affiliates.partners.cta_body_offer_unlimited', jsonb_build_object('en', 'Join today to get the {tier} rate while the offer lasts.', 'fr', 'Inscrivez-vous aujourd''hui pour obtenir le taux {tier} pendant que l''offre dure.'), now(), now()),
+  ('affiliates.partners.cta_title', jsonb_build_object('en', 'Ready to earn {rate}% on every sale?', 'fr', 'Envie de gagner {rate} % sur chaque vente?'), now(), now()),
+  ('affiliates.partners.cta_title_no_rate', jsonb_build_object('en', 'Ready to earn on every sale?', 'fr', 'Envie de gagner sur chaque vente?'), now(), now()),
+  ('affiliates.partners.cta_title_up_to', jsonb_build_object('en', 'Ready to earn up to {rate}% on every sale?', 'fr', 'Envie de gagner jusqu''à {rate} % sur chaque vente?'), now(), now()),
+  ('affiliates.partners.faq_approval_answer', jsonb_build_object('en', 'Build your page, then send it for review. Our team reads it, then publishes it or asks for changes. You get an email either way.', 'fr', 'Bâtissez votre page, puis envoyez-la pour révision. Notre équipe la lit, puis la publie ou demande des changements. Vous recevez un courriel dans les deux cas.'), now(), now()),
+  ('affiliates.partners.faq_approval_question', jsonb_build_object('en', 'How does approval work?', 'fr', 'Comment fonctionne l''approbation?'), now(), now()),
+  ('affiliates.partners.faq_commission_answer', jsonb_build_object('en', 'You earn your tier''s rate on the first payment of each order you refer. We use the order total after discounts, without tax or shipping. Renewals and later subscription payments do not earn a commission. A free trial earns once it turns into a paid order.', 'fr', 'Vous touchez le taux de votre niveau sur le premier paiement de chaque commande recommandée. Nous utilisons le total de la commande après les rabais, sans les taxes ni la livraison. Les renouvellements et les paiements d''abonnement suivants ne donnent pas de commission. Un essai gratuit en donne une quand il devient une commande payée.'), now(), now()),
+  ('affiliates.partners.faq_commission_question', jsonb_build_object('en', 'How are commissions calculated?', 'fr', 'Comment les commissions sont-elles calculées?'), now(), now()),
+  ('affiliates.partners.faq_cookie_answer', jsonb_build_object('en', 'It lasts {days} days. If a shopper buys within that time, the sale is yours. If they click another partner''s link later, the newest link wins.', 'fr', 'Il dure {days} jours. Si le client achète pendant cette période, la vente est à vous. S''il clique plus tard sur le lien d''un autre partenaire, le lien le plus récent l''emporte.'), now(), now()),
+  ('affiliates.partners.faq_cookie_question', jsonb_build_object('en', 'How long does the referral cookie last?', 'fr', 'Combien de temps dure le témoin de recommandation?'), now(), now()),
+  ('affiliates.partners.faq_cost_answer', jsonb_build_object('en', 'No. Joining is free, and there are no monthly fees. You only need an account and a bank account for payouts.', 'fr', 'Non. L''inscription est gratuite et il n''y a aucuns frais mensuels. Il vous faut seulement un compte et un compte bancaire pour les versements.'), now(), now()),
+  ('affiliates.partners.faq_cost_question', jsonb_build_object('en', 'Does it cost anything to join?', 'fr', 'L''inscription est-elle payante?'), now(), now()),
+  ('affiliates.partners.faq_payouts_answer', jsonb_build_object('en', 'Each commission waits {days} days in case of a refund. Then it clears, and we send it to your bank through Stripe. Payouts go out on their own once your cleared balance reaches the minimum.', 'fr', 'Chaque commission attend {days} jours en cas de remboursement. Elle est ensuite confirmée, puis envoyée à votre banque avec Stripe. Les versements partent tout seuls dès que votre solde confirmé atteint le minimum.'), now(), now()),
+  ('affiliates.partners.faq_payouts_question', jsonb_build_object('en', 'When do I get paid?', 'fr', 'Quand suis-je payé?'), now(), now()),
+  ('affiliates.partners.faq_refund_answer', jsonb_build_object('en', 'The commission for that order is cancelled. A partial refund lowers it by the same share.', 'fr', 'La commission de cette commande est annulée. Un remboursement partiel la réduit dans la même proportion.'), now(), now()),
+  ('affiliates.partners.faq_refund_question', jsonb_build_object('en', 'What happens if an order is refunded?', 'fr', 'Que se passe-t-il si une commande est remboursée?'), now(), now()),
+  ('affiliates.partners.faq_title', jsonb_build_object('en', 'Frequently asked questions', 'fr', 'Questions fréquentes'), now(), now()),
+  ('affiliates.partners.hero_badge_open', jsonb_build_object('en', 'Now open: our partner program', 'fr', 'Maintenant ouvert : notre programme de partenaires'), now(), now()),
+  ('affiliates.partners.hero_cta_how', jsonb_build_object('en', 'See how it works', 'fr', 'Voir comment ça marche'), now(), now()),
+  ('affiliates.partners.hero_cta_signup', jsonb_build_object('en', 'Claim your storefront', 'fr', 'Réservez votre vitrine'), now(), now()),
+  ('affiliates.partners.hero_eyebrow', jsonb_build_object('en', 'Partner program', 'fr', 'Programme de partenaires'), now(), now()),
+  ('affiliates.partners.hero_point_free', jsonb_build_object('en', 'Free to join', 'fr', 'Inscription gratuite'), now(), now()),
+  ('affiliates.partners.hero_point_no_fees', jsonb_build_object('en', 'No monthly fees', 'fr', 'Aucuns frais mensuels'), now(), now()),
+  ('affiliates.partners.hero_point_payouts_stripe', jsonb_build_object('en', 'Payouts through Stripe', 'fr', 'Versements par Stripe'), now(), now()),
+  ('affiliates.partners.hero_spots_taken', jsonb_build_object('en', '{taken} of {cap} spots taken', 'fr', '{taken} places prises sur {cap}'), now(), now()),
+  ('affiliates.partners.hero_spots_taken_one', jsonb_build_object('en', '{taken} of {cap} spots taken', 'fr', '{taken} place prise sur {cap}'), now(), now()),
+  ('affiliates.partners.hero_subtitle', jsonb_build_object('en', 'Share the products you love from your own storefront. We track each sale and pay you automatically.', 'fr', 'Partagez les produits que vous aimez dans votre propre vitrine. Nous suivons chaque vente et nous vous payons automatiquement.'), now(), now()),
+  ('affiliates.partners.hero_title', jsonb_build_object('en', 'Earn up to {rate}% on every sale you refer', 'fr', 'Gagnez jusqu''à {rate} % sur chaque vente que vous recommandez'), now(), now()),
+  ('affiliates.partners.hero_title_no_rate', jsonb_build_object('en', 'Earn a commission on every sale you refer', 'fr', 'Touchez une commission sur chaque vente que vous recommandez'), now(), now()),
+  ('affiliates.partners.hero_visual_amount', jsonb_build_object('en', '{amount} a month', 'fr', '{amount} par mois'), now(), now()),
+  ('affiliates.partners.hero_visual_chart', jsonb_build_object('en', 'Example over six months', 'fr', 'Exemple sur six mois'), now(), now()),
+  ('affiliates.partners.hero_visual_formula', jsonb_build_object('en', '{sales} sales of {price} each month', 'fr', '{sales} ventes de {price} chaque mois'), now(), now()),
+  ('affiliates.partners.hero_visual_note', jsonb_build_object('en', 'An example, not a promise.', 'fr', 'Un exemple, pas une promesse.'), now(), now()),
+  ('affiliates.partners.hero_visual_per_month', jsonb_build_object('en', 'a month', 'fr', 'par mois'), now(), now()),
+  ('affiliates.partners.hero_visual_rate', jsonb_build_object('en', 'At {rate}% commission', 'fr', 'Avec une commission de {rate} %'), now(), now()),
+  ('affiliates.partners.hero_visual_sale_generic', jsonb_build_object('en', 'Referred sale', 'fr', 'Vente recommandée'), now(), now()),
+  ('affiliates.partners.hero_visual_title', jsonb_build_object('en', 'Example month', 'fr', 'Un mois type'), now(), now()),
+  ('affiliates.partners.how_intro', jsonb_build_object('en', 'Four simple steps take you from sign-up to your first payout.', 'fr', 'Quatre étapes simples vous mènent de l''inscription à votre premier versement.'), now(), now()),
+  ('affiliates.partners.how_step_account_body', jsonb_build_object('en', 'Claim your handle and get your own storefront address in about a minute.', 'fr', 'Réservez votre identifiant et obtenez votre adresse de vitrine en une minute environ.'), now(), now()),
+  ('affiliates.partners.how_step_account_title', jsonb_build_object('en', 'Create your account', 'fr', 'Créez votre compte'), now(), now()),
+  ('affiliates.partners.how_step_label', jsonb_build_object('en', 'Step {number}', 'fr', 'Étape {number}'), now(), now()),
+  ('affiliates.partners.how_step_payouts_body', jsonb_build_object('en', 'Link your bank once through Stripe. After that, your payouts arrive on their own.', 'fr', 'Liez votre banque une seule fois avec Stripe. Ensuite, vos versements arrivent tout seuls.'), now(), now()),
+  ('affiliates.partners.how_step_payouts_title', jsonb_build_object('en', 'Connect your bank', 'fr', 'Connectez votre banque'), now(), now()),
+  ('affiliates.partners.how_step_profile_body', jsonb_build_object('en', 'Add a short bio and a photo, so shoppers know who you are.', 'fr', 'Ajoutez une courte bio et une photo, pour que les clients sachent qui vous êtes.'), now(), now()),
+  ('affiliates.partners.how_step_profile_title', jsonb_build_object('en', 'Complete your profile', 'fr', 'Complétez votre profil'), now(), now()),
+  ('affiliates.partners.how_step_storefront_body', jsonb_build_object('en', 'Pick your favorite products, then send your page to our team for a quick review.', 'fr', 'Choisissez vos produits préférés, puis envoyez votre page à notre équipe pour une révision rapide.'), now(), now()),
+  ('affiliates.partners.how_step_storefront_title', jsonb_build_object('en', 'Publish your storefront', 'fr', 'Publiez votre vitrine'), now(), now()),
+  ('affiliates.partners.how_title', jsonb_build_object('en', 'How it works', 'fr', 'Comment ça marche'), now(), now()),
+  ('affiliates.partners.ladder_cookie', jsonb_build_object('en', '{days}-day referral window', 'fr', 'Fenêtre de recommandation de {days} jours'), now(), now()),
+  ('affiliates.partners.ladder_empty', jsonb_build_object('en', 'New partner tiers are coming soon. Check back shortly.', 'fr', 'De nouveaux niveaux de partenaire arrivent bientôt. Revenez sous peu.'), now(), now()),
+  ('affiliates.partners.ladder_goal_label', jsonb_build_object('en', 'Goal', 'fr', 'Objectif'), now(), now()),
+  ('affiliates.partners.ladder_goal_note', jsonb_build_object('en', 'Goals are a guide, not a promise. Our team decides each move to a higher tier, and the new rate applies to sales after the move. Refunded orders don''t count.', 'fr', 'Les objectifs sont un repère, pas une promesse. Notre équipe décide de chaque passage à un niveau supérieur, et le nouveau taux s''applique aux ventes suivantes. Les commandes remboursées ne comptent pas.'), now(), now()),
+  ('affiliates.partners.ladder_intro', jsonb_build_object('en', 'Every partner earns a share of each sale. Higher tiers earn a bigger share.', 'fr', 'Chaque partenaire touche une part de chaque vente. Les niveaux supérieurs touchent une plus grande part.'), now(), now()),
+  ('affiliates.partners.ladder_offer_label', jsonb_build_object('en', 'Your rate if you join today', 'fr', 'Votre taux si vous vous inscrivez aujourd''hui'), now(), now()),
+  ('affiliates.partners.ladder_title', jsonb_build_object('en', 'Grow with our partner tiers', 'fr', 'Progressez avec nos niveaux de partenaire'), now(), now()),
+  ('affiliates.partners.ladder_track_offer', jsonb_build_object('en', 'The launch offer is locked on the {tier} tier at {rate}%.', 'fr', 'L''offre de lancement est verrouillée sur le niveau {tier}, à {rate} %.'), now(), now()),
+  ('affiliates.partners.ladder_track_standard', jsonb_build_object('en', 'New partners start on the {tier} tier at {rate}%.', 'fr', 'Les nouveaux partenaires commencent au niveau {tier}, à {rate} %.'), now(), now()),
+  ('affiliates.partners.meta_description', jsonb_build_object('en', 'Join our free partner program. Earn up to {rate}% on every sale you refer, get your own storefront and receive automatic payouts through Stripe.', 'fr', 'Inscrivez-vous gratuitement à notre programme de partenaires. Gagnez jusqu''à {rate} % sur chaque vente recommandée et recevez vos versements automatiquement.'), now(), now()),
+  ('affiliates.partners.meta_description_no_rate', jsonb_build_object('en', 'Join our free partner program. Earn a commission on every sale you refer, get your own storefront and receive automatic payouts through Stripe.', 'fr', 'Inscrivez-vous gratuitement à notre programme de partenaires. Touchez une commission sur chaque vente recommandée et recevez vos versements automatiquement.'), now(), now()),
+  ('affiliates.partners.meta_title', jsonb_build_object('en', 'Partner Program: Earn up to {rate}% Commission', 'fr', 'Programme de partenaires : jusqu''à {rate} % de commission'), now(), now()),
+  ('affiliates.partners.meta_title_no_rate', jsonb_build_object('en', 'Partner Program: Earn on Every Sale You Refer', 'fr', 'Programme de partenaires : gagnez sur chaque vente'), now(), now()),
+  ('affiliates.partners.offer_claim', jsonb_build_object('en', 'Claim {rate}% Revenue Share', 'fr', 'Obtenez {rate} % de partage des revenus'), now(), now()),
+  ('affiliates.partners.offer_eyebrow', jsonb_build_object('en', 'Limited time launch offer', 'fr', 'Offre de lancement à durée limitée'), now(), now()),
+  ('affiliates.partners.offer_range', jsonb_build_object('en', '(Normally {min}%–{max}%)', 'fr', '(normalement de {min} % à {max} %)'), now(), now()),
+  ('affiliates.partners.offer_range_single', jsonb_build_object('en', '(Normally {rate}%)', 'fr', '(normalement {rate} %)'), now(), now()),
+  ('affiliates.partners.offer_spots_many', jsonb_build_object('en', '— Only {spots} {tier} Spots Left!', 'fr', '— il ne reste que {spots} places au niveau {tier}!'), now(), now()),
+  ('affiliates.partners.offer_spots_one', jsonb_build_object('en', '— Only 1 {tier} Spot Left!', 'fr', '— il ne reste qu''une place au niveau {tier}!'), now(), now()),
+  ('affiliates.partners.offer_spots_unlimited', jsonb_build_object('en', '— For a Limited Time Only!', 'fr', '— pour une durée limitée seulement!'), now(), now()),
+  ('affiliates.partners.signup_check_email_body', jsonb_build_object('en', 'We sent you a link to confirm your address. Open it to finish setting up your storefront.', 'fr', 'Nous vous avons envoyé un lien pour confirmer votre adresse. Ouvrez-le pour terminer la création de votre vitrine.'), now(), now()),
+  ('affiliates.partners.signup_check_email_title', jsonb_build_object('en', 'Check your email', 'fr', 'Vérifiez vos courriels'), now(), now()),
+  ('affiliates.partners.signup_closed', jsonb_build_object('en', 'Sign-ups are paused while we prepare new spots. Please check back soon.', 'fr', 'Les inscriptions sont en pause pendant que nous préparons de nouvelles places. Revenez bientôt.'), now(), now()),
+  ('affiliates.partners.signup_email_label', jsonb_build_object('en', 'Email', 'fr', 'Courriel'), now(), now()),
+  ('affiliates.partners.signup_error_account_exists', jsonb_build_object('en', 'An account already uses this email. Sign in first, then come back to claim your handle.', 'fr', 'Un compte utilise déjà ce courriel. Connectez-vous d''abord, puis revenez réserver votre identifiant.'), now(), now()),
+  ('affiliates.partners.signup_error_captcha', jsonb_build_object('en', 'We couldn''t confirm that you''re a person. Please try again.', 'fr', 'Nous n''avons pas pu confirmer que vous êtes une personne. Veuillez réessayer.'), now(), now()),
+  ('affiliates.partners.signup_error_email', jsonb_build_object('en', 'Enter a valid email address.', 'fr', 'Entrez une adresse courriel valide.'), now(), now()),
+  ('affiliates.partners.signup_error_factor_pending', jsonb_build_object('en', 'Finish signing in with your second factor, then try again.', 'fr', 'Terminez la connexion avec votre deuxième facteur, puis réessayez.'), now(), now()),
+  ('affiliates.partners.signup_error_name', jsonb_build_object('en', 'Enter a display name of up to 80 characters.', 'fr', 'Entrez un nom affiché d''au plus 80 caractères.'), now(), now()),
+  ('affiliates.partners.signup_error_password', jsonb_build_object('en', 'Use a password of at least 8 characters.', 'fr', 'Utilisez un mot de passe d''au moins 8 caractères.'), now(), now()),
+  ('affiliates.partners.signup_error_terms', jsonb_build_object('en', 'Please accept the partner terms.', 'fr', 'Veuillez accepter les conditions du programme.'), now(), now()),
+  ('affiliates.partners.signup_error_throttled', jsonb_build_object('en', 'Too many partner accounts were created from your network. Please try again in an hour.', 'fr', 'Trop de comptes partenaires ont été créés à partir de votre réseau. Veuillez réessayer dans une heure.'), now(), now()),
+  ('affiliates.partners.signup_handle_available', jsonb_build_object('en', 'Good news: this handle is available.', 'fr', 'Bonne nouvelle : cet identifiant est disponible.'), now(), now()),
+  ('affiliates.partners.signup_handle_checking', jsonb_build_object('en', 'Checking availability…', 'fr', 'Vérification de la disponibilité…'), now(), now()),
+  ('affiliates.partners.signup_handle_hint', jsonb_build_object('en', 'Use 3 to 32 lowercase letters, numbers or hyphens.', 'fr', 'Utilisez de 3 à 32 lettres minuscules, chiffres ou traits d''union.'), now(), now()),
+  ('affiliates.partners.signup_handle_invalid', jsonb_build_object('en', 'Use 3 to 32 lowercase letters, numbers or hyphens, starting and ending with a letter or number.', 'fr', 'Utilisez de 3 à 32 lettres minuscules, chiffres ou traits d''union, en commençant et en terminant par une lettre ou un chiffre.'), now(), now()),
+  ('affiliates.partners.signup_handle_label', jsonb_build_object('en', 'Your handle', 'fr', 'Votre identifiant'), now(), now()),
+  ('affiliates.partners.signup_handle_preview', jsonb_build_object('en', 'Your storefront address: {url}', 'fr', 'Adresse de votre vitrine : {url}'), now(), now()),
+  ('affiliates.partners.signup_handle_reserved', jsonb_build_object('en', 'This handle is reserved. Try another one.', 'fr', 'Cet identifiant est réservé. Essayez-en un autre.'), now(), now()),
+  ('affiliates.partners.signup_handle_taken', jsonb_build_object('en', 'This handle is already taken. Try another one.', 'fr', 'Cet identifiant est déjà utilisé. Essayez-en un autre.'), now(), now()),
+  ('affiliates.partners.signup_handle_unknown', jsonb_build_object('en', 'We couldn''t check this handle right now. You can still send the form.', 'fr', 'Impossible de vérifier cet identifiant pour le moment. Vous pouvez quand même envoyer le formulaire.'), now(), now()),
+  ('affiliates.partners.signup_have_account', jsonb_build_object('en', 'Already have an account?', 'fr', 'Vous avez déjà un compte?'), now(), now()),
+  ('affiliates.partners.signup_intro', jsonb_build_object('en', 'It takes about a minute. You can finish your profile later.', 'fr', 'Ça prend environ une minute. Vous pourrez compléter votre profil plus tard.'), now(), now()),
+  ('affiliates.partners.signup_name_hint', jsonb_build_object('en', 'Shown at the top of your storefront.', 'fr', 'Affiché en haut de votre vitrine.'), now(), now()),
+  ('affiliates.partners.signup_name_label', jsonb_build_object('en', 'Display name', 'fr', 'Nom affiché'), now(), now()),
+  ('affiliates.partners.signup_open_portal', jsonb_build_object('en', 'Open my partner portal', 'fr', 'Ouvrir mon portail partenaire'), now(), now()),
+  ('affiliates.partners.signup_partner_body', jsonb_build_object('en', 'Your storefront, payouts and stats are waiting in your partner portal.', 'fr', 'Votre vitrine, vos versements et vos statistiques vous attendent dans votre portail partenaire.'), now(), now()),
+  ('affiliates.partners.signup_partner_title', jsonb_build_object('en', 'You are already a partner', 'fr', 'Vous êtes déjà partenaire'), now(), now()),
+  ('affiliates.partners.signup_password_hint', jsonb_build_object('en', 'At least 8 characters.', 'fr', 'Au moins 8 caractères.'), now(), now()),
+  ('affiliates.partners.signup_password_label', jsonb_build_object('en', 'Password', 'fr', 'Mot de passe'), now(), now()),
+  ('affiliates.partners.signup_ready_body', jsonb_build_object('en', 'Sign in to open your partner portal.', 'fr', 'Connectez-vous pour ouvrir votre portail partenaire.'), now(), now()),
+  ('affiliates.partners.signup_ready_title', jsonb_build_object('en', 'Your partner account is ready', 'fr', 'Votre compte partenaire est prêt'), now(), now()),
+  ('affiliates.partners.signup_sign_in', jsonb_build_object('en', 'Sign in', 'fr', 'Se connecter'), now(), now()),
+  ('affiliates.partners.signup_sign_in_first', jsonb_build_object('en', 'Sign in first', 'fr', 'Connectez-vous d''abord'), now(), now()),
+  ('affiliates.partners.signup_signed_in_as', jsonb_build_object('en', 'You are signed in as {email}.', 'fr', 'Session ouverte avec {email}.'), now(), now()),
+  ('affiliates.partners.signup_staff_body', jsonb_build_object('en', 'Sign out, then create a separate account to join the partner program.', 'fr', 'Déconnectez-vous, puis créez un compte distinct pour adhérer au programme de partenaires.'), now(), now()),
+  ('affiliates.partners.signup_staff_title', jsonb_build_object('en', 'Staff accounts cannot join', 'fr', 'Les comptes du personnel ne peuvent pas adhérer'), now(), now()),
+  ('affiliates.partners.signup_submit', jsonb_build_object('en', 'Create my partner account', 'fr', 'Créer mon compte partenaire'), now(), now()),
+  ('affiliates.partners.signup_submitting', jsonb_build_object('en', 'Creating your account…', 'fr', 'Création de votre compte…'), now(), now()),
+  ('affiliates.partners.signup_terms_accept', jsonb_build_object('en', 'I accept the {terms}. I will tell my audience that I earn a commission, and I won''t buy through my own links.', 'fr', 'J''accepte les {terms}. Je dirai à mon public que je touche une commission, et je n''achèterai pas avec mes propres liens.'), now(), now()),
+  ('affiliates.partners.signup_terms_link', jsonb_build_object('en', 'partner terms', 'fr', 'conditions du programme partenaires'), now(), now()),
+  ('affiliates.partners.signup_terms_new_tab', jsonb_build_object('en', '(opens in a new tab)', 'fr', '(s''ouvre dans un nouvel onglet)'), now(), now()),
+  ('affiliates.partners.signup_tier_note', jsonb_build_object('en', 'You will start on the {tier} tier at {rate}%.', 'fr', 'Vous commencerez au niveau {tier}, à {rate} %.'), now(), now()),
+  ('affiliates.partners.signup_title', jsonb_build_object('en', 'Claim your storefront', 'fr', 'Réservez votre vitrine'), now(), now()),
+  ('affiliates.partners.signup_upgrade_intro', jsonb_build_object('en', 'Claim a handle to turn this account into a partner account.', 'fr', 'Réservez un identifiant pour transformer ce compte en compte partenaire.'), now(), now()),
+  ('affiliates.partners.signup_upgrade_submit', jsonb_build_object('en', 'Become a partner', 'fr', 'Devenir partenaire'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.storefront.* (14 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.storefront.disclosure', jsonb_build_object('en', '{name} earns a commission on purchases made through this page, at no extra cost to you.', 'fr', '{name} touche une commission sur les achats faits à partir de cette page, sans frais supplémentaires pour vous.'), now(), now()),
+  ('affiliates.storefront.featured_title', jsonb_build_object('en', 'Featured products', 'fr', 'Produits en vedette'), now(), now()),
+  ('affiliates.storefront.join_cta_link', jsonb_build_object('en', 'Join the partner program', 'fr', 'Joignez-vous au programme de partenaires'), now(), now()),
+  ('affiliates.storefront.join_cta_text', jsonb_build_object('en', 'Want a storefront like this one?', 'fr', 'Vous voulez une vitrine comme celle-ci?'), now(), now()),
+  ('affiliates.storefront.meta_description_fallback', jsonb_build_object('en', 'Shop {name}''s favorite products, hand-picked and personally recommended. Every pick is chosen with care.', 'fr', 'Magasinez les produits préférés de {name}, choisis avec soin et recommandés personnellement.'), now(), now()),
+  ('affiliates.storefront.meta_title_fallback', jsonb_build_object('en', '{name}''s picks', 'fr', 'La sélection de {name}'), now(), now()),
+  ('affiliates.storefront.not_found_title', jsonb_build_object('en', 'Storefront not found', 'fr', 'Vitrine introuvable'), now(), now()),
+  ('affiliates.storefront.og_tagline', jsonb_build_object('en', 'Shop my picks', 'fr', 'Magasinez ma sélection'), now(), now()),
+  ('affiliates.storefront.opens_new_tab', jsonb_build_object('en', '(opens in a new tab)', 'fr', '(s''ouvre dans un nouvel onglet)'), now(), now()),
+  ('affiliates.storefront.photo_credit', jsonb_build_object('en', 'Photo: {photographer} / {provider}', 'fr', 'Photo : {photographer} / {provider}'), now(), now()),
+  ('affiliates.storefront.products_title', jsonb_build_object('en', 'Products', 'fr', 'Produits'), now(), now()),
+  ('affiliates.storefront.social_nav_label', jsonb_build_object('en', '{name} on social media', 'fr', '{name} sur les réseaux sociaux'), now(), now()),
+  ('affiliates.storefront.social_website', jsonb_build_object('en', 'Website', 'fr', 'Site Web'), now(), now()),
+  ('affiliates.storefront.tier_label', jsonb_build_object('en', 'Partner tier', 'fr', 'Niveau de partenaire'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.portal.* (244 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.portal.autosave_error', jsonb_build_object('en', 'Couldn''t save. We''ll try again when you keep editing.', 'fr', 'Enregistrement impossible. Nous réessaierons lorsque vous poursuivrez vos modifications.'), now(), now()),
+  ('affiliates.portal.autosave_saved', jsonb_build_object('en', 'All changes saved', 'fr', 'Toutes les modifications sont enregistrées'), now(), now()),
+  ('affiliates.portal.autosave_saving', jsonb_build_object('en', 'Saving…', 'fr', 'Enregistrement…'), now(), now()),
+  ('affiliates.portal.autosave_unsaved', jsonb_build_object('en', 'Unsaved changes', 'fr', 'Modifications non enregistrées'), now(), now()),
+  ('affiliates.portal.avatar_alt', jsonb_build_object('en', 'Profile photo of {name}', 'fr', 'Photo de profil de {name}'), now(), now()),
+  ('affiliates.portal.avatar_change', jsonb_build_object('en', 'Change photo', 'fr', 'Changer la photo'), now(), now()),
+  ('affiliates.portal.avatar_hint', jsonb_build_object('en', 'JPEG, PNG, WebP, AVIF or GIF, up to 2 MB. We crop it to a square.', 'fr', 'JPEG, PNG, WebP, AVIF ou GIF, jusqu''à 2 Mo. Nous la recadrons en carré.'), now(), now()),
+  ('affiliates.portal.avatar_upload', jsonb_build_object('en', 'Upload a photo', 'fr', 'Téléverser une photo'), now(), now()),
+  ('affiliates.portal.avatar_uploaded', jsonb_build_object('en', 'Photo updated.', 'fr', 'Photo mise à jour.'), now(), now()),
+  ('affiliates.portal.avatar_uploading', jsonb_build_object('en', 'Uploading…', 'fr', 'Téléversement…'), now(), now()),
+  ('affiliates.portal.balance_cleared', jsonb_build_object('en', 'Cleared, awaiting payout', 'fr', 'Confirmé, en attente de versement'), now(), now()),
+  ('affiliates.portal.balance_cleared_hint', jsonb_build_object('en', 'Paid automatically once it reaches {min}.', 'fr', 'Versé automatiquement dès qu''il atteint {min}.'), now(), now()),
+  ('affiliates.portal.balance_failed_retry_hint', jsonb_build_object('en', 'A transfer of {amount} failed. We''ll try again automatically.', 'fr', 'Un virement de {amount} a échoué. Nous réessaierons automatiquement.'), now(), now()),
+  ('affiliates.portal.balance_failed_review_hint', jsonb_build_object('en', 'A transfer of {amount} failed. We''ll look into it and send it again.', 'fr', 'Un virement de {amount} a échoué. Nous allons vérifier la situation et vous le renvoyer.'), now(), now()),
+  ('affiliates.portal.balance_next_payout', jsonb_build_object('en', 'Next automated payout', 'fr', 'Prochain versement automatisé'), now(), now()),
+  ('affiliates.portal.balance_paid', jsonb_build_object('en', 'Paid out (lifetime)', 'fr', 'Versé (depuis le début)'), now(), now()),
+  ('affiliates.portal.balance_pending', jsonb_build_object('en', 'Pending ({days}-day refund window)', 'fr', 'En attente (période de remboursement de {days} jours)'), now(), now()),
+  ('affiliates.portal.balance_pending_hint', jsonb_build_object('en', 'Next commission clears on {date}.', 'fr', 'Prochaine confirmation le {date}.'), now(), now()),
+  ('affiliates.portal.balance_pending_hint_empty', jsonb_build_object('en', 'Nothing pending right now.', 'fr', 'Rien en attente pour le moment.'), now(), now()),
+  ('affiliates.portal.balance_processing_hint', jsonb_build_object('en', '{amount} is on its way to your bank.', 'fr', '{amount} est en route vers votre compte bancaire.'), now(), now()),
+  ('affiliates.portal.balance_title', jsonb_build_object('en', 'Your balance', 'fr', 'Votre solde'), now(), now()),
+  ('affiliates.portal.banner_changes_action', jsonb_build_object('en', 'Open the storefront studio', 'fr', 'Ouvrir le studio de vitrine'), now(), now()),
+  ('affiliates.portal.banner_changes_body', jsonb_build_object('en', 'We reviewed your storefront and asked for a few changes before it can go live. Here''s the note from our team:', 'fr', 'Nous avons examiné votre vitrine et demandé quelques modifications avant sa mise en ligne. Voici la note de notre équipe :'), now(), now()),
+  ('affiliates.portal.banner_changes_title', jsonb_build_object('en', 'Changes requested', 'fr', 'Modifications demandées'), now(), now()),
+  ('affiliates.portal.banner_not_approved_action', jsonb_build_object('en', 'Finish my storefront', 'fr', 'Terminer ma vitrine'), now(), now()),
+  ('affiliates.portal.banner_not_approved_body', jsonb_build_object('en', 'Commissions start once your storefront is approved for the first time. Finish your page and submit it for review.', 'fr', 'Les commissions commencent dès la première approbation de votre vitrine. Terminez votre page et soumettez-la pour révision.'), now(), now()),
+  ('affiliates.portal.banner_not_approved_title', jsonb_build_object('en', 'Your links don''t earn commissions yet', 'fr', 'Vos liens ne rapportent pas encore de commissions'), now(), now()),
+  ('affiliates.portal.banner_review_body', jsonb_build_object('en', 'We''ll email you as soon as it''s approved. Your referral links start earning commissions from that first approval.', 'fr', 'Nous vous écrirons par courriel dès qu''elle sera approuvée. Vos liens de recommandation commenceront à rapporter des commissions à partir de cette première approbation.'), now(), now()),
+  ('affiliates.portal.banner_review_title', jsonb_build_object('en', 'Your storefront is in review', 'fr', 'Votre vitrine est en révision'), now(), now()),
+  ('affiliates.portal.banner_review_update_body', jsonb_build_object('en', 'Your current storefront stays live while we review the update. We''ll email you when it''s done.', 'fr', 'Votre vitrine actuelle reste en ligne pendant que nous examinons la mise à jour. Nous vous écrirons par courriel une fois l''examen terminé.'), now(), now()),
+  ('affiliates.portal.banner_review_update_title', jsonb_build_object('en', 'Your changes are in review', 'fr', 'Vos modifications sont en révision'), now(), now()),
+  ('affiliates.portal.character_count', jsonb_build_object('en', '{count} of {max} characters', 'fr', '{count} sur {max} caractères'), now(), now()),
+  ('affiliates.portal.commission_refunded', jsonb_build_object('en', '{amount} refunded', 'fr', '{amount} remboursé'), now(), now()),
+  ('affiliates.portal.commissions_empty', jsonb_build_object('en', 'No commissions yet.', 'fr', 'Aucune commission pour l''instant.'), now(), now()),
+  ('affiliates.portal.commissions_title', jsonb_build_object('en', 'Commissions', 'fr', 'Commissions'), now(), now()),
+  ('affiliates.portal.conflict_reload', jsonb_build_object('en', 'Load the latest version', 'fr', 'Charger la dernière version'), now(), now()),
+  ('affiliates.portal.conflict_title', jsonb_build_object('en', 'This storefront changed somewhere else', 'fr', 'Cette vitrine a été modifiée ailleurs'), now(), now()),
+  ('affiliates.portal.connect_button', jsonb_build_object('en', 'Connect bank account (automated payouts)', 'fr', 'Connecter un compte bancaire (versements automatisés)'), now(), now()),
+  ('affiliates.portal.connect_check_status', jsonb_build_object('en', 'Check status', 'fr', 'Vérifier l''état'), now(), now()),
+  ('affiliates.portal.connect_checking', jsonb_build_object('en', 'Checking your Stripe account…', 'fr', 'Vérification de votre compte Stripe…'), now(), now()),
+  ('affiliates.portal.connect_continue', jsonb_build_object('en', 'Continue setup', 'fr', 'Poursuivre la configuration'), now(), now()),
+  ('affiliates.portal.connect_country', jsonb_build_object('en', 'Country of your bank account', 'fr', 'Pays de votre compte bancaire'), now(), now()),
+  ('affiliates.portal.connect_country_hint', jsonb_build_object('en', 'This can''t be changed later.', 'fr', 'Ce choix ne pourra pas être modifié par la suite.'), now(), now()),
+  ('affiliates.portal.connect_dashboard', jsonb_build_object('en', 'Open my Stripe Express dashboard', 'fr', 'Ouvrir mon tableau de bord Stripe Express'), now(), now()),
+  ('affiliates.portal.connect_error_return', jsonb_build_object('en', 'We couldn''t reopen Stripe''s setup. Try again.', 'fr', 'Impossible de rouvrir la configuration de Stripe. Réessayez.'), now(), now()),
+  ('affiliates.portal.connect_incomplete', jsonb_build_object('en', 'Your Stripe account setup isn''t finished yet.', 'fr', 'La configuration de votre compte Stripe n''est pas terminée.'), now(), now()),
+  ('affiliates.portal.connect_incomplete_message', jsonb_build_object('en', 'Stripe still needs a few details. Continue the setup to turn on payouts.', 'fr', 'Stripe a encore besoin de quelques renseignements. Poursuivez la configuration pour activer les versements.'), now(), now()),
+  ('affiliates.portal.connect_intro', jsonb_build_object('en', 'Connect a bank account through Stripe to receive your commissions automatically. Stripe handles identity checks and bank details securely; we never see them.', 'fr', 'Connectez un compte bancaire par l''entremise de Stripe pour recevoir vos commissions automatiquement. Stripe s''occupe de façon sécurisée de la vérification d''identité et des coordonnées bancaires; nous n''y avons jamais accès.'), now(), now()),
+  ('affiliates.portal.connect_not_configured', jsonb_build_object('en', 'Bank payouts aren''t available on this store yet. Once the store finishes setting up its payment account, you can connect your bank account here. The commissions you earn until then are kept.', 'fr', 'Les versements bancaires ne sont pas encore offerts sur cette boutique. Dès que la boutique aura terminé la configuration de son compte de paiement, vous pourrez connecter votre compte bancaire ici. Les commissions gagnées d''ici là sont conservées.'), now(), now()),
+  ('affiliates.portal.connect_opening', jsonb_build_object('en', 'Opening Stripe…', 'fr', 'Ouverture de Stripe…'), now(), now()),
+  ('affiliates.portal.connect_ready', jsonb_build_object('en', 'Automated payouts are on', 'fr', 'Les versements automatisés sont activés'), now(), now()),
+  ('affiliates.portal.connect_ready_body', jsonb_build_object('en', 'Cleared commissions are sent to your bank automatically. Manage your bank details and see transfers in your Stripe Express dashboard.', 'fr', 'Les commissions confirmées sont versées automatiquement dans votre compte bancaire. Gérez vos coordonnées bancaires et consultez vos virements dans votre tableau de bord Stripe Express.'), now(), now()),
+  ('affiliates.portal.connect_ready_message', jsonb_build_object('en', 'Your Stripe account is ready. Payouts are on.', 'fr', 'Votre compte Stripe est prêt. Les versements sont activés.'), now(), now()),
+  ('affiliates.portal.connect_review', jsonb_build_object('en', 'Stripe is reviewing your details. This usually takes a few minutes, sometimes longer.', 'fr', 'Stripe vérifie vos renseignements. Cela prend généralement quelques minutes, parfois plus.'), now(), now()),
+  ('affiliates.portal.connect_sandbox', jsonb_build_object('en', 'Payouts are turned off in this demo, so Stripe can''t be connected here.', 'fr', 'Les versements sont désactivés dans cette démo; Stripe ne peut donc pas être connecté ici.'), now(), now()),
+  ('affiliates.portal.connect_title', jsonb_build_object('en', 'Bank payouts', 'fr', 'Versements bancaires'), now(), now()),
+  ('affiliates.portal.content_description', jsonb_build_object('en', 'Type / to add headings, lists, images or a product grid with /promote.', 'fr', 'Tapez / pour ajouter des titres, des listes, des images ou une grille de produits avec /promote.'), now(), now()),
+  ('affiliates.portal.content_editor_label', jsonb_build_object('en', 'Storefront page content', 'fr', 'Contenu de la page de vitrine'), now(), now()),
+  ('affiliates.portal.content_title', jsonb_build_object('en', 'Page content', 'fr', 'Contenu de la page'), now(), now()),
+  ('affiliates.portal.copilot_bio_applied', jsonb_build_object('en', 'The assistant filled in your bio and meta description. Review them, then save your profile.', 'fr', 'L''assistant a rempli votre bio et votre description. Relisez-les, puis enregistrez votre profil.'), now(), now()),
+  ('affiliates.portal.copilot_unavailable', jsonb_build_object('en', 'The storefront assistant isn''t available on this site right now. You can still edit your page yourself.', 'fr', 'L''assistant de vitrine n''est pas disponible sur ce site pour le moment. Vous pouvez tout de même modifier votre page vous-même.'), now(), now()),
+  ('affiliates.portal.copy_manual', jsonb_build_object('en', 'Couldn''t copy automatically. The link is selected: press Ctrl+C (or ⌘+C) to copy it.', 'fr', 'Copie automatique impossible. Le lien est sélectionné : appuyez sur Ctrl+C (ou ⌘+C) pour le copier.'), now(), now()),
+  ('affiliates.portal.error_conflict', jsonb_build_object('en', 'Your storefront was changed in another tab or on another device. Load the latest version to keep editing; unsaved changes here will be lost.', 'fr', 'Votre vitrine a été modifiée dans un autre onglet ou sur un autre appareil. Chargez la dernière version pour continuer; les modifications non enregistrées ici seront perdues.'), now(), now()),
+  ('affiliates.portal.error_connect_unavailable', jsonb_build_object('en', 'We couldn''t reach Stripe right now. Try again in a moment.', 'fr', 'Impossible de joindre Stripe pour le moment. Réessayez dans un instant.'), now(), now()),
+  ('affiliates.portal.error_empty_storefront', jsonb_build_object('en', 'Add some content to your storefront before submitting it.', 'fr', 'Ajoutez du contenu à votre vitrine avant de la soumettre.'), now(), now()),
+  ('affiliates.portal.error_missing_title', jsonb_build_object('en', 'Add a page title before submitting.', 'fr', 'Ajoutez un titre de page avant de soumettre.'), now(), now()),
+  ('affiliates.portal.error_not_pending', jsonb_build_object('en', 'There''s no submission to withdraw.', 'fr', 'Il n''y a aucune soumission à retirer.'), now(), now()),
+  ('affiliates.portal.error_nothing_to_submit', jsonb_build_object('en', 'Nothing has changed since your last approval.', 'fr', 'Rien n''a changé depuis votre dernière approbation.'), now(), now()),
+  ('affiliates.portal.error_payouts_not_configured', jsonb_build_object('en', 'Bank payouts aren''t available on this store yet. Try again once the store has finished setting up its payment account.', 'fr', 'Les versements bancaires ne sont pas encore offerts sur cette boutique. Réessayez lorsque la boutique aura terminé la configuration de son compte de paiement.'), now(), now()),
+  ('affiliates.portal.error_pending_review', jsonb_build_object('en', 'Your storefront is in review, so it can''t be changed right now. Withdraw the submission to edit it.', 'fr', 'Votre vitrine est en révision et ne peut pas être modifiée pour le moment. Retirez la soumission pour la modifier.'), now(), now()),
+  ('affiliates.portal.error_sandbox', jsonb_build_object('en', 'Payouts are turned off in this demo.', 'fr', 'Les versements sont désactivés dans cette démo.'), now(), now()),
+  ('affiliates.portal.error_social_links', jsonb_build_object('en', 'Some social links can''t be used. Check the highlighted fields.', 'fr', 'Certains liens de réseaux sociaux ne peuvent pas être utilisés. Vérifiez les champs signalés.'), now(), now()),
+  ('affiliates.portal.error_storefront_too_large', jsonb_build_object('en', 'Your storefront is too large to save. Remove some text, links or images so it can be saved.', 'fr', 'Votre vitrine est trop volumineuse pour être enregistrée. Retirez du texte, des liens ou des images pour pouvoir l''enregistrer.'), now(), now()),
+  ('affiliates.portal.error_submit_cooldown', jsonb_build_object('en', 'You can submit your storefront again 10 minutes after your last submission. Try again in a few minutes.', 'fr', 'Vous pourrez soumettre votre vitrine de nouveau 10 minutes après votre dernière soumission. Réessayez dans quelques minutes.'), now(), now()),
+  ('affiliates.portal.faq_earn_answer', jsonb_build_object('en', 'A share of each order you refer, based on your partner tier. It''s calculated on the order total after discounts, without taxes or shipping.', 'fr', 'Une part de chaque commande que vous recommandez, selon votre niveau partenaire. Elle est calculée sur le total de la commande après rabais, sans les taxes ni la livraison.'), now(), now()),
+  ('affiliates.portal.faq_earn_answer_rate', jsonb_build_object('en', '{rate} of each order you refer, calculated on the order total after discounts, without taxes or shipping.', 'fr', '{rate} de chaque commande que vous recommandez, calculé sur le total de la commande après rabais, sans les taxes ni la livraison.'), now(), now()),
+  ('affiliates.portal.faq_earn_question', jsonb_build_object('en', 'What do I earn?', 'fr', 'Combien est-ce que je gagne?'), now(), now()),
+  ('affiliates.portal.faq_hold_answer', jsonb_build_object('en', 'Each commission waits {days} days so refunds can be handled. A refunded order cancels its commission; a partial refund reduces it.', 'fr', 'Chaque commission attend {days} jours afin de permettre le traitement des remboursements. Une commande remboursée annule sa commission; un remboursement partiel la réduit.'), now(), now()),
+  ('affiliates.portal.faq_hold_question', jsonb_build_object('en', 'Why is a commission pending?', 'fr', 'Pourquoi une commission est-elle en attente?'), now(), now()),
+  ('affiliates.portal.faq_payout_answer', jsonb_build_object('en', 'Once your cleared balance reaches {min}, it is sent automatically to your bank account through Stripe in the next daily payout run.', 'fr', 'Dès que votre solde confirmé atteint {min}, il est versé automatiquement dans votre compte bancaire par Stripe lors du prochain versement quotidien.'), now(), now()),
+  ('affiliates.portal.faq_payout_question', jsonb_build_object('en', 'When am I paid?', 'fr', 'Quand est-ce que je reçois mes versements?'), now(), now()),
+  ('affiliates.portal.faq_renewals_answer', jsonb_build_object('en', 'No. A commission is earned once, when an order you referred is first paid. Renewals and later subscription payments don''t earn; a free trial earns when it converts to a paid order.', 'fr', 'Non. Une commission est gagnée une seule fois, au premier paiement d''une commande que vous avez recommandée. Les renouvellements et les paiements d''abonnement suivants ne rapportent rien; un essai gratuit rapporte lorsqu''il devient une commande payée.'), now(), now()),
+  ('affiliates.portal.faq_renewals_question', jsonb_build_object('en', 'Do renewals and subscriptions earn?', 'fr', 'Les renouvellements et les abonnements rapportent-ils?'), now(), now()),
+  ('affiliates.portal.faq_terms_link', jsonb_build_object('en', 'Read the partner terms', 'fr', 'Lire les conditions du programme partenaires'), now(), now()),
+  ('affiliates.portal.faq_terms_question', jsonb_build_object('en', 'Where are the program rules?', 'fr', 'Où trouver les règles du programme?'), now(), now()),
+  ('affiliates.portal.faq_title', jsonb_build_object('en', 'How payouts work', 'fr', 'Fonctionnement des versements'), now(), now()),
+  ('affiliates.portal.faq_window_answer', jsonb_build_object('en', 'A visitor who arrives through your link is credited to you for {days} days, unless they later follow another partner''s link.', 'fr', 'Un visiteur arrivé par votre lien vous est attribué pendant {days} jours, sauf s''il suit ensuite le lien d''un autre partenaire.'), now(), now()),
+  ('affiliates.portal.faq_window_question', jsonb_build_object('en', 'How long does a referral last?', 'fr', 'Combien de temps dure une recommandation?'), now(), now()),
+  ('affiliates.portal.featured_choose', jsonb_build_object('en', 'Choose products', 'fr', 'Choisir des produits'), now(), now()),
+  ('affiliates.portal.featured_description', jsonb_build_object('en', 'Pick up to {max} products to feature on your storefront, after your page content. Products already shown in a product grid appear only once.', 'fr', 'Choisissez jusqu''à {max} produits à mettre en vedette dans votre vitrine, après le contenu de votre page. Les produits déjà présents dans une grille n''apparaissent qu''une fois.'), now(), now()),
+  ('affiliates.portal.featured_edit', jsonb_build_object('en', 'Edit featured products', 'fr', 'Modifier les produits vedettes'), now(), now()),
+  ('affiliates.portal.featured_empty', jsonb_build_object('en', 'No featured products yet.', 'fr', 'Aucun produit vedette pour l''instant.'), now(), now()),
+  ('affiliates.portal.featured_remove', jsonb_build_object('en', 'Remove {name}', 'fr', 'Retirer {name}'), now(), now()),
+  ('affiliates.portal.featured_title', jsonb_build_object('en', 'Featured products', 'fr', 'Produits vedettes'), now(), now()),
+  ('affiliates.portal.featured_unavailable', jsonb_build_object('en', 'Unavailable product', 'fr', 'Produit non disponible'), now(), now()),
+  ('affiliates.portal.ledger_error_body', jsonb_build_object('en', 'This is usually temporary. Reload the page in a moment.', 'fr', 'C''est généralement temporaire. Rechargez la page dans un instant.'), now(), now()),
+  ('affiliates.portal.ledger_error_title', jsonb_build_object('en', 'Your earnings couldn''t be loaded', 'fr', 'Vos gains n''ont pas pu être chargés'), now(), now()),
+  ('affiliates.portal.locale_en', jsonb_build_object('en', 'English', 'fr', 'English'), now(), now()),
+  ('affiliates.portal.locale_fr', jsonb_build_object('en', 'Français', 'fr', 'Français'), now(), now()),
+  ('affiliates.portal.meta_hint_empty', jsonb_build_object('en', 'Describe your storefront in a sentence or two. About 70 to {max} characters works best.', 'fr', 'Décrivez votre vitrine en une ou deux phrases. De 70 à {max} caractères environ, c''est idéal.'), now(), now()),
+  ('affiliates.portal.meta_hint_long', jsonb_build_object('en', 'Search engines usually show about {max} characters; the rest may be cut off.', 'fr', 'Les moteurs de recherche affichent environ {max} caractères; le reste peut être coupé.'), now(), now()),
+  ('affiliates.portal.meta_hint_ok', jsonb_build_object('en', 'Good length for search results.', 'fr', 'Bonne longueur pour les résultats de recherche.'), now(), now()),
+  ('affiliates.portal.meta_title', jsonb_build_object('en', 'Partner portal', 'fr', 'Portail partenaire'), now(), now()),
+  ('affiliates.portal.nav_label', jsonb_build_object('en', 'Partner portal sections', 'fr', 'Sections du portail partenaire'), now(), now()),
+  ('affiliates.portal.nav_overview', jsonb_build_object('en', 'Overview', 'fr', 'Aperçu'), now(), now()),
+  ('affiliates.portal.nav_payouts', jsonb_build_object('en', 'Payouts', 'fr', 'Versements'), now(), now()),
+  ('affiliates.portal.nav_storefront', jsonb_build_object('en', 'Storefront', 'fr', 'Vitrine'), now(), now()),
+  ('affiliates.portal.next_payout_below_minimum', jsonb_build_object('en', 'Below the minimum', 'fr', 'Sous le minimum'), now(), now()),
+  ('affiliates.portal.next_payout_below_minimum_hint', jsonb_build_object('en', 'Payouts start at {min}; {remaining} to go, counting commissions still pending.', 'fr', 'Les versements commencent à {min}; il manque {remaining}, en comptant les commissions en attente.'), now(), now()),
+  ('affiliates.portal.next_payout_connect', jsonb_build_object('en', 'Connect your bank account', 'fr', 'Connectez votre compte bancaire'), now(), now()),
+  ('affiliates.portal.next_payout_connect_hint', jsonb_build_object('en', 'Payouts start once Stripe confirms your account.', 'fr', 'Les versements commencent dès que Stripe confirme votre compte.'), now(), now()),
+  ('affiliates.portal.next_payout_none', jsonb_build_object('en', 'No earnings yet', 'fr', 'Aucun gain pour l''instant'), now(), now()),
+  ('affiliates.portal.next_payout_none_hint', jsonb_build_object('en', 'Payouts start once your cleared balance reaches {min}.', 'fr', 'Les versements commencent dès que votre solde confirmé atteint {min}.'), now(), now()),
+  ('affiliates.portal.next_payout_not_eligible', jsonb_build_object('en', 'After your first approval', 'fr', 'Après votre première approbation'), now(), now()),
+  ('affiliates.portal.next_payout_not_eligible_hint', jsonb_build_object('en', 'Payouts start once your storefront is approved.', 'fr', 'Les versements commencent dès l''approbation de votre vitrine.'), now(), now()),
+  ('affiliates.portal.next_payout_paused', jsonb_build_object('en', 'Paused', 'fr', 'En pause'), now(), now()),
+  ('affiliates.portal.next_payout_paused_hint', jsonb_build_object('en', 'Automated payouts are paused for now. Your balance is safe.', 'fr', 'Les versements automatisés sont en pause pour le moment. Votre solde est conservé.'), now(), now()),
+  ('affiliates.portal.next_payout_scheduled_hint', jsonb_build_object('en', 'Estimate. Payouts run automatically once a day.', 'fr', 'Estimation. Les versements sont faits automatiquement une fois par jour.'), now(), now()),
+  ('affiliates.portal.opens_new_tab', jsonb_build_object('en', '(opens in a new tab)', 'fr', '(s''ouvre dans un nouvel onglet)'), now(), now()),
+  ('affiliates.portal.overview_greeting', jsonb_build_object('en', 'Hi {name}, here''s how your storefront is doing.', 'fr', 'Bonjour {name}, voici où en est votre vitrine.'), now(), now()),
+  ('affiliates.portal.overview_meta_title', jsonb_build_object('en', 'Partner dashboard', 'fr', 'Tableau de bord partenaire'), now(), now()),
+  ('affiliates.portal.overview_tier', jsonb_build_object('en', 'Your tier: {tier}, {rate} commission', 'fr', 'Votre niveau : {tier}, commission de {rate}'), now(), now()),
+  ('affiliates.portal.overview_title', jsonb_build_object('en', 'Partner dashboard', 'fr', 'Tableau de bord partenaire'), now(), now()),
+  ('affiliates.portal.payout_failed_note', jsonb_build_object('en', 'The transfer failed. We''ll try again automatically.', 'fr', 'Le virement a échoué. Nous réessaierons automatiquement.'), now(), now()),
+  ('affiliates.portal.payout_failed_review_note', jsonb_build_object('en', 'The transfer failed. We''ll look into it and send it again.', 'fr', 'Le virement a échoué. Nous allons vérifier la situation et vous le renvoyer.'), now(), now()),
+  ('affiliates.portal.payout_processing_note', jsonb_build_object('en', 'Being sent to your bank.', 'fr', 'En cours d''envoi vers votre banque.'), now(), now()),
+  ('affiliates.portal.payout_reference', jsonb_build_object('en', 'Ref. {reference}', 'fr', 'Réf. {reference}'), now(), now()),
+  ('affiliates.portal.payouts_description', jsonb_build_object('en', 'Your commissions clear after the refund window, then go to your bank automatically through Stripe.', 'fr', 'Vos commissions sont confirmées après la période de remboursement, puis versées automatiquement dans votre compte bancaire par Stripe.'), now(), now()),
+  ('affiliates.portal.payouts_empty', jsonb_build_object('en', 'No payouts yet.', 'fr', 'Aucun versement pour l''instant.'), now(), now()),
+  ('affiliates.portal.payouts_history_title', jsonb_build_object('en', 'Payout history', 'fr', 'Historique des versements'), now(), now()),
+  ('affiliates.portal.payouts_meta_title', jsonb_build_object('en', 'Payouts', 'fr', 'Versements'), now(), now()),
+  ('affiliates.portal.payouts_title', jsonb_build_object('en', 'Payouts', 'fr', 'Versements'), now(), now()),
+  ('affiliates.portal.preview_description', jsonb_build_object('en', 'See your draft the way visitors will once it''s approved.', 'fr', 'Voyez votre brouillon comme les visiteurs le verront une fois approuvé.'), now(), now()),
+  ('affiliates.portal.preview_featured_heading', jsonb_build_object('en', 'Featured products', 'fr', 'Produits vedettes'), now(), now()),
+  ('affiliates.portal.preview_hide', jsonb_build_object('en', 'Hide preview', 'fr', 'Masquer l''aperçu'), now(), now()),
+  ('affiliates.portal.preview_photo_credit', jsonb_build_object('en', 'Photo: {photographer} / {provider}', 'fr', 'Photo : {photographer} / {provider}'), now(), now()),
+  ('affiliates.portal.preview_show', jsonb_build_object('en', 'Show preview', 'fr', 'Afficher l''aperçu'), now(), now()),
+  ('affiliates.portal.preview_title', jsonb_build_object('en', 'Preview', 'fr', 'Aperçu'), now(), now()),
+  ('affiliates.portal.preview_untitled', jsonb_build_object('en', 'Untitled storefront', 'fr', 'Vitrine sans titre'), now(), now()),
+  ('affiliates.portal.profile_bio', jsonb_build_object('en', 'Bio', 'fr', 'Bio'), now(), now()),
+  ('affiliates.portal.profile_bio_hint', jsonb_build_object('en', 'Write at least {min} characters to complete your profile.', 'fr', 'Écrivez au moins {min} caractères pour compléter votre profil.'), now(), now()),
+  ('affiliates.portal.profile_bio_hint_ok', jsonb_build_object('en', 'Tell visitors who you are and why they can trust your picks.', 'fr', 'Dites aux visiteurs qui vous êtes et pourquoi ils peuvent se fier à vos choix.'), now(), now()),
+  ('affiliates.portal.profile_description', jsonb_build_object('en', 'Shown at the top of your storefront. Changes go live with your next approval.', 'fr', 'Affiché en haut de votre vitrine. Les modifications sont mises en ligne à votre prochaine approbation.'), now(), now()),
+  ('affiliates.portal.profile_display_name', jsonb_build_object('en', 'Display name', 'fr', 'Nom affiché'), now(), now()),
+  ('affiliates.portal.profile_locale', jsonb_build_object('en', 'Language', 'fr', 'Langue'), now(), now()),
+  ('affiliates.portal.profile_locale_hint', jsonb_build_object('en', 'The language of our emails to you and of your storefront. A new language reaches your live page at its next approval.', 'fr', 'La langue de nos courriels et de votre vitrine. Une nouvelle langue s''applique à votre page en ligne à sa prochaine approbation.'), now(), now()),
+  ('affiliates.portal.profile_save', jsonb_build_object('en', 'Save profile', 'fr', 'Enregistrer le profil'), now(), now()),
+  ('affiliates.portal.profile_saved', jsonb_build_object('en', 'Profile saved.', 'fr', 'Profil enregistré.'), now(), now()),
+  ('affiliates.portal.profile_saved_completed', jsonb_build_object('en', 'Profile saved. That''s one step done!', 'fr', 'Profil enregistré. Une étape de franchie!'), now(), now()),
+  ('affiliates.portal.profile_social_hint', jsonb_build_object('en', 'Optional. Use the full address of your profile, for example https://instagram.com/yourname.', 'fr', 'Facultatif. Utilisez l''adresse complète de votre profil, par exemple https://instagram.com/votrenom.'), now(), now()),
+  ('affiliates.portal.profile_social_invalid', jsonb_build_object('en', 'Use a secure link (https) to this network''s own site.', 'fr', 'Utilisez un lien sécurisé (https) vers le site de ce réseau.'), now(), now()),
+  ('affiliates.portal.profile_social_title', jsonb_build_object('en', 'Social links', 'fr', 'Réseaux sociaux'), now(), now()),
+  ('affiliates.portal.profile_title', jsonb_build_object('en', 'Your profile', 'fr', 'Votre profil'), now(), now()),
+  ('affiliates.portal.profile_unsaved', jsonb_build_object('en', 'Unsaved changes', 'fr', 'Modifications non enregistrées'), now(), now()),
+  ('affiliates.portal.progress_action_payouts', jsonb_build_object('en', 'Connect my bank account', 'fr', 'Connecter mon compte bancaire'), now(), now()),
+  ('affiliates.portal.progress_action_profile', jsonb_build_object('en', 'Complete my profile', 'fr', 'Compléter mon profil'), now(), now()),
+  ('affiliates.portal.progress_action_storefront', jsonb_build_object('en', 'Build my storefront', 'fr', 'Créer ma vitrine'), now(), now()),
+  ('affiliates.portal.progress_next_step', jsonb_build_object('en', 'Next step', 'fr', 'Prochaine étape'), now(), now()),
+  ('affiliates.portal.progress_title', jsonb_build_object('en', 'Getting started', 'fr', 'Premiers pas'), now(), now()),
+  ('affiliates.portal.publish_explainer', jsonb_build_object('en', 'When you are ready, submit your storefront for approval. Your profile and page changes go live only after we approve them; the version visitors see now stays live until then.', 'fr', 'Lorsque tout est prêt, soumettez votre vitrine pour approbation. Les modifications de votre profil et de votre page ne sont mises en ligne qu''après notre approbation; la version que voient les visiteurs reste en ligne d''ici là.'), now(), now()),
+  ('affiliates.portal.publish_live', jsonb_build_object('en', 'Your storefront is live.', 'fr', 'Votre vitrine est en ligne.'), now(), now()),
+  ('affiliates.portal.publish_not_live', jsonb_build_object('en', 'Your storefront isn''t live yet.', 'fr', 'Votre vitrine n''est pas encore en ligne.'), now(), now()),
+  ('affiliates.portal.publish_status_label', jsonb_build_object('en', 'Status:', 'fr', 'Statut :'), now(), now()),
+  ('affiliates.portal.publish_title', jsonb_build_object('en', 'Review and publish', 'fr', 'Révision et publication'), now(), now()),
+  ('affiliates.portal.recent_empty', jsonb_build_object('en', 'No commissions yet. Share your storefront and referral links to start earning.', 'fr', 'Aucune commission pour l''instant. Partagez votre vitrine et vos liens de recommandation pour commencer à gagner.'), now(), now()),
+  ('affiliates.portal.recent_title', jsonb_build_object('en', 'Recent commissions', 'fr', 'Commissions récentes'), now(), now()),
+  ('affiliates.portal.settings_description', jsonb_build_object('en', 'The title and description shown in search results and when your page is shared.', 'fr', 'Le titre et la description affichés dans les résultats de recherche et lors du partage de votre page.'), now(), now()),
+  ('affiliates.portal.settings_meta', jsonb_build_object('en', 'Meta description', 'fr', 'Description (moteurs de recherche)'), now(), now()),
+  ('affiliates.portal.settings_page_title', jsonb_build_object('en', 'Page title', 'fr', 'Titre de la page'), now(), now()),
+  ('affiliates.portal.settings_title', jsonb_build_object('en', 'Page details', 'fr', 'Détails de la page'), now(), now()),
+  ('affiliates.portal.share_description', jsonb_build_object('en', 'Send people to your storefront, or link to any page of the store with your referral code. Orders from your links earn you a commission.', 'fr', 'Dirigez les gens vers votre vitrine, ou créez un lien vers n''importe quelle page de la boutique avec votre code de recommandation. Les commandes passées grâce à vos liens vous rapportent une commission.'), now(), now()),
+  ('affiliates.portal.share_description_not_approved', jsonb_build_object('en', 'Your links are ready to copy. They start earning commissions after your storefront''s first approval.', 'fr', 'Vos liens sont prêts à copier. Ils commenceront à rapporter des commissions après la première approbation de votre vitrine.'), now(), now()),
+  ('affiliates.portal.share_ref_error_excluded', jsonb_build_object('en', 'That page can''t carry a referral link. Pick a public page of the store.', 'fr', 'Cette page ne peut pas porter de lien de recommandation. Choisissez une page publique de la boutique.'), now(), now()),
+  ('affiliates.portal.share_ref_error_invalid', jsonb_build_object('en', 'That doesn''t look like a page address. Try something like /product/your-favorite.', 'fr', 'Cette adresse ne semble pas valide. Essayez quelque chose comme /product/votre-favori.'), now(), now()),
+  ('affiliates.portal.share_ref_error_other_site', jsonb_build_object('en', 'Use a page from this store. Links to other sites don''t earn commissions.', 'fr', 'Utilisez une page de cette boutique. Les liens vers d''autres sites ne rapportent pas de commissions.'), now(), now()),
+  ('affiliates.portal.share_ref_hint', jsonb_build_object('en', 'Paste a page address from this site, like a product page. Your referral code is added for you.', 'fr', 'Collez l''adresse d''une page de ce site, comme une page de produit. Votre code de recommandation est ajouté pour vous.'), now(), now()),
+  ('affiliates.portal.share_ref_label', jsonb_build_object('en', 'Link to any page of the store', 'fr', 'Lien vers n''importe quelle page de la boutique'), now(), now()),
+  ('affiliates.portal.share_ref_placeholder', jsonb_build_object('en', '/product/your-favorite', 'fr', '/product/votre-favori'), now(), now()),
+  ('affiliates.portal.share_ref_result_label', jsonb_build_object('en', 'Your referral link', 'fr', 'Votre lien de recommandation'), now(), now()),
+  ('affiliates.portal.share_storefront_label', jsonb_build_object('en', 'Your storefront link', 'fr', 'Lien de votre vitrine'), now(), now()),
+  ('affiliates.portal.share_storefront_not_live', jsonb_build_object('en', 'Your storefront goes live after it''s approved; until then this link shows a page that isn''t available yet.', 'fr', 'Votre vitrine sera en ligne après son approbation; d''ici là, ce lien mène à une page qui n''est pas encore accessible.'), now(), now()),
+  ('affiliates.portal.share_title', jsonb_build_object('en', 'Share and earn', 'fr', 'Partager et gagner'), now(), now()),
+  ('affiliates.portal.shell_eyebrow', jsonb_build_object('en', 'Partner portal', 'fr', 'Portail partenaire'), now(), now()),
+  ('affiliates.portal.social_facebook', jsonb_build_object('en', 'Facebook', 'fr', 'Facebook'), now(), now()),
+  ('affiliates.portal.social_instagram', jsonb_build_object('en', 'Instagram', 'fr', 'Instagram'), now(), now()),
+  ('affiliates.portal.social_linkedin', jsonb_build_object('en', 'LinkedIn', 'fr', 'LinkedIn'), now(), now()),
+  ('affiliates.portal.social_pinterest', jsonb_build_object('en', 'Pinterest', 'fr', 'Pinterest'), now(), now()),
+  ('affiliates.portal.social_tiktok', jsonb_build_object('en', 'TikTok', 'fr', 'TikTok'), now(), now()),
+  ('affiliates.portal.social_website', jsonb_build_object('en', 'Website', 'fr', 'Site Web'), now(), now()),
+  ('affiliates.portal.social_x', jsonb_build_object('en', 'X (Twitter)', 'fr', 'X (Twitter)'), now(), now()),
+  ('affiliates.portal.social_youtube', jsonb_build_object('en', 'YouTube', 'fr', 'YouTube'), now(), now()),
+  ('affiliates.portal.stats_cleared', jsonb_build_object('en', 'Ready for payout', 'fr', 'Prêt pour le versement'), now(), now()),
+  ('affiliates.portal.stats_cleared_hint', jsonb_build_object('en', 'Cleared commissions waiting for the next automated payout.', 'fr', 'Commissions confirmées en attente du prochain versement automatisé.'), now(), now()),
+  ('affiliates.portal.stats_clicks', jsonb_build_object('en', 'Referral visits', 'fr', 'Visites issues de vos liens'), now(), now()),
+  ('affiliates.portal.stats_clicks_hint', jsonb_build_object('en', 'New visitors who arrived through your links.', 'fr', 'Nouveaux visiteurs arrivés par vos liens.'), now(), now()),
+  ('affiliates.portal.stats_paid', jsonb_build_object('en', 'Paid out (lifetime)', 'fr', 'Versé (depuis le début)'), now(), now()),
+  ('affiliates.portal.stats_payouts_link', jsonb_build_object('en', 'See payouts and commissions', 'fr', 'Voir les versements et les commissions'), now(), now()),
+  ('affiliates.portal.stats_pending', jsonb_build_object('en', 'Pending ({days}-day refund window)', 'fr', 'En attente (période de remboursement de {days} jours)'), now(), now()),
+  ('affiliates.portal.stats_pending_hint', jsonb_build_object('en', 'Commissions still inside the refund window.', 'fr', 'Commissions encore dans la période de remboursement.'), now(), now()),
+  ('affiliates.portal.stats_title', jsonb_build_object('en', 'Your numbers', 'fr', 'Vos chiffres'), now(), now()),
+  ('affiliates.portal.studio_changes_body', jsonb_build_object('en', 'Update your storefront with these notes in mind, then submit it again:', 'fr', 'Mettez votre vitrine à jour en tenant compte de ces remarques, puis soumettez-la de nouveau :'), now(), now()),
+  ('affiliates.portal.studio_description', jsonb_build_object('en', 'Build your storefront page, pick the products you love and tell your story. Changes save automatically as a draft; your profile and page go live only after we approve them, and your current storefront stays live in the meantime.', 'fr', 'Créez la page de votre vitrine, choisissez les produits que vous aimez et racontez votre histoire. Vos modifications sont enregistrées automatiquement comme brouillon; votre profil et votre page ne sont mis en ligne qu''après notre approbation, et votre vitrine actuelle reste en ligne entre-temps.'), now(), now()),
+  ('affiliates.portal.studio_live_at', jsonb_build_object('en', 'Live at', 'fr', 'En ligne à l''adresse'), now(), now()),
+  ('affiliates.portal.studio_locked_pending', jsonb_build_object('en', 'Editing is paused while your storefront is in review.', 'fr', 'La modification est en pause pendant la révision de votre vitrine.'), now(), now()),
+  ('affiliates.portal.studio_locked_suspended', jsonb_build_object('en', 'Your account is suspended, so editing is turned off.', 'fr', 'Votre compte est suspendu : la modification est désactivée.'), now(), now()),
+  ('affiliates.portal.studio_meta_title', jsonb_build_object('en', 'Storefront studio', 'fr', 'Studio de vitrine'), now(), now()),
+  ('affiliates.portal.studio_missing_body', jsonb_build_object('en', 'Contact us and we''ll set it up for you.', 'fr', 'Communiquez avec nous et nous la créerons pour vous.'), now(), now()),
+  ('affiliates.portal.studio_missing_title', jsonb_build_object('en', 'Your storefront page is missing', 'fr', 'La page de votre vitrine est introuvable'), now(), now()),
+  ('affiliates.portal.studio_pending_body', jsonb_build_object('en', 'Editing is paused while we review your storefront. Withdraw the submission if you need to change something.', 'fr', 'La modification est en pause pendant que nous examinons votre vitrine. Retirez la soumission si vous devez changer quelque chose.'), now(), now()),
+  ('affiliates.portal.studio_pending_title', jsonb_build_object('en', 'In review', 'fr', 'En révision'), now(), now()),
+  ('affiliates.portal.studio_title', jsonb_build_object('en', 'Storefront studio', 'fr', 'Studio de vitrine'), now(), now()),
+  ('affiliates.portal.submit_button', jsonb_build_object('en', 'Submit for approval', 'fr', 'Soumettre pour approbation'), now(), now()),
+  ('affiliates.portal.submit_need_content', jsonb_build_object('en', 'Add some content to your page before submitting.', 'fr', 'Ajoutez du contenu à votre page avant de soumettre.'), now(), now()),
+  ('affiliates.portal.submit_need_title', jsonb_build_object('en', 'Add a page title before submitting.', 'fr', 'Ajoutez un titre de page avant de soumettre.'), now(), now()),
+  ('affiliates.portal.submit_save_first', jsonb_build_object('en', 'Your latest changes aren''t saved yet. Wait a moment and try again.', 'fr', 'Vos dernières modifications ne sont pas encore enregistrées. Patientez un instant et réessayez.'), now(), now()),
+  ('affiliates.portal.submit_success', jsonb_build_object('en', 'Submitted! We''ll email you when it''s reviewed.', 'fr', 'Soumise! Nous vous écrirons par courriel après la révision.'), now(), now()),
+  ('affiliates.portal.submit_up_to_date', jsonb_build_object('en', 'Your live storefront is up to date. Edit your page or profile to submit changes.', 'fr', 'Votre vitrine en ligne est à jour. Modifiez votre page ou votre profil pour soumettre des changements.'), now(), now()),
+  ('affiliates.portal.submitting', jsonb_build_object('en', 'Submitting…', 'fr', 'Soumission…'), now(), now()),
+  ('affiliates.portal.suspended_body', jsonb_build_object('en', 'Your storefront and referral links are paused, and you can''t make changes for now. Your earnings history stays available here. Contact us if you have questions.', 'fr', 'Votre vitrine et vos liens de recommandation sont en pause, et vous ne pouvez rien modifier pour le moment. L''historique de vos gains reste disponible ici. Communiquez avec nous si vous avez des questions.'), now(), now()),
+  ('affiliates.portal.suspended_reason', jsonb_build_object('en', 'Reason given: {reason}', 'fr', 'Motif indiqué : {reason}'), now(), now()),
+  ('affiliates.portal.suspended_title', jsonb_build_object('en', 'Your partner account is suspended', 'fr', 'Votre compte partenaire est suspendu'), now(), now()),
+  ('affiliates.portal.table_amount', jsonb_build_object('en', 'Amount', 'fr', 'Montant'), now(), now()),
+  ('affiliates.portal.table_clears_on', jsonb_build_object('en', 'Clears on', 'fr', 'Date de confirmation'), now(), now()),
+  ('affiliates.portal.table_date', jsonb_build_object('en', 'Date', 'fr', 'Date'), now(), now()),
+  ('affiliates.portal.table_details', jsonb_build_object('en', 'Details', 'fr', 'Détails'), now(), now()),
+  ('affiliates.portal.table_order', jsonb_build_object('en', 'Order', 'fr', 'Commande'), now(), now()),
+  ('affiliates.portal.table_rate', jsonb_build_object('en', 'Rate', 'fr', 'Taux'), now(), now()),
+  ('affiliates.portal.table_sent_on', jsonb_build_object('en', 'Sent on', 'fr', 'Envoyé le'), now(), now()),
+  ('affiliates.portal.table_showing_latest', jsonb_build_object('en', 'Showing the latest {shown} of {total}', 'fr', 'Affichage des {shown} plus récents sur {total}'), now(), now()),
+  ('affiliates.portal.table_status', jsonb_build_object('en', 'Status', 'fr', 'Statut'), now(), now()),
+  ('affiliates.portal.upload_error_generic', jsonb_build_object('en', 'The upload didn''t work. Try again.', 'fr', 'Le téléversement n''a pas fonctionné. Réessayez.'), now(), now()),
+  ('affiliates.portal.upload_error_image_limit', jsonb_build_object('en', 'Your storefront has reached its image limit. Reuse an image you already uploaded.', 'fr', 'Votre vitrine a atteint sa limite d''images. Réutilisez une image déjà téléversée.'), now(), now()),
+  ('affiliates.portal.upload_error_invalid', jsonb_build_object('en', 'That file couldn''t be read as an image. Try another one.', 'fr', 'Ce fichier n''a pas pu être lu comme une image. Essayez-en un autre.'), now(), now()),
+  ('affiliates.portal.upload_error_rate_limited', jsonb_build_object('en', 'You''ve uploaded a lot of images in the last hour. Try again later.', 'fr', 'Vous avez téléversé beaucoup d''images dans la dernière heure. Réessayez plus tard.'), now(), now()),
+  ('affiliates.portal.upload_error_too_large_avatar', jsonb_build_object('en', 'That photo is larger than 2 MB. Choose a smaller one.', 'fr', 'Cette photo dépasse 2 Mo. Choisissez-en une plus petite.'), now(), now()),
+  ('affiliates.portal.upload_error_too_large_image', jsonb_build_object('en', 'That image is larger than 5 MB. Choose a smaller one.', 'fr', 'Cette image dépasse 5 Mo. Choisissez-en une plus petite.'), now(), now()),
+  ('affiliates.portal.upload_error_type', jsonb_build_object('en', 'Use a JPEG, PNG, WebP, AVIF or GIF image.', 'fr', 'Utilisez une image JPEG, PNG, WebP, AVIF ou GIF.'), now(), now()),
+  ('affiliates.portal.upload_error_unavailable', jsonb_build_object('en', 'Image uploads aren''t available right now. Try again later.', 'fr', 'Le téléversement d''images n''est pas offert pour le moment. Réessayez plus tard.'), now(), now()),
+  ('affiliates.portal.view_storefront', jsonb_build_object('en', 'View my storefront', 'fr', 'Voir ma vitrine'), now(), now()),
+  ('affiliates.portal.welcome_body', jsonb_build_object('en', 'Three steps get your storefront live: complete your profile, connect your bank account for automated payouts, then build your page and submit it for approval. Your links start earning commissions after the first approval.', 'fr', 'Trois étapes pour mettre votre vitrine en ligne : complétez votre profil, connectez votre compte bancaire pour les versements automatisés, puis créez votre page et soumettez-la pour approbation. Vos liens commencent à rapporter des commissions après la première approbation.'), now(), now()),
+  ('affiliates.portal.welcome_title', jsonb_build_object('en', 'Welcome to the partner program, {name}!', 'fr', 'Bienvenue dans le programme de partenaires, {name}!'), now(), now()),
+  ('affiliates.portal.withdraw_button', jsonb_build_object('en', 'Withdraw submission', 'fr', 'Retirer la soumission'), now(), now()),
+  ('affiliates.portal.withdraw_success', jsonb_build_object('en', 'Submission withdrawn. You can edit your storefront again.', 'fr', 'Soumission retirée. Vous pouvez de nouveau modifier votre vitrine.'), now(), now()),
+  ('affiliates.portal.withdrawing', jsonb_build_object('en', 'Withdrawing…', 'fr', 'Retrait…'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.editor.* (99 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.editor.add_image', jsonb_build_object('en', 'Add an image', 'fr', 'Ajouter une image'), now(), now()),
+  ('affiliates.editor.add_products', jsonb_build_object('en', 'Add products', 'fr', 'Ajouter des produits'), now(), now()),
+  ('affiliates.editor.bold', jsonb_build_object('en', 'Bold', 'fr', 'Gras'), now(), now()),
+  ('affiliates.editor.bullet_list', jsonb_build_object('en', 'Bulleted list', 'fr', 'Liste à puces'), now(), now()),
+  ('affiliates.editor.callout', jsonb_build_object('en', 'Callout', 'fr', 'Encadré'), now(), now()),
+  ('affiliates.editor.callout_style', jsonb_build_object('en', 'Callout style', 'fr', 'Style de l''encadré'), now(), now()),
+  ('affiliates.editor.callout_tone_highlight', jsonb_build_object('en', 'Highlight', 'fr', 'Mise en valeur'), now(), now()),
+  ('affiliates.editor.callout_tone_info', jsonb_build_object('en', 'Info', 'fr', 'Information'), now(), now()),
+  ('affiliates.editor.callout_tone_tip', jsonb_build_object('en', 'Tip', 'fr', 'Astuce'), now(), now()),
+  ('affiliates.editor.cancel', jsonb_build_object('en', 'Cancel', 'fr', 'Annuler'), now(), now()),
+  ('affiliates.editor.content_error', jsonb_build_object('en', 'Your saved storefront couldn''t be opened in the editor, so editing is turned off to keep your draft safe. Reload the page, and contact us if this keeps happening.', 'fr', 'Votre vitrine enregistrée n''a pas pu s''ouvrir dans l''éditeur. La modification est désactivée pour protéger votre brouillon. Rechargez la page et communiquez avec nous si le problème persiste.'), now(), now()),
+  ('affiliates.editor.content_label', jsonb_build_object('en', 'Storefront content', 'fr', 'Contenu de la vitrine'), now(), now()),
+  ('affiliates.editor.divider', jsonb_build_object('en', 'Divider', 'fr', 'Séparateur'), now(), now()),
+  ('affiliates.editor.grid_choose_products', jsonb_build_object('en', 'Choose products', 'fr', 'Choisir des produits'), now(), now()),
+  ('affiliates.editor.grid_columns_label', jsonb_build_object('en', 'Columns', 'fr', 'Colonnes'), now(), now()),
+  ('affiliates.editor.grid_columns_option', jsonb_build_object('en', '{count} columns', 'fr', '{count} colonnes'), now(), now()),
+  ('affiliates.editor.grid_count', jsonb_build_object('en', '{count} of {max} products', 'fr', '{count} sur {max} produits'), now(), now()),
+  ('affiliates.editor.grid_drag_handle', jsonb_build_object('en', 'Drag to move the grid', 'fr', 'Glissez pour déplacer la grille'), now(), now()),
+  ('affiliates.editor.grid_edit_products', jsonb_build_object('en', 'Edit products', 'fr', 'Modifier les produits'), now(), now()),
+  ('affiliates.editor.grid_empty', jsonb_build_object('en', 'No products yet. Choose up to {max} products from the store.', 'fr', 'Aucun produit pour l''instant. Choisissez jusqu''à {max} produits de la boutique.'), now(), now()),
+  ('affiliates.editor.grid_label', jsonb_build_object('en', 'Product grid', 'fr', 'Grille de produits'), now(), now()),
+  ('affiliates.editor.grid_remove', jsonb_build_object('en', 'Remove grid', 'fr', 'Retirer la grille'), now(), now()),
+  ('affiliates.editor.grid_title_label', jsonb_build_object('en', 'Grid title (optional)', 'fr', 'Titre de la grille (facultatif)'), now(), now()),
+  ('affiliates.editor.grid_title_placeholder', jsonb_build_object('en', 'My favorite products', 'fr', 'Mes produits préférés'), now(), now()),
+  ('affiliates.editor.heading_2', jsonb_build_object('en', 'Heading 2', 'fr', 'Titre 2'), now(), now()),
+  ('affiliates.editor.heading_3', jsonb_build_object('en', 'Heading 3', 'fr', 'Titre 3'), now(), now()),
+  ('affiliates.editor.image_alt_dialog_description', jsonb_build_object('en', 'A short description helps visitors who use screen readers, and helps search engines understand your page.', 'fr', 'Une courte description aide les personnes qui utilisent un lecteur d''écran ainsi que les moteurs de recherche à comprendre votre page.'), now(), now()),
+  ('affiliates.editor.image_alt_dialog_title', jsonb_build_object('en', 'Describe this image', 'fr', 'Décrivez cette image'), now(), now()),
+  ('affiliates.editor.image_alt_placeholder', jsonb_build_object('en', 'Example: Hand-poured soy candle on a wooden table', 'fr', 'Exemple : chandelle de soya coulée à la main sur une table en bois'), now(), now()),
+  ('affiliates.editor.image_description', jsonb_build_object('en', 'Image description', 'fr', 'Description de l''image'), now(), now()),
+  ('affiliates.editor.image_file_label', jsonb_build_object('en', 'Choose an image to upload', 'fr', 'Choisissez une image à téléverser'), now(), now()),
+  ('affiliates.editor.image_not_allowed', jsonb_build_object('en', 'This image can''t be used on your storefront.', 'fr', 'Cette image ne peut pas être utilisée dans votre vitrine.'), now(), now()),
+  ('affiliates.editor.image_type_invalid', jsonb_build_object('en', 'Choose a JPEG, PNG, WebP or GIF image.', 'fr', 'Choisissez une image JPEG, PNG, WebP ou GIF.'), now(), now()),
+  ('affiliates.editor.image_upload_failed', jsonb_build_object('en', 'The image couldn''t be uploaded. Try another file.', 'fr', 'L''image n''a pas pu être téléversée. Essayez un autre fichier.'), now(), now()),
+  ('affiliates.editor.image_uploaded', jsonb_build_object('en', 'Image added', 'fr', 'Image ajoutée'), now(), now()),
+  ('affiliates.editor.image_uploading', jsonb_build_object('en', 'Uploading the image…', 'fr', 'Téléversement de l''image…'), now(), now()),
+  ('affiliates.editor.insert_failed', jsonb_build_object('en', 'That block couldn''t be added. Try again.', 'fr', 'Ce bloc n''a pas pu être ajouté. Réessayez.'), now(), now()),
+  ('affiliates.editor.italic', jsonb_build_object('en', 'Italic', 'fr', 'Italique'), now(), now()),
+  ('affiliates.editor.link', jsonb_build_object('en', 'Link', 'fr', 'Lien'), now(), now()),
+  ('affiliates.editor.link_apply', jsonb_build_object('en', 'Apply', 'fr', 'Appliquer'), now(), now()),
+  ('affiliates.editor.link_dialog_description', jsonb_build_object('en', 'Link to a web page, an email address or a page of this site.', 'fr', 'Liez une page Web, une adresse courriel ou une page de ce site.'), now(), now()),
+  ('affiliates.editor.link_dialog_title_add', jsonb_build_object('en', 'Add a link', 'fr', 'Ajouter un lien'), now(), now()),
+  ('affiliates.editor.link_dialog_title_edit', jsonb_build_object('en', 'Edit link', 'fr', 'Modifier le lien'), now(), now()),
+  ('affiliates.editor.link_error_empty', jsonb_build_object('en', 'Enter a link address.', 'fr', 'Entrez l''adresse du lien.'), now(), now()),
+  ('affiliates.editor.link_error_invalid', jsonb_build_object('en', 'Use a web address (https://…), an email address (mailto:…) or a page path that starts with /.', 'fr', 'Utilisez une adresse Web (https://…), une adresse courriel (mailto:…) ou un chemin de page qui commence par /.'), now(), now()),
+  ('affiliates.editor.link_remove', jsonb_build_object('en', 'Remove link', 'fr', 'Retirer le lien'), now(), now()),
+  ('affiliates.editor.link_url_hint', jsonb_build_object('en', 'Examples: https://example.com, mailto:name@example.com or /products/candle', 'fr', 'Exemples : https://exemple.com, mailto:nom@exemple.com ou /produits/chandelle'), now(), now()),
+  ('affiliates.editor.link_url_label', jsonb_build_object('en', 'Link address', 'fr', 'Adresse du lien'), now(), now()),
+  ('affiliates.editor.link_url_placeholder', jsonb_build_object('en', 'https://example.com', 'fr', 'https://exemple.com'), now(), now()),
+  ('affiliates.editor.loading', jsonb_build_object('en', 'Loading the editor…', 'fr', 'Chargement de l''éditeur…'), now(), now()),
+  ('affiliates.editor.ordered_list', jsonb_build_object('en', 'Numbered list', 'fr', 'Liste numérotée'), now(), now()),
+  ('affiliates.editor.picker_confirm', jsonb_build_object('en', 'Save selection', 'fr', 'Enregistrer la sélection'), now(), now()),
+  ('affiliates.editor.picker_description', jsonb_build_object('en', 'Select up to {max} products. They appear in the order you pick them.', 'fr', 'Sélectionnez jusqu''à {max} produits. Ils s''affichent dans l''ordre où vous les choisissez.'), now(), now()),
+  ('affiliates.editor.picker_error', jsonb_build_object('en', 'Products couldn''t be loaded. Try again.', 'fr', 'Les produits n''ont pas pu être chargés. Réessayez.'), now(), now()),
+  ('affiliates.editor.picker_limit_reached', jsonb_build_object('en', 'You''ve reached the limit of {max} products for this grid.', 'fr', 'Vous avez atteint la limite de {max} produits pour cette grille.'), now(), now()),
+  ('affiliates.editor.picker_move_down', jsonb_build_object('en', 'Move {name} down', 'fr', 'Descendre {name}'), now(), now()),
+  ('affiliates.editor.picker_move_up', jsonb_build_object('en', 'Move {name} up', 'fr', 'Monter {name}'), now(), now()),
+  ('affiliates.editor.picker_no_results', jsonb_build_object('en', 'No products match your search.', 'fr', 'Aucun produit ne correspond à votre recherche.'), now(), now()),
+  ('affiliates.editor.picker_page_limit_reached', jsonb_build_object('en', 'Your page can feature up to {max} different products.', 'fr', 'Votre page peut présenter jusqu''à {max} produits différents.'), now(), now()),
+  ('affiliates.editor.picker_result_count_one', jsonb_build_object('en', '1 product found', 'fr', '1 produit trouvé'), now(), now()),
+  ('affiliates.editor.picker_result_count_other', jsonb_build_object('en', '{count} products found', 'fr', '{count} produits trouvés'), now(), now()),
+  ('affiliates.editor.picker_results_label', jsonb_build_object('en', 'Products', 'fr', 'Produits'), now(), now()),
+  ('affiliates.editor.picker_retry', jsonb_build_object('en', 'Try again', 'fr', 'Réessayer'), now(), now()),
+  ('affiliates.editor.picker_search_label', jsonb_build_object('en', 'Search the store', 'fr', 'Rechercher dans la boutique'), now(), now()),
+  ('affiliates.editor.picker_search_placeholder', jsonb_build_object('en', 'Search by product name…', 'fr', 'Recherchez par nom de produit…'), now(), now()),
+  ('affiliates.editor.picker_searching', jsonb_build_object('en', 'Searching…', 'fr', 'Recherche en cours…'), now(), now()),
+  ('affiliates.editor.picker_selected_empty', jsonb_build_object('en', 'No products selected yet.', 'fr', 'Aucun produit sélectionné pour l''instant.'), now(), now()),
+  ('affiliates.editor.picker_selected_label', jsonb_build_object('en', 'Selected ({count}/{max})', 'fr', 'Sélection ({count}/{max})'), now(), now()),
+  ('affiliates.editor.picker_title', jsonb_build_object('en', 'Choose products', 'fr', 'Choisir des produits'), now(), now()),
+  ('affiliates.editor.placeholder', jsonb_build_object('en', 'Write your story, or type / to add a block…', 'fr', 'Racontez votre histoire, ou tapez / pour ajouter un bloc…'), now(), now()),
+  ('affiliates.editor.placeholder_callout', jsonb_build_object('en', 'Write a tip or a highlight…', 'fr', 'Écrivez une astuce ou un point fort…'), now(), now()),
+  ('affiliates.editor.placeholder_heading', jsonb_build_object('en', 'Heading', 'fr', 'Titre'), now(), now()),
+  ('affiliates.editor.product_fallback', jsonb_build_object('en', 'Product', 'fr', 'Produit'), now(), now()),
+  ('affiliates.editor.product_loading', jsonb_build_object('en', 'Loading product…', 'fr', 'Chargement du produit…'), now(), now()),
+  ('affiliates.editor.product_unavailable', jsonb_build_object('en', 'Unavailable product', 'fr', 'Produit non disponible'), now(), now()),
+  ('affiliates.editor.quote', jsonb_build_object('en', 'Quote', 'fr', 'Citation'), now(), now()),
+  ('affiliates.editor.redo', jsonb_build_object('en', 'Redo', 'fr', 'Rétablir'), now(), now()),
+  ('affiliates.editor.region_label', jsonb_build_object('en', 'Storefront editor', 'fr', 'Éditeur de vitrine'), now(), now()),
+  ('affiliates.editor.remove_product', jsonb_build_object('en', 'Remove {name}', 'fr', 'Retirer {name}'), now(), now()),
+  ('affiliates.editor.save', jsonb_build_object('en', 'Save', 'fr', 'Enregistrer'), now(), now()),
+  ('affiliates.editor.skip', jsonb_build_object('en', 'Skip', 'fr', 'Passer'), now(), now()),
+  ('affiliates.editor.slash_active_option', jsonb_build_object('en', '{title}, {position} of {count}', 'fr', '{title}, {position} sur {count}'), now(), now()),
+  ('affiliates.editor.slash_bullet_list_description', jsonb_build_object('en', 'A simple bulleted list', 'fr', 'Une liste à puces simple'), now(), now()),
+  ('affiliates.editor.slash_callout_description', jsonb_build_object('en', 'A tip, note or highlight box', 'fr', 'Un encadré pour une astuce, une note ou un point fort'), now(), now()),
+  ('affiliates.editor.slash_divider_description', jsonb_build_object('en', 'A visual break between sections', 'fr', 'Une séparation visuelle entre les sections'), now(), now()),
+  ('affiliates.editor.slash_heading_2_description', jsonb_build_object('en', 'Large section heading', 'fr', 'Grand titre de section'), now(), now()),
+  ('affiliates.editor.slash_heading_3_description', jsonb_build_object('en', 'Smaller subsection heading', 'fr', 'Titre de sous-section'), now(), now()),
+  ('affiliates.editor.slash_image_description', jsonb_build_object('en', 'Upload a photo', 'fr', 'Téléversez une photo'), now(), now()),
+  ('affiliates.editor.slash_image_title', jsonb_build_object('en', 'Image', 'fr', 'Image'), now(), now()),
+  ('affiliates.editor.slash_menu_label', jsonb_build_object('en', 'Blocks', 'fr', 'Blocs'), now(), now()),
+  ('affiliates.editor.slash_no_results', jsonb_build_object('en', 'No matching blocks', 'fr', 'Aucun bloc correspondant'), now(), now()),
+  ('affiliates.editor.slash_ordered_list_description', jsonb_build_object('en', 'A list with numbers', 'fr', 'Une liste avec des numéros'), now(), now()),
+  ('affiliates.editor.slash_products_description', jsonb_build_object('en', 'Showcase products from the store', 'fr', 'Présentez des produits de la boutique'), now(), now()),
+  ('affiliates.editor.slash_products_title', jsonb_build_object('en', 'Promote products', 'fr', 'Promouvoir des produits'), now(), now()),
+  ('affiliates.editor.slash_quote_description', jsonb_build_object('en', 'Highlight a quote or a testimonial', 'fr', 'Mettez en valeur une citation ou un témoignage'), now(), now()),
+  ('affiliates.editor.strike', jsonb_build_object('en', 'Strikethrough', 'fr', 'Barré'), now(), now()),
+  ('affiliates.editor.toolbar_label', jsonb_build_object('en', 'Text formatting', 'fr', 'Mise en forme du texte'), now(), now()),
+  ('affiliates.editor.underline', jsonb_build_object('en', 'Underline', 'fr', 'Souligné'), now(), now()),
+  ('affiliates.editor.undo', jsonb_build_object('en', 'Undo', 'fr', 'Annuler'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.copilot.* (70 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.copilot.apply_bio', jsonb_build_object('en', 'Apply to my profile', 'fr', 'Appliquer à mon profil'), now(), now()),
+  ('affiliates.copilot.bio_applied', jsonb_build_object('en', 'Applied to your profile', 'fr', 'Appliquée à votre profil'), now(), now()),
+  ('affiliates.copilot.bio_meta_label', jsonb_build_object('en', 'Description for search engines', 'fr', 'Description pour les moteurs de recherche'), now(), now()),
+  ('affiliates.copilot.bio_title', jsonb_build_object('en', 'Suggested bio', 'fr', 'Bio suggérée'), now(), now()),
+  ('affiliates.copilot.disabled_default', jsonb_build_object('en', 'The assistant is not available right now.', 'fr', 'L''assistant n''est pas disponible pour le moment.'), now(), now()),
+  ('affiliates.copilot.disclaimer', jsonb_build_object('en', 'Suggestions can contain mistakes. Review them before you use them.', 'fr', 'Les suggestions peuvent contenir des erreurs. Relisez-les avant de les utiliser.'), now(), now()),
+  ('affiliates.copilot.editor_not_ready', jsonb_build_object('en', 'Your page editor is not ready yet. Try again in a moment.', 'fr', 'L''éditeur de votre page n''est pas encore prêt. Réessayez dans un instant.'), now(), now()),
+  ('affiliates.copilot.empty_state', jsonb_build_object('en', 'Ask for a bio, a section about your favorite products or a rewrite of the text you selected.', 'fr', 'Demandez une bio, une section sur vos produits préférés ou une réécriture du texte sélectionné.'), now(), now()),
+  ('affiliates.copilot.error_empty_output', jsonb_build_object('en', 'The suggestion came back empty. Try asking again with more details.', 'fr', 'La suggestion est revenue vide. Redemandez-la avec plus de détails.'), now(), now()),
+  ('affiliates.copilot.error_empty_section', jsonb_build_object('en', 'Nothing usable came back for this section. Add details or name products from the store.', 'fr', 'Rien d''utilisable n''est revenu pour cette section. Ajoutez des détails ou nommez des produits de la boutique.'), now(), now()),
+  ('affiliates.copilot.error_forbidden', jsonb_build_object('en', 'The assistant is not available for your account right now.', 'fr', 'L''assistant n''est pas disponible pour votre compte en ce moment.'), now(), now()),
+  ('affiliates.copilot.error_generic', jsonb_build_object('en', 'The assistant ran into a problem. Please try again.', 'fr', 'L''assistant a rencontré un problème. Veuillez réessayer.'), now(), now()),
+  ('affiliates.copilot.error_invalid_input', jsonb_build_object('en', 'The suggestion was incomplete. Ask again, or add a few more details.', 'fr', 'La suggestion était incomplète. Redemandez-la, ou ajoutez quelques détails.'), now(), now()),
+  ('affiliates.copilot.error_invalid_request', jsonb_build_object('en', 'That message could not be sent. Shorten it and try again.', 'fr', 'Ce message n''a pas pu être envoyé. Raccourcissez-le et réessayez.'), now(), now()),
+  ('affiliates.copilot.error_network', jsonb_build_object('en', 'The assistant could not be reached. Check your connection and try again.', 'fr', 'Impossible de joindre l''assistant. Vérifiez votre connexion et réessayez.'), now(), now()),
+  ('affiliates.copilot.error_rate_limited', jsonb_build_object('en', 'You''ve reached the assistant''s limit for now. Try again in about {minutes} min.', 'fr', 'Vous avez atteint la limite de l''assistant pour le moment. Réessayez dans environ {minutes} min.'), now(), now()),
+  ('affiliates.copilot.error_rate_limited_later', jsonb_build_object('en', 'You''ve reached the assistant''s limit for now. Please try again later.', 'fr', 'Vous avez atteint la limite de l''assistant pour le moment. Veuillez réessayer plus tard.'), now(), now()),
+  ('affiliates.copilot.error_section_limit', jsonb_build_object('en', 'This message reached its limit of new sections. Ask again for the next ones.', 'fr', 'Ce message a atteint sa limite de nouvelles sections. Redemandez pour obtenir les suivantes.'), now(), now()),
+  ('affiliates.copilot.error_timeout', jsonb_build_object('en', 'The assistant took too long to answer. Please try again.', 'fr', 'L''assistant a mis trop de temps à répondre. Veuillez réessayer.'), now(), now()),
+  ('affiliates.copilot.error_tool', jsonb_build_object('en', 'That suggestion could not be prepared. Please try again.', 'fr', 'Cette suggestion n''a pas pu être préparée. Veuillez réessayer.'), now(), now()),
+  ('affiliates.copilot.error_unavailable', jsonb_build_object('en', 'The assistant is unavailable right now. Please try again later.', 'fr', 'L''assistant est indisponible pour le moment. Veuillez réessayer plus tard.'), now(), now()),
+  ('affiliates.copilot.error_unavailable_sandbox', jsonb_build_object('en', 'The assistant is unavailable in this demo right now. Add your own OpenRouter API key in the field above, then try again.', 'fr', 'L''assistant est indisponible dans cette démo pour le moment. Ajoutez votre propre clé d''API OpenRouter dans le champ ci-dessus, puis réessayez.'), now(), now()),
+  ('affiliates.copilot.input_hint', jsonb_build_object('en', 'Press Enter to send and Shift+Enter for a new line.', 'fr', 'Appuyez sur Entrée pour envoyer et sur Maj+Entrée pour aller à la ligne.'), now(), now()),
+  ('affiliates.copilot.input_label', jsonb_build_object('en', 'Message to the assistant', 'fr', 'Message à l''assistant'), now(), now()),
+  ('affiliates.copilot.input_placeholder', jsonb_build_object('en', 'Ask for a bio, a section or a rewrite…', 'fr', 'Demandez une bio, une section ou une réécriture…'), now(), now()),
+  ('affiliates.copilot.insert_failed', jsonb_build_object('en', 'The section could not be inserted. Please try again.', 'fr', 'La section n''a pas pu être insérée. Veuillez réessayer.'), now(), now()),
+  ('affiliates.copilot.insert_section', jsonb_build_object('en', 'Insert into my page', 'fr', 'Insérer dans ma page'), now(), now()),
+  ('affiliates.copilot.messages_label', jsonb_build_object('en', 'Conversation with the assistant', 'fr', 'Conversation avec l''assistant'), now(), now()),
+  ('affiliates.copilot.new_conversation', jsonb_build_object('en', 'New conversation', 'fr', 'Nouvelle conversation'), now(), now()),
+  ('affiliates.copilot.panel_description', jsonb_build_object('en', 'Get help with your bio, new sections for your page and polished copy. Nothing changes on your page until you use a suggestion.', 'fr', 'Obtenez de l''aide pour votre bio, de nouvelles sections pour votre page et des textes peaufinés. Rien ne change sur votre page tant que vous n''utilisez pas une suggestion.'), now(), now()),
+  ('affiliates.copilot.panel_title', jsonb_build_object('en', 'Storefront assistant', 'fr', 'Assistant de vitrine'), now(), now()),
+  ('affiliates.copilot.photo_credit', jsonb_build_object('en', 'Photo: {photographer} / {provider}', 'fr', 'Photo : {photographer} / {provider}'), now(), now()),
+  ('affiliates.copilot.polish_needs_selection', jsonb_build_object('en', 'Select the text you want to polish in your page first.', 'fr', 'Sélectionnez d''abord, dans votre page, le texte à peaufiner.'), now(), now()),
+  ('affiliates.copilot.polish_single_block', jsonb_build_object('en', 'To polish text, select it within a single paragraph, heading or list item.', 'fr', 'Pour peaufiner un texte, sélectionnez-le dans un seul paragraphe, titre ou élément de liste.'), now(), now()),
+  ('affiliates.copilot.quick_actions_label', jsonb_build_object('en', 'Quick actions', 'fr', 'Actions rapides'), now(), now()),
+  ('affiliates.copilot.quick_bio', jsonb_build_object('en', 'Write my bio from notes', 'fr', 'Rédiger ma bio à partir de notes'), now(), now()),
+  ('affiliates.copilot.quick_bio_prompt', jsonb_build_object('en', 'Write my bio from these notes:', 'fr', 'Rédige ma bio à partir de ces notes :'), now(), now()),
+  ('affiliates.copilot.quick_polish', jsonb_build_object('en', 'Polish the selected text', 'fr', 'Peaufiner le texte sélectionné'), now(), now()),
+  ('affiliates.copilot.quick_polish_prompt', jsonb_build_object('en', 'Polish the text I selected in my page.', 'fr', 'Peaufine le texte que j''ai sélectionné dans ma page.'), now(), now()),
+  ('affiliates.copilot.quick_section', jsonb_build_object('en', 'Create a section about…', 'fr', 'Créer une section sur…'), now(), now()),
+  ('affiliates.copilot.quick_section_prompt', jsonb_build_object('en', 'Create a section about', 'fr', 'Crée une section sur'), now(), now()),
+  ('affiliates.copilot.replace_needs_selection', jsonb_build_object('en', 'Select the text to replace in your page first.', 'fr', 'Sélectionnez d''abord, dans votre page, le texte à remplacer.'), now(), now()),
+  ('affiliates.copilot.replace_selection', jsonb_build_object('en', 'Replace selection', 'fr', 'Remplacer la sélection'), now(), now()),
+  ('affiliates.copilot.replace_single_block', jsonb_build_object('en', 'To replace text, select it within a single paragraph, heading or list item. Nothing was changed.', 'fr', 'Pour remplacer un texte, sélectionnez-le dans un seul paragraphe, titre ou élément de liste. Rien n''a été modifié.'), now(), now()),
+  ('affiliates.copilot.rewrite_title', jsonb_build_object('en', 'Suggested rewrite', 'fr', 'Réécriture suggérée'), now(), now()),
+  ('affiliates.copilot.running_bio', jsonb_build_object('en', 'Writing your bio…', 'fr', 'Rédaction de votre bio…'), now(), now()),
+  ('affiliates.copilot.running_rewrite', jsonb_build_object('en', 'Polishing your text…', 'fr', 'Peaufinage de votre texte…'), now(), now()),
+  ('affiliates.copilot.running_section', jsonb_build_object('en', 'Building your section…', 'fr', 'Création de votre section…'), now(), now()),
+  ('affiliates.copilot.sandbox_key_forget', jsonb_build_object('en', 'Remove key', 'fr', 'Supprimer la clé'), now(), now()),
+  ('affiliates.copilot.sandbox_key_forgotten', jsonb_build_object('en', 'Your key was removed from this browser.', 'fr', 'Votre clé a été supprimée de ce navigateur.'), now(), now()),
+  ('affiliates.copilot.sandbox_key_go_to_field', jsonb_build_object('en', 'Add my key', 'fr', 'Ajouter ma clé'), now(), now()),
+  ('affiliates.copilot.sandbox_key_hint', jsonb_build_object('en', 'It''s saved only in this browser and sent only with this site''s AI assistant requests.', 'fr', 'Elle est enregistrée uniquement dans ce navigateur et n''est envoyée qu''avec les demandes aux assistants IA de ce site.'), now(), now()),
+  ('affiliates.copilot.sandbox_key_invalid', jsonb_build_object('en', 'That doesn''t look like an OpenRouter API key. Paste the whole key, without spaces.', 'fr', 'Cette valeur ne ressemble pas à une clé d''API OpenRouter. Collez la clé complète, sans espaces.'), now(), now()),
+  ('affiliates.copilot.sandbox_key_label', jsonb_build_object('en', 'Your OpenRouter API key (demo)', 'fr', 'Votre clé d''API OpenRouter (démo)'), now(), now()),
+  ('affiliates.copilot.sandbox_key_save', jsonb_build_object('en', 'Save key', 'fr', 'Enregistrer la clé'), now(), now()),
+  ('affiliates.copilot.sandbox_key_saved', jsonb_build_object('en', 'Your key is saved in this browser.', 'fr', 'Votre clé est enregistrée dans ce navigateur.'), now(), now()),
+  ('affiliates.copilot.sandbox_key_storage_failed', jsonb_build_object('en', 'This browser is blocking site storage, so your key can''t be saved or removed.', 'fr', 'Ce navigateur bloque le stockage du site : votre clé ne peut être ni enregistrée ni supprimée.'), now(), now()),
+  ('affiliates.copilot.section_inserted', jsonb_build_object('en', 'Inserted into your page', 'fr', 'Insérée dans votre page'), now(), now()),
+  ('affiliates.copilot.section_preview_label', jsonb_build_object('en', 'Section preview', 'fr', 'Aperçu de la section'), now(), now()),
+  ('affiliates.copilot.section_products_one', jsonb_build_object('en', '1 store product', 'fr', '1 produit de la boutique'), now(), now()),
+  ('affiliates.copilot.section_products_other', jsonb_build_object('en', '{count} store products', 'fr', '{count} produits de la boutique'), now(), now()),
+  ('affiliates.copilot.section_skipped', jsonb_build_object('en', 'Some products or photos could not be used and were left out.', 'fr', 'Certains produits ou certaines photos n''ont pas pu être utilisés et ont été retirés.'), now(), now()),
+  ('affiliates.copilot.section_title', jsonb_build_object('en', 'Suggested section', 'fr', 'Section suggérée'), now(), now()),
+  ('affiliates.copilot.selection_replaced', jsonb_build_object('en', 'Selection replaced', 'fr', 'Sélection remplacée'), now(), now()),
+  ('affiliates.copilot.send', jsonb_build_object('en', 'Send', 'fr', 'Envoyer'), now(), now()),
+  ('affiliates.copilot.speaker_assistant', jsonb_build_object('en', 'Assistant', 'fr', 'Assistant'), now(), now()),
+  ('affiliates.copilot.speaker_you', jsonb_build_object('en', 'You', 'fr', 'Vous'), now(), now()),
+  ('affiliates.copilot.stop', jsonb_build_object('en', 'Stop', 'fr', 'Arrêter'), now(), now()),
+  ('affiliates.copilot.stopped', jsonb_build_object('en', 'Stopped.', 'fr', 'Arrêté.'), now(), now()),
+  ('affiliates.copilot.working', jsonb_build_object('en', 'Working on it…', 'fr', 'Préparation en cours…'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.sandbox.* (10 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.sandbox.guide_admin', jsonb_build_object('en', 'Sign in as {email} to approve storefronts and see the commission ledger', 'fr', 'Connectez-vous avec {email} pour approuver les vitrines et consulter le registre des commissions'), now(), now()),
+  ('affiliates.sandbox.guide_body', jsonb_build_object('en', 'This shared demo resets every 15 minutes. Try the program three ways:', 'fr', 'Cette démo partagée est réinitialisée toutes les 15 minutes. Essayez le programme de trois façons :'), now(), now()),
+  ('affiliates.sandbox.guide_portal', jsonb_build_object('en', 'Sign in as {email} to see the partner portal and edit the demo storefront', 'fr', 'Connectez-vous avec {email} pour voir le portail partenaire et modifier la vitrine de démonstration'), now(), now()),
+  ('affiliates.sandbox.guide_storefront', jsonb_build_object('en', 'Browse the demo partner''s storefront, as shoppers see it', 'fr', 'Parcourez la vitrine du partenaire de démonstration, telle que la voient les clients'), now(), now()),
+  ('affiliates.sandbox.guide_title', jsonb_build_object('en', 'Explore the program in this demo', 'fr', 'Explorez le programme dans cette démo'), now(), now()),
+  ('affiliates.sandbox.portal_notice_body', jsonb_build_object('en', 'Every visitor uses this account. The demo resets every 15 minutes and sends no email. After you submit your page, sign in as {email} to approve it.', 'fr', 'Tous les visiteurs utilisent ce compte. La démo est réinitialisée toutes les 15 minutes et n''envoie aucun courriel. Après avoir soumis votre page, connectez-vous avec {email} pour l''approuver.'), now(), now()),
+  ('affiliates.sandbox.portal_notice_title', jsonb_build_object('en', 'Shared demo account', 'fr', 'Compte de démonstration partagé'), now(), now()),
+  ('affiliates.sandbox.signup_done_body', jsonb_build_object('en', 'On a real store, this step creates your partner account and a starter storefront at {url}, after an email confirmation when the store requires one. Nothing was saved here.', 'fr', 'Dans une vraie boutique, cette étape crée votre compte partenaire et une vitrine de départ à l''adresse {url}, après une confirmation par courriel si la boutique l''exige. Rien n''a été enregistré ici.'), now(), now()),
+  ('affiliates.sandbox.signup_done_title', jsonb_build_object('en', 'Demo sign-up complete', 'fr', 'Inscription de démonstration terminée'), now(), now()),
+  ('affiliates.sandbox.signup_notice', jsonb_build_object('en', 'Demo mode: this form runs the real sign-up checks but creates no partner account and sends no email.', 'fr', 'Mode démo : ce formulaire effectue les vraies vérifications d''inscription, mais il ne crée aucun compte partenaire et n''envoie aucun courriel.'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- affiliates.terms.* (88 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.terms.changes_accept', jsonb_build_object('en', 'If you keep taking part after an update, the new terms apply to you.', 'fr', 'Si vous continuez à participer après une mise à jour, les nouvelles conditions s''appliquent à vous.'), now(), now()),
+  ('affiliates.terms.changes_body', jsonb_build_object('en', 'We may update these terms. When we do, we change the date at the top of this page.', 'fr', 'Nous pouvons mettre à jour ces conditions. Nous changeons alors la date en haut de cette page.'), now(), now()),
+  ('affiliates.terms.changes_title', jsonb_build_object('en', 'Changes to these terms', 'fr', 'Modifications de ces conditions'), now(), now()),
+  ('affiliates.terms.contact_body', jsonb_build_object('en', 'Questions about these terms? Write to us at {email}.', 'fr', 'Des questions sur ces conditions? Écrivez-nous à {email}.'), now(), now()),
+  ('affiliates.terms.contact_title', jsonb_build_object('en', 'Contact', 'fr', 'Nous joindre'), now(), now()),
+  ('affiliates.terms.content_licence', jsonb_build_object('en', 'You allow us to store, show, copy and adapt it, for example to resize your images, so we can run and promote your storefront.', 'fr', 'Vous nous permettez de le conserver, de l''afficher, de le copier et de l''adapter, par exemple pour redimensionner vos images, afin d''exploiter et de promouvoir votre vitrine.'), now(), now()),
+  ('affiliates.terms.content_ownership', jsonb_build_object('en', 'You keep the rights to what you write and upload.', 'fr', 'Vous conservez vos droits sur ce que vous écrivez et téléversez.'), now(), now()),
+  ('affiliates.terms.content_responsibility', jsonb_build_object('en', 'You are responsible for your content, including text the storefront assistant drafts for you. Only use text and images you have the right to use.', 'fr', 'Vous êtes responsable de votre contenu, y compris le texte que l''assistant de vitrine rédige pour vous. Utilisez seulement des textes et des images que vous avez le droit d''utiliser.'), now(), now()),
+  ('affiliates.terms.content_title', jsonb_build_object('en', 'Your storefront content', 'fr', 'Le contenu de votre vitrine'), now(), now()),
+  ('affiliates.terms.details_commission', jsonb_build_object('en', 'Commission', 'fr', 'Commission'), now(), now()),
+  ('affiliates.terms.details_currency', jsonb_build_object('en', 'Currency', 'fr', 'Devise'), now(), now()),
+  ('affiliates.terms.details_days_one', jsonb_build_object('en', '{count} day', 'fr', '{count} jour'), now(), now()),
+  ('affiliates.terms.details_days_other', jsonb_build_object('en', '{count} days', 'fr', '{count} jours'), now(), now()),
+  ('affiliates.terms.details_hold', jsonb_build_object('en', 'Hold period', 'fr', 'Période de retenue'), now(), now()),
+  ('affiliates.terms.details_intro', jsonb_build_object('en', 'These details come from our current settings. They can change at any time.', 'fr', 'Ces détails proviennent de nos paramètres actuels. Ils peuvent changer en tout temps.'), now(), now()),
+  ('affiliates.terms.details_minimum_payout', jsonb_build_object('en', 'Minimum payout', 'fr', 'Versement minimum'), now(), now()),
+  ('affiliates.terms.details_no_tiers', jsonb_build_object('en', 'No tier is open right now.', 'fr', 'Aucun niveau n''est offert pour le moment.'), now(), now()),
+  ('affiliates.terms.details_payout_method', jsonb_build_object('en', 'Payout method', 'fr', 'Mode de versement'), now(), now()),
+  ('affiliates.terms.details_payout_method_stripe', jsonb_build_object('en', 'Transfer to your Stripe account (Stripe Connect Express)', 'fr', 'Virement à votre compte Stripe (Stripe Connect Express)'), now(), now()),
+  ('affiliates.terms.details_rate', jsonb_build_object('en', '{rate}%', 'fr', '{rate} %'), now(), now()),
+  ('affiliates.terms.details_schedule', jsonb_build_object('en', 'Payout schedule', 'fr', 'Calendrier des versements'), now(), now()),
+  ('affiliates.terms.details_schedule_daily', jsonb_build_object('en', 'Automatic, every day', 'fr', 'Automatique, chaque jour'), now(), now()),
+  ('affiliates.terms.details_schedule_manual', jsonb_build_object('en', 'When we run them', 'fr', 'Quand nous les lançons'), now(), now()),
+  ('affiliates.terms.details_tier', jsonb_build_object('en', 'Tier', 'fr', 'Niveau'), now(), now()),
+  ('affiliates.terms.details_tiers_caption', jsonb_build_object('en', 'Commission, referral window and hold period of each tier', 'fr', 'Commission, période de recommandation et période de retenue de chaque niveau'), now(), now()),
+  ('affiliates.terms.details_title', jsonb_build_object('en', 'Program details', 'fr', 'Détails du programme'), now(), now()),
+  ('affiliates.terms.details_window', jsonb_build_object('en', 'Referral window', 'fr', 'Période de recommandation'), now(), now()),
+  ('affiliates.terms.earning_base', jsonb_build_object('en', 'Your commission is your tier''s rate on the order total after discounts, without taxes or shipping.', 'fr', 'Votre commission est le taux de votre niveau appliqué au total de la commande après les rabais, sans les taxes ni la livraison.'), now(), now()),
+  ('affiliates.terms.earning_consent', jsonb_build_object('en', 'If the shopper declined marketing cookies, the order earns no commission.', 'fr', 'Si le client a refusé les témoins marketing, la commande ne donne aucune commission.'), now(), now()),
+  ('affiliates.terms.earning_currency', jsonb_build_object('en', 'Commissions are recorded in the store''s currency. An order in another currency is converted at the rate saved with the order.', 'fr', 'Les commissions sont inscrites dans la devise de la boutique. Une commande dans une autre devise est convertie au taux enregistré avec la commande.'), now(), now()),
+  ('affiliates.terms.earning_first_payment', jsonb_build_object('en', 'You earn once per order, when it is first paid. Renewals and later subscription payments don''t earn a commission.', 'fr', 'Vous gagnez une seule commission par commande, à son premier paiement. Les renouvellements et les paiements d''abonnement suivants ne donnent pas de commission.'), now(), now()),
+  ('affiliates.terms.earning_one_partner', jsonb_build_object('en', 'Only one partner earns per order. A product added to the cart from a storefront comes first. Otherwise, the last referral link the shopper followed counts.', 'fr', 'Un seul partenaire touche une commission par commande. Un produit ajouté au panier depuis une vitrine a priorité. Sinon, c''est le dernier lien de recommandation suivi par le client qui compte.'), now(), now()),
+  ('affiliates.terms.earning_rate_changes', jsonb_build_object('en', 'A rate change applies only to commissions recorded after the change.', 'fr', 'Un changement de taux s''applique seulement aux commissions inscrites après ce changement.'), now(), now()),
+  ('affiliates.terms.earning_referral', jsonb_build_object('en', 'An order counts for you when the shopper came through your referral link or your storefront, within your tier''s referral window.', 'fr', 'Une commande compte pour vous quand le client est arrivé par votre lien de recommandation ou votre vitrine, pendant la période de recommandation de votre niveau.'), now(), now()),
+  ('affiliates.terms.earning_self', jsonb_build_object('en', 'Orders placed with your own account or your own email address never earn a commission.', 'fr', 'Les commandes passées avec votre propre compte ou votre propre adresse courriel ne donnent jamais de commission.'), now(), now()),
+  ('affiliates.terms.earning_start', jsonb_build_object('en', 'You start earning once your first storefront is approved.', 'fr', 'Vous commencez à gagner des commissions dès que votre première vitrine est approuvée.'), now(), now()),
+  ('affiliates.terms.earning_tiers', jsonb_build_object('en', 'We decide which tier you are in, and we may move you to another tier.', 'fr', 'Nous décidons de votre niveau, et nous pouvons vous faire passer à un autre niveau.'), now(), now()),
+  ('affiliates.terms.earning_title', jsonb_build_object('en', 'How you earn', 'fr', 'Comment vous gagnez des commissions'), now(), now()),
+  ('affiliates.terms.hold_body', jsonb_build_object('en', 'Each commission waits for your tier''s hold period before it clears. The hold protects the store against refunds.', 'fr', 'Chaque commission attend la fin de la période de retenue de votre niveau avant d''être confirmée. Cette retenue protège la boutique contre les remboursements.'), now(), now()),
+  ('affiliates.terms.hold_dispute', jsonb_build_object('en', 'A commission stays on hold while a payment dispute about its order is open.', 'fr', 'Une commission reste en attente tant qu''un litige de paiement sur sa commande est ouvert.'), now(), now()),
+  ('affiliates.terms.hold_title', jsonb_build_object('en', 'Hold period', 'fr', 'Période de retenue'), now(), now()),
+  ('affiliates.terms.intro', jsonb_build_object('en', 'These terms explain how our partner program works and what we expect from you. By creating a partner account, you accept them.', 'fr', 'Ces conditions expliquent le fonctionnement de notre programme partenaires et ce que nous attendons de vous. En créant un compte partenaire, vous les acceptez.'), now(), now()),
+  ('affiliates.terms.joining_changes', jsonb_build_object('en', 'When you change your page or your profile, we review the changes before they go live. Until then, the approved version stays online.', 'fr', 'Quand vous modifiez votre page ou votre profil, nous révisons les changements avant leur mise en ligne. D''ici là, la version approuvée reste en ligne.'), now(), now()),
+  ('affiliates.terms.joining_free', jsonb_build_object('en', 'Joining is free.', 'fr', 'L''adhésion est gratuite.'), now(), now()),
+  ('affiliates.terms.joining_refuse', jsonb_build_object('en', 'We may refuse a storefront, ask for changes, or take it offline.', 'fr', 'Nous pouvons refuser une vitrine, demander des changements ou la retirer du site.'), now(), now()),
+  ('affiliates.terms.joining_review', jsonb_build_object('en', 'We review every storefront before it goes live.', 'fr', 'Nous révisons chaque vitrine avant sa mise en ligne.'), now(), now()),
+  ('affiliates.terms.joining_title', jsonb_build_object('en', 'Joining the program', 'fr', 'Adhésion au programme'), now(), now()),
+  ('affiliates.terms.last_updated', jsonb_build_object('en', 'Last updated: {date}', 'fr', 'Dernière mise à jour : {date}'), now(), now()),
+  ('affiliates.terms.law_body', jsonb_build_object('en', 'These terms are governed by the laws of the place where {company} is established.', 'fr', 'Ces conditions sont régies par les lois du lieu où {company} a son établissement.'), now(), now()),
+  ('affiliates.terms.law_title', jsonb_build_object('en', 'Governing law', 'fr', 'Droit applicable'), now(), now()),
+  ('affiliates.terms.leave_body', jsonb_build_object('en', 'To leave the program, contact us. You can''t delete your partner account yourself.', 'fr', 'Pour quitter le programme, communiquez avec nous. Vous ne pouvez pas supprimer vous-même votre compte partenaire.'), now(), now()),
+  ('affiliates.terms.leave_records', jsonb_build_object('en', 'We keep the records of your commissions and payouts.', 'fr', 'Nous conservons l''historique de vos commissions et de vos versements.'), now(), now()),
+  ('affiliates.terms.meta_description', jsonb_build_object('en', 'How our partner program works: commissions, the hold period, refunds, payouts through Stripe, your duties and how to leave.', 'fr', 'Le fonctionnement de notre programme partenaires : commissions, retenue, remboursements, versements par Stripe, vos obligations et votre départ.'), now(), now()),
+  ('affiliates.terms.meta_title', jsonb_build_object('en', 'Partner program terms', 'fr', 'Conditions du programme partenaires'), now(), now()),
+  ('affiliates.terms.operator', jsonb_build_object('en', 'The program is run by {company} (“we” or “us”).', 'fr', 'Le programme est géré par {company} (« nous »).'), now(), now()),
+  ('affiliates.terms.pause_balance', jsonb_build_object('en', 'The commissions you already earned stay in your balance, and payouts resume once we reactivate your account.', 'fr', 'Les commissions que vous avez déjà gagnées restent dans votre solde, et les versements reprennent à la réactivation de votre compte.'), now(), now()),
+  ('affiliates.terms.pause_body', jsonb_build_object('en', 'We may suspend your partner account, for example while we look into a problem.', 'fr', 'Nous pouvons suspendre votre compte partenaire, par exemple pendant que nous examinons un problème.'), now(), now()),
+  ('affiliates.terms.pause_effects', jsonb_build_object('en', 'While your account is suspended, your storefront is offline, you earn no new commissions and no payouts are sent.', 'fr', 'Pendant la suspension, votre vitrine est hors ligne, vous ne gagnez aucune nouvelle commission et aucun versement n''est envoyé.'), now(), now()),
+  ('affiliates.terms.pause_records', jsonb_build_object('en', 'Your records are kept, and you can still sign in to see them.', 'fr', 'Votre historique est conservé, et vous pouvez toujours vous connecter pour le consulter.'), now(), now()),
+  ('affiliates.terms.pause_title', jsonb_build_object('en', 'Suspension and leaving', 'fr', 'Suspension et départ'), now(), now()),
+  ('affiliates.terms.payouts_currency', jsonb_build_object('en', 'Payouts are sent in the store''s currency.', 'fr', 'Les versements sont envoyés dans la devise de la boutique.'), now(), now()),
+  ('affiliates.terms.payouts_minimum', jsonb_build_object('en', 'We send a payout once your cleared commissions reach the minimum payout.', 'fr', 'Nous envoyons un versement dès que vos commissions confirmées atteignent le versement minimum.'), now(), now()),
+  ('affiliates.terms.payouts_schedule', jsonb_build_object('en', 'Payouts follow our schedule. A payout can be late, for example if Stripe is unavailable or our Stripe balance is too low.', 'fr', 'Les versements suivent notre calendrier. Un versement peut être retardé, par exemple si Stripe est indisponible ou si notre solde Stripe est insuffisant.'), now(), now()),
+  ('affiliates.terms.payouts_setup', jsonb_build_object('en', 'To get paid, finish the Stripe setup in your partner portal. Your Stripe account must be in a country where we can pay you.', 'fr', 'Pour être payé, terminez la configuration Stripe dans votre portail partenaire. Votre compte Stripe doit être situé dans un pays où nous pouvons vous payer.'), now(), now()),
+  ('affiliates.terms.payouts_stripe', jsonb_build_object('en', 'We pay you with Stripe Connect Express, into a Stripe account in your name.', 'fr', 'Nous vous payons avec Stripe Connect Express, dans un compte Stripe à votre nom.'), now(), now()),
+  ('affiliates.terms.payouts_stripe_agreement', jsonb_build_object('en', 'Your Stripe account is covered by Stripe''s own agreement with you.', 'fr', 'Votre compte Stripe est soumis à l''entente que Stripe conclut avec vous.'), now(), now()),
+  ('affiliates.terms.payouts_title', jsonb_build_object('en', 'Payouts', 'fr', 'Versements'), now(), now()),
+  ('affiliates.terms.privacy_body', jsonb_build_object('en', 'Our privacy policy explains how we handle your personal information.', 'fr', 'Notre politique de confidentialité explique comment nous traitons vos renseignements personnels.'), now(), now()),
+  ('affiliates.terms.privacy_link', jsonb_build_object('en', 'Read our privacy policy', 'fr', 'Lire notre politique de confidentialité'), now(), now()),
+  ('affiliates.terms.privacy_stripe', jsonb_build_object('en', 'To set up your payouts, we share your email address, your country and your storefront address with Stripe.', 'fr', 'Pour configurer vos versements, nous transmettons à Stripe votre adresse courriel, votre pays et l''adresse de votre vitrine.'), now(), now()),
+  ('affiliates.terms.privacy_title', jsonb_build_object('en', 'Privacy', 'fr', 'Confidentialité'), now(), now()),
+  ('affiliates.terms.refunds_after_payout', jsonb_build_object('en', 'If a refund or a lost dispute comes after we paid you, we may take that amount back by reversing the Stripe transfer.', 'fr', 'Si un remboursement ou un litige perdu survient après votre versement, nous pouvons reprendre ce montant en annulant le virement Stripe.'), now(), now()),
+  ('affiliates.terms.refunds_dispute', jsonb_build_object('en', 'If the store loses a payment dispute, the commission is cancelled.', 'fr', 'Si la boutique perd un litige de paiement, la commission est annulée.'), now(), now()),
+  ('affiliates.terms.refunds_full', jsonb_build_object('en', 'If an order is fully refunded or cancelled, its commission is cancelled.', 'fr', 'Si une commande est remboursée en entier ou annulée, sa commission est annulée.'), now(), now()),
+  ('affiliates.terms.refunds_partial', jsonb_build_object('en', 'A partial refund lowers the commission by the same share.', 'fr', 'Un remboursement partiel réduit la commission dans la même proportion.'), now(), now()),
+  ('affiliates.terms.refunds_title', jsonb_build_object('en', 'Refunds and disputes', 'fr', 'Remboursements et litiges'), now(), now()),
+  ('affiliates.terms.rules_breach', jsonb_build_object('en', 'If you break these rules, we may suspend your partner account.', 'fr', 'Si vous enfreignez ces règles, nous pouvons suspendre votre compte partenaire.'), now(), now()),
+  ('affiliates.terms.rules_disclosure', jsonb_build_object('en', 'Tell your audience that you earn a commission, everywhere you promote the store. Your storefront already shows this notice.', 'fr', 'Dites à votre public que vous touchez une commission, partout où vous faites la promotion de la boutique. Votre vitrine affiche déjà cet avis.'), now(), now()),
+  ('affiliates.terms.rules_forbidden_claims', jsonb_build_object('en', 'False or misleading claims about the store, its products or its prices.', 'fr', 'Les affirmations fausses ou trompeuses sur la boutique, ses produits ou ses prix.'), now(), now()),
+  ('affiliates.terms.rules_forbidden_cookies', jsonb_build_object('en', 'Cookie stuffing: setting a referral cookie for someone who didn''t choose to follow your link.', 'fr', 'Le bourrage de témoins : placer un témoin de recommandation chez quelqu''un qui n''a pas choisi de suivre votre lien.'), now(), now()),
+  ('affiliates.terms.rules_forbidden_impersonation', jsonb_build_object('en', 'Pretending to be the store, or to speak for it.', 'fr', 'Se faire passer pour la boutique, ou parler en son nom.'), now(), now()),
+  ('affiliates.terms.rules_forbidden_intro', jsonb_build_object('en', 'These are not allowed:', 'fr', 'Ces pratiques sont interdites :'), now(), now()),
+  ('affiliates.terms.rules_forbidden_self', jsonb_build_object('en', 'Buying through your own links or your own storefront.', 'fr', 'Acheter avec vos propres liens ou votre propre vitrine.'), now(), now()),
+  ('affiliates.terms.rules_forbidden_spam', jsonb_build_object('en', 'Spam, or messages people didn''t ask for.', 'fr', 'Le pourriel, ou les messages que les gens n''ont pas demandés.'), now(), now()),
+  ('affiliates.terms.rules_title', jsonb_build_object('en', 'How you promote the store', 'fr', 'Promouvoir la boutique'), now(), now()),
+  ('affiliates.terms.taxes_body', jsonb_build_object('en', 'We don''t deduct taxes from your payouts. You are responsible for reporting your earnings and paying your own taxes.', 'fr', 'Nous ne retenons aucun impôt sur vos versements. Vous devez déclarer vos revenus et payer vos propres impôts et taxes.'), now(), now()),
+  ('affiliates.terms.taxes_title', jsonb_build_object('en', 'Taxes', 'fr', 'Impôts et taxes'), now(), now()),
+  ('affiliates.terms.title', jsonb_build_object('en', 'Partner program terms', 'fr', 'Conditions du programme partenaires'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- site-wide keys, AFFILIATE_GLOBAL_TRANSLATIONS (7 keys)
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('demo_partner_access_desc', jsonb_build_object('en', 'To explore the partner portal, sign in with the demo partner account:', 'fr', 'Pour explorer le portail partenaire, connectez-vous avec le compte partenaire de démonstration :'), now(), now()),
+  ('demo_partner_storefront_link', jsonb_build_object('en', 'View the demo partner''s public storefront', 'fr', 'Voir la vitrine publique du partenaire de démonstration'), now(), now()),
+  ('nav.badge_new', jsonb_build_object('en', 'New', 'fr', 'Nouveau'), now(), now()),
+  ('partner_portal', jsonb_build_object('en', 'Partner portal', 'fr', 'Portail partenaire'), now(), now()),
+  ('sandbox_signup_disabled', jsonb_build_object('en', 'Sign-up is turned off in this demo. Sign in with a demo account below instead.', 'fr', 'L''inscription est désactivée dans cette démo. Connectez-vous plutôt avec un compte de démonstration ci-dessous.'), now(), now()),
+  ('unauthorized.retailer_only', jsonb_build_object('en', 'The partner portal is for partner accounts only. Staff accounts manage partners from the CMS.', 'fr', 'Le portail partenaire est réservé aux comptes partenaires. Les comptes du personnel gèrent les partenaires à partir du CMS.'), now(), now()),
+  ('unauthorized.retailer_suspended', jsonb_build_object('en', 'Your partner account is suspended, so the partner portal is unavailable. Contact the store if you think this is a mistake.', 'fr', 'Votre compte partenaire est suspendu : le portail partenaire n''est donc pas accessible. Communiquez avec la boutique si vous croyez qu''il s''agit d''une erreur.'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+
+-- >>> FROM: 02032_affiliates_store_product.sql <<<
+-- 02032: the NextBlock™ Affiliates & Creator Storefronts license product page, EN + FR. Vendor-only
+-- rows: nextblock.dev sells the package; every other install has no NextBlock Commerce Pro store
+-- product (Freemius 24851), so this is a no-op there. Data only; no schema.
+--
+-- Freemius product 43273, plan 75655: one single-site pricing (110047) at USD 20 a month or 200 a
+-- year, with a 30-day trial that needs no card (libs/utils/src/lib/nextblock-packages.ts). 02019
+-- (Cortex AI) and 02020 (Commerce Pro) rewrote rows a Freemius sync had made; this one creates the
+-- English row when it is missing, the way that sync would (SKU FM-43273-75655, so a later sync
+-- updates the same row instead of adding one), with its plan and single-site pricing, so the vendor
+-- never has to sync it. A row it creates starts as a DRAFT: publish both languages under CMS ->
+-- Products at launch. A row a sync already made keeps its status.
+--
+-- Copy: the title, descriptions, meta and five sections of
+-- apps/nextblock/app/api/cron/reset-sandbox/affiliates-product-copy.ts, which dresses the sandbox's
+-- product after every reset (tools/scripts/affiliates-product-migration.test.ts fails if the two
+-- drift; this file was generated from it). The copy's {{PRODUCT_URL}} becomes the product's own page,
+-- https://nextblock.dev/product/<slug> (<slug>-fr in French). Cover: the bundled
+-- images/affiliates-square.webp (resolveMediaUrl serves it from /images), attached to a row without
+-- media; the Software category when the store has one, for the rows created here. A no-break space
+-- in the copy is written as {{NBSP}} (text, turned back into chr(160)) or \\u00a0 (JSON), so the
+-- bundles generated from this file hold no raw one (ESLint no-irregular-whitespace).
+--
+-- Guarded: the copy is written only to a row that this file creates, that has no description blocks
+-- (a fresh sync), or that still carries this copy; a row the vendor rewrote by hand is left alone
+-- and named in a NOTICE. Idempotent: a second run writes the same rows again.
+--
+-- NOTE: keep the word "sandbox" OUT of this filename -- generate-sandbox-reset.ts excludes any
+-- migration whose filename contains "sandbox" from the reset bundle. The reset replays this file on
+-- an empty database, where it skips; the reset route dresses the sandbox's product instead.
+
+DO $nb_02032_affiliates_product$
+DECLARE
+  v_en_lang bigint;
+  v_fr_lang bigint;
+  v_en uuid;
+  v_fr uuid;
+  v_group uuid;
+  v_slug text;
+  v_fr_slug text;
+  v_en_created boolean := false;
+  v_fr_created boolean := false;
+  v_plan uuid;
+  v_media uuid;
+  v_category uuid;
+BEGIN
+  -- Vendor only: the store that sells NextBlock's packages carries the Commerce Pro license.
+  IF NOT EXISTS (SELECT 1 FROM public.products WHERE freemius_product_id = '24851') THEN
+    RAISE NOTICE '02032: no NextBlock Commerce Pro store product here (not the vendor store); skipped.';
+    RETURN;
+  END IF;
+
+  SELECT id INTO v_en_lang FROM public.languages WHERE code = 'en' ORDER BY id LIMIT 1;
+  SELECT id INTO v_fr_lang FROM public.languages WHERE code = 'fr' ORDER BY id LIMIT 1;
+  IF v_en_lang IS NULL THEN
+    RAISE NOTICE '02032: no English language row; skipped.';
+    RETURN;
+  END IF;
+
+  -- English: the row a Freemius sync made (the registry's plan first), else a new one.
+  SELECT p.id, p.slug, p.translation_group_id INTO v_en, v_slug, v_group
+    FROM public.products AS p
+   WHERE p.language_id = v_en_lang AND p.freemius_product_id = '43273'
+   ORDER BY (p.freemius_plan_id = '75655') DESC NULLS LAST, p.created_at, p.id
+   LIMIT 1;
+
+  IF v_en IS NULL THEN
+    INSERT INTO public.products (
+      language_id, sku, title, slug, product_type, payment_provider, price, stock, status,
+      freemius_product_id, freemius_plan_id, trial_period_days, trial_requires_payment_method
+    ) VALUES (
+      v_en_lang, 'FM-43273-75655', $nbaf_en_new_title$NextBlock™ Affiliates & Creator Storefronts License$nbaf_en_new_title$,
+      'nextblock-affiliates-creator-storefronts-affiliates-license', 'digital', 'freemius', 20000, 999, 'draft',
+      '43273', '75655', 30, false
+    )
+    RETURNING id, slug, translation_group_id INTO v_en, v_slug, v_group;
+    v_en_created := true;
+  END IF;
+
+  -- Its plan and single-site pricing, as the sync records them (the French row reads the English
+  -- row's pricing through the translation group).
+  SELECT id INTO v_plan FROM public.freemius_plans WHERE product_id = v_en ORDER BY created_at, id LIMIT 1;
+  IF v_plan IS NULL THEN
+    INSERT INTO public.freemius_plans (product_id, name, title)
+    VALUES (v_en, 'affiliates', 'Affiliates License')
+    RETURNING id INTO v_plan;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.freemius_pricing WHERE plan_id = v_plan) THEN
+    INSERT INTO public.freemius_pricing (plan_id, license_quota, api_monthly_price, api_annual_price, api_lifetime_price)
+    VALUES (v_plan, 1, 20, 200, NULL);
+  END IF;
+
+  IF v_en_created
+     OR NOT EXISTS (SELECT 1 FROM public.blocks WHERE product_id = v_en)
+     OR EXISTS (SELECT 1 FROM public.blocks WHERE product_id = v_en
+                 AND content::text LIKE $nbaf_en_sig$%Your Own Affiliate Program, Built Into Your Store.%$nbaf_en_sig$) THEN
+      DELETE FROM public.blocks WHERE product_id = v_en;
+      INSERT INTO public.blocks (product_id, language_id, block_type, content, "order") VALUES
+        (v_en, v_en_lang, 'section', replace($nbaf_en_0\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#172554","position":0},{"color":"#1e3a8a","position":35},{"color":"#0f172a","position":100}],"direction":"135deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<p class='text-xs uppercase tracking-[0.3em] text-sky-400 font-semibold mb-4'>Commerce Pro Add-On · 30-Day Free Trial</p><h2 class='text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5'>Your Own Affiliate Program, Built Into Your Store.</h2><p class='text-base md:text-lg text-slate-200 leading-relaxed mb-4'>Partners sign up at /partners, build a co-branded storefront in a restricted editor, and share their referral links. You approve every storefront version before it goes live, and commissions reach each partner's bank automatically through Stripe Connect Express.</p><p class='text-base text-slate-300 leading-relaxed mb-6'>Affiliates &amp; Creator Storefronts is an add-on for NextBlock™ Commerce Pro: it needs an active Commerce Pro license on the same site, sold separately. While Commerce Pro is off, the program pauses and keeps its partners, storefronts and ledger. The license starts with a 30-day free trial and no credit card.</p>"},"block_type":"text"},{"content":{"url":"https://cms.nextblock.dev/partners","size":"lg","text":"Explore the Live Demo →","variant":"default","position":"left"},"block_type":"button"}],[{"content":{"html_content":"<div class='rounded-2xl border border-sky-700 bg-slate-950 p-6 shadow-xl sm:p-8'><h3 class='text-lg font-bold text-white mb-5'>Everything a Partner Program Needs</h3><ul class='space-y-4 text-sm leading-relaxed text-slate-300'><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Signup and landing page</strong> — /partners shows your tier ladder, a revenue calculator and the signup form in the visitor's language, and /partenaires always shows it in French.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Approved storefronts</strong> — one co-branded page per partner, and no version goes live until you approve it.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Referral tracking</strong> — referral links and storefront visits credit the partner at checkout. Visitors who decline marketing cookies are never attributed.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Automatic payouts</strong> — each commission waits out a refund-protection hold, then goes to the partner's bank through Stripe Connect Express.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Refund-aware ledger</strong> — refunds cancel or reduce an unpaid commission, pro rata for partial refunds, and open disputes hold it. A refund after a payout alerts you.</span></li></ul></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$nbaf_en_0$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_slug)::jsonb, 0),
+        (v_en, v_en_lang, 'section', replace($nbaf_en_1\${"padding":{"top":"lg","bottom":"lg"},"background":{"type":"theme","theme":"muted"},"column_gap":"lg","column_blocks":[[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>30</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Days free, no card</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>1</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Approved storefront per partner</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>4</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Ready-made tiers, all editable</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>EN + FR</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Partner pages and emails</span></p>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":2,"desktop":4},"vertical_alignment":"center"}$nbaf_en_1$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_slug)::jsonb, 1),
+        (v_en, v_en_lang, 'section', replace($nbaf_en_2\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"none"},"column_gap":"lg","column_blocks":[[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M4 10v9a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-9'></path><path d='M3 10 5 4h14l2 6Z'></path><path d='M10 20v-5h4v5'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Co-Branded Storefronts</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Each partner gets one page at /partners/&lt;handle&gt;, built in a restricted editor with product grids from your catalog. Partner content is sanitized and never rendered as raw HTML.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><rect x='3' y='4' width='7' height='16' rx='1.5'></rect><rect x='14' y='4' width='7' height='16' rx='1.5'></rect><path d='m15.5 12 1.5 1.5 2.5-3'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Side-by-Side Review</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Submissions wait in a review queue. Compare the live page with the proposed one, changed blocks highlighted, then approve it or request changes with a note.</p></div>"},"block_type":"text"}],[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M19 5 5 19'></path><circle cx='6.5' cy='6.5' r='2.5'></circle><circle cx='17.5' cy='17.5' r='2.5'></circle></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Commission Tiers</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Set each tier's rate, referral window and refund hold, and run a capped launch offer for your first partners. Commissions use the order total after discounts, without tax or shipping.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='m3 9 9-5 9 5'></path><path d='M5 10v8M9.5 10v8M14.5 10v8M19 10v8'></path><path d='M3 20h18'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Stripe Connect Payouts</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Partners connect their bank once through Stripe Connect Express. Cleared commissions are transferred from your Stripe balance in your store's base currency, automatically or when you click Run payouts now.</p></div>"},"block_type":"text"}],[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><circle cx='12' cy='8' r='4'></circle><path d='M4 21a8 8 0 0 1 16 0'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Partner Portal</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Partners follow their getting-started steps, see referral visits and balances, build referral links, and track their commissions and payouts. They never enter your CMS.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z'></path><path d='M19 15v4M17 17h4'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Storefront Copilot</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>With Cortex AI active, partners get an optional assistant that drafts their bio and storefront copy on your OpenRouter key, within hourly limits. Its tools only return suggestions.</p></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":2,"desktop":3},"vertical_alignment":"stretch"}$nbaf_en_2$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_slug)::jsonb, 2),
+        (v_en, v_en_lang, 'section', replace($nbaf_en_3\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#020617","position":0},{"color":"#0f172a","position":100}],"direction":"180deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<p class='text-xs uppercase tracking-[0.3em] text-sky-400 font-semibold mb-4'>How It Works</p><h3 class='text-2xl md:text-3xl font-extrabold text-white mb-4'>From Referral to Payout, Tracked End to End.</h3><p class='text-slate-300 leading-relaxed mb-5'>A referral link or a storefront visit credits the partner when the order is placed, through Stripe or Freemius checkout. The commission is recorded when the order is first paid and waits out the tier's refund-protection hold. It then goes out with the partner's next automatic payout, once their cleared balance reaches your minimum and your Stripe balance covers it.</p><ul class='space-y-3 text-sm text-slate-400'><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Only active partners with an approved storefront earn, from their first approval on.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>No self-referrals: orders placed with a partner's own account or email never earn.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>One commission per order, on its first payment. Renewals never earn.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Suspending a partner takes their storefront off your site at once.</span></li></ul>"},"block_type":"text"}],[{"content":{"html_content":"<div class='space-y-4'><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Admin Control Center</h4><p class='text-xs text-slate-400 leading-relaxed'>A partner table with search, tier moves and suspension, a tier editor, the review queue, the commission ledger, and payout controls with Retry, Release and Run payouts now.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Email Notifications</h4><p class='text-xs text-slate-400 leading-relaxed'>With SMTP set up, admins hear about signups, submissions, failed payouts and refunds after a payout. Partners are emailed when their page is published or needs changes, when they earn, and when a payout is sent.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Bilingual by Default</h4><p class='text-xs text-slate-400 leading-relaxed'>The landing page, storefronts, partner portal and partner emails speak English and Québec French. The CMS screens stay in English.</p></div></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$nbaf_en_3$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_slug)::jsonb, 3),
+        (v_en, v_en_lang, 'section', replace($nbaf_en_4\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#1e3a8a","position":0},{"color":"#172554","position":100}],"direction":"135deg"}},"column_gap":"none","column_blocks":[[{"content":{"level":2,"textAlign":"center","textColor":"white","text_content":"Ready to launch your partner program?"},"block_type":"heading"},{"content":{"html_content":"<p class='text-center text-sky-100 max-w-xl mx-auto mt-2 mb-6'>Add Affiliates &amp; Creator Storefronts to your Commerce Pro store. Start with 30 days free and no credit card, set your tiers, and approve your first partner storefront.</p>"},"block_type":"text"},{"content":{"url":"{{PRODUCT_URL}}","size":"lg","text":"Start the 30-Day Free Trial","variant":"secondary","position":"center"},"block_type":"button"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":1},"vertical_alignment":"center"}$nbaf_en_4$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_slug)::jsonb, 4);
+      UPDATE public.products
+         SET title = $nbaf_en_title$NextBlock™ Affiliates & Creator Storefronts License$nbaf_en_title$,
+             short_description = $nbaf_en_short$NextBlock™ Affiliates & Creator Storefronts adds a partner program to your store. Partners sign up at /partners, publish a co-branded storefront you approve, and earn commissions at the tier rates you set, paid automatically through Stripe Connect. An add-on that needs NextBlock™ Commerce Pro, sold separately. Free for 30 days, no credit card.$nbaf_en_short$,
+             meta_title = $nbaf_en_meta_title$NextBlock™ Affiliate Program & Storefronts for Next.js$nbaf_en_meta_title$,
+             meta_description = $nbaf_en_meta_description$Add an affiliate program to your NextBlock™ Commerce Pro store: partner signup, approved co-branded storefronts, commission tiers and Stripe Connect payouts.$nbaf_en_meta_description$,
+             description_json = NULL,
+             updated_at = now()
+       WHERE id = v_en;
+  ELSE
+    RAISE NOTICE '02032: product % (en) has description blocks of its own; left unchanged.', v_slug;
+  END IF;
+
+  -- French: the twin in the same translation group, else a new one.
+  IF v_fr_lang IS NOT NULL THEN
+    SELECT p.id, p.slug INTO v_fr, v_fr_slug
+      FROM public.products AS p
+     WHERE p.translation_group_id = v_group AND p.language_id = v_fr_lang
+     ORDER BY p.created_at, p.id
+     LIMIT 1;
+
+    IF v_fr IS NULL THEN
+      INSERT INTO public.products (
+        language_id, translation_group_id, sku, title, slug, product_type, payment_provider, price, stock,
+        status, freemius_product_id, freemius_plan_id, trial_period_days, trial_requires_payment_method
+      )
+      SELECT v_fr_lang, v_group, p.sku, $nbaf_fr_new_title$Licence NextBlock™ Affiliates & Creator Storefronts$nbaf_fr_new_title$, p.slug || '-fr', 'digital', 'freemius',
+             p.price, p.stock, p.status, p.freemius_product_id, p.freemius_plan_id, p.trial_period_days,
+             p.trial_requires_payment_method
+        FROM public.products AS p
+       WHERE p.id = v_en
+      RETURNING id, slug INTO v_fr, v_fr_slug;
+      v_fr_created := true;
+    END IF;
+
+    IF v_fr_created
+       OR NOT EXISTS (SELECT 1 FROM public.blocks WHERE product_id = v_fr)
+       OR EXISTS (SELECT 1 FROM public.blocks WHERE product_id = v_fr
+                   AND content::text LIKE $nbaf_fr_sig$%Votre propre programme d'affiliation, intégré à votre boutique.%$nbaf_fr_sig$) THEN
+      DELETE FROM public.blocks WHERE product_id = v_fr;
+      INSERT INTO public.blocks (product_id, language_id, block_type, content, "order") VALUES
+        (v_fr, v_fr_lang, 'section', replace($nbaf_fr_0\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#172554","position":0},{"color":"#1e3a8a","position":35},{"color":"#0f172a","position":100}],"direction":"135deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<p class='text-xs uppercase tracking-[0.3em] text-sky-400 font-semibold mb-4'>Module complémentaire de Commerce Pro · Essai gratuit de 30 jours</p><h2 class='text-3xl md:text-5xl font-extrabold text-white leading-tight mb-5'>Votre propre programme d'affiliation, intégré à votre boutique.</h2><p class='text-base md:text-lg text-slate-200 leading-relaxed mb-4'>Vos partenaires s'inscrivent sur /partenaires, bâtissent dans un éditeur restreint une vitrine à leur nom, aux couleurs de votre boutique, et partagent leurs liens de recommandation. Vous approuvez chaque version d'une vitrine avant sa mise en ligne, et les commissions sont versées automatiquement dans le compte bancaire de chaque partenaire par Stripe Connect Express.</p><p class='text-base text-slate-300 leading-relaxed mb-6'>Affiliates &amp; Creator Storefronts est un module complémentaire de NextBlock™ Commerce Pro&nbsp;: il exige une licence Commerce Pro active sur le même site, vendue séparément. Tant que Commerce Pro est désactivé, le programme est en pause et conserve ses partenaires, ses vitrines et son registre des commissions. La licence commence par un essai gratuit de 30 jours, sans carte de crédit.</p>"},"block_type":"text"},{"content":{"url":"https://cms.nextblock.dev/partenaires","size":"lg","text":"Explorer la démo en ligne →","variant":"default","position":"left"},"block_type":"button"}],[{"content":{"html_content":"<div class='rounded-2xl border border-sky-700 bg-slate-950 p-6 shadow-xl sm:p-8'><h3 class='text-lg font-bold text-white mb-5'>Tout ce qu'il faut pour un programme de partenaires</h3><ul class='space-y-4 text-sm leading-relaxed text-slate-300'><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Inscription et page du programme</strong> — /partenaires présente vos niveaux de partenaire, un calculateur de revenus et le formulaire d'inscription en français, et /partners affiche la même page dans la langue du visiteur.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Vitrines approuvées</strong> — une page à son nom pour chaque partenaire, et aucune version n'est mise en ligne avant votre approbation.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Suivi des recommandations</strong> — les liens de recommandation et les visites de vitrine attribuent la vente au partenaire au moment de la commande. Un visiteur qui refuse les témoins marketing n'est jamais attribué à un partenaire.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Versements automatiques</strong> — chaque commission attend la fin d'une période de retenue qui protège contre les remboursements, puis est versée dans le compte bancaire du partenaire par Stripe Connect Express.</span></li><li class='flex items-start gap-3'><span aria-hidden='true' class='flex-shrink-0 w-6 h-6 rounded-full bg-sky-950 flex items-center justify-center text-sky-300 text-xs font-bold'>✓</span><span><strong class='text-white'>Registre qui tient compte des remboursements</strong> — un remboursement annule ou réduit une commission non versée, au prorata s'il est partiel, et un litige ouvert la retient. Un remboursement après un versement vous est signalé.</span></li></ul></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$nbaf_fr_0$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_fr_slug)::jsonb, 0),
+        (v_fr, v_fr_lang, 'section', replace($nbaf_fr_1\${"padding":{"top":"lg","bottom":"lg"},"background":{"type":"theme","theme":"muted"},"column_gap":"lg","column_blocks":[[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>30</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Jours gratuits, sans carte</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>1</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Vitrine approuvée par partenaire</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>4</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Niveaux prêts à l'emploi, tous modifiables</span></p>"},"block_type":"text"}],[{"content":{"html_content":"<p class='text-center'><span class='block text-2xl font-extrabold text-foreground'>EN + FR</span><span class='text-xs text-muted-foreground uppercase tracking-wider'>Pages et courriels des partenaires</span></p>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":2,"desktop":4},"vertical_alignment":"center"}$nbaf_fr_1$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_fr_slug)::jsonb, 1),
+        (v_fr, v_fr_lang, 'section', replace($nbaf_fr_2\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"none"},"column_gap":"lg","column_blocks":[[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M4 10v9a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-9'></path><path d='M3 10 5 4h14l2 6Z'></path><path d='M10 20v-5h4v5'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Vitrines de partenaires</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Chaque partenaire obtient une page à l'adresse /partners/&lt;identifiant&gt;, bâtie dans un éditeur restreint avec des grilles de produits de votre catalogue. Le contenu des partenaires est filtré et n'est jamais affiché en HTML brut.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><rect x='3' y='4' width='7' height='16' rx='1.5'></rect><rect x='14' y='4' width='7' height='16' rx='1.5'></rect><path d='m15.5 12 1.5 1.5 2.5-3'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Révision côte à côte</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Les soumissions attendent dans une file de révision. Comparez la page en ligne et la page proposée, blocs modifiés surlignés, puis approuvez-la ou demandez des changements avec une note.</p></div>"},"block_type":"text"}],[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M19 5 5 19'></path><circle cx='6.5' cy='6.5' r='2.5'></circle><circle cx='17.5' cy='17.5' r='2.5'></circle></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Niveaux de commission</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Fixez le taux, la fenêtre de recommandation et la période de retenue de chaque niveau, et proposez une offre de lancement à places limitées à vos premiers partenaires. Les commissions portent sur le total de la commande après rabais, sans les taxes ni la livraison.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='m3 9 9-5 9 5'></path><path d='M5 10v8M9.5 10v8M14.5 10v8M19 10v8'></path><path d='M3 20h18'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Versements Stripe Connect</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Vos partenaires lient leur banque une seule fois avec Stripe Connect Express. Les commissions confirmées sont transférées depuis votre solde Stripe, dans la devise de base de votre boutique, automatiquement ou quand vous cliquez sur Run payouts now.</p></div>"},"block_type":"text"}],[{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><circle cx='12' cy='8' r='4'></circle><path d='M4 21a8 8 0 0 1 16 0'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Portail partenaire</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Vos partenaires franchissent les étapes de démarrage, consultent leurs visites et leurs soldes, créent leurs liens de recommandation et suivent leurs commissions et leurs versements. Ils n'ont jamais accès à votre CMS.</p></div>"},"block_type":"text"},{"content":{"html_content":"<div class='h-full rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition-colors hover:border-sky-300 hover:bg-slate-50 dark:border-white/10 dark:bg-slate-950 dark:hover:border-sky-500 sm:p-7'><div class='mb-4 inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300'><svg class='h-5 w-5' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24' aria-hidden='true'><path d='M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z'></path><path d='M19 15v4M17 17h4'></path></svg></div><h3 class='text-base font-bold text-slate-900 dark:text-white mb-2'>Copilote de vitrine</h3><p class='text-sm text-slate-600 dark:text-slate-300 leading-relaxed'>Avec Cortex AI actif, vos partenaires profitent d'un assistant facultatif qui rédige leur bio et le texte de leur vitrine à l'aide de votre clé OpenRouter, avec un nombre de requêtes limité par heure. Ses outils se contentent de faire des suggestions.</p></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":2,"desktop":3},"vertical_alignment":"stretch"}$nbaf_fr_2$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_fr_slug)::jsonb, 2),
+        (v_fr, v_fr_lang, 'section', replace($nbaf_fr_3\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#020617","position":0},{"color":"#0f172a","position":100}],"direction":"180deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<p class='text-xs uppercase tracking-[0.3em] text-sky-400 font-semibold mb-4'>Comment ça marche</p><h3 class='text-2xl md:text-3xl font-extrabold text-white mb-4'>De la recommandation au versement, tout est suivi.</h3><p class='text-slate-300 leading-relaxed mb-5'>Un lien de recommandation ou une visite de vitrine attribue la commande au partenaire au moment de l'achat, avec le paiement Stripe ou Freemius. La commission est enregistrée au premier paiement de la commande, puis attend la fin de la période de retenue du niveau. Elle part ensuite avec le prochain versement automatique du partenaire, dès que son solde confirmé atteint votre minimum et que votre solde Stripe le couvre.</p><ul class='space-y-3 text-sm text-slate-400'><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Seuls les partenaires actifs dont la vitrine est approuvée touchent des commissions, à partir de leur première approbation.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Pas de commission sur ses propres achats&nbsp;: une commande passée avec le compte ou le courriel du partenaire ne rapporte rien.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Une commission par commande, sur son premier paiement. Les renouvellements ne rapportent rien.</span></li><li class='flex items-start gap-2.5'><span aria-hidden='true' class='text-sky-400'>→</span><span>Suspendre un partenaire retire aussitôt sa vitrine de votre site.</span></li></ul>"},"block_type":"text"}],[{"content":{"html_content":"<div class='space-y-4'><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Centre de contrôle</h4><p class='text-xs text-slate-400 leading-relaxed'>Un tableau des partenaires avec recherche, changements de niveau et suspension, un éditeur de niveaux, la file de révision, le registre des commissions et la gestion des versements, avec les boutons Retry, Release et Run payouts now.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Notifications par courriel</h4><p class='text-xs text-slate-400 leading-relaxed'>Si le SMTP est configuré, les administrateurs sont avisés des inscriptions, des soumissions, des versements en échec et des remboursements survenus après un versement. Les partenaires reçoivent un courriel quand leur page est publiée ou doit être modifiée, quand ils gagnent une commission et quand un versement leur est envoyé.</p></div><div class='p-5 rounded-xl border border-slate-700 bg-slate-900'><h4 class='text-sm font-bold text-white mb-1'>Bilingue d'emblée</h4><p class='text-xs text-slate-400 leading-relaxed'>La page du programme, les vitrines, le portail partenaire et les courriels des partenaires sont offerts en anglais et en français du Québec. Les écrans du CMS restent en anglais.</p></div></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$nbaf_fr_3$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_fr_slug)::jsonb, 3),
+        (v_fr, v_fr_lang, 'section', replace($nbaf_fr_4\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#1e3a8a","position":0},{"color":"#172554","position":100}],"direction":"135deg"}},"column_gap":"none","column_blocks":[[{"content":{"level":2,"textAlign":"center","textColor":"white","text_content":"Prêt à lancer votre programme de partenaires?"},"block_type":"heading"},{"content":{"html_content":"<p class='text-center text-sky-100 max-w-xl mx-auto mt-2 mb-6'>Ajoutez Affiliates &amp; Creator Storefronts à votre boutique Commerce Pro. Commencez avec 30 jours gratuits, sans carte de crédit, fixez vos niveaux et approuvez la vitrine de votre premier partenaire.</p>"},"block_type":"text"},{"content":{"url":"{{PRODUCT_URL}}","size":"lg","text":"Commencer l'essai gratuit de 30 jours","variant":"secondary","position":"center"},"block_type":"button"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":1},"vertical_alignment":"center"}$nbaf_fr_4$, '{{PRODUCT_URL}}', 'https://nextblock.dev/product/' || v_fr_slug)::jsonb, 4);
+      UPDATE public.products
+         SET title = $nbaf_fr_title$Licence NextBlock™ Affiliates & Creator Storefronts$nbaf_fr_title$,
+             short_description = $nbaf_fr_short$NextBlock™ Affiliates & Creator Storefronts ajoute un programme de partenaires à votre boutique. Vos partenaires s'inscrivent sur /partenaires, publient une vitrine à leur nom après votre approbation et touchent des commissions aux taux que vous fixez pour chaque niveau, versées automatiquement par Stripe Connect. Un module complémentaire qui exige NextBlock™ Commerce Pro, vendu séparément. Gratuit pendant 30 jours, sans carte de crédit.$nbaf_fr_short$,
+             meta_title = $nbaf_fr_meta_title$Programme d'affiliation NextBlock™ pour boutiques Next.js$nbaf_fr_meta_title$,
+             meta_description = replace($nbaf_fr_meta_description$Ajoutez un programme d'affiliation à votre boutique NextBlock™ Commerce Pro{{NBSP}}: inscription, vitrines approuvées, niveaux de commission et versements Stripe.$nbaf_fr_meta_description$, '{{NBSP}}', chr(160)),
+             description_json = NULL,
+             updated_at = now()
+       WHERE id = v_fr;
+    ELSE
+      RAISE NOTICE '02032: product % (fr) has description blocks of its own; left unchanged.', v_fr_slug;
+    END IF;
+  END IF;
+
+  -- The bundled cover, on each row that has no media yet.
+  INSERT INTO public.media (file_name, object_key, file_type, size_bytes, description, width, height, file_path, folder)
+  VALUES ('affiliates-square.webp', 'images/affiliates-square.webp', 'image/webp', 153906,
+          $nbaf_media$NextBlock™ Affiliates & Creator Storefronts cover image$nbaf_media$, 2048, 2048,
+          'images/affiliates-square.webp', 'images')
+  ON CONFLICT (object_key) DO NOTHING;
+  SELECT id INTO v_media FROM public.media WHERE object_key = 'images/affiliates-square.webp';
+
+  INSERT INTO public.product_media (product_id, media_id, sort_order)
+  SELECT row_id, v_media, 0
+    FROM (VALUES (v_en), (v_fr)) AS rows_to_dress(row_id)
+   WHERE row_id IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM public.product_media AS pm WHERE pm.product_id = rows_to_dress.row_id)
+  ON CONFLICT DO NOTHING;
+
+  -- Software, like the other two licenses, for the rows created here.
+  SELECT id INTO v_category FROM public.categories WHERE slug = 'software' ORDER BY created_at, id LIMIT 1;
+  IF v_category IS NOT NULL THEN
+    INSERT INTO public.product_categories (product_id, category_id)
+    SELECT row_id, v_category
+      FROM (VALUES (CASE WHEN v_en_created THEN v_en END), (CASE WHEN v_fr_created THEN v_fr END)) AS created_rows(row_id)
+     WHERE row_id IS NOT NULL
+    ON CONFLICT DO NOTHING;
+  END IF;
+END
+$nb_02032_affiliates_product$;
+
+
+-- >>> FROM: 02033_affiliate_tier_goals.sql <<<
+-- 02033: a per-tier goal on affiliate_tiers, shown under each tier on the /partners ladder
+-- ("Make 8 confirmed sales, then contact us…"). English lives in goal, other languages in
+-- goal_translations ({"fr": "..."}), like name / name_translations (02030 section 2). Edited under
+-- CMS -> Affiliates -> Tiers.
+--
+-- Display only: no SQL reads it and nothing moves a partner when a goal is met. Tier changes stay
+-- an admin decision (CMS -> Affiliates -> Overview, "Change tier"), and the page says goals count
+-- confirmed sales only (a refunded order does not count).
+--
+-- Append-only, forward-only, idempotent: ADD COLUMN IF NOT EXISTS, each CHECK dropped by name
+-- before it is added, and the seed fills a launch tier (matched by slug, never by id) only while
+-- its goal is still NULL, so a goal an operator wrote, or cleared to '' and back, is never touched.
+-- The seeded wording is generic ("cleared sales", the page's word for a sale past its refund hold;
+-- no product name, no person): the four launch tiers of 02030 exist on every install, and each
+-- store edits its goals in the CMS.
+--
+-- Vendor only: on nextblock.dev (the store that sells NextBlock's modules; detected the way 02032
+-- does, by the Commerce Pro license product, Freemius 24851) the Growth and Elite goals then take
+-- the vendor's own wording, only while they still read exactly as seeded. Elsewhere, and on the
+-- sandbox replay (no products exist yet when it runs), they keep the generic wording.
+--
+-- Grants: none. affiliate_tiers is granted at the table level (02030 section 14: anon SELECT,
+-- authenticated and service_role CRUD under RLS), which covers columns added later; it has no
+-- column grant to extend, and the post-apply pass (API_ROLE_REVOKE_SQL) never touches it
+-- (migrate-core.test.mjs asserts that). RLS is unchanged: anon still reads active tiers only.
+
+ALTER TABLE public.affiliate_tiers
+  ADD COLUMN IF NOT EXISTS goal text NULL,
+  ADD COLUMN IF NOT EXISTS goal_translations jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+ALTER TABLE public.affiliate_tiers DROP CONSTRAINT IF EXISTS affiliate_tiers_goal_check;
+ALTER TABLE public.affiliate_tiers
+  ADD CONSTRAINT affiliate_tiers_goal_check
+  CHECK (goal IS NULL OR char_length(btrim(goal)) BETWEEN 1 AND 160);
+
+ALTER TABLE public.affiliate_tiers DROP CONSTRAINT IF EXISTS affiliate_tiers_goal_translations_check;
+ALTER TABLE public.affiliate_tiers
+  ADD CONSTRAINT affiliate_tiers_goal_translations_check
+  CHECK (jsonb_typeof(goal_translations) = 'object' AND octet_length(goal_translations::text) <= 2000);
+
+-- The four launch tiers of 02030, English and Quebec French together. French is written with a
+-- plain space before ":" (the display helper turns it into a no-break space); none is needed here.
+UPDATE public.affiliate_tiers AS t
+   SET goal = s.goal_en,
+       goal_translations = CASE
+         WHEN nullif(btrim(t.goal_translations ->> 'fr'), '') IS NULL
+           THEN t.goal_translations || jsonb_build_object('fr', s.goal_fr)
+         ELSE t.goal_translations
+       END
+  FROM (VALUES
+    ('starter-partner', 'Simply sign up!', 'Inscrivez-vous, tout simplement!'),
+    ('growth-partner', 'Make 8 cleared sales, then contact us to talk about your growth.', 'Réalisez 8 ventes confirmées, puis contactez-nous pour discuter de votre croissance.'),
+    ('elite-partner', 'Make 30 cleared sales and get a personal call from our team.', 'Réalisez 30 ventes confirmées et recevez un appel personnel de notre équipe.'),
+    ('founding-ambassador', 'Join during the launch offer.', 'Inscrivez-vous pendant l''offre de lancement.')
+  ) AS s (slug, goal_en, goal_fr)
+ WHERE t.slug = s.slug
+   AND t.goal IS NULL;
+
+-- nextblock.dev's own wording (see the header). Both languages move together, and only from the
+-- exact seeded text above, so a goal the vendor already edited is left alone. The partners page
+-- says that refunded orders never count toward a goal.
+DO $nb_02033_vendor_goals$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.products WHERE freemius_product_id = '24851') THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.affiliate_tiers AS t
+     SET goal = v.goal_en,
+         goal_translations = jsonb_set(t.goal_translations, '{fr}', to_jsonb(v.goal_fr))
+    FROM (VALUES
+      ('growth-partner',
+       'Make 8 cleared sales, then contact us to talk about your growth.',
+       'Réalisez 8 ventes confirmées, puis contactez-nous pour discuter de votre croissance.',
+       'Sell 8 modules, then contact us for a meeting to grow.',
+       'Vendez 8 modules, puis prenez rendez-vous avec nous pour grandir ensemble.'),
+      ('elite-partner',
+       'Make 30 cleared sales and get a personal call from our team.',
+       'Réalisez 30 ventes confirmées et recevez un appel personnel de notre équipe.',
+       'Sell 30 modules and get a call from our CEO.',
+       'Vendez 30 modules et recevez un appel de notre PDG.')
+    ) AS v (slug, seeded_en, seeded_fr, goal_en, goal_fr)
+   WHERE t.slug = v.slug
+     AND t.goal = v.seeded_en
+     AND t.goal_translations ->> 'fr' = v.seeded_fr;
+END
+$nb_02033_vendor_goals$;
+
+COMMENT ON COLUMN public.affiliate_tiers.goal IS 'What a partner aims for to reach this tier, shown on the /partners ladder (English; NULL = no goal line). Display only: tier changes stay an admin decision.';
+COMMENT ON COLUMN public.affiliate_tiers.goal_translations IS 'Localized goals, e.g. {"fr": "Réalisez 8 ventes confirmées"}; English lives in goal.';
+
+
+-- >>> FROM: 02034_partner_program_nav_and_home.sql <<<
+-- 02034: tell visitors the partner program is open. Adds a "Become a partner" link to the header,
+-- a "Partner program" link to the footer, and a home-page section that promotes the partner
+-- program and the Affiliates & Creator Storefronts module. English and Quebec French ship together.
+--
+-- 1. Navigation rows (HEADER and FOOTER, EN and FR).
+--    - Each menu has one fixed translation group, shared by its EN and FR rows (as the seeded footer
+--      links are), so the CMS language switcher pairs them and a CMS delete removes both languages.
+--      The two group ids are mirrored in apps/nextblock/lib/affiliates/partner-program-nav.ts, which
+--      styles the header row as a highlighted pill and gives both rows a "New" badge;
+--      partner-program-nav.test.ts pins the ids, URLs and labels to this file.
+--    - Insert-only. A row is skipped when its language already has a row in that group, or when the
+--      same menu already links /partners or /partenaires in that language. Nothing is updated or
+--      deleted, so a label, order or deletion an operator chose in /cms/navigation stands.
+--    - Languages are looked up by code, and a missing language is skipped. page_id is NULL: the
+--      program's addresses are app routes, not CMS pages. Each row goes after the last top-level
+--      item of its menu.
+--    - The rows ship to every install, and the root layout (app/layout.tsx) hides both groups, and
+--      anything nested under them, while the program is inactive (isAffiliatesProgramActive():
+--      the Affiliates package AND Commerce Pro), so a site without the program never shows a link
+--      that would 404. Operators still see the rows in /cms/navigation, where they can edit or
+--      delete them.
+--
+-- 2. Home section (EN page 'home', FR page 'accueil'), inserted right after the seeded Cortex AI
+--    section, which is found by content signature (never by id or position). A home page without
+--    that section (a customized home) is left alone, and so is one that already holds the sentinel
+--    class 'nb-partner-program'. Later blocks move down by one, so their relative order is kept.
+--    Like the other seeded promos (the Cortex AI and Commerce sections), the buttons use absolute
+--    https://nextblock.dev links, so they work on every install whether or not it runs the program
+--    itself. No prices (they go stale) and no images.
+--
+-- Forward-only, idempotent and non-destructive: a re-run finds the rows and the sentinel and does
+-- nothing. The identity sequences only ever move forward (the 02018 form). This file writes no UI
+-- strings: the badge key nav.badge_new is seeded by the 02031 generator, from
+-- apps/nextblock/lib/i18n/global-affiliate-keys.ts.
+
+DO $partner_nav$
+DECLARE
+  c_header_group constant uuid := 'e130cf70-04d2-4201-ba44-f8ac22fc071b';
+  c_footer_group constant uuid := '78a4685e-c6ee-4065-9e8b-b257887256f9';
+  r record;
+BEGIN
+  -- The seed inserts explicit ids. Only ever move the sequence forward: rewinding it would hand a
+  -- deleted row's id to this insert, or collide with a concurrent CMS insert on a live site.
+  PERFORM setval('public.navigation_items_id_seq',
+    GREATEST(COALESCE((SELECT MAX(id) FROM public.navigation_items), 1),
+             (SELECT last_value FROM public.navigation_items_id_seq)), true);
+
+  FOR r IN
+    SELECT l.id AS language_id, x.menu_key, x.group_id, x.label, x.url
+      FROM (VALUES
+        ('en', 'HEADER'::public.menu_location, c_header_group, 'Become a partner', '/partners'),
+        ('fr', 'HEADER'::public.menu_location, c_header_group, 'Devenir partenaire', '/partenaires'),
+        ('en', 'FOOTER'::public.menu_location, c_footer_group, 'Partner program', '/partners'),
+        ('fr', 'FOOTER'::public.menu_location, c_footer_group, 'Programme de partenaires', '/partenaires')
+      ) AS x (code, menu_key, group_id, label, url)
+      JOIN public.languages AS l ON l.code = x.code
+  LOOP
+    -- Already there (this group in this language), or the menu already links the program.
+    CONTINUE WHEN EXISTS (
+      SELECT 1
+        FROM public.navigation_items AS n
+       WHERE n.language_id = r.language_id
+         AND (n.translation_group_id = r.group_id
+              OR (n.menu_key = r.menu_key
+                  AND rtrim(lower(btrim(n.url)), '/') IN ('/partners', '/partenaires')))
+    );
+
+    INSERT INTO public.navigation_items
+      (language_id, menu_key, label, url, parent_id, "order", page_id, translation_group_id)
+    SELECT r.language_id, r.menu_key, r.label, r.url, NULL,
+           COALESCE(MAX(n."order"), -1) + 1, NULL, r.group_id
+      FROM public.navigation_items AS n
+     WHERE n.menu_key = r.menu_key
+       AND n.language_id = r.language_id
+       AND n.parent_id IS NULL;
+  END LOOP;
+END
+$partner_nav$;
+
+DO $partner_home$
+DECLARE
+  r record;
+  v_page bigint;
+  v_lang bigint;
+  v_anchor integer;
+BEGIN
+  PERFORM setval('public.blocks_id_seq',
+    GREATEST(COALESCE((SELECT MAX(id) FROM public.blocks), 1),
+             (SELECT last_value FROM public.blocks_id_seq)), true);
+
+  FOR r IN
+    SELECT *
+      FROM (VALUES
+        ('en', 'home', '%Now Available — Cortex AI%', '%Cortex AI Is the%',
+         $en\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#0c1a3d","position":0},{"color":"#172554","position":50},{"color":"#0f172a","position":100}],"direction":"135deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<div class='nb-partner-program'><p class='text-xs uppercase tracking-[0.3em] text-amber-300 font-semibold mb-4'>New — Partner Program Now Open</p><h2 class='text-4xl md:text-5xl font-bold text-white mb-6 leading-tight'>Share NextBlock.<br/>Earn 50% on Every Sale.</h2><p class='text-lg text-slate-300 max-w-2xl leading-relaxed mb-4'>Our partner program is open. Founding Ambassadors earn 50% of every sale they refer, on all three premium modules: Commerce Pro, Cortex AI, and the new Affiliates & Creator Storefronts. Founding spots are capped at 50.</p><p class='text-base text-slate-400 max-w-2xl leading-relaxed'>Want the same program for your own store? NextBlock™ Affiliates & Creator Storefronts adds partner sign-up, approved storefronts, commission tiers, and automatic Stripe payouts to Commerce Pro. Try it free for 30 days, no credit card.</p></div>"},"block_type":"text"},{"content":{"url":"https://nextblock.dev/partners","size":"lg","text":"Become a Partner →","variant":"default","position":"left"},"block_type":"button"},{"content":{"url":"https://nextblock.dev/product/nextblock-affiliates-creator-storefronts-affiliates-license","size":"lg","text":"Get the Affiliates Module","variant":"outline","position":"left"},"block_type":"button"}],[{"content":{"html_content":"<div class='grid grid-cols-1 gap-4 sm:grid-cols-3 lg:grid-cols-1'><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>50%</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Founding commission</p></div><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>3</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Premium modules to sell</p></div><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>30</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Day referral window</p></div></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$en$),
+        ('fr', 'accueil', '%Maintenant disponible — Cortex AI%', '%Cortex AI est la mise%',
+         $fr\${"padding":{"top":"xl","bottom":"xl"},"background":{"type":"gradient","gradient":{"type":"linear","stops":[{"color":"#0c1a3d","position":0},{"color":"#172554","position":50},{"color":"#0f172a","position":100}],"direction":"135deg"}},"column_gap":"xl","column_blocks":[[{"content":{"html_content":"<div class='nb-partner-program'><p class='text-xs uppercase tracking-[0.3em] text-amber-300 font-semibold mb-4'>Nouveau — le programme de partenaires est ouvert</p><h2 class='text-4xl md:text-5xl font-bold text-white mb-6 leading-tight'>Recommandez NextBlock.<br/>Gagnez 50 % sur chaque vente.</h2><p class='text-lg text-slate-300 max-w-2xl leading-relaxed mb-4'>Notre programme de partenaires est ouvert. Les ambassadeurs fondateurs touchent 50 % de chaque vente qu'ils recommandent, sur les trois modules premium : Commerce Pro, Cortex AI et le nouveau module Affiliates & Creator Storefronts. Les places fondatrices sont limitées à 50.</p><p class='text-base text-slate-400 max-w-2xl leading-relaxed'>Vous voulez le même programme pour votre boutique? NextBlock™ Affiliates & Creator Storefronts ajoute à Commerce Pro l'inscription des partenaires, des vitrines approuvées, des niveaux de commission et des versements Stripe automatiques. Essayez-le gratuitement pendant 30 jours, sans carte de crédit.</p></div>"},"block_type":"text"},{"content":{"url":"https://nextblock.dev/partenaires","size":"lg","text":"Devenir partenaire →","variant":"default","position":"left"},"block_type":"button"},{"content":{"url":"https://nextblock.dev/product/nextblock-affiliates-creator-storefronts-affiliates-license-fr","size":"lg","text":"Obtenir le module Affiliates","variant":"outline","position":"left"},"block_type":"button"}],[{"content":{"html_content":"<div class='grid grid-cols-1 gap-4 sm:grid-cols-3 lg:grid-cols-1'><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>50 %</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Commission fondatrice</p></div><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>3</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Modules premium à vendre</p></div><div class='rounded-2xl border border-amber-400/30 bg-white/5 p-6 text-center'><p class='text-3xl font-extrabold text-white'>30</p><p class='text-xs uppercase tracking-wider text-amber-100 mt-1'>Jours de fenêtre de recommandation</p></div></div>"},"block_type":"text"}]],"container_type":"container","responsive_columns":{"mobile":1,"tablet":1,"desktop":2},"vertical_alignment":"center"}$fr$)
+      ) AS t (code, slug, anchor, anchor_fallback, body)
+  LOOP
+    SELECT p.id, p.language_id
+      INTO v_page, v_lang
+      FROM public.pages AS p
+      JOIN public.languages AS l ON l.id = p.language_id
+     WHERE p.slug = r.slug
+       AND l.code = r.code
+     ORDER BY p.id
+     LIMIT 1;
+    CONTINUE WHEN v_page IS NULL;
+
+    -- Already promoted: a re-run, or the section is there and an operator kept or edited it.
+    CONTINUE WHEN EXISTS (
+      SELECT 1 FROM public.blocks
+       WHERE page_id = v_page
+         AND content::text LIKE '%nb-partner-program%'
+    );
+
+    SELECT MAX(b."order") INTO v_anchor
+      FROM public.blocks AS b
+     WHERE b.page_id = v_page
+       AND b.block_type = 'section'
+       AND b.content::text LIKE r.anchor;
+    IF v_anchor IS NULL THEN
+      SELECT MAX(b."order") INTO v_anchor
+        FROM public.blocks AS b
+       WHERE b.page_id = v_page
+         AND b.block_type = 'section'
+         AND b.content::text LIKE r.anchor_fallback;
+    END IF;
+    -- No seeded Cortex AI section: a customized home page, left exactly as the operator built it.
+    CONTINUE WHEN v_anchor IS NULL;
+
+    UPDATE public.blocks
+       SET "order" = "order" + 1,
+           updated_at = now()
+     WHERE page_id = v_page
+       AND "order" > v_anchor;
+
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order")
+    VALUES (v_page, v_lang, 'section', replace(r.body, chr(13), '')::jsonb, v_anchor + 1);
+  END LOOP;
+END
+$partner_home$;
+
+
+-- >>> FROM: 02035_affiliate_tier_rate_at_payment.sql <<<
+-- 02035: a partner's tier can change at any time, and the new rate applies only to orders paid
+-- from the moment of the change (Affiliates & Creator Storefronts, docs/15 → "The amount").
+--
+-- Before this file private.affiliate_record_commission() (02030) read the partner's CURRENT tier
+-- when it recorded a commission. The paid trigger records at payment, but
+-- reconcile_affiliate_commissions() credits an order paid while the partner was paused (or whose
+-- trigger failed) later, at the next payout run, with the tier in effect THEN: an order paid
+-- before a tier move could earn the new rate and the other way round, a rate edit on the Tiers
+-- screen leaked into orders paid before it, and the refund hold counted from the recording, not
+-- the payment. Now:
+--
+-- 1. orders.affiliate_commission_rate / orders.affiliate_clearance_hold_days (nullable). A BEFORE
+--    INSERT OR UPDATE OF paid_at trigger (private.affiliate_snapshot_order_rate) copies the
+--    partner's tier rate and hold onto an attributed order the moment it is paid: paid_at goes
+--    NULL -> set on an UPDATE (every "mark paid" path ends in assign_order_invoice_metadata()), or
+--    an order is inserted already paid. The partner's status is not checked (a paused partner's
+--    order keeps the rate of its payment for reconcile), a value the statement already wrote is
+--    kept, and the body swallows every error (an order write never fails because of it).
+--    BEFORE triggers always run before the AFTER trigger that records the commission.
+-- 2. private.affiliate_record_commission() records coalesce(the order's rate, the current tier's
+--    rate) and clears at the payment time plus coalesce(the order's hold, the tier's hold). A
+--    recording whose hold has already passed (a late reconcile) clears at the next promote, unless
+--    an open dispute holds it (5): the hold protects against refunds, and refunds keep being
+--    applied after it (apply_affiliate_refund flags and alerts what was paid or is in flight).
+--    Every other rule is unchanged.
+-- 3. affiliate_profiles.tier_changed_at: stamped by private.affiliate_profile_guard() whenever
+--    tier_id changes (every writer), and one more column a partner session may not change.
+-- 4. public.change_affiliate_partner_tier(affiliate, tier, allow_over_cap): the CMS move, service
+--    role only. It locks the profile, then both tier rows, re-checks under the locks and answers
+--    'not_found' | 'unchanged' | 'tier_not_found' | 'tier_inactive' | 'tier_full' | 'moved'. It
+--    never checks the partner's status (paused partners can be moved). A capped tier that is full
+--    takes the partner only with p_allow_over_cap: the cap limits public sign-ups and the spots
+--    the public pages count, not the operator.
+-- 5. orders.affiliate_disputed_at: a payment dispute that opens before the order has a commission
+--    (the partner was paused at payment, or the paid trigger failed). set_affiliate_commission_dispute()
+--    answered 'none' for it and kept nothing; with the hold counted from the payment (2), reconcile
+--    could then record that commission already past its hold, and one payout run (reconcile,
+--    promote, claim) would transfer it on a disputed sale. Now such a dispute is kept on the order
+--    (opened: set, closed without a loss: cleared; 'held' / 'released' as for a commission), and
+--    affiliate_record_commission() records the commission with disputed_at from it, so promote,
+--    claim and retry skip it until the dispute closes. A lost dispute is a full refund, whose
+--    tombstone (apply_affiliate_refund) stops the commission from being recorded at all.
+--
+-- Orders paid before this file ran carry no stored rate: those still waiting for a commission
+-- (a paused partner's, or one whose trigger failed) are recorded at the tier's rate in effect when
+-- reconcile reaches them, as before, but their hold now counts from paid_at as well (the tier's
+-- hold then), so one whose hold has passed clears at the next promote too. No backfill: the tier in
+-- effect at their payment was never recorded anywhere, and neither was a dispute opened before
+-- this file ran (it was answered 'none'). Commissions already recorded keep their rate, hold and
+-- clears_at.
+--
+-- Copy. The partner terms clause on rate changes now says "orders paid after the change" (EN +
+-- FR, AFFILIATE_TERMS_VERSION 2026-11-11), and the partner portal gains "Tier since {date}".
+-- Both ship here as translations rows in the forms the generator header of 02031 prescribes: a
+-- new key with ON CONFLICT (key) DO NOTHING, changed text guarded by the exact text 02031 seeded,
+-- so a string an operator edited stays theirs.
+--
+-- Grants. No table, view or sequence is created, and new columns are covered by the existing
+-- table grants: on orders an ADMIN on a satisfied second factor already writes every column, and
+-- authenticated holds only the four self-service UPDATE column grants on affiliate_profiles
+-- (table UPDATE revoked by 02030 and by the post-apply pass), so tier_changed_at is not writable
+-- over the Data API. The trigger function is a SECURITY DEFINER in \`private\` (search_path '',
+-- revoked from PUBLIC, anon, authenticated); the RPC is SECURITY INVOKER in public, revoked from
+-- the API roles here and in BOTH copies of API_ROLE_REVOKE_SQL (apps/nextblock/tools/lib/migrate-core.mjs,
+-- apps/nextblock/lib/setup/schema-apply.ts). set_affiliate_commission_dispute() keeps 02030's
+-- signature, security and grants (its revoke is restated here and has been in API_ROLE_REVOKE_SQL
+-- since 02030). tools/scripts/security-verify.sql section 39 checks all of it.
+--
+-- Append-only, forward-only, idempotent: ADD COLUMN IF NOT EXISTS, constraints added only when
+-- missing, CREATE OR REPLACE, DROP TRIGGER IF EXISTS before CREATE TRIGGER; it replays cleanly
+-- after 02000-02034 on an empty database and on one that holds data.
+
+-- 02001 turns body validation off for the session; a one-connection replay would otherwise
+-- create every function below unchecked.
+SET check_function_bodies = on;
+
+-- ---------------------------------------------------------------------------
+-- 1. Columns
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_commission_rate numeric(5,2) NULL;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_clearance_hold_days integer NULL;
+ALTER TABLE public.affiliate_profiles ADD COLUMN IF NOT EXISTS tier_changed_at timestamptz NULL;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS affiliate_disputed_at timestamptz NULL;
+
+DO $nb_02035_checks$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_commission_rate_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_commission_rate_check CHECK (
+        affiliate_commission_rate IS NULL OR (affiliate_commission_rate >= 0 AND affiliate_commission_rate <= 100));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'orders_affiliate_clearance_hold_days_check' AND conrelid = 'public.orders'::regclass) THEN
+    ALTER TABLE public.orders
+      ADD CONSTRAINT orders_affiliate_clearance_hold_days_check CHECK (
+        affiliate_clearance_hold_days IS NULL OR affiliate_clearance_hold_days BETWEEN 0 AND 365);
+  END IF;
+END
+$nb_02035_checks$;
+
+-- ---------------------------------------------------------------------------
+-- 2. The rate at payment: BEFORE INSERT OR UPDATE OF paid_at on orders
+-- ---------------------------------------------------------------------------
+-- Copies the partner's tier rate and clearance hold onto an attributed order when it becomes
+-- paid. Lock order of the ledger (02030): the order row (this write already holds it on an
+-- UPDATE; the AFTER trigger and apply_affiliate_refund() take it first too), then the partner
+-- profile, then a plain read of the tier, exactly as affiliate_record_commission() does. So a
+-- concurrent change_affiliate_partner_tier() either commits first (the order gets the new tier)
+-- or waits for this payment (the order keeps the old one). Never fails the order write.
+CREATE OR REPLACE FUNCTION private.affiliate_snapshot_order_rate()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_tier_id uuid;
+  v_rate numeric(5,2);
+  v_hold integer;
+BEGIN
+  IF NEW.affiliate_id IS NULL OR NEW.paid_at IS NULL THEN
+    RETURN NEW;
+  END IF;
+  -- the first payment only: a later "mark paid" rewrites paid_at with the same value
+  IF TG_OP = 'UPDATE' THEN
+    IF OLD.paid_at IS NOT NULL THEN
+      RETURN NEW;
+    END IF;
+  END IF;
+  -- a value the statement already wrote is kept
+  IF NEW.affiliate_commission_rate IS NOT NULL AND NEW.affiliate_clearance_hold_days IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+
+  BEGIN
+    SELECT p.tier_id INTO v_tier_id
+      FROM public.affiliate_profiles p
+     WHERE p.id = NEW.affiliate_id
+     FOR UPDATE;
+    IF FOUND THEN
+      SELECT t.commission_percentage, t.clearance_hold_days INTO v_rate, v_hold
+        FROM public.affiliate_tiers t
+       WHERE t.id = v_tier_id;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    v_rate := NULL;
+    v_hold := NULL;
+    RAISE WARNING 'affiliate rate snapshot failed for order %: %', NEW.id, SQLERRM;
+  END;
+
+  IF v_rate IS NOT NULL THEN
+    NEW.affiliate_commission_rate := coalesce(NEW.affiliate_commission_rate, v_rate);
+  END IF;
+  IF v_hold IS NOT NULL THEN
+    NEW.affiliate_clearance_hold_days := coalesce(NEW.affiliate_clearance_hold_days, v_hold);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+-- Trigger functions are never called by API roles (02013, 02021, 02030).
+REVOKE ALL ON FUNCTION private.affiliate_snapshot_order_rate() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_snapshot_order_rate() TO service_role;
+
+DROP TRIGGER IF EXISTS affiliate_snapshot_order_rate ON public.orders;
+CREATE TRIGGER affiliate_snapshot_order_rate
+  BEFORE INSERT OR UPDATE OF paid_at ON public.orders
+  FOR EACH ROW
+  WHEN (NEW.affiliate_id IS NOT NULL AND NEW.paid_at IS NOT NULL)
+  EXECUTE FUNCTION private.affiliate_snapshot_order_rate();
+
+-- ---------------------------------------------------------------------------
+-- 3. private.affiliate_record_commission: the stored rate and the hold from the payment
+-- ---------------------------------------------------------------------------
+-- 02030's definition with four changes: the order's affiliate_commission_rate,
+-- affiliate_clearance_hold_days and affiliate_disputed_at are read with it, the commission and
+-- commission_rate_snapshot use coalesce(the stored rate, the current tier's rate) (an order paid
+-- before 02035 has none), clears_at is the payment time plus coalesce(the stored hold, the tier's
+-- hold), so a late recording whose hold already passed clears at the next promote, and a dispute
+-- the order kept from before the commission existed (section 3b) is recorded as its disputed_at,
+-- so that late recording is held instead (promote, claim and retry skip it until the dispute
+-- closes). Signature, SECURITY DEFINER, search_path and grants are 02030's.
+--
+-- Records the commission of a paid, attributed order (idempotent: one row per order and
+-- gateway, ON CONFLICT DO NOTHING) and returns its id, or NULL when nothing was recorded: the
+-- order is not paid/shipped or not attributed, the partner is not ACTIVE or not approved yet
+-- (first_published_at, A12), the buyer is the partner (same account, or the same normalised
+-- e-mail, A13), or the commission rounds to 0. Amounts are in the base currency (A14). The row
+-- carries the sale's key mode (orders.affiliate_livemode; true when unknown, C), and a partial
+-- refund that arrived before it (kept on the order by apply_affiliate_refund, Y) is taken off
+-- from the start with the same share rule: total_earned_cents grows by the rest only, and a
+-- refund that takes the whole commission records it VOIDED_REFUND ('refunded').
+CREATE OR REPLACE FUNCTION private.affiliate_record_commission(p_order_id uuid)
+    RETURNS uuid
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_order record;
+  v_profile record;
+  v_tier record;
+  v_buyer_email text;
+  v_partner_email text;
+  v_order_currency text;
+  v_base_currency text;
+  v_net_minor bigint;
+  v_net_base bigint;
+  v_rate numeric(20,10);
+  v_commission_pct numeric(5,2);
+  v_hold_days integer;
+  v_commission bigint;
+  v_refunded bigint;
+  v_voided boolean;
+  v_id uuid;
+BEGIN
+  SELECT o.id, o.user_id, o.status, o.total, o.subtotal, o.discount_total, o.shipping_total, o.currency,
+         o.exchange_rate_at_purchase, o.provider, o.paid_at, o.affiliate_id,
+         o.affiliate_base_currency, o.affiliate_livemode, o.affiliate_refunded_minor,
+         o.affiliate_refund_total_minor, o.customer_details,
+         o.affiliate_commission_rate, o.affiliate_clearance_hold_days, o.affiliate_disputed_at
+    INTO v_order
+    FROM public.orders o
+   WHERE o.id = p_order_id;
+
+  IF NOT FOUND OR v_order.affiliate_id IS NULL OR v_order.paid_at IS NULL
+     OR v_order.status IS NULL OR v_order.status NOT IN ('paid', 'shipped') THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT p.id, p.user_id, p.tier_id, p.status::text AS status, p.first_published_at
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = v_order.affiliate_id
+   FOR UPDATE;
+
+  IF NOT FOUND OR v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_order.user_id IS NOT NULL AND v_order.user_id = v_profile.user_id THEN
+    RETURN NULL;
+  END IF;
+  v_buyer_email := private.affiliate_normalize_email(v_order.customer_details ->> 'email');
+  IF v_buyer_email IS NOT NULL THEN
+    SELECT private.affiliate_normalize_email(u.email::text) INTO v_partner_email
+      FROM auth.users u
+     WHERE u.id = v_profile.user_id;
+    IF v_partner_email IS NOT NULL AND v_partner_email = v_buyer_email THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+
+  SELECT t.commission_percentage, t.clearance_hold_days
+    INTO v_tier
+    FROM public.affiliate_tiers t
+   WHERE t.id = v_profile.tier_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  -- the rate and hold stored on the order when it was paid (02035); the current tier for an order
+  -- paid before that
+  v_commission_pct := coalesce(v_order.affiliate_commission_rate, v_tier.commission_percentage);
+  v_hold_days := coalesce(v_order.affiliate_clearance_hold_days, v_tier.clearance_hold_days);
+
+  v_order_currency := upper(btrim(coalesce(v_order.currency, 'USD')));
+  v_base_currency := coalesce(
+    nullif(upper(btrim(coalesce(v_order.affiliate_base_currency, ''))), ''),
+    (SELECT upper(c.code) FROM public.currencies c
+      WHERE c.is_default
+      ORDER BY c.updated_at DESC, c.created_at DESC, c.code
+      LIMIT 1),
+    v_order_currency
+  );
+
+  v_net_minor := GREATEST(coalesce(v_order.subtotal, v_order.total)::bigint - coalesce(v_order.discount_total, 0)::bigint, 0);
+  IF v_order_currency = v_base_currency THEN
+    v_net_base := v_net_minor;
+    v_rate := 1;
+  ELSE
+    v_rate := v_order.exchange_rate_at_purchase;
+    IF v_rate IS NULL OR v_rate <= 0 THEN
+      RETURN NULL;
+    END IF;
+    v_net_base := round(
+      (v_net_minor::numeric / private.affiliate_currency_factor(v_order_currency))
+      / v_rate
+      * private.affiliate_currency_factor(v_base_currency)
+    )::bigint;
+  END IF;
+
+  v_commission := round(v_net_base::numeric * v_commission_pct / 100)::bigint;
+  IF v_commission <= 0 THEN
+    RETURN NULL;
+  END IF;
+  v_refunded := private.affiliate_refund_share(v_commission, v_order.affiliate_refunded_minor,
+                                               v_order.affiliate_refund_total_minor, v_order.total, v_order.shipping_total);
+  v_voided := v_refunded >= v_commission;
+
+  INSERT INTO public.affiliate_commissions (
+    affiliate_id, order_id, gateway, order_currency, order_net_amount_minor, exchange_rate_snapshot,
+    net_order_amount_cents, commission_rate_snapshot, commission_amount_cents, refunded_amount_cents,
+    currency, livemode, status, clears_at, voided_at, void_reason, disputed_at
+  )
+  VALUES (
+    v_profile.id,
+    v_order.id,
+    CASE WHEN coalesce(v_order.provider, 'stripe') = 'freemius'
+      THEN 'FREEMIUS'::public.affiliate_gateway
+      ELSE 'STRIPE'::public.affiliate_gateway
+    END,
+    v_order_currency,
+    v_net_minor,
+    v_rate,
+    v_net_base,
+    v_commission_pct,
+    v_commission,
+    v_refunded,
+    v_base_currency,
+    coalesce(v_order.affiliate_livemode, true),
+    CASE WHEN v_voided
+      THEN 'VOIDED_REFUND'::public.affiliate_commission_status
+      ELSE 'PENDING_CLEARANCE'::public.affiliate_commission_status
+    END,
+    -- the hold counts from the payment, not the recording (02035)
+    coalesce(v_order.paid_at, now()) + make_interval(days => v_hold_days),
+    CASE WHEN v_voided THEN now() END,
+    CASE WHEN v_voided THEN 'refunded' END,
+    -- an open dispute the order kept from before its commission existed holds it from the start
+    -- (02035); a voided row holds nothing
+    CASE WHEN v_voided THEN NULL ELSE v_order.affiliate_disputed_at END
+  )
+  ON CONFLICT ON CONSTRAINT affiliate_commissions_order_gateway_key DO NOTHING
+  RETURNING id INTO v_id;
+
+  IF v_id IS NOT NULL AND NOT v_voided THEN
+    UPDATE public.affiliate_profiles SET total_earned_cents = total_earned_cents + (v_commission - v_refunded) WHERE id = v_profile.id;
+  END IF;
+  RETURN v_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_record_commission(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_record_commission(uuid) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3b. public.set_affiliate_commission_dispute: a dispute that opens before the commission
+-- ---------------------------------------------------------------------------
+-- 02030's definition with the order row locked first and one more branch: an attributed order
+-- with no commission yet keeps the dispute (orders.affiliate_disputed_at) instead of answering
+-- 'none' and forgetting it, and affiliate_record_commission() (section 3) records that commission
+-- held. Without it, a commission recorded late (reconcile after a pause) whose hold, counted from
+-- the payment, had passed would be promoted, claimed and transferred in one payout run on a
+-- disputed sale. Signature, SECURITY INVOKER, search_path, grants and the three answers are
+-- 02030's.
+--
+-- Payment disputes (finding L). Returns 'held' | 'released' | 'none'.
+--   p_open = true (Stripe charge.dispute.created, Freemius payment.dispute.created): the order's
+--     PENDING_CLEARANCE / CLEARED commission gets disputed_at ('held'; again 'held' on a
+--     redelivery), so promote, claim and retry skip it: it neither clears nor is transferred
+--     while the dispute is open. One already attached to a PROCESSING payout is held too: that
+--     transfer is not stopped (complete_affiliate_payout still marks it PAID), but if it fails
+--     the retry detaches the commission instead of re-sending it. A PAID or voided commission:
+--     'none'. An attributed order with no commission yet keeps the dispute itself
+--     (affiliate_disputed_at, first date kept; 'held'), and the commission recorded later starts
+--     with disputed_at. An unattributed or unknown order: 'none'.
+--   p_open = false (won, or closed without a loss): the hold is cleared whatever the status, the
+--     order's included ('released'; 'none' when nothing was held). A lost dispute is a full
+--     refund and goes through apply_affiliate_refund().
+-- Lock order: the order row first, as apply_affiliate_refund() takes it (the orders triggers hold
+-- it while they record or void, so a dispute racing the paid update waits for its commission),
+-- then A2: the profile, then the commission, re-read under the profile lock. reconcile records
+-- while it holds the profile lock and reads the order without locking it, so "no commission yet"
+-- is decided only once no recording can be in flight, and a recording that waited for this one
+-- reads the dispute it kept.
+CREATE OR REPLACE FUNCTION public.set_affiliate_commission_dispute(p_gateway public.affiliate_gateway, p_order_id uuid, p_open boolean)
+    RETURNS text
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_order record;
+  v_affiliate uuid;
+  v_commission record;
+  v_order_released boolean := false;
+BEGIN
+  IF p_gateway IS NULL OR p_order_id IS NULL OR p_open IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  SELECT o.id, o.affiliate_id, o.affiliate_disputed_at
+    INTO v_order
+    FROM public.orders o
+   WHERE o.id = p_order_id
+   FOR UPDATE;
+
+  SELECT c.affiliate_id INTO v_affiliate
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway;
+  IF v_affiliate IS NULL THEN
+    v_affiliate := v_order.affiliate_id;
+  END IF;
+  IF v_affiliate IS NULL THEN
+    RETURN 'none';
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  SELECT c.id, c.status::text AS status, c.disputed_at
+    INTO v_commission
+    FROM public.affiliate_commissions c
+   WHERE c.order_id = p_order_id AND c.gateway = p_gateway
+   FOR UPDATE;
+
+  IF NOT FOUND THEN
+    -- no commission yet (02035): the order keeps the dispute for the commission recorded later
+    IF v_order.id IS NULL OR v_order.affiliate_id IS DISTINCT FROM v_affiliate THEN
+      RETURN 'none';
+    END IF;
+    IF p_open THEN
+      IF v_order.affiliate_disputed_at IS NULL THEN
+        UPDATE public.orders o SET affiliate_disputed_at = now() WHERE o.id = p_order_id;
+      END IF;
+      RETURN 'held';
+    END IF;
+    IF v_order.affiliate_disputed_at IS NULL THEN
+      RETURN 'none';
+    END IF;
+    UPDATE public.orders o SET affiliate_disputed_at = NULL WHERE o.id = p_order_id;
+    RETURN 'released';
+  END IF;
+
+  IF NOT p_open THEN
+    -- a dispute the order kept from before its commission existed is lifted with it (02035)
+    IF v_order.affiliate_disputed_at IS NOT NULL THEN
+      UPDATE public.orders o SET affiliate_disputed_at = NULL WHERE o.id = p_order_id;
+      v_order_released := true;
+    END IF;
+    IF v_commission.disputed_at IS NULL THEN
+      IF v_order_released THEN
+        RETURN 'released';
+      END IF;
+      RETURN 'none';
+    END IF;
+    UPDATE public.affiliate_commissions c SET disputed_at = NULL WHERE c.id = v_commission.id;
+    RETURN 'released';
+  END IF;
+
+  IF v_commission.status NOT IN ('PENDING_CLEARANCE', 'CLEARED') THEN
+    RETURN 'none';
+  END IF;
+  IF v_commission.disputed_at IS NULL THEN
+    UPDATE public.affiliate_commissions c SET disputed_at = now() WHERE c.id = v_commission.id;
+  END IF;
+  RETURN 'held';
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. private.affiliate_profile_guard: tier_changed_at
+-- ---------------------------------------------------------------------------
+-- 02030's definition with two changes: tier_changed_at joins the columns a non-admin session may
+-- not change, and every writer that changes tier_id gets tier_changed_at = now() (whatever the
+-- statement wrote there). An INSERT leaves it NULL: a partner is in the sign-up tier since
+-- created_at.
+--
+-- A request that carries a user session (auth.uid() is set) and is not an ADMIN on a satisfied
+-- second factor may not change any column the partner does not own. It keys off the session,
+-- not the SQL role (02021's protect_profile_role reasoning): service_role and postgres carry no
+-- session. total_clicks / last_click_at are not on the list (record_affiliate_click() bumps
+-- them from any session; the column grants already pin them, A15). The same session may not
+-- change display_name, bio or social_links while the partner's page is PENDING_REVIEW either
+-- (finding A): approval snapshots them, and the portal withdraws the submission first. The review
+-- lock is session-scoped on purpose: server writes (portal actions, the upload route, the
+-- sandbox demo) carry no session and are held by the app, whose Approve pins the profile the
+-- reviewer saw. Then, for every writer: a tier move stamps tier_changed_at, the handle is
+-- lower-cased and onboarding_step is recomputed from the lifecycle timestamps.
+CREATE OR REPLACE FUNCTION private.affiliate_profile_guard()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.user_id IS DISTINCT FROM OLD.user_id
+          OR NEW.tier_id IS DISTINCT FROM OLD.tier_id
+          OR NEW.tier_changed_at IS DISTINCT FROM OLD.tier_changed_at
+          OR NEW.handle IS DISTINCT FROM OLD.handle
+          OR NEW.status IS DISTINCT FROM OLD.status
+          OR NEW.suspended_reason IS DISTINCT FROM OLD.suspended_reason
+          OR NEW.avatar_object_key IS DISTINCT FROM OLD.avatar_object_key
+          OR NEW.onboarding_step IS DISTINCT FROM OLD.onboarding_step
+          OR NEW.stripe_connect_account_id IS DISTINCT FROM OLD.stripe_connect_account_id
+          OR NEW.stripe_connect_livemode IS DISTINCT FROM OLD.stripe_connect_livemode
+          OR NEW.stripe_connect_onboarding_complete IS DISTINCT FROM OLD.stripe_connect_onboarding_complete
+          OR NEW.stripe_connect_details_submitted IS DISTINCT FROM OLD.stripe_connect_details_submitted
+          OR NEW.stripe_connect_payouts_enabled IS DISTINCT FROM OLD.stripe_connect_payouts_enabled
+          OR NEW.stripe_connect_checked_at IS DISTINCT FROM OLD.stripe_connect_checked_at
+          OR NEW.total_earned_cents IS DISTINCT FROM OLD.total_earned_cents
+          OR NEW.total_paid_cents IS DISTINCT FROM OLD.total_paid_cents
+          OR NEW.profile_completed_at IS DISTINCT FROM OLD.profile_completed_at
+          OR NEW.payout_configured_at IS DISTINCT FROM OLD.payout_configured_at
+          OR NEW.page_submitted_at IS DISTINCT FROM OLD.page_submitted_at
+          OR NEW.first_published_at IS DISTINCT FROM OLD.first_published_at
+          OR NEW.signup_ip_masked IS DISTINCT FROM OLD.signup_ip_masked
+          OR NEW.created_at IS DISTINCT FROM OLD.created_at)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_field_protected'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Only an administrator or the server can change this partner field.';
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.display_name IS DISTINCT FROM OLD.display_name
+          OR NEW.bio IS DISTINCT FROM OLD.bio
+          OR NEW.social_links IS DISTINCT FROM OLD.social_links)
+     AND EXISTS (
+       SELECT 1 FROM public.affiliate_pages pg
+        WHERE pg.affiliate_id = OLD.id
+          AND pg.approval_status = 'PENDING_REVIEW'::public.affiliate_page_status)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_pending_review'
+      USING ERRCODE = '55000',
+            HINT = 'Withdraw the submission before editing the public profile.';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND NEW.tier_id IS DISTINCT FROM OLD.tier_id THEN
+    NEW.tier_changed_at := now();
+  END IF;
+
+  NEW.handle := lower(NEW.handle);
+  NEW.onboarding_step := CASE
+    WHEN NEW.first_published_at IS NOT NULL THEN 'ACTIVE_PUBLISHED'::public.affiliate_onboarding_step
+    WHEN NEW.page_submitted_at IS NOT NULL THEN 'PAGE_SUBMITTED'::public.affiliate_onboarding_step
+    WHEN NEW.payout_configured_at IS NOT NULL THEN 'PAYOUT_CONFIGURED'::public.affiliate_onboarding_step
+    WHEN NEW.profile_completed_at IS NOT NULL THEN 'PROFILE_COMPLETED'::public.affiliate_onboarding_step
+    ELSE 'SIGNED_UP'::public.affiliate_onboarding_step
+  END;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_profile_guard() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_profile_guard() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. public.change_affiliate_partner_tier (service role only)
+-- ---------------------------------------------------------------------------
+-- The CMS "Change tier" move (lib/affiliates/review.ts, after requireCmsAdmin()). Lock order: the
+-- partner profile, then both tier rows in the order create_affiliate_account() locks tiers
+-- (default sign-up tiers first, highest sort_order first among them, then the others by
+-- sort_order, then created_at and id), so a move never deadlocks with a concurrent sign-up or
+-- another move; the member_count trigger then updates rows already held. Everything is checked
+-- under those locks, so two moves into the last spot of a capped tier cannot both pass.
+-- Returns:
+--   'not_found'      no such partner
+--   'unchanged'      the partner is already in that tier (nothing written)
+--   'tier_not_found' no such tier
+--   'tier_inactive'  the tier is inactive
+--   'tier_full'      the tier is capped, member_count >= the cap, and p_allow_over_cap is false
+--   'moved'          tier_id written: the member_count trigger moves the counts and the profile
+--                    guard stamps tier_changed_at; orders paid from now on store the new rate
+-- The partner's status is never checked: a paused partner can be moved.
+CREATE OR REPLACE FUNCTION public.change_affiliate_partner_tier(p_affiliate_id uuid, p_tier_id uuid, p_allow_over_cap boolean DEFAULT false)
+    RETURNS text
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_profile record;
+  v_target record;
+BEGIN
+  IF p_affiliate_id IS NULL THEN
+    RETURN 'not_found';
+  END IF;
+
+  SELECT p.id, p.tier_id INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = p_affiliate_id
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN 'not_found';
+  END IF;
+
+  IF p_tier_id IS NULL THEN
+    RETURN 'tier_not_found';
+  END IF;
+  IF v_profile.tier_id = p_tier_id THEN
+    RETURN 'unchanged';
+  END IF;
+
+  PERFORM 1
+     FROM public.affiliate_tiers t
+    WHERE t.id IN (v_profile.tier_id, p_tier_id)
+    ORDER BY t.is_default_signup_tier DESC,
+             CASE WHEN t.is_default_signup_tier THEN -t.sort_order ELSE t.sort_order END,
+             t.created_at,
+             t.id
+      FOR UPDATE;
+
+  SELECT t.id, t.is_active, t.max_ambassadors_cap, t.member_count INTO v_target
+    FROM public.affiliate_tiers t
+   WHERE t.id = p_tier_id;
+  IF NOT FOUND THEN
+    RETURN 'tier_not_found';
+  END IF;
+  IF NOT v_target.is_active THEN
+    RETURN 'tier_inactive';
+  END IF;
+  IF v_target.max_ambassadors_cap IS NOT NULL
+     AND v_target.member_count >= v_target.max_ambassadors_cap
+     AND NOT coalesce(p_allow_over_cap, false) THEN
+    RETURN 'tier_full';
+  END IF;
+
+  UPDATE public.affiliate_profiles p
+     SET tier_id = p_tier_id
+   WHERE p.id = v_profile.id;
+  RETURN 'moved';
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.change_affiliate_partner_tier(uuid, uuid, boolean) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.change_affiliate_partner_tier(uuid, uuid, boolean) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 6. Comments (02030's that this file makes wrong, and the new objects)
+-- ---------------------------------------------------------------------------
+COMMENT ON COLUMN public.orders.affiliate_commission_rate IS 'The partner''s tier rate when the order was paid (private.affiliate_snapshot_order_rate, 02035); the commission is recorded at this rate whenever it is recorded. NULL for an unattributed order or one paid before 02035 (recorded at the tier in effect then).';
+COMMENT ON COLUMN public.orders.affiliate_clearance_hold_days IS 'The partner''s tier clearance hold when the order was paid (02035): the commission clears this many days after paid_at. NULL as for affiliate_commission_rate.';
+COMMENT ON COLUMN public.affiliate_profiles.tier_changed_at IS 'When tier_id last changed (stamped by affiliate_profile_guard for every writer); NULL = in the sign-up tier since created_at. A partner session cannot write it.';
+COMMENT ON COLUMN public.affiliate_tiers.commission_percentage IS 'Share of the net order amount (subtotal minus discount, no tax or shipping). Copied onto an attributed order when it is paid (orders.affiliate_commission_rate), so a rate edit or a tier move applies only to orders paid afterwards.';
+COMMENT ON COLUMN public.affiliate_tiers.clearance_hold_days IS 'Refund-protection hold, copied onto an attributed order when it is paid (orders.affiliate_clearance_hold_days): its commission clears this many days after the payment.';
+COMMENT ON COLUMN public.affiliate_commissions.commission_rate_snapshot IS 'Rate the commission was recorded at: the rate stored on the order at payment (orders.affiliate_commission_rate), else the partner''s tier rate at recording for an order paid before 02035.';
+COMMENT ON COLUMN public.affiliate_commissions.clears_at IS 'End of the refund-protection hold: the order''s paid_at plus the hold stored on the order at payment (else the tier''s); a commission recorded after that clears at the next promote, unless an open dispute holds it (disputed_at).';
+COMMENT ON COLUMN public.orders.affiliate_disputed_at IS 'Open payment dispute on an attributed order that had no commission yet (set_affiliate_commission_dispute, 02035); cleared when it closes without a loss. affiliate_record_commission records the commission with this as disputed_at, so it is held until the dispute closes.';
+COMMENT ON COLUMN public.affiliate_commissions.disputed_at IS 'Open payment dispute (set_affiliate_commission_dispute): while set, the commission is not promoted, claimed or re-sent by a retry. A dispute that opened before the commission was recorded is copied from orders.affiliate_disputed_at (02035).';
+COMMENT ON FUNCTION public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) IS 'Service role: holds (open) or releases (closed without a loss) the commission of a disputed order, or keeps the dispute on an attributed order that has no commission yet (orders.affiliate_disputed_at, 02035); returns held, released or none.';
+COMMENT ON FUNCTION public.change_affiliate_partner_tier(uuid, uuid, boolean) IS 'Service role: moves a partner to another tier under row locks; returns not_found, unchanged, tier_not_found, tier_inactive, tier_full (a full capped tier without p_allow_over_cap) or moved. Never checks the partner''s status.';
+
+-- ---------------------------------------------------------------------------
+-- 7. UI copy (the forms the 02031 generator header prescribes)
+-- ---------------------------------------------------------------------------
+-- New key: the partner portal overview's "Tier since {date}".
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.portal.overview_tier_since', jsonb_build_object('en', 'Tier since {date}', 'fr', 'À ce niveau depuis le {date}'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- Changed text: the partner terms clause on rate changes, each language guarded by the text 02031
+-- seeded, so a clause an operator edited (CMS > Settings > Extra Translations) stays theirs.
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{en}', to_jsonb(fix.new_en)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.terms.earning_rate_changes',
+     'A rate change applies only to commissions recorded after the change.',
+     'A rate change applies only to orders paid after the change.')
+  ) AS fix(key, old_en, new_en)
+ WHERE t.key = fix.key AND t.translations->>'en' = fix.old_en;
+
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{fr}', to_jsonb(fix.new_fr)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.terms.earning_rate_changes',
+     'Un changement de taux s''applique seulement aux commissions inscrites après ce changement.',
+     'Un changement de taux s''applique seulement aux commandes payées après ce changement.')
+  ) AS fix(key, old_fr, new_fr)
+ WHERE t.key = fix.key AND t.translations->>'fr' = fix.old_fr;
+
+
+-- >>> FROM: 02036_affiliate_manual_payouts.sql <<<
+-- 02036: commissions paid outside Stripe (Affiliates & Creator Storefronts, docs/15 → "Paying
+-- partners manually").
+--
+-- Partners are paid by Stripe Connect transfers from the platform's Stripe balance. Freemius pays
+-- the operator (monthly, by PayPal), never the partners, and that money never reaches the Stripe
+-- balance (and Canada has no Stripe top-ups), so a store that sells digital products through
+-- Freemius cannot fund those commissions in Stripe. A partner's Stripe Express account cannot receive
+-- money from PayPal either. So the program now routes each gateway's commissions either to Stripe
+-- Connect (as before) or to "manual" (affiliates_settings.payoutMethods, read by the app): the daily
+-- run leaves manual-routed commissions out of every transfer, and the operator sends that money from
+-- PayPal, Interac e-Transfer, Wise or a bank and records it in the CMS. This file:
+--
+-- 1. affiliate_payouts gains the payout's method: 'stripe_connect' (default, every existing row) or
+--    'manual'. A Stripe payout still needs its destination account; a manual one carries no Stripe
+--    field at all (stripe_destination_account becomes nullable; no destination and no transfer id,
+--    so complete_affiliate_payout() and prepare_affiliate_payout_retry(), which write them, can never
+--    touch a manual payout). A manual payout is claimed BEFORE the money is sent, like a Stripe one:
+--    PROCESSING while it is prepared (its commissions reserved for it), COMPLETED once the admin
+--    records it, never FAILED (a cancelled one is deleted and its commissions handed back). A
+--    recorded one names its channel (paypal, interac, wise, bank_transfer, other) and carries the
+--    admin's reference (the PayPal transaction ID, e-Transfer or bank reference; unique per partner,
+--    case ignored), an optional note the partner reads, and the admin who recorded it (recorded_by).
+--    One prepared payout per partner and currency at a time.
+-- 2. affiliate_profiles.payout_email: where the partner wants manual payouts sent (PayPal or
+--    Interac e-Transfer). The portal writes it for the partner with the service role after
+--    requireRetailer(), like every other portal write, so it gets no Data API grant: authenticated
+--    keeps exactly its four self-service UPDATE columns (02030, re-pinned by the post-apply pass),
+--    and private.affiliate_profile_guard() (02035's definition plus this column) refuses it from a
+--    partner session even with table rights. anon reads no partner table at all. Its CHECK also
+--    refuses a leading =, +, - or @: a spreadsheet would read such an address as a formula, and the
+--    PayPal payouts file would have to rewrite it (a different, still valid recipient).
+-- 3. public.claim_affiliate_payout gains p_gateways public.affiliate_gateway[] DEFAULT NULL: only
+--    commissions of those gateways are claimed (NULL = every gateway, the behaviour before this
+--    file). The 4-argument function is dropped (a call with four arguments resolves to this one; two
+--    overloads would make PostgREST refuse it with PGRST203), and the new one is 02030's body with
+--    that filter on each of its four commission statements. The app passes the gateways routed to
+--    Stripe; when none is, it never calls Stripe.
+-- 4. The manual payout lifecycle, three service-role RPCs in the claim's lock order (the profile, the
+--    commissions, the payout), each answering a status instead of raising for every expected case:
+--    - claim_manual_affiliate_payout(affiliate, currency, min amount, gateways), the CMS "Prepare":
+--      for an ACTIVE, approved partner, the CLEARED, unattached, undisputed, live-mode commissions of
+--      that currency and those gateways (refunded or cancelled orders voided first, as the claim
+--      does) are attached to a new PROCESSING manual payout of their sum. The admin sends exactly
+--      that amount afterwards, so nothing can change under the payment: a refund or a dispute that
+--      arrives meanwhile takes the in-flight path (flagged and alerted, never silently taken out),
+--      and a commission that clears later waits for the next payout. A test-mode commission is
+--      never paid with real money.
+--    - record_manual_affiliate_payout(payout, channel, reference, note, recorded_by), the CMS "Record
+--      payout": once the money left, that exact payout becomes COMPLETED with the reference, its
+--      commissions PAID and total_paid_cents up by its amount, as complete_affiliate_payout() does
+--      for a transfer (no eligibility or amount check: the money was sent).
+--    - cancel_manual_affiliate_payout(payout), the CMS "Cancel": a prepared payout given up before any
+--      money left; the refund work owed to its commissions is applied (A8), the rest are handed back
+--      to the cleared balance and the row is deleted.
+-- 5. private.affiliate_alert_refund_after_payout (02030's definition): a refund after a recorded
+--    MANUAL payout says "Recover the amount from the partner, for example by asking them to send it
+--    back" instead of the Stripe reversal advice; one whose manual payout is only prepared says to
+--    cancel and prepare it again if it was not sent yet. The metadata names the payout's method and
+--    status. The ledger still has no clawback: a refund after any payout is flagged and alerted,
+--    never taken back automatically (and nothing deducts it from a later payout).
+-- 6. The UI copy of the partner side (section 7): new portal and terms keys, and the terms, landing
+--    and onboarding lines that promised every payout would go through Stripe, each changed only
+--    where it still holds the text 02031 seeded.
+--
+-- Grants. No table, view or sequence is created; the new columns ride the existing table grants
+-- (02030: authenticated SELECT through the owner and ADMIN policies, so a partner reads its own
+-- payout rows, note included; no API write on payouts; the profile column grants as above). The
+-- four RPCs are SECURITY INVOKER in public, revoked from PUBLIC, anon and authenticated here and in
+-- BOTH copies of API_ROLE_REVOKE_SQL (apps/nextblock/tools/lib/migrate-core.mjs,
+-- apps/nextblock/lib/setup/schema-apply.ts). The two redefined private functions keep 02030's
+-- SECURITY DEFINER, search_path and grants (restated below). tools/scripts/security-verify.sql
+-- section 40 checks all of it, and section 35 pins the new claim signature.
+--
+-- Append-only, forward-only, idempotent: ADD COLUMN IF NOT EXISTS, constraints and the foreign key
+-- added only when missing, CREATE UNIQUE INDEX IF NOT EXISTS, DROP FUNCTION IF EXISTS before the new
+-- claim, CREATE OR REPLACE elsewhere; it replays cleanly after 02000-02035 on an empty database and
+-- on one that holds data (every existing payout is a Stripe transfer with a destination).
+
+-- 02001 turns body validation off for the session; a one-connection replay would otherwise
+-- create every function below unchecked.
+SET check_function_bodies = on;
+
+-- ---------------------------------------------------------------------------
+-- 1. affiliate_payouts: the method of a payout, and what a manual one records
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS method text NOT NULL DEFAULT 'stripe_connect';
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS manual_channel text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS external_reference text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS note text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS recorded_by uuid NULL;
+-- A manual payout has no Connect account; a Stripe payout still needs one (the CHECK below).
+ALTER TABLE public.affiliate_payouts ALTER COLUMN stripe_destination_account DROP NOT NULL;
+
+DO $nb_02036_payouts$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_method_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_method_check CHECK (method IN ('stripe_connect', 'manual'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_destination_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_destination_check CHECK (method <> 'stripe_connect' OR stripe_destination_account IS NOT NULL);
+  END IF;
+  -- a manual payout is prepared (PROCESSING, its commissions reserved) or recorded (COMPLETED); it
+  -- never fails (a cancelled one is deleted), so fail_affiliate_payout() and release_affiliate_payout()
+  -- never apply to it
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_manual_status_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_manual_status_check CHECK (
+        method = 'stripe_connect'
+        OR status IN ('PROCESSING'::public.affiliate_payout_status, 'COMPLETED'::public.affiliate_payout_status));
+  END IF;
+  -- a manual payout carries no Stripe field: complete_affiliate_payout() (transfer id) and
+  -- prepare_affiliate_payout_retry() (destination) can never complete or re-send one
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_manual_stripe_fields_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_manual_stripe_fields_check CHECK (
+        method <> 'manual' OR (stripe_destination_account IS NULL AND stripe_transfer_id IS NULL));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_manual_channel_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_manual_channel_check CHECK (
+        manual_channel IS NULL OR manual_channel IN ('paypal', 'interac', 'wise', 'bank_transfer', 'other'));
+  END IF;
+  -- a recorded manual payout names its channel and reference and when it was paid
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_manual_recorded_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_manual_recorded_check CHECK (
+        method <> 'manual' OR status <> 'COMPLETED'::public.affiliate_payout_status
+        OR (manual_channel IS NOT NULL AND external_reference IS NOT NULL AND paid_at IS NOT NULL));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_external_reference_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_external_reference_check CHECK (external_reference IS NULL OR char_length(external_reference) <= 120);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_note_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_note_check CHECK (note IS NULL OR char_length(note) <= 500);
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_recorded_by_fkey' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_recorded_by_fkey FOREIGN KEY (recorded_by) REFERENCES auth.users (id) ON DELETE SET NULL;
+  END IF;
+END
+$nb_02036_payouts$;
+
+-- One manual payout per reference and partner (a PayPal transaction recorded twice would pay the
+-- same commissions twice in the books); record_manual_affiliate_payout() answers
+-- 'duplicate_reference' first, the index is the backstop.
+CREATE UNIQUE INDEX IF NOT EXISTS affiliate_payouts_manual_reference_key
+  ON public.affiliate_payouts (affiliate_id, lower(external_reference))
+  WHERE method = 'manual' AND external_reference IS NOT NULL;
+
+-- One prepared (not yet recorded) manual payout per partner and currency: the PayPal file and the
+-- "Record payout" row each name exactly one. claim_manual_affiliate_payout() answers
+-- 'already_prepared' first, under the profile lock; the index is the backstop.
+CREATE UNIQUE INDEX IF NOT EXISTS affiliate_payouts_manual_prepared_key
+  ON public.affiliate_payouts (affiliate_id, currency)
+  WHERE method = 'manual' AND status = 'PROCESSING'::public.affiliate_payout_status;
+
+-- ---------------------------------------------------------------------------
+-- 2. affiliate_profiles.payout_email (server-written; no Data API grant)
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.affiliate_profiles ADD COLUMN IF NOT EXISTS payout_email text NULL;
+
+DO $nb_02036_profiles$
+BEGIN
+  -- a simple shape: one @, no whitespace, at most 254 characters (the app validates more strictly),
+  -- and no leading =, +, - or @: a spreadsheet reads such a cell as a formula, and neutralizing it in
+  -- the PayPal payouts file would change the recipient
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_profiles_payout_email_check' AND conrelid = 'public.affiliate_profiles'::regclass) THEN
+    ALTER TABLE public.affiliate_profiles
+      ADD CONSTRAINT affiliate_profiles_payout_email_check CHECK (
+        payout_email IS NULL OR (char_length(payout_email) <= 254 AND payout_email ~ '^[^@[:space:]]+@[^@[:space:]]+$'
+                                 AND payout_email !~ '^[=+@-]'));
+  END IF;
+END
+$nb_02036_profiles$;
+
+-- 02035's definition with one change: payout_email joins the columns a non-admin session may not
+-- change (the portal writes it with the service role, which carries no session). Signature,
+-- SECURITY DEFINER, search_path, grants and the trigger are 02030's.
+--
+-- A request that carries a user session (auth.uid() is set) and is not an ADMIN on a satisfied
+-- second factor may not change any column the partner does not own. It keys off the session,
+-- not the SQL role (02021's protect_profile_role reasoning): service_role and postgres carry no
+-- session. total_clicks / last_click_at are not on the list (record_affiliate_click() bumps
+-- them from any session; the column grants already pin them, A15). The same session may not
+-- change display_name, bio or social_links while the partner's page is PENDING_REVIEW either
+-- (finding A): approval snapshots them, and the portal withdraws the submission first. The review
+-- lock is session-scoped on purpose: server writes (portal actions, the upload route, the
+-- sandbox demo) carry no session and are held by the app, whose Approve pins the profile the
+-- reviewer saw. Then, for every writer: a tier move stamps tier_changed_at, the handle is
+-- lower-cased and onboarding_step is recomputed from the lifecycle timestamps.
+CREATE OR REPLACE FUNCTION private.affiliate_profile_guard()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.user_id IS DISTINCT FROM OLD.user_id
+          OR NEW.tier_id IS DISTINCT FROM OLD.tier_id
+          OR NEW.tier_changed_at IS DISTINCT FROM OLD.tier_changed_at
+          OR NEW.handle IS DISTINCT FROM OLD.handle
+          OR NEW.status IS DISTINCT FROM OLD.status
+          OR NEW.suspended_reason IS DISTINCT FROM OLD.suspended_reason
+          OR NEW.avatar_object_key IS DISTINCT FROM OLD.avatar_object_key
+          OR NEW.onboarding_step IS DISTINCT FROM OLD.onboarding_step
+          OR NEW.stripe_connect_account_id IS DISTINCT FROM OLD.stripe_connect_account_id
+          OR NEW.stripe_connect_livemode IS DISTINCT FROM OLD.stripe_connect_livemode
+          OR NEW.stripe_connect_onboarding_complete IS DISTINCT FROM OLD.stripe_connect_onboarding_complete
+          OR NEW.stripe_connect_details_submitted IS DISTINCT FROM OLD.stripe_connect_details_submitted
+          OR NEW.stripe_connect_payouts_enabled IS DISTINCT FROM OLD.stripe_connect_payouts_enabled
+          OR NEW.stripe_connect_checked_at IS DISTINCT FROM OLD.stripe_connect_checked_at
+          OR NEW.total_earned_cents IS DISTINCT FROM OLD.total_earned_cents
+          OR NEW.total_paid_cents IS DISTINCT FROM OLD.total_paid_cents
+          OR NEW.profile_completed_at IS DISTINCT FROM OLD.profile_completed_at
+          OR NEW.payout_configured_at IS DISTINCT FROM OLD.payout_configured_at
+          OR NEW.page_submitted_at IS DISTINCT FROM OLD.page_submitted_at
+          OR NEW.first_published_at IS DISTINCT FROM OLD.first_published_at
+          OR NEW.signup_ip_masked IS DISTINCT FROM OLD.signup_ip_masked
+          OR NEW.payout_email IS DISTINCT FROM OLD.payout_email
+          OR NEW.created_at IS DISTINCT FROM OLD.created_at)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_field_protected'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Only an administrator or the server can change this partner field.';
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.display_name IS DISTINCT FROM OLD.display_name
+          OR NEW.bio IS DISTINCT FROM OLD.bio
+          OR NEW.social_links IS DISTINCT FROM OLD.social_links)
+     AND EXISTS (
+       SELECT 1 FROM public.affiliate_pages pg
+        WHERE pg.affiliate_id = OLD.id
+          AND pg.approval_status = 'PENDING_REVIEW'::public.affiliate_page_status)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_pending_review'
+      USING ERRCODE = '55000',
+            HINT = 'Withdraw the submission before editing the public profile.';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND NEW.tier_id IS DISTINCT FROM OLD.tier_id THEN
+    NEW.tier_changed_at := now();
+  END IF;
+
+  NEW.handle := lower(NEW.handle);
+  NEW.onboarding_step := CASE
+    WHEN NEW.first_published_at IS NOT NULL THEN 'ACTIVE_PUBLISHED'::public.affiliate_onboarding_step
+    WHEN NEW.page_submitted_at IS NOT NULL THEN 'PAGE_SUBMITTED'::public.affiliate_onboarding_step
+    WHEN NEW.payout_configured_at IS NOT NULL THEN 'PAYOUT_CONFIGURED'::public.affiliate_onboarding_step
+    WHEN NEW.profile_completed_at IS NOT NULL THEN 'PROFILE_COMPLETED'::public.affiliate_onboarding_step
+    ELSE 'SIGNED_UP'::public.affiliate_onboarding_step
+  END;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_profile_guard() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_profile_guard() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. public.claim_affiliate_payout: only the gateways routed to Stripe
+-- ---------------------------------------------------------------------------
+-- 02030's definition with one change: p_gateways (NULL = every gateway) filters the commissions on
+-- each of the four statements that select them (the lock, the void loop, the sum and the attaching
+-- UPDATE). The old signature is dropped first: with both, a four-argument call would match two
+-- functions. Security, search_path, owner semantics and grants are 02030's.
+--
+-- Claims a payout for one partner and currency: the partner must be ACTIVE, approved and
+-- onboarded to Stripe Connect with an account of a known key mode; CLEARED, unattached
+-- commissions in p_currency of that mode (finding C: a test-mode sale is only ever paid by a
+-- test-mode transfer, a live one by a live transfer) that no open dispute holds (finding L), of the
+-- gateways in p_gateways (02036: those the program pays through Stripe), are locked, those whose
+-- order is now refunded or cancelled are voided (A11), and the rest are attached to a new PROCESSING
+-- payout of sum(commission - refunded) with a snapshot of the destination account and its mode.
+-- Returns no row when nothing is claimable or the sum is below p_min_amount.
+DROP FUNCTION IF EXISTS public.claim_affiliate_payout(uuid, text, bigint, text);
+CREATE OR REPLACE FUNCTION public.claim_affiliate_payout(
+    p_affiliate_id uuid, p_currency text, p_min_amount bigint, p_trigger text, p_gateways public.affiliate_gateway[] DEFAULT NULL)
+    RETURNS SETOF public.affiliate_payouts
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_currency text := upper(btrim(coalesce(p_currency, '')));
+  v_profile record;
+  v_order record;
+  v_amount bigint;
+  v_payout public.affiliate_payouts%ROWTYPE;
+BEGIN
+  IF v_currency !~ '^[A-Z]{3}$' THEN
+    RETURN;
+  END IF;
+
+  SELECT p.id, p.status::text AS status, p.first_published_at, p.stripe_connect_account_id,
+         p.stripe_connect_onboarding_complete, p.stripe_connect_livemode
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = p_affiliate_id
+   FOR UPDATE;
+  IF NOT FOUND OR v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL
+     OR v_profile.stripe_connect_account_id IS NULL OR NOT v_profile.stripe_connect_onboarding_complete
+     OR v_profile.stripe_connect_livemode IS NULL THEN
+    RETURN;
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_commissions c
+    WHERE c.affiliate_id = p_affiliate_id
+      AND c.status = 'CLEARED'::public.affiliate_commission_status
+      AND c.payout_id IS NULL
+      AND c.currency = v_currency
+      AND c.livemode = v_profile.stripe_connect_livemode
+      AND c.disputed_at IS NULL
+      AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways))
+    FOR UPDATE;
+
+  FOR v_order IN
+    SELECT DISTINCT c.order_id, o.status
+      FROM public.affiliate_commissions c
+      JOIN public.orders o ON o.id = c.order_id
+     WHERE c.affiliate_id = p_affiliate_id
+       AND c.status = 'CLEARED'::public.affiliate_commission_status
+       AND c.payout_id IS NULL
+       AND c.currency = v_currency
+       AND c.livemode = v_profile.stripe_connect_livemode
+       AND c.disputed_at IS NULL
+       AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways))
+       AND o.status IN ('refunded', 'cancelled')
+  LOOP
+    PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+  END LOOP;
+
+  SELECT coalesce(sum(c.commission_amount_cents - c.refunded_amount_cents), 0)::bigint
+    INTO v_amount
+    FROM public.affiliate_commissions c
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = v_profile.stripe_connect_livemode
+     AND c.disputed_at IS NULL
+     AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways));
+  IF v_amount <= 0 OR v_amount < coalesce(p_min_amount, 0) THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO public.affiliate_payouts (affiliate_id, amount_cents, currency, stripe_destination_account, livemode, status, attempt_count, last_attempt_at, trigger)
+  VALUES (p_affiliate_id, v_amount, v_currency, v_profile.stripe_connect_account_id, v_profile.stripe_connect_livemode,
+          'PROCESSING'::public.affiliate_payout_status, 1, now(), coalesce(p_trigger, 'cron'))
+  RETURNING * INTO v_payout;
+
+  UPDATE public.affiliate_commissions c
+     SET payout_id = v_payout.id
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = v_profile.stripe_connect_livemode
+     AND c.disputed_at IS NULL
+     AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways));
+
+  RETURN NEXT v_payout;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[]) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. The manual payout lifecycle (service role only): claim, record, cancel
+-- ---------------------------------------------------------------------------
+-- The CMS "Pay manually" section (lib/affiliates/manual-payouts.ts, after requireCmsAdmin()). A
+-- manual payout follows the Stripe path's order: the commissions are claimed (PROCESSING) BEFORE any
+-- money is sent, so what the admin sends, what the PayPal file lists and what gets recorded are the
+-- same commissions. A refund, a lost dispute or a cancellation that arrives while the payout is
+-- prepared takes the in-flight path of private.affiliate_void_order_commissions() and
+-- apply_affiliate_refund() (void_requested_at / refund_pending_cents and a refund-after-payout
+-- alert), a dispute only holds the commission (disputed_at), and a commission that clears later is
+-- left for the next payout. Nothing here moves money. Lock order of the claim and of
+-- complete_affiliate_payout(): the profile, then the commissions, then the payout.
+
+-- claim_manual_affiliate_payout(): the CMS "Prepare payout" (and "Prepare PayPal payouts", which
+-- passes the program minimum). For an ACTIVE, approved partner (paused partners are not paid, as the
+-- terms say) with no prepared manual payout in that currency yet, the CLEARED, unattached,
+-- undisputed, live-mode commissions of p_currency and the gateways in p_gateways (NULL = every
+-- gateway) are locked, those whose order is refunded or cancelled are voided exactly as the claim
+-- does, and the rest are attached to a new PROCESSING manual payout of sum(commission - refunded).
+-- Only live-mode commissions: a test-mode sale (Stripe test key, Freemius sandbox) is never paid
+-- with real money. Answers:
+--   {"status": "invalid_input"}       a currency that is not three letters
+--   {"status": "not_found"}           no such partner
+--   {"status": "not_eligible"}        the partner is not ACTIVE or was never approved
+--   {"status": "already_prepared", "payout_id": id, "amount_cents": n}
+--                                     a prepared payout of that currency waits to be recorded or
+--                                     cancelled (one at a time per partner and currency)
+--   {"status": "nothing_owed"}        nothing of that currency and those gateways is left (after the voids)
+--   {"status": "below_minimum", "amount_cents": n, "commission_count": n}
+--                                     the sum is below p_min_amount: nothing is reserved
+--   {"status": "prepared", "payout_id": id, "amount_cents": n, "commission_count": n}
+CREATE OR REPLACE FUNCTION public.claim_manual_affiliate_payout(
+    p_affiliate_id uuid, p_currency text, p_min_amount bigint DEFAULT 0, p_gateways public.affiliate_gateway[] DEFAULT NULL)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_currency text := upper(btrim(coalesce(p_currency, '')));
+  v_profile record;
+  v_existing record;
+  v_order record;
+  v_amount bigint;
+  v_count integer;
+  v_payout_id uuid;
+BEGIN
+  IF v_currency !~ '^[A-Z]{3}$' THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+  IF p_affiliate_id IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+
+  SELECT p.id, p.status::text AS status, p.first_published_at
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = p_affiliate_id
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_eligible');
+  END IF;
+
+  -- read under the profile lock: a concurrent claim of the same partner committed before it
+  SELECT po.id, po.amount_cents
+    INTO v_existing
+    FROM public.affiliate_payouts po
+   WHERE po.affiliate_id = p_affiliate_id
+     AND po.method = 'manual'
+     AND po.status = 'PROCESSING'::public.affiliate_payout_status
+     AND po.currency = v_currency
+   LIMIT 1;
+  IF FOUND THEN
+    RETURN jsonb_build_object('status', 'already_prepared', 'payout_id', v_existing.id, 'amount_cents', v_existing.amount_cents);
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_commissions c
+    WHERE c.affiliate_id = p_affiliate_id
+      AND c.status = 'CLEARED'::public.affiliate_commission_status
+      AND c.payout_id IS NULL
+      AND c.currency = v_currency
+      AND c.livemode = true
+      AND c.disputed_at IS NULL
+      AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways))
+    FOR UPDATE;
+
+  FOR v_order IN
+    SELECT DISTINCT c.order_id, o.status
+      FROM public.affiliate_commissions c
+      JOIN public.orders o ON o.id = c.order_id
+     WHERE c.affiliate_id = p_affiliate_id
+       AND c.status = 'CLEARED'::public.affiliate_commission_status
+       AND c.payout_id IS NULL
+       AND c.currency = v_currency
+       AND c.livemode = true
+       AND c.disputed_at IS NULL
+       AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways))
+       AND o.status IN ('refunded', 'cancelled')
+  LOOP
+    PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+  END LOOP;
+
+  SELECT coalesce(sum(c.commission_amount_cents - c.refunded_amount_cents), 0)::bigint, count(*)::integer
+    INTO v_amount, v_count
+    FROM public.affiliate_commissions c
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = true
+     AND c.disputed_at IS NULL
+     AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways));
+  IF v_amount <= 0 THEN
+    RETURN jsonb_build_object('status', 'nothing_owed');
+  END IF;
+  IF v_amount < GREATEST(coalesce(p_min_amount, 0), 0) THEN
+    RETURN jsonb_build_object('status', 'below_minimum', 'amount_cents', v_amount, 'commission_count', v_count);
+  END IF;
+
+  INSERT INTO public.affiliate_payouts (
+    affiliate_id, amount_cents, currency, stripe_destination_account, livemode, status, attempt_count, last_attempt_at,
+    trigger, method
+  )
+  VALUES (
+    p_affiliate_id, v_amount, v_currency, NULL, true, 'PROCESSING'::public.affiliate_payout_status, 1, now(),
+    'admin', 'manual'
+  )
+  RETURNING id INTO v_payout_id;
+
+  UPDATE public.affiliate_commissions c
+     SET payout_id = v_payout_id
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = true
+     AND c.disputed_at IS NULL
+     AND (p_gateways IS NULL OR c.gateway = ANY (p_gateways));
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  RETURN jsonb_build_object('status', 'prepared', 'payout_id', v_payout_id, 'amount_cents', v_amount, 'commission_count', v_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[]) TO service_role;
+
+-- record_manual_affiliate_payout(): the CMS "Record payout", once the money of a prepared payout
+-- left (p_recorded_by is the verified admin, never a value from the request). That exact payout
+-- becomes COMPLETED with the channel, the reference, the note the partner reads and paid_at; its
+-- commissions become PAID and the partner's total_paid_cents grows by its amount, as
+-- complete_affiliate_payout() does for a transfer. No eligibility or amount check: the money was
+-- sent (a partner paused since, or a refund flagged since, changes nothing here; the refund already
+-- raised its alert). Answers:
+--   {"status": "invalid_input"}       an unknown channel, a reference over 120 or a note over 500 characters
+--   {"status": "reference_required"}  an empty reference
+--   {"status": "not_found"}           no such manual payout (it was cancelled, or it is a Stripe payout)
+--   {"status": "already_recorded"}    it is COMPLETED already (a second click, or another admin)
+--   {"status": "duplicate_reference"} another manual payout of this partner has this reference (case ignored)
+--   {"status": "recorded", "payout_id": id, "affiliate_id": id, "amount_cents": n, "currency": c, "commission_count": n}
+CREATE OR REPLACE FUNCTION public.record_manual_affiliate_payout(
+    p_payout_id uuid, p_channel text, p_reference text, p_note text, p_recorded_by uuid)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_channel text := lower(btrim(coalesce(p_channel, '')));
+  v_reference text := nullif(btrim(coalesce(p_reference, '')), '');
+  v_note text := nullif(btrim(coalesce(p_note, '')), '');
+  v_affiliate uuid;
+  v_payout record;
+  v_count integer;
+BEGIN
+  IF v_channel NOT IN ('paypal', 'interac', 'wise', 'bank_transfer', 'other')
+     OR char_length(coalesce(v_reference, '')) > 120
+     OR char_length(coalesce(v_note, '')) > 500 THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+  IF v_reference IS NULL THEN
+    RETURN jsonb_build_object('status', 'reference_required');
+  END IF;
+
+  SELECT po.affiliate_id INTO v_affiliate
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'manual';
+  IF v_affiliate IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.amount_cents, po.currency
+    INTO v_payout
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'manual'
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_payout.status <> 'PROCESSING' THEN
+    RETURN jsonb_build_object('status', 'already_recorded');
+  END IF;
+  -- read under the profile lock: a concurrent record of the same reference committed before it
+  IF EXISTS (
+    SELECT 1 FROM public.affiliate_payouts po
+     WHERE po.affiliate_id = v_affiliate
+       AND po.method = 'manual'
+       AND po.id <> p_payout_id
+       AND po.external_reference IS NOT NULL
+       AND lower(po.external_reference) = lower(v_reference)
+  ) THEN
+    RETURN jsonb_build_object('status', 'duplicate_reference');
+  END IF;
+
+  UPDATE public.affiliate_payouts
+     SET status = 'COMPLETED'::public.affiliate_payout_status, paid_at = now(), manual_channel = v_channel,
+         external_reference = v_reference, note = v_note, recorded_by = p_recorded_by
+   WHERE id = p_payout_id;
+  UPDATE public.affiliate_commissions c
+     SET status = 'PAID'::public.affiliate_commission_status, paid_at = now()
+   WHERE c.payout_id = p_payout_id
+     AND c.status IN ('PENDING_CLEARANCE'::public.affiliate_commission_status, 'CLEARED'::public.affiliate_commission_status);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  UPDATE public.affiliate_profiles SET total_paid_cents = total_paid_cents + v_payout.amount_cents WHERE id = v_affiliate;
+
+  RETURN jsonb_build_object('status', 'recorded', 'payout_id', p_payout_id, 'affiliate_id', v_affiliate,
+                            'amount_cents', v_payout.amount_cents, 'currency', v_payout.currency, 'commission_count', v_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.record_manual_affiliate_payout(uuid, text, text, text, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_manual_affiliate_payout(uuid, text, text, text, uuid) TO service_role;
+
+-- cancel_manual_affiliate_payout(): the CMS "Cancel" of a prepared payout, before any money left.
+-- The work the payout owes its commissions is applied (A8: a refund flagged while it was prepared
+-- voids or reduces its commission), every commission left is handed back to the cleared balance
+-- (for a later payout, manual or Stripe) and the row is deleted: it moved no money, and a manual
+-- payout is never FAILED. Answers:
+--   {"status": "not_found"}           no such manual payout (cancelled already, or a Stripe payout)
+--   {"status": "already_recorded"}    it is COMPLETED: a recorded payout cannot be cancelled
+--   {"status": "cancelled", "commission_count": n}   n commissions handed back
+CREATE OR REPLACE FUNCTION public.cancel_manual_affiliate_payout(p_payout_id uuid)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_status text;
+  v_count integer;
+BEGIN
+  SELECT po.affiliate_id INTO v_affiliate
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'manual';
+  IF v_affiliate IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text INTO v_status
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'manual'
+   FOR UPDATE;
+  IF v_status IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_status <> 'PROCESSING' THEN
+    RETURN jsonb_build_object('status', 'already_recorded');
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+  UPDATE public.affiliate_commissions c SET payout_id = NULL WHERE c.payout_id = p_payout_id;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  DELETE FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+
+  RETURN jsonb_build_object('status', 'cancelled', 'commission_count', v_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.cancel_manual_affiliate_payout(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.cancel_manual_affiliate_payout(uuid) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. private.affiliate_alert_refund_after_payout: the advice follows the payout's method
+-- ---------------------------------------------------------------------------
+-- 02030's definition with one change: the advice follows the payout's method and status. A manual
+-- payout already recorded (COMPLETED) has no Stripe transfer to reverse: the admin recovers the
+-- amount from the partner (asking them to send it back; nothing in the ledger deducts it from a
+-- later payout, which would only record a false amount). A manual payout still prepared
+-- (PROCESSING) may not have been sent yet: the admin cancels it and prepares it again, so the
+-- refunded commission is voided first, or, if the money already left, records it and recovers the
+-- amount. The metadata names the method and the status (payout_method, payout_status). Signature,
+-- SECURITY DEFINER, search_path, grants and the one-unresolved-alert-per-commission rule are 02030's.
+--
+-- One unresolved affiliate_refund_after_payout alert per commission (A19 text and metadata).
+CREATE OR REPLACE FUNCTION private.affiliate_alert_refund_after_payout(
+    p_commission_id uuid, p_affiliate_id uuid, p_order_id uuid, p_payout_id uuid, p_reason text)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_method text;
+  v_status text;
+  v_manual boolean := false;
+  v_advice text;
+BEGIN
+  IF p_commission_id IS NULL THEN
+    RETURN;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.system_alerts a
+     WHERE a.alert_type = 'affiliate_refund_after_payout'
+       AND a.is_resolved = false
+       AND a.metadata ->> 'commission_id' = p_commission_id::text
+  ) THEN
+    RETURN;
+  END IF;
+  IF p_payout_id IS NOT NULL THEN
+    SELECT po.method, po.status::text INTO v_method, v_status FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+    v_manual := coalesce(v_method = 'manual', false);
+  END IF;
+  v_advice := CASE
+    WHEN v_manual AND v_status = 'PROCESSING' THEN 'Its manual payout is prepared but not recorded yet: if you have not sent it, cancel it under Pay manually and prepare it again; if you already sent it, record it, then recover the amount from the partner, for example by asking them to send it back.'
+    WHEN v_manual THEN 'Recover the amount from the partner, for example by asking them to send it back.'
+    ELSE 'Reverse the transfer in Stripe if needed.'
+  END;
+  INSERT INTO public.system_alerts (alert_type, title, message, metadata)
+  VALUES (
+    'affiliate_refund_after_payout',
+    'Refund after an affiliate payout',
+    CASE
+      WHEN p_reason = 'order_deleted' THEN
+        format('Order %s was deleted after its commission was paid or queued. %s', coalesce(p_order_id::text, 'unknown'), v_advice)
+      ELSE
+        format('Order %s was refunded after its commission was paid or queued. %s', coalesce(p_order_id::text, 'unknown'), v_advice)
+    END,
+    jsonb_build_object(
+      'commission_id', p_commission_id,
+      'affiliate_id', p_affiliate_id,
+      'order_id', p_order_id,
+      'payout_id', p_payout_id,
+      'payout_method', CASE WHEN v_manual THEN 'manual' ELSE 'stripe_connect' END,
+      'payout_status', v_status,
+      'reason', p_reason,
+      'action_url', '/cms/affiliates/payouts',
+      'action_label', 'Review payouts'
+    )
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 6. Comments (02030's that this file makes wrong, and the new objects)
+-- ---------------------------------------------------------------------------
+COMMENT ON TABLE public.affiliate_payouts IS 'Payouts to partners: Stripe Connect transfers (method stripe_connect) and payouts the operator sends outside Stripe (method manual, 02036), each claimed before the money moves (PROCESSING). A manual payout is COMPLETED when an admin records it and deleted when cancelled, never FAILED. Written only by the service-role RPCs; the partner reads its own rows.';
+COMMENT ON COLUMN public.affiliate_payouts.stripe_destination_account IS 'Connect account snapshot at claim (refreshed on retry); required for a Stripe payout, NULL for a manual one (02036).';
+COMMENT ON COLUMN public.affiliate_payouts.method IS 'stripe_connect (a Stripe Connect transfer from the platform balance) or manual (money sent outside Stripe: prepared with claim_manual_affiliate_payout, recorded with record_manual_affiliate_payout, cancelled with cancel_manual_affiliate_payout; never carries a destination or a transfer id). 02036.';
+COMMENT ON COLUMN public.affiliate_payouts.manual_channel IS 'Where a manual payout was sent from: paypal, interac (Interac e-Transfer), wise, bank_transfer or other. Required once a manual payout is recorded (COMPLETED); NULL while it is prepared.';
+COMMENT ON COLUMN public.affiliate_payouts.external_reference IS 'A manual payout''s reference (the PayPal transaction ID, e-Transfer or bank reference), at most 120 characters, unique per partner (case ignored).';
+COMMENT ON COLUMN public.affiliate_payouts.note IS 'An optional note from the admin, at most 500 characters. The partner reads it in the portal: never put anything internal here.';
+COMMENT ON COLUMN public.affiliate_payouts.recorded_by IS 'The admin who recorded a manual payout (auth.users; NULL for a Stripe payout or once that account is deleted).';
+COMMENT ON COLUMN public.affiliate_profiles.payout_email IS 'Where the partner wants manual payouts sent (a PayPal or Interac e-Transfer address), or NULL. Written by the server for the partner (the portal, after requireRetailer()) or by an admin; no Data API grant, and the profile guard refuses it from a partner session (02036).';
+COMMENT ON TABLE public.affiliate_profiles IS 'One per partner (RTL) account. Created only by create_affiliate_account(); the owner may edit display_name, bio, social_links and preferred_locale over the Data API, everything else (payout_email included, written by the portal with the service role) is server- or ADMIN-written (column grants + affiliate_profile_guard).';
+COMMENT ON FUNCTION public.claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[]) IS 'Service role: attaches a partner''s CLEARED, unattached, undisputed commissions of one currency, of the partner''s Connect key mode and of the gateways in p_gateways (NULL = all), to a new PROCESSING Stripe payout; no row when nothing is claimable or the sum is below p_min_amount.';
+COMMENT ON FUNCTION public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[]) IS 'Service role: prepares a manual payout before any money is sent, attaching an ACTIVE, approved partner''s CLEARED, unattached, undisputed, live-mode commissions of one currency and of the gateways in p_gateways (NULL = all) to a new PROCESSING manual payout; one per partner and currency. Returns {status, ...}: invalid_input, not_found, not_eligible, already_prepared, nothing_owed, below_minimum or prepared.';
+COMMENT ON FUNCTION public.record_manual_affiliate_payout(uuid, text, text, text, uuid) IS 'Service role: records that the money of a prepared manual payout was sent: COMPLETED with its channel, reference (unique per partner) and note, its commissions PAID, total_paid_cents up by its amount. Returns {status, ...}: invalid_input, reference_required, not_found, already_recorded, duplicate_reference or recorded.';
+COMMENT ON FUNCTION public.cancel_manual_affiliate_payout(uuid) IS 'Service role: gives up a prepared manual payout before any money left: the pending refund work applied, its commissions handed back to the cleared balance, the row deleted. Returns {status, ...}: not_found, already_recorded or cancelled.';
+
+-- ---------------------------------------------------------------------------
+-- 7. UI copy of the partner side (the forms the 02031 generator header prescribes)
+-- ---------------------------------------------------------------------------
+-- The partner portal's payouts page now says how each commission is paid: the "How you get paid"
+-- card and the payout email form (saveRetailerPayoutEmail), the figure for the payouts the store
+-- sends by hand (and one it prepared and is sending), the commissions table's Payout column and
+-- "PayPal · Ref. …" history rows. The
+-- partner terms describe both ways of paying, the recovery after a refund (a Stripe transfer
+-- reversal, or a deduction from a later payout) and what the PayPal payouts file shares; the
+-- Program details table reads the method per kind of sale from the settings. The landing page and
+-- the onboarding tracker no longer promise that every payout goes through Stripe.
+--
+-- New keys, never overwriting a row that already exists.
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.portal.balance_cleared_manual_hint', jsonb_build_object('en', 'Paid by {site} once it reaches {min}.', 'fr', 'Versé par {site} une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.balance_cleared_mixed_hint', jsonb_build_object('en', '{stripe} goes by Stripe transfer and {manual} is paid by {site}, each once it reaches {min}.', 'fr', '{stripe} part par virement Stripe et {manual} est versé par {site}, chacun une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.balance_next_manual_payout', jsonb_build_object('en', 'Next payout from {site}', 'fr', 'Prochain versement de {site}'), now(), now()),
+  ('affiliates.portal.balance_processing_manual_hint', jsonb_build_object('en', 'We''re sending you {amount} directly.', 'fr', 'Nous vous envoyons {amount} directement.'), now(), now()),
+  ('affiliates.portal.commission_payout_direct', jsonb_build_object('en', 'Sent directly', 'fr', 'Envoi direct'), now(), now()),
+  ('affiliates.portal.commission_payout_stripe', jsonb_build_object('en', 'Stripe transfer', 'fr', 'Virement Stripe'), now(), now()),
+  ('affiliates.portal.connect_intro_partial', jsonb_build_object('en', 'Connect a bank account through Stripe to receive the commissions we pay through Stripe. Stripe handles identity checks and bank details securely; we never see them.', 'fr', 'Connectez un compte bancaire par l''entremise de Stripe pour recevoir les commissions que nous payons par Stripe. Stripe s''occupe de façon sécurisée de la vérification d''identité et des coordonnées bancaires; nous n''y avons jamais accès.'), now(), now()),
+  ('affiliates.portal.connect_ready_body_partial', jsonb_build_object('en', 'Cleared commissions we pay through Stripe are sent to your bank automatically. Manage your bank details and see transfers in your Stripe Express dashboard.', 'fr', 'Les commissions confirmées que nous payons par Stripe sont versées automatiquement dans votre compte bancaire. Gérez vos coordonnées bancaires et consultez vos virements dans votre tableau de bord Stripe Express.'), now(), now()),
+  ('affiliates.portal.error_payout_email', jsonb_build_object('en', 'Enter a valid email address, like name@example.com.', 'fr', 'Entrez une adresse courriel valide, comme nom@exemple.com.'), now(), now()),
+  ('affiliates.portal.faq_payout_answer_manual', jsonb_build_object('en', 'Once your cleared balance reaches {min}, {site} sends it to you directly, by PayPal or Interac e-Transfer. Each payout then appears in your payout history.', 'fr', 'Une fois que votre solde confirmé atteint {min}, {site} vous l''envoie directement, par PayPal ou virement Interac. Chaque versement apparaît ensuite dans votre historique des versements.'), now(), now()),
+  ('affiliates.portal.faq_payout_answer_mixed', jsonb_build_object('en', 'It depends on the order: “How you get paid” above says which commissions go through Stripe. Those go to your bank in the daily payout run once they reach {min}. {site} sends you the others directly, by PayPal or Interac e-Transfer, once they reach the same minimum.', 'fr', 'Cela dépend de la commande : la section « Comment vous êtes payé » ci-dessus indique quelles commissions passent par Stripe. Celles-ci sont versées dans votre compte bancaire lors du versement quotidien, dès qu''elles atteignent {min}. {site} vous envoie les autres directement, par PayPal ou virement Interac, une fois ce même minimum atteint.'), now(), now()),
+  ('affiliates.portal.next_payout_email_required', jsonb_build_object('en', 'Add your payout email', 'fr', 'Ajoutez votre courriel de versement'), now(), now()),
+  ('affiliates.portal.next_payout_email_required_hint', jsonb_build_object('en', '{site} needs it to send your payouts.', 'fr', '{site} en a besoin pour vous envoyer vos versements.'), now(), now()),
+  ('affiliates.portal.next_payout_manual', jsonb_build_object('en', 'Paid by {site}', 'fr', 'Versé par {site}'), now(), now()),
+  ('affiliates.portal.next_payout_manual_clearing_hint', jsonb_build_object('en', 'Sent to {email} by PayPal or Interac e-Transfer once your cleared balance reaches {min}.', 'fr', 'Envoyé à {email} par PayPal ou virement Interac une fois que votre solde confirmé atteint {min}.'), now(), now()),
+  ('affiliates.portal.next_payout_manual_ready_hint', jsonb_build_object('en', '{site} sends your cleared balance to {email} by PayPal or Interac e-Transfer.', 'fr', '{site} envoie votre solde confirmé à {email} par PayPal ou virement Interac.'), now(), now()),
+  ('affiliates.portal.next_payout_manual_sending_hint', jsonb_build_object('en', '{site} is sending you {amount}.', 'fr', '{site} vous envoie {amount}.'), now(), now()),
+  ('affiliates.portal.payout_channel_bank_transfer', jsonb_build_object('en', 'Bank transfer', 'fr', 'Virement bancaire'), now(), now()),
+  ('affiliates.portal.payout_channel_interac', jsonb_build_object('en', 'Interac e-Transfer', 'fr', 'Virement Interac'), now(), now()),
+  ('affiliates.portal.payout_channel_other', jsonb_build_object('en', 'Other method', 'fr', 'Autre mode de paiement'), now(), now()),
+  ('affiliates.portal.payout_channel_paypal', jsonb_build_object('en', 'PayPal', 'fr', 'PayPal'), now(), now()),
+  ('affiliates.portal.payout_channel_wise', jsonb_build_object('en', 'Wise', 'fr', 'Wise'), now(), now()),
+  ('affiliates.portal.payout_email_help', jsonb_build_object('en', 'We send manual payouts to this address. Use the email of your PayPal account, or the one you use for Interac e-Transfer.', 'fr', 'Nous envoyons les versements manuels à cette adresse. Utilisez le courriel de votre compte PayPal, ou celui que vous utilisez pour les virements Interac.'), now(), now()),
+  ('affiliates.portal.payout_email_label', jsonb_build_object('en', 'Email for PayPal or Interac e-Transfer payouts', 'fr', 'Courriel pour les versements par PayPal ou virement Interac'), now(), now()),
+  ('affiliates.portal.payout_email_remove', jsonb_build_object('en', 'Remove', 'fr', 'Retirer'), now(), now()),
+  ('affiliates.portal.payout_email_removed', jsonb_build_object('en', 'Payout email removed.', 'fr', 'Courriel de versement retiré.'), now(), now()),
+  ('affiliates.portal.payout_email_saved', jsonb_build_object('en', 'Payout email saved.', 'fr', 'Courriel de versement enregistré.'), now(), now()),
+  ('affiliates.portal.payout_manual_note', jsonb_build_object('en', 'Note: {note}', 'fr', 'Note : {note}'), now(), now()),
+  ('affiliates.portal.payout_manual_reference', jsonb_build_object('en', '{channel} · Ref. {reference}', 'fr', '{channel} · Réf. {reference}'), now(), now()),
+  ('affiliates.portal.payout_manual_sending_note', jsonb_build_object('en', 'Being sent to you directly.', 'fr', 'Envoi direct en cours.'), now(), now()),
+  ('affiliates.portal.payout_methods_by_site', jsonb_build_object('en', 'Your commissions are sent to you directly by {site}, by PayPal or Interac e-Transfer.', 'fr', 'Vos commissions vous sont envoyées directement par {site}, par PayPal ou virement Interac.'), now(), now()),
+  ('affiliates.portal.payout_methods_by_stripe', jsonb_build_object('en', 'Your commissions are transferred to your Stripe account.', 'fr', 'Vos commissions sont virées dans votre compte Stripe.'), now(), now()),
+  ('affiliates.portal.payout_methods_manual', jsonb_build_object('en', '{site} sends your commissions to you directly, by PayPal or Interac e-Transfer.', 'fr', '{site} vous envoie vos commissions directement, par PayPal ou virement Interac.'), now(), now()),
+  ('affiliates.portal.payout_methods_mixed_intro', jsonb_build_object('en', 'How a commission is paid depends on how the order was paid.', 'fr', 'Le mode de versement d''une commission dépend du mode de paiement de la commande.'), now(), now()),
+  ('affiliates.portal.payout_methods_orders_freemius', jsonb_build_object('en', 'Orders paid through Freemius', 'fr', 'Commandes payées par Freemius'), now(), now()),
+  ('affiliates.portal.payout_methods_orders_stripe', jsonb_build_object('en', 'Orders paid through Stripe', 'fr', 'Commandes payées par Stripe'), now(), now()),
+  ('affiliates.portal.payout_methods_title', jsonb_build_object('en', 'How you get paid', 'fr', 'Comment vous êtes payé'), now(), now()),
+  ('affiliates.portal.payouts_description_manual', jsonb_build_object('en', 'Your commissions clear after the refund window, then {site} sends them to you directly, by PayPal or Interac e-Transfer.', 'fr', 'Vos commissions sont confirmées après la période de remboursement, puis {site} vous les envoie directement, par PayPal ou virement Interac.'), now(), now()),
+  ('affiliates.portal.payouts_description_mixed', jsonb_build_object('en', 'Your commissions clear after the refund window. Depending on the order, they then go to your bank through Stripe, or {site} sends them to you directly.', 'fr', 'Vos commissions sont confirmées après la période de remboursement. Selon la commande, elles sont ensuite versées dans votre compte bancaire par Stripe, ou {site} vous les envoie directement.'), now(), now()),
+  ('affiliates.portal.table_payout', jsonb_build_object('en', 'Payout', 'fr', 'Versement'), now(), now()),
+  ('affiliates.terms.details_payout_method_freemius_orders', jsonb_build_object('en', 'Payout method, orders paid through Freemius', 'fr', 'Mode de versement, commandes payées par Freemius'), now(), now()),
+  ('affiliates.terms.details_payout_method_manual', jsonb_build_object('en', 'Sent directly by us, for example by PayPal or Interac e-Transfer', 'fr', 'Envoyé directement par nous, par exemple par PayPal ou virement Interac'), now(), now()),
+  ('affiliates.terms.details_payout_method_stripe_orders', jsonb_build_object('en', 'Payout method, orders paid through Stripe', 'fr', 'Mode de versement, commandes payées par Stripe'), now(), now()),
+  ('affiliates.terms.details_schedule_direct', jsonb_build_object('en', 'When we send them', 'fr', 'Quand nous les envoyons'), now(), now()),
+  ('affiliates.terms.details_schedule_mixed_daily', jsonb_build_object('en', 'Stripe transfers: automatic, every day. Direct payouts: when we send them.', 'fr', 'Virements Stripe : automatiques, chaque jour. Versements directs : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_mixed_manual', jsonb_build_object('en', 'Stripe transfers: when we run them. Direct payouts: when we send them.', 'fr', 'Virements Stripe : quand nous les lançons. Versements directs : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.payouts_direct', jsonb_build_object('en', 'For payouts we send directly, add your payout email in your partner portal. We send the money to that address, so keep it up to date.', 'fr', 'Pour les versements que nous envoyons directement, ajoutez votre courriel de versement dans votre portail partenaire. Nous envoyons l''argent à cette adresse : gardez-la à jour.'), now(), now()),
+  ('affiliates.terms.privacy_direct', jsonb_build_object('en', 'To send you a payout directly, we give your payout email, the amount and your handle to the payment service we use, such as PayPal.', 'fr', 'Pour vous envoyer un versement directement, nous transmettons votre courriel de versement, le montant et votre identifiant au service de paiement que nous utilisons, comme PayPal.'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- Changed text, each language guarded by the text 02031 seeded, so copy an operator edited (CMS >
+-- Settings > Extra Translations) stays theirs.
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{en}', to_jsonb(fix.new_en)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.common.step_payouts',
+     'Bank payouts connected',
+     'Payouts set up'),
+    ('affiliates.partners.benefit_payouts_body',
+     'Cleared money goes straight to your bank. You never need to ask for a payout.',
+     'Once your cleared balance reaches the minimum, we send your money. You never need to ask for a payout.'),
+    ('affiliates.partners.benefit_payouts_title',
+     'Automatic Stripe payouts',
+     'Payouts come to you'),
+    ('affiliates.partners.faq_cost_answer',
+     'No. Joining is free, and there are no monthly fees. You only need an account and a bank account for payouts.',
+     'No. Joining is free, and there are no monthly fees. You only need an account and a way to receive your payouts.'),
+    ('affiliates.partners.faq_payouts_answer',
+     'Each commission waits {days} days in case of a refund. Then it clears, and we send it to your bank through Stripe. Payouts go out on their own once your cleared balance reaches the minimum.',
+     'Each commission waits {days} days in case of a refund. Then it clears. We send your payout once your cleared balance reaches the minimum. Your partner portal shows how you get paid.'),
+    ('affiliates.partners.hero_point_payouts_stripe',
+     'Payouts through Stripe',
+     'Payouts sent by our team'),
+    ('affiliates.partners.hero_subtitle',
+     'Share the products you love from your own storefront. We track each sale and pay you automatically.',
+     'Share the products you love from your own storefront. We track each sale and pay your commissions.'),
+    ('affiliates.partners.how_step_payouts_body',
+     'Link your bank once through Stripe. After that, your payouts arrive on their own.',
+     'Tell us once where to send your money. After that, your payouts come to you.'),
+    ('affiliates.partners.how_step_payouts_title',
+     'Connect your bank',
+     'Set up your payouts'),
+    ('affiliates.partners.meta_description',
+     'Join our free partner program. Earn up to {rate}% on every sale you refer, get your own storefront and receive automatic payouts through Stripe.',
+     'Join our free partner program. Earn up to {rate}% on every sale you refer, get your own storefront and get paid once your commissions clear.'),
+    ('affiliates.partners.meta_description_no_rate',
+     'Join our free partner program. Earn a commission on every sale you refer, get your own storefront and receive automatic payouts through Stripe.',
+     'Join our free partner program. Earn a commission on every sale you refer, get your own storefront and get paid once your commissions clear.'),
+    ('affiliates.portal.next_payout_none',
+     'No earnings yet',
+     'Nothing to pay out yet'),
+    ('affiliates.portal.progress_action_payouts',
+     'Connect my bank account',
+     'Set up my payouts'),
+    ('affiliates.portal.stats_cleared_hint',
+     'Cleared commissions waiting for the next automated payout.',
+     'Cleared commissions waiting for the next payout.'),
+    ('affiliates.portal.welcome_body',
+     'Three steps get your storefront live: complete your profile, connect your bank account for automated payouts, then build your page and submit it for approval. Your links start earning commissions after the first approval.',
+     'Three steps get your storefront live: complete your profile, set up your payouts, then build your page and submit it for approval. Your links start earning commissions after the first approval.'),
+    ('affiliates.terms.meta_description',
+     'How our partner program works: commissions, the hold period, refunds, payouts through Stripe, your duties and how to leave.',
+     'How our partner program works: commissions, the hold period, refunds, payouts, your duties and how to leave.'),
+    ('affiliates.terms.payouts_schedule',
+     'Payouts follow our schedule. A payout can be late, for example if Stripe is unavailable or our Stripe balance is too low.',
+     'Payouts follow our schedule. A payout can be late, for example if a payment service is unavailable or our Stripe balance is too low.'),
+    ('affiliates.terms.payouts_setup',
+     'To get paid, finish the Stripe setup in your partner portal. Your Stripe account must be in a country where we can pay you.',
+     'For payouts through Stripe, finish the Stripe setup in your partner portal. Your Stripe account must be in a country where we can pay you.'),
+    ('affiliates.terms.payouts_stripe',
+     'We pay you with Stripe Connect Express, into a Stripe account in your name.',
+     'Depending on the sale, we pay you with Stripe Connect Express, into a Stripe account in your name, or we send the money to you directly, for example by PayPal or Interac e-Transfer.'),
+    ('affiliates.terms.privacy_stripe',
+     'To set up your payouts, we share your email address, your country and your storefront address with Stripe.',
+     'If you set up payouts through Stripe, we share your email address, your country and your storefront address with Stripe.'),
+    ('affiliates.terms.refunds_after_payout',
+     'If a refund or a lost dispute comes after we paid you, we may take that amount back by reversing the Stripe transfer.',
+     'If a refund or a lost dispute comes after we paid you, we may take that amount back, by reversing the Stripe transfer or by deducting it from a later payout.')
+  ) AS fix(key, old_en, new_en)
+ WHERE t.key = fix.key AND t.translations->>'en' = fix.old_en;
+
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{fr}', to_jsonb(fix.new_fr)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.common.step_payouts',
+     'Versements bancaires connectés',
+     'Versements configurés'),
+    ('affiliates.partners.benefit_payouts_body',
+     'L''argent confirmé va directement dans votre compte bancaire. Vous n''avez jamais à demander un versement.',
+     'Une fois que votre solde confirmé atteint le minimum, nous vous envoyons votre argent. Vous n''avez jamais à demander un versement.'),
+    ('affiliates.partners.benefit_payouts_title',
+     'Versements Stripe automatiques',
+     'Les versements viennent à vous'),
+    ('affiliates.partners.faq_cost_answer',
+     'Non. L''inscription est gratuite et il n''y a aucuns frais mensuels. Il vous faut seulement un compte et un compte bancaire pour les versements.',
+     'Non. L''inscription est gratuite et il n''y a aucuns frais mensuels. Il vous faut seulement un compte et un moyen de recevoir vos versements.'),
+    ('affiliates.partners.faq_payouts_answer',
+     'Chaque commission attend {days} jours en cas de remboursement. Elle est ensuite confirmée, puis envoyée à votre banque avec Stripe. Les versements partent tout seuls dès que votre solde confirmé atteint le minimum.',
+     'Chaque commission attend {days} jours en cas de remboursement. Elle est ensuite confirmée. Nous envoyons votre versement une fois que votre solde confirmé atteint le minimum. Votre portail partenaire indique comment vous êtes payé.'),
+    ('affiliates.partners.hero_point_payouts_stripe',
+     'Versements par Stripe',
+     'Versements envoyés par notre équipe'),
+    ('affiliates.partners.hero_subtitle',
+     'Partagez les produits que vous aimez dans votre propre vitrine. Nous suivons chaque vente et nous vous payons automatiquement.',
+     'Partagez les produits que vous aimez dans votre propre vitrine. Nous suivons chaque vente et nous vous versons vos commissions.'),
+    ('affiliates.partners.how_step_payouts_body',
+     'Liez votre banque une seule fois avec Stripe. Ensuite, vos versements arrivent tout seuls.',
+     'Dites-nous une seule fois où envoyer votre argent. Ensuite, vos versements viennent à vous.'),
+    ('affiliates.partners.how_step_payouts_title',
+     'Connectez votre banque',
+     'Configurez vos versements'),
+    ('affiliates.partners.meta_description',
+     'Inscrivez-vous gratuitement à notre programme de partenaires. Gagnez jusqu''à {rate} % sur chaque vente recommandée et recevez vos versements automatiquement.',
+     'Inscrivez-vous gratuitement à notre programme de partenaires. Gagnez jusqu''à {rate} % sur chaque vente recommandée et recevez vos versements.'),
+    ('affiliates.partners.meta_description_no_rate',
+     'Inscrivez-vous gratuitement à notre programme de partenaires. Touchez une commission sur chaque vente recommandée et recevez vos versements automatiquement.',
+     'Inscrivez-vous gratuitement à notre programme de partenaires. Touchez une commission sur chaque vente recommandée et recevez vos versements.'),
+    ('affiliates.portal.next_payout_none',
+     'Aucun gain pour l''instant',
+     'Rien à verser pour l''instant'),
+    ('affiliates.portal.progress_action_payouts',
+     'Connecter mon compte bancaire',
+     'Configurer mes versements'),
+    ('affiliates.portal.stats_cleared_hint',
+     'Commissions confirmées en attente du prochain versement automatisé.',
+     'Commissions confirmées en attente du prochain versement.'),
+    ('affiliates.portal.welcome_body',
+     'Trois étapes pour mettre votre vitrine en ligne : complétez votre profil, connectez votre compte bancaire pour les versements automatisés, puis créez votre page et soumettez-la pour approbation. Vos liens commencent à rapporter des commissions après la première approbation.',
+     'Trois étapes pour mettre votre vitrine en ligne : complétez votre profil, configurez vos versements, puis créez votre page et soumettez-la pour approbation. Vos liens commencent à rapporter des commissions après la première approbation.'),
+    ('affiliates.terms.meta_description',
+     'Le fonctionnement de notre programme partenaires : commissions, retenue, remboursements, versements par Stripe, vos obligations et votre départ.',
+     'Le fonctionnement de notre programme partenaires : commissions, retenue, remboursements, versements, vos obligations et votre départ.'),
+    ('affiliates.terms.payouts_schedule',
+     'Les versements suivent notre calendrier. Un versement peut être retardé, par exemple si Stripe est indisponible ou si notre solde Stripe est insuffisant.',
+     'Les versements suivent notre calendrier. Un versement peut être retardé, par exemple si un service de paiement est indisponible ou si notre solde Stripe est insuffisant.'),
+    ('affiliates.terms.payouts_setup',
+     'Pour être payé, terminez la configuration Stripe dans votre portail partenaire. Votre compte Stripe doit être situé dans un pays où nous pouvons vous payer.',
+     'Pour les versements par Stripe, terminez la configuration Stripe dans votre portail partenaire. Votre compte Stripe doit être situé dans un pays où nous pouvons vous payer.'),
+    ('affiliates.terms.payouts_stripe',
+     'Nous vous payons avec Stripe Connect Express, dans un compte Stripe à votre nom.',
+     'Selon la vente, nous vous payons avec Stripe Connect Express, dans un compte Stripe à votre nom, ou nous vous envoyons l''argent directement, par exemple par PayPal ou virement Interac.'),
+    ('affiliates.terms.privacy_stripe',
+     'Pour configurer vos versements, nous transmettons à Stripe votre adresse courriel, votre pays et l''adresse de votre vitrine.',
+     'Si vous configurez des versements par Stripe, nous transmettons à Stripe votre adresse courriel, votre pays et l''adresse de votre vitrine.'),
+    ('affiliates.terms.refunds_after_payout',
+     'Si un remboursement ou un litige perdu survient après votre versement, nous pouvons reprendre ce montant en annulant le virement Stripe.',
+     'Si un remboursement ou un litige perdu survient après votre versement, nous pouvons reprendre ce montant, en annulant le virement Stripe ou en le déduisant d''un versement suivant.')
+  ) AS fix(key, old_fr, new_fr)
+ WHERE t.key = fix.key AND t.translations->>'fr' = fix.old_fr;
+
+
+-- >>> FROM: 02037_affiliate_paypal_payouts.sql <<<
+-- 02037: commissions paid automatically from the operator's PayPal balance (Affiliates & Creator
+-- Storefronts, docs/15 → "Paying partners with PayPal").
+--
+-- 02036 let the program route a gateway's commissions to "manual": the operator sends the money from
+-- PayPal, Interac e-Transfer, Wise or a bank and records each payment in the CMS. An operator whose
+-- Freemius earnings land in a PayPal Business balance can let the daily payout run send that money
+-- itself with the PayPal Payouts REST API instead. affiliates_settings.payoutMethods (read by the
+-- app) gains 'paypal'; partners whose payout email is an Interac e-Transfer address (PayPal cannot
+-- send one), or who have none, are still paid by hand under Pay manually. This file:
+--
+-- 1. affiliate_payouts.method also allows 'paypal' (the 02036 CHECK replaced by name). A PayPal
+--    payout snapshots its recipient (paypal_receiver, the partner's payout email when it was claimed)
+--    and carries PayPal's ids as they become known: the sender_batch_id the app saves BEFORE the
+--    create call (also its PayPal-Request-Id, so a create that timed out is retried with the same
+--    id), PayPal's payout_batch_id and payout_item_id, the transaction id once paid, the item's last
+--    transaction_status, PayPal's fee and when PayPal was last asked. It carries no Stripe field and
+--    no manual field; a payout of another method carries no PayPal field. It is PROCESSING while
+--    PayPal has it, COMPLETED once PayPal paid the item (transaction id required), FAILED when PayPal
+--    will not pay it (its commissions are then handed back, so a FAILED PayPal payout holds nothing).
+--    02036's manual status CHECK (written when only two methods existed, it kept every payout that is
+--    not a Stripe one PROCESSING or COMPLETED, so a PayPal payout could never fail) is replaced by
+--    name and now holds for manual payouts only. A FAILED PayPal payout carries a paypal_ reason
+--    (fail_ or release_paypal_affiliate_payout): the Stripe RPCs fail_affiliate_payout,
+--    release_affiliate_payout and prepare_affiliate_payout_retry raise on a PayPal payout instead of
+--    failing it with its commissions still attached, or rewriting the reason that keeps PayPal off an
+--    address it returned a payout from.
+--    One in flight per partner, currency and mode; a PayPal item and a transaction id are recorded
+--    on one payout only. livemode is the PayPal environment's money: a live payout holds only
+--    live-mode commissions, a PayPal sandbox payout only test-mode ones (a real sale is never marked
+--    paid with sandbox money).
+-- 2. affiliate_profiles.payout_email_kind ('paypal', the default, or 'interac'): what payout_email
+--    is, and affiliate_profiles.payout_email_saved_at: when the partner last saved it (the portal
+--    stamps it on every save, the same address included). The run stops sending PayPal payouts to an
+--    address PayPal returned one from; a save after that return lifts it, so a partner who opened or
+--    confirmed their PayPal account can ask for PayPal again. Both are written like payout_email (the
+--    portal, with the service role after requireRetailer(), or an admin): no Data API grant, and
+--    private.affiliate_profile_guard() (02036's definition plus these two columns) refuses them from a
+--    partner session.
+-- 3. Six service-role RPCs in the claim's lock order (the profile, the commissions, the payout), each
+--    answering a status instead of raising for every expected case:
+--    - claim_paypal_affiliate_payout(affiliate, currency, min, gateways, livemode, trigger): for an
+--      ACTIVE, approved partner whose payout email is a PayPal account (kind 'paypal', at most 127
+--      characters, PayPal's receiver limit), the CLEARED, unattached, undisputed commissions of that
+--      currency, of the PayPal gateways and of the environment's mode (refunded or cancelled orders
+--      voided first, as the claim does) are attached to a new PROCESSING PayPal payout of their sum.
+--      Nothing moves money here.
+--    - record_paypal_affiliate_payout_batch(payouts, sender batch id, payout batch id): saves a
+--      batch's ids on its PROCESSING PayPal payouts, never overwriting a different id; called with the
+--      same sender id before every resend, it stamps that send (last_attempt_at, attempt_count).
+--    - note_paypal_affiliate_payout_item(payout, item id, status, fee): what a sync learned about an
+--      in-flight payout (PENDING, UNCLAIMED, ONHOLD, …).
+--    - complete_paypal_affiliate_payout(payout, item id, transaction id, fee, status): PayPal paid the
+--      item; that exact payout becomes COMPLETED with the transaction id and fee, its commissions PAID,
+--      total_paid_cents up by its amount, exactly once.
+--    - fail_paypal_affiliate_payout(payout, reason, status): PayPal will not pay it (a definitive
+--      refusal, FAILED, BLOCKED, RETURNED, REFUNDED, REVERSED, a denied batch, an UNCLAIMED item the
+--      admin cancelled); the refund work owed to its commissions is applied as the Stripe failure path
+--      does (A8), the rest are handed back to the cleared balance (unattached, payable again), and the
+--      row is FAILED with the reason.
+--    - release_paypal_affiliate_payout(payout): the CMS Release, once the admin checked PayPal paid
+--      nothing. Checked under the row locks, not only by the screen: a batch PayPal never acknowledged
+--      is released only an hour after its last send (a resend stamps it first), one PayPal acknowledged
+--      but never settled only 7 days after it and while PayPal lists no status it holds money in.
+-- 4. private.affiliate_alert_refund_after_payout (02036's definition): a refund while a PayPal payout
+--    is still with PayPal says the refund is applied if PayPal returns it or it fails, and to recover
+--    the amount from the partner if it completes; after a completed PayPal payout, to recover the
+--    amount (PayPal cannot take a payout back). The metadata names payout_method 'paypal'.
+-- 5. site_settings.affiliates_paypal_secret, the CMS-saved PayPal credentials (the active environment
+--    and, per environment, a client id and the secret encrypted with the app's secret envelope): a
+--    RESTRICTIVE policy keeps it from every API role, an ADMIN on an aal2 session included (the
+--    02021/02028 tiers already make an unlisted key ADMIN-only; this makes it service-role only). The
+--    app reads and writes it with the service role after requireCmsAdmin(), never on the public
+--    sandbox; the PAYPAL_* environment variables are the fallback.
+-- 6. The UI copy of the partner side (section 7, data only): the partner portal's PayPal or Interac
+--    e-Transfer choice and PayPal wording, and the terms clauses and Program details rows that name
+--    PayPal Payouts, as new public.translations keys and guarded rewordings (the 02031 header's forms).
+--
+-- Grants. No table, view or sequence is created; the new columns ride the existing table grants
+-- (02030: authenticated SELECT through the owner and ADMIN policies, no API write on payouts;
+-- affiliate_profiles keeps exactly its four self-service UPDATE column grants). The six RPCs are
+-- SECURITY INVOKER in public, revoked from PUBLIC, anon and authenticated here and in BOTH copies of
+-- API_ROLE_REVOKE_SQL (apps/nextblock/tools/lib/migrate-core.mjs, apps/nextblock/lib/setup/schema-apply.ts).
+-- The two redefined private functions keep their SECURITY DEFINER, search_path and grants (restated
+-- below). tools/scripts/security-verify.sql section 41 checks all of it.
+--
+-- Append-only, forward-only, idempotent: ADD COLUMN IF NOT EXISTS, the method and manual status CHECKs
+-- dropped and added by name, the other constraints added only when missing, CREATE UNIQUE INDEX IF NOT
+-- EXISTS, CREATE OR REPLACE, DROP POLICY IF EXISTS before CREATE POLICY; it replays cleanly after
+-- 02000-02036 on an empty database and on one that holds data (no existing payout is a PayPal payout,
+-- and every manual payout is PROCESSING or COMPLETED already).
+
+-- 02001 turns body validation off for the session; a one-connection replay would otherwise
+-- create every function below unchecked.
+SET check_function_bodies = on;
+
+-- ---------------------------------------------------------------------------
+-- 1. affiliate_payouts: the PayPal method and what a PayPal payout records
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_receiver text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_sender_batch_id text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_batch_id text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_item_id text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_transaction_id text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_item_status text NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_fee_cents bigint NULL;
+ALTER TABLE public.affiliate_payouts ADD COLUMN IF NOT EXISTS paypal_checked_at timestamptz NULL;
+
+-- 02036's method CHECK, replaced by name: 'paypal' joins. Every existing row holds 'stripe_connect' or
+-- 'manual', so the re-check passes; dropping and adding it again on a replay is harmless.
+ALTER TABLE public.affiliate_payouts DROP CONSTRAINT IF EXISTS affiliate_payouts_method_check;
+ALTER TABLE public.affiliate_payouts
+  ADD CONSTRAINT affiliate_payouts_method_check CHECK (method IN ('stripe_connect', 'paypal', 'manual'));
+
+-- 02036's manual status CHECK, replaced by name. It read "a payout that is not a Stripe payout is
+-- PROCESSING or COMPLETED" (written when 'manual' was the only other method), so a PayPal payout could
+-- never become FAILED: fail_paypal_affiliate_payout() would raise and keep its commissions reserved. It
+-- now holds for manual payouts only (still never FAILED: a cancelled one is deleted). Every existing row
+-- passes it: Stripe rows of any status, and manual rows the old CHECK already kept PROCESSING or
+-- COMPLETED; dropping and adding it again on a replay is harmless.
+ALTER TABLE public.affiliate_payouts DROP CONSTRAINT IF EXISTS affiliate_payouts_manual_status_check;
+ALTER TABLE public.affiliate_payouts
+  ADD CONSTRAINT affiliate_payouts_manual_status_check CHECK (
+    method <> 'manual'
+    OR status IN ('PROCESSING'::public.affiliate_payout_status, 'COMPLETED'::public.affiliate_payout_status));
+
+DO $nb_02037_payouts$
+BEGIN
+  -- a PayPal payout names its recipient and carries no Stripe or manual field: complete_affiliate_payout()
+  -- (transfer id) and prepare_affiliate_payout_retry() (destination) can never complete or re-send one
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_fields_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_fields_check CHECK (
+        method <> 'paypal'
+        OR (paypal_receiver IS NOT NULL AND stripe_destination_account IS NULL AND stripe_transfer_id IS NULL
+            AND manual_channel IS NULL AND external_reference IS NULL AND recorded_by IS NULL));
+  END IF;
+  -- a payout of another method carries no PayPal field
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_only_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_only_check CHECK (
+        method = 'paypal'
+        OR (paypal_receiver IS NULL AND paypal_sender_batch_id IS NULL AND paypal_batch_id IS NULL AND paypal_item_id IS NULL
+            AND paypal_transaction_id IS NULL AND paypal_item_status IS NULL AND paypal_fee_cents IS NULL AND paypal_checked_at IS NULL));
+  END IF;
+  -- a PayPal payout is in flight (PROCESSING), paid (COMPLETED) or given up (FAILED, its commissions
+  -- handed back); unlike a manual payout it can fail
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_status_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_status_check CHECK (
+        method <> 'paypal'
+        OR status IN ('PROCESSING'::public.affiliate_payout_status, 'COMPLETED'::public.affiliate_payout_status,
+                      'FAILED'::public.affiliate_payout_status));
+  END IF;
+  -- a FAILED PayPal payout was failed by fail_ or release_paypal_affiliate_payout(), which hand its
+  -- commissions back and give it a paypal_ reason. The Stripe RPCs therefore raise on a PayPal payout:
+  -- fail_affiliate_payout() (a Stripe reason, commissions left attached while PayPal may still pay the
+  -- item), release_affiliate_payout() ('released') and the give-up branch of
+  -- prepare_affiliate_payout_retry() ('nothing_to_pay', 'below_minimum') would rewrite the reason that
+  -- keeps the run off an address PayPal returned a payout from (its re-send branch is refused by the
+  -- fields CHECK above)
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_failure_reason_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_failure_reason_check CHECK (
+        method <> 'paypal' OR status <> 'FAILED'::public.affiliate_payout_status
+        OR coalesce(failure_reason, '') ~ '^paypal_');
+  END IF;
+  -- a paid PayPal payout names PayPal's item and transaction and when it was paid
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_completed_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_completed_check CHECK (
+        method <> 'paypal' OR status <> 'COMPLETED'::public.affiliate_payout_status
+        OR (paypal_item_id IS NOT NULL AND paypal_transaction_id IS NOT NULL AND paid_at IS NOT NULL));
+  END IF;
+  -- PayPal's receiver takes at most 127 characters; the shape of payout_email's own CHECK (02036)
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_receiver_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_receiver_check CHECK (
+        paypal_receiver IS NULL OR (char_length(paypal_receiver) <= 127 AND paypal_receiver ~ '^[^@[:space:]]+@[^@[:space:]]+$'
+                                    AND paypal_receiver !~ '^[=+@-]'));
+  END IF;
+  -- PayPal's ids end up in request paths: letters, digits, _ and - only
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_ids_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_ids_check CHECK (
+        (paypal_sender_batch_id IS NULL OR paypal_sender_batch_id ~ '^[A-Za-z0-9_-]{1,64}$')
+        AND (paypal_batch_id IS NULL OR paypal_batch_id ~ '^[A-Za-z0-9_-]{1,128}$')
+        AND (paypal_item_id IS NULL OR paypal_item_id ~ '^[A-Za-z0-9_-]{1,128}$')
+        AND (paypal_transaction_id IS NULL OR paypal_transaction_id ~ '^[A-Za-z0-9_-]{1,128}$')
+        AND (paypal_item_status IS NULL OR paypal_item_status ~ '^[A-Z][A-Z_]{0,39}$'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_payouts_paypal_fee_check' AND conrelid = 'public.affiliate_payouts'::regclass) THEN
+    ALTER TABLE public.affiliate_payouts
+      ADD CONSTRAINT affiliate_payouts_paypal_fee_check CHECK (paypal_fee_cents IS NULL OR paypal_fee_cents >= 0);
+  END IF;
+END
+$nb_02037_payouts$;
+
+-- One PayPal payout in flight per partner, currency and mode: claim_paypal_affiliate_payout() answers
+-- 'already_in_flight' first, under the profile lock; the index is the backstop.
+CREATE UNIQUE INDEX IF NOT EXISTS affiliate_payouts_paypal_in_flight_key
+  ON public.affiliate_payouts (affiliate_id, currency, livemode)
+  WHERE method = 'paypal' AND status = 'PROCESSING'::public.affiliate_payout_status;
+
+-- A PayPal item, and a PayPal transaction, completes one payout only.
+CREATE UNIQUE INDEX IF NOT EXISTS affiliate_payouts_paypal_item_key
+  ON public.affiliate_payouts (paypal_item_id) WHERE paypal_item_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS affiliate_payouts_paypal_transaction_key
+  ON public.affiliate_payouts (paypal_transaction_id) WHERE paypal_transaction_id IS NOT NULL;
+
+-- The sync groups in-flight payouts by their batch.
+CREATE INDEX IF NOT EXISTS affiliate_payouts_paypal_sender_batch_idx
+  ON public.affiliate_payouts (paypal_sender_batch_id) WHERE paypal_sender_batch_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 2. affiliate_profiles.payout_email_kind and payout_email_saved_at (server-written; no Data API grant)
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.affiliate_profiles ADD COLUMN IF NOT EXISTS payout_email_kind text NOT NULL DEFAULT 'paypal';
+-- When the partner last saved the payout email (the portal stamps every save, the same address too):
+-- a PayPal payout returned from an address keeps the run off it until a save after that return.
+ALTER TABLE public.affiliate_profiles ADD COLUMN IF NOT EXISTS payout_email_saved_at timestamptz NULL;
+
+DO $nb_02037_profiles$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'affiliate_profiles_payout_email_kind_check' AND conrelid = 'public.affiliate_profiles'::regclass) THEN
+    ALTER TABLE public.affiliate_profiles
+      ADD CONSTRAINT affiliate_profiles_payout_email_kind_check CHECK (payout_email_kind IN ('paypal', 'interac'));
+  END IF;
+END
+$nb_02037_profiles$;
+
+-- 02036's definition with one change: payout_email_kind and payout_email_saved_at join the columns a
+-- non-admin session may not change (the portal writes them with the service role, which carries no
+-- session). Signature, SECURITY DEFINER, search_path, grants and the trigger are 02030's.
+--
+-- A request that carries a user session (auth.uid() is set) and is not an ADMIN on a satisfied
+-- second factor may not change any column the partner does not own. It keys off the session,
+-- not the SQL role (02021's protect_profile_role reasoning): service_role and postgres carry no
+-- session. total_clicks / last_click_at are not on the list (record_affiliate_click() bumps
+-- them from any session; the column grants already pin them, A15). The same session may not
+-- change display_name, bio or social_links while the partner's page is PENDING_REVIEW either
+-- (finding A): approval snapshots them, and the portal withdraws the submission first. The review
+-- lock is session-scoped on purpose: server writes (portal actions, the upload route, the
+-- sandbox demo) carry no session and are held by the app, whose Approve pins the profile the
+-- reviewer saw. Then, for every writer: a tier move stamps tier_changed_at, the handle is
+-- lower-cased and onboarding_step is recomputed from the lifecycle timestamps.
+CREATE OR REPLACE FUNCTION private.affiliate_profile_guard()
+    RETURNS trigger
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.id IS DISTINCT FROM OLD.id
+          OR NEW.user_id IS DISTINCT FROM OLD.user_id
+          OR NEW.tier_id IS DISTINCT FROM OLD.tier_id
+          OR NEW.tier_changed_at IS DISTINCT FROM OLD.tier_changed_at
+          OR NEW.handle IS DISTINCT FROM OLD.handle
+          OR NEW.status IS DISTINCT FROM OLD.status
+          OR NEW.suspended_reason IS DISTINCT FROM OLD.suspended_reason
+          OR NEW.avatar_object_key IS DISTINCT FROM OLD.avatar_object_key
+          OR NEW.onboarding_step IS DISTINCT FROM OLD.onboarding_step
+          OR NEW.stripe_connect_account_id IS DISTINCT FROM OLD.stripe_connect_account_id
+          OR NEW.stripe_connect_livemode IS DISTINCT FROM OLD.stripe_connect_livemode
+          OR NEW.stripe_connect_onboarding_complete IS DISTINCT FROM OLD.stripe_connect_onboarding_complete
+          OR NEW.stripe_connect_details_submitted IS DISTINCT FROM OLD.stripe_connect_details_submitted
+          OR NEW.stripe_connect_payouts_enabled IS DISTINCT FROM OLD.stripe_connect_payouts_enabled
+          OR NEW.stripe_connect_checked_at IS DISTINCT FROM OLD.stripe_connect_checked_at
+          OR NEW.total_earned_cents IS DISTINCT FROM OLD.total_earned_cents
+          OR NEW.total_paid_cents IS DISTINCT FROM OLD.total_paid_cents
+          OR NEW.profile_completed_at IS DISTINCT FROM OLD.profile_completed_at
+          OR NEW.payout_configured_at IS DISTINCT FROM OLD.payout_configured_at
+          OR NEW.page_submitted_at IS DISTINCT FROM OLD.page_submitted_at
+          OR NEW.first_published_at IS DISTINCT FROM OLD.first_published_at
+          OR NEW.signup_ip_masked IS DISTINCT FROM OLD.signup_ip_masked
+          OR NEW.payout_email IS DISTINCT FROM OLD.payout_email
+          OR NEW.payout_email_kind IS DISTINCT FROM OLD.payout_email_kind
+          OR NEW.payout_email_saved_at IS DISTINCT FROM OLD.payout_email_saved_at
+          OR NEW.created_at IS DISTINCT FROM OLD.created_at)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_field_protected'
+      USING ERRCODE = 'insufficient_privilege',
+            HINT = 'Only an administrator or the server can change this partner field.';
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND (SELECT auth.uid()) IS NOT NULL
+     AND (SELECT public.is_admin_mfa()) IS NOT TRUE
+     AND (NEW.display_name IS DISTINCT FROM OLD.display_name
+          OR NEW.bio IS DISTINCT FROM OLD.bio
+          OR NEW.social_links IS DISTINCT FROM OLD.social_links)
+     AND EXISTS (
+       SELECT 1 FROM public.affiliate_pages pg
+        WHERE pg.affiliate_id = OLD.id
+          AND pg.approval_status = 'PENDING_REVIEW'::public.affiliate_page_status)
+  THEN
+    RAISE EXCEPTION 'affiliate_profile_pending_review'
+      USING ERRCODE = '55000',
+            HINT = 'Withdraw the submission before editing the public profile.';
+  END IF;
+
+  IF TG_OP = 'UPDATE' AND NEW.tier_id IS DISTINCT FROM OLD.tier_id THEN
+    NEW.tier_changed_at := now();
+  END IF;
+
+  NEW.handle := lower(NEW.handle);
+  NEW.onboarding_step := CASE
+    WHEN NEW.first_published_at IS NOT NULL THEN 'ACTIVE_PUBLISHED'::public.affiliate_onboarding_step
+    WHEN NEW.page_submitted_at IS NOT NULL THEN 'PAGE_SUBMITTED'::public.affiliate_onboarding_step
+    WHEN NEW.payout_configured_at IS NOT NULL THEN 'PAYOUT_CONFIGURED'::public.affiliate_onboarding_step
+    WHEN NEW.profile_completed_at IS NOT NULL THEN 'PROFILE_COMPLETED'::public.affiliate_onboarding_step
+    ELSE 'SIGNED_UP'::public.affiliate_onboarding_step
+  END;
+  RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_profile_guard() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_profile_guard() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. The PayPal payout lifecycle (service role only): claim, batch ids, item notes, complete, fail
+-- ---------------------------------------------------------------------------
+-- The daily payout run, "Run payouts now" and the CMS PayPal payouts screen
+-- (apps/nextblock/lib/affiliates/paypal/, after the package, sandbox and ADMIN checks). A PayPal payout
+-- follows the Stripe path's order: the commissions are claimed (PROCESSING) BEFORE PayPal is asked to
+-- send anything, the batch's sender_batch_id is saved before the create call, and PayPal's answer
+-- settles the payout later (SUCCESS completes it, a definitive failure fails it and hands its
+-- commissions back). A refund, a lost dispute or a cancellation that arrives while it is in flight
+-- takes the in-flight path of private.affiliate_void_order_commissions() and apply_affiliate_refund()
+-- (void_requested_at / refund_pending_cents and a refund-after-payout alert), applied if it fails; a
+-- dispute only holds the commission (disputed_at). Lock order of the claim and of
+-- complete_affiliate_payout(): the profile, then the commissions, then the payout.
+
+-- claim_paypal_affiliate_payout(): one PayPal payout for one partner and currency. For an ACTIVE,
+-- approved partner (paused partners are not paid, as the terms say) whose payout email is a PayPal
+-- account (payout_email_kind 'paypal', at most 127 characters: PayPal's receiver limit) and who has
+-- no PayPal payout of that currency and mode in flight, the CLEARED, unattached, undisputed
+-- commissions of p_currency, of the gateways in p_gateways (required: the gateways the program pays
+-- with PayPal) and of the mode p_livemode (true: live PayPal pays live sales only; false: the PayPal
+-- sandbox pays test-mode sales only, so a real sale is never marked paid with sandbox money) are
+-- locked, those whose order is refunded or cancelled are voided exactly as the claim does, and the
+-- rest are attached to a new PROCESSING PayPal payout of sum(commission - refunded) with the email as
+-- its recipient. Answers:
+--   {"status": "invalid_input"}      a currency that is not three letters, no gateway, no mode, a bad trigger
+--   {"status": "not_found"}          no such partner
+--   {"status": "not_eligible"}       the partner is not ACTIVE or was never approved
+--   {"status": "no_paypal_email"}    no payout email, an Interac e-Transfer one, or one PayPal cannot take
+--   {"status": "already_in_flight", "payout_id": id, "amount_cents": n}
+--                                    a PayPal payout of that currency and mode is still with PayPal
+--   {"status": "nothing_owed"}       nothing of that currency, those gateways and that mode is left
+--   {"status": "below_minimum", "amount_cents": n, "commission_count": n}
+--                                    the sum is below p_min_amount: nothing is reserved
+--   {"status": "claimed", "payout_id": id, "amount_cents": n, "commission_count": n, "receiver": email}
+CREATE OR REPLACE FUNCTION public.claim_paypal_affiliate_payout(
+    p_affiliate_id uuid, p_currency text, p_min_amount bigint, p_gateways public.affiliate_gateway[], p_livemode boolean,
+    p_trigger text DEFAULT 'cron')
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_currency text := upper(btrim(coalesce(p_currency, '')));
+  v_trigger text := lower(btrim(coalesce(p_trigger, 'cron')));
+  v_profile record;
+  v_receiver text;
+  v_existing record;
+  v_order record;
+  v_amount bigint;
+  v_count integer;
+  v_payout_id uuid;
+BEGIN
+  IF v_currency !~ '^[A-Z]{3}$' OR p_livemode IS NULL OR p_gateways IS NULL OR cardinality(p_gateways) = 0
+     OR v_trigger NOT IN ('cron', 'admin', 'auto') THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+  IF p_affiliate_id IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+
+  SELECT p.id, p.status::text AS status, p.first_published_at, p.payout_email, p.payout_email_kind
+    INTO v_profile
+    FROM public.affiliate_profiles p
+   WHERE p.id = p_affiliate_id
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_profile.status <> 'ACTIVE' OR v_profile.first_published_at IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_eligible');
+  END IF;
+  v_receiver := lower(btrim(coalesce(v_profile.payout_email, '')));
+  IF v_profile.payout_email_kind IS DISTINCT FROM 'paypal' OR v_receiver = '' OR char_length(v_receiver) > 127
+     OR v_receiver !~ '^[^@[:space:]]+@[^@[:space:]]+$' OR v_receiver ~ '^[=+@-]' THEN
+    RETURN jsonb_build_object('status', 'no_paypal_email');
+  END IF;
+
+  -- read under the profile lock: a concurrent claim of the same partner committed before it
+  SELECT po.id, po.amount_cents
+    INTO v_existing
+    FROM public.affiliate_payouts po
+   WHERE po.affiliate_id = p_affiliate_id
+     AND po.method = 'paypal'
+     AND po.status = 'PROCESSING'::public.affiliate_payout_status
+     AND po.currency = v_currency
+     AND po.livemode = p_livemode
+   LIMIT 1;
+  IF FOUND THEN
+    RETURN jsonb_build_object('status', 'already_in_flight', 'payout_id', v_existing.id, 'amount_cents', v_existing.amount_cents);
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_commissions c
+    WHERE c.affiliate_id = p_affiliate_id
+      AND c.status = 'CLEARED'::public.affiliate_commission_status
+      AND c.payout_id IS NULL
+      AND c.currency = v_currency
+      AND c.livemode = p_livemode
+      AND c.disputed_at IS NULL
+      AND c.gateway = ANY (p_gateways)
+    FOR UPDATE;
+
+  FOR v_order IN
+    SELECT DISTINCT c.order_id, o.status
+      FROM public.affiliate_commissions c
+      JOIN public.orders o ON o.id = c.order_id
+     WHERE c.affiliate_id = p_affiliate_id
+       AND c.status = 'CLEARED'::public.affiliate_commission_status
+       AND c.payout_id IS NULL
+       AND c.currency = v_currency
+       AND c.livemode = p_livemode
+       AND c.disputed_at IS NULL
+       AND c.gateway = ANY (p_gateways)
+       AND o.status IN ('refunded', 'cancelled')
+  LOOP
+    PERFORM private.affiliate_void_order_commissions(v_order.order_id, v_order.status);
+  END LOOP;
+
+  SELECT coalesce(sum(c.commission_amount_cents - c.refunded_amount_cents), 0)::bigint, count(*)::integer
+    INTO v_amount, v_count
+    FROM public.affiliate_commissions c
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = p_livemode
+     AND c.disputed_at IS NULL
+     AND c.gateway = ANY (p_gateways);
+  IF v_amount <= 0 THEN
+    RETURN jsonb_build_object('status', 'nothing_owed');
+  END IF;
+  IF v_amount < GREATEST(coalesce(p_min_amount, 0), 0) THEN
+    RETURN jsonb_build_object('status', 'below_minimum', 'amount_cents', v_amount, 'commission_count', v_count);
+  END IF;
+
+  INSERT INTO public.affiliate_payouts (
+    affiliate_id, amount_cents, currency, stripe_destination_account, livemode, status, attempt_count, last_attempt_at,
+    trigger, method, paypal_receiver
+  )
+  VALUES (
+    p_affiliate_id, v_amount, v_currency, NULL, p_livemode, 'PROCESSING'::public.affiliate_payout_status, 1, now(),
+    v_trigger, 'paypal', v_receiver
+  )
+  RETURNING id INTO v_payout_id;
+
+  UPDATE public.affiliate_commissions c
+     SET payout_id = v_payout_id
+   WHERE c.affiliate_id = p_affiliate_id
+     AND c.status = 'CLEARED'::public.affiliate_commission_status
+     AND c.payout_id IS NULL
+     AND c.currency = v_currency
+     AND c.livemode = p_livemode
+     AND c.disputed_at IS NULL
+     AND c.gateway = ANY (p_gateways);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  RETURN jsonb_build_object('status', 'claimed', 'payout_id', v_payout_id, 'amount_cents', v_amount, 'commission_count', v_count,
+                            'receiver', v_receiver);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text) TO service_role;
+
+-- record_paypal_affiliate_payout_batch(): a batch's ids on its PROCESSING PayPal payouts. Called with
+-- p_payout_batch_id NULL BEFORE the create call (the sender_batch_id, also the PayPal-Request-Id, is
+-- saved first, so a create that timed out is retried with the same id: PayPal pays a sender_batch_id
+-- once in 30 days), and with PayPal's payout_batch_id after it. Never overwrites a different id. Every
+-- call without a batch id stamps the send (last_attempt_at; attempt_count + 1 when the same sender id
+-- is saved again, i.e. a resend): the CMS Release waits an hour after the LAST send, which
+-- release_paypal_affiliate_payout() checks under the payout lock. The payouts are locked in id order.
+-- Answers {"status": "invalid_input"} (a malformed id, no payout, more than PayPal's 15,000 items) or
+-- {"status": "recorded", "count": n}: how many of p_payout_ids carry the ids now (fewer when one was
+-- released or settled meanwhile: the caller sends exactly the payouts that still carry the id).
+CREATE OR REPLACE FUNCTION public.record_paypal_affiliate_payout_batch(
+    p_payout_ids uuid[], p_sender_batch_id text, p_payout_batch_id text DEFAULT NULL)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_sender text := btrim(coalesce(p_sender_batch_id, ''));
+  v_batch text := nullif(btrim(coalesce(p_payout_batch_id, '')), '');
+  v_count integer;
+BEGIN
+  IF v_sender !~ '^[A-Za-z0-9_-]{1,64}$' OR (v_batch IS NOT NULL AND v_batch !~ '^[A-Za-z0-9_-]{1,128}$')
+     OR p_payout_ids IS NULL OR cardinality(p_payout_ids) = 0 OR cardinality(p_payout_ids) > 15000 THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+
+  PERFORM 1 FROM public.affiliate_payouts po WHERE po.id = ANY (p_payout_ids) ORDER BY po.id FOR UPDATE;
+  UPDATE public.affiliate_payouts po
+     SET paypal_sender_batch_id = v_sender,
+         paypal_batch_id = coalesce(v_batch, po.paypal_batch_id),
+         last_attempt_at = CASE WHEN v_batch IS NULL THEN now() ELSE po.last_attempt_at END,
+         attempt_count = CASE WHEN v_batch IS NULL AND po.paypal_sender_batch_id = v_sender THEN po.attempt_count + 1 ELSE po.attempt_count END,
+         paypal_checked_at = CASE WHEN v_batch IS NULL THEN po.paypal_checked_at ELSE now() END
+   WHERE po.id = ANY (p_payout_ids)
+     AND po.method = 'paypal'
+     AND po.status = 'PROCESSING'::public.affiliate_payout_status
+     AND (po.paypal_sender_batch_id IS NULL OR po.paypal_sender_batch_id = v_sender)
+     AND (v_batch IS NULL OR po.paypal_batch_id IS NULL OR po.paypal_batch_id = v_batch);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  RETURN jsonb_build_object('status', 'recorded', 'count', v_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.record_paypal_affiliate_payout_batch(uuid[], text, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.record_paypal_affiliate_payout_batch(uuid[], text, text) TO service_role;
+
+-- note_paypal_affiliate_payout_item(): what a sync learned about an in-flight PayPal payout: its item
+-- id (kept once set: a different one is refused), the item's transaction_status (PENDING, UNCLAIMED,
+-- ONHOLD, …, or a status this file does not know, recorded as PayPal wrote it) and fee, and the time
+-- of the check. Answers {"status": "invalid_input"} (a malformed id or status, a negative fee),
+-- {"status": "not_found"} (no such PayPal payout in flight, or another item id) or {"status": "noted"}.
+CREATE OR REPLACE FUNCTION public.note_paypal_affiliate_payout_item(
+    p_payout_id uuid, p_item_id text, p_item_status text, p_fee_cents bigint DEFAULT NULL)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_item text := nullif(btrim(coalesce(p_item_id, '')), '');
+  v_status text := nullif(upper(btrim(coalesce(p_item_status, ''))), '');
+BEGIN
+  IF p_payout_id IS NULL OR (v_item IS NOT NULL AND v_item !~ '^[A-Za-z0-9_-]{1,128}$')
+     OR (v_status IS NOT NULL AND v_status !~ '^[A-Z][A-Z_]{0,39}$') OR (p_fee_cents IS NOT NULL AND p_fee_cents < 0) THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+
+  UPDATE public.affiliate_payouts po
+     SET paypal_item_id = coalesce(po.paypal_item_id, v_item),
+         paypal_item_status = coalesce(v_status, po.paypal_item_status),
+         paypal_fee_cents = coalesce(p_fee_cents, po.paypal_fee_cents),
+         paypal_checked_at = now()
+   WHERE po.id = p_payout_id
+     AND po.method = 'paypal'
+     AND po.status = 'PROCESSING'::public.affiliate_payout_status
+     AND (v_item IS NULL OR po.paypal_item_id IS NULL OR po.paypal_item_id = v_item);
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  RETURN jsonb_build_object('status', 'noted');
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.note_paypal_affiliate_payout_item(uuid, text, text, bigint) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.note_paypal_affiliate_payout_item(uuid, text, text, bigint) TO service_role;
+
+-- complete_paypal_affiliate_payout(): PayPal paid the item (transaction_status SUCCESS). That exact
+-- PayPal payout, still PROCESSING, becomes COMPLETED with the item id, the transaction id, the fee and
+-- paid_at; its commissions become PAID and the partner's total_paid_cents grows by its amount, as
+-- complete_affiliate_payout() does for a transfer (no eligibility or amount check: PayPal paid it).
+-- Exactly once. Answers:
+--   {"status": "invalid_input"}          a malformed item or transaction id or status, a negative fee
+--   {"status": "not_found"}              no such PayPal payout
+--   {"status": "already_completed"}      it is COMPLETED already (a concurrent sync)
+--   {"status": "not_processing"}         it was FAILED (its commissions were handed back)
+--   {"status": "item_mismatch"}          it holds another PayPal item, or this item completes another payout
+--   {"status": "duplicate_transaction"}  another payout carries this transaction id
+--   {"status": "completed", "payout_id": id, "affiliate_id": id, "amount_cents": n, "currency": c,
+--    "commission_count": n, "transaction_id": t}
+CREATE OR REPLACE FUNCTION public.complete_paypal_affiliate_payout(
+    p_payout_id uuid, p_item_id text, p_transaction_id text, p_fee_cents bigint DEFAULT NULL, p_item_status text DEFAULT 'SUCCESS')
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_item text := nullif(btrim(coalesce(p_item_id, '')), '');
+  v_transaction text := nullif(btrim(coalesce(p_transaction_id, '')), '');
+  v_status text := coalesce(nullif(upper(btrim(coalesce(p_item_status, ''))), ''), 'SUCCESS');
+  v_affiliate uuid;
+  v_payout record;
+  v_count integer;
+BEGIN
+  IF p_payout_id IS NULL OR v_item IS NULL OR v_item !~ '^[A-Za-z0-9_-]{1,128}$'
+     OR v_transaction IS NULL OR v_transaction !~ '^[A-Za-z0-9_-]{1,128}$'
+     OR v_status !~ '^[A-Z][A-Z_]{0,39}$' OR (p_fee_cents IS NOT NULL AND p_fee_cents < 0) THEN
+    RETURN jsonb_build_object('status', 'invalid_input');
+  END IF;
+
+  SELECT po.affiliate_id INTO v_affiliate
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal';
+  IF v_affiliate IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.amount_cents, po.currency, po.paypal_item_id
+    INTO v_payout
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal'
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_payout.status = 'COMPLETED' THEN
+    RETURN jsonb_build_object('status', 'already_completed');
+  END IF;
+  IF v_payout.status <> 'PROCESSING' THEN
+    RETURN jsonb_build_object('status', 'not_processing');
+  END IF;
+  IF (v_payout.paypal_item_id IS NOT NULL AND v_payout.paypal_item_id <> v_item)
+     OR EXISTS (SELECT 1 FROM public.affiliate_payouts po WHERE po.paypal_item_id = v_item AND po.id <> p_payout_id) THEN
+    RETURN jsonb_build_object('status', 'item_mismatch');
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.affiliate_payouts po WHERE po.paypal_transaction_id = v_transaction AND po.id <> p_payout_id) THEN
+    RETURN jsonb_build_object('status', 'duplicate_transaction');
+  END IF;
+
+  UPDATE public.affiliate_payouts
+     SET status = 'COMPLETED'::public.affiliate_payout_status, paid_at = now(), failure_reason = NULL,
+         paypal_item_id = v_item, paypal_transaction_id = v_transaction, paypal_item_status = v_status,
+         paypal_fee_cents = coalesce(p_fee_cents, paypal_fee_cents), paypal_checked_at = now()
+   WHERE id = p_payout_id;
+  UPDATE public.affiliate_commissions c
+     SET status = 'PAID'::public.affiliate_commission_status, paid_at = now()
+   WHERE c.payout_id = p_payout_id
+     AND c.status IN ('PENDING_CLEARANCE'::public.affiliate_commission_status, 'CLEARED'::public.affiliate_commission_status);
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  UPDATE public.affiliate_profiles SET total_paid_cents = total_paid_cents + v_payout.amount_cents WHERE id = v_affiliate;
+
+  RETURN jsonb_build_object('status', 'completed', 'payout_id', p_payout_id, 'affiliate_id', v_affiliate,
+                            'amount_cents', v_payout.amount_cents, 'currency', v_payout.currency, 'commission_count', v_count,
+                            'transaction_id', v_transaction);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.complete_paypal_affiliate_payout(uuid, text, text, bigint, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.complete_paypal_affiliate_payout(uuid, text, text, bigint, text) TO service_role;
+
+-- fail_paypal_affiliate_payout(): PayPal will not pay it. That PayPal payout, still PROCESSING, becomes
+-- FAILED with the reason (trimmed to 500 characters, prefixed 'paypal_failed:' unless it starts with
+-- 'paypal_', which the failure reason CHECK requires) and the item's status; the work it owes its
+-- commissions is applied first (A8: a full refund flagged while it was in flight voids its commission,
+-- a partial one reduces it, as fail_affiliate_payout() does for a transfer), and every commission left
+-- is handed back to the cleared balance (unattached), so the next run pays it again (manually, through
+-- Stripe or PayPal, by the program's routing then). Nothing here moves money. Answers:
+--   {"status": "not_found"}          no such PayPal payout
+--   {"status": "already_completed"}  PayPal paid it: it cannot fail
+--   {"status": "already_failed"}     it is FAILED already (its commissions were handed back)
+--   {"status": "failed", "payout_id": id, "affiliate_id": id, "amount_cents": n, "currency": c, "commission_count": n}
+--                                    commission_count: how many commissions went back to the cleared balance
+CREATE OR REPLACE FUNCTION public.fail_paypal_affiliate_payout(p_payout_id uuid, p_reason text, p_item_status text DEFAULT NULL)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_reason text := left(coalesce(nullif(btrim(coalesce(p_reason, '')), ''), 'paypal_failed'), 500);
+  v_status text := nullif(upper(btrim(coalesce(p_item_status, ''))), '');
+  v_affiliate uuid;
+  v_payout record;
+  v_count integer;
+BEGIN
+  IF v_status IS NOT NULL AND v_status !~ '^[A-Z][A-Z_]{0,39}$' THEN
+    v_status := NULL;
+  END IF;
+  IF v_reason !~ '^paypal_' THEN
+    v_reason := left('paypal_failed:' || v_reason, 500);
+  END IF;
+
+  SELECT po.affiliate_id INTO v_affiliate
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal';
+  IF v_affiliate IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.amount_cents, po.currency
+    INTO v_payout
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal'
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_payout.status = 'COMPLETED' THEN
+    RETURN jsonb_build_object('status', 'already_completed');
+  END IF;
+  IF v_payout.status <> 'PROCESSING' THEN
+    RETURN jsonb_build_object('status', 'already_failed');
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+  UPDATE public.affiliate_commissions c SET payout_id = NULL WHERE c.payout_id = p_payout_id;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  UPDATE public.affiliate_payouts
+     SET status = 'FAILED'::public.affiliate_payout_status, failure_reason = v_reason,
+         paypal_item_status = coalesce(v_status, paypal_item_status), paypal_checked_at = now()
+   WHERE id = p_payout_id;
+
+  RETURN jsonb_build_object('status', 'failed', 'payout_id', p_payout_id, 'affiliate_id', v_affiliate,
+                            'amount_cents', v_payout.amount_cents, 'currency', v_payout.currency, 'commission_count', v_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.fail_paypal_affiliate_payout(uuid, text, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.fail_paypal_affiliate_payout(uuid, text, text) TO service_role;
+
+-- release_paypal_affiliate_payout(): the CMS Release of a PayPal payout PayPal has not settled, after
+-- the admin checked in PayPal (Activity) that it paid nothing. The rule is checked here, under the
+-- claim's lock order (the profile, the commissions, the payout), not only by the screen that offers the
+-- button: a run that sends the batch again meanwhile stamps last_attempt_at first, so the release
+-- waits. That PayPal payout, still PROCESSING, is released only when PayPal cannot be paying it:
+--   - PayPal never acknowledged its batch (no paypal_batch_id: claimed and never sent, or sent with an
+--     unknown outcome) and its last send is at least 1 hour old;
+--   - or PayPal acknowledged the batch but never settled the payout (the run cannot read the batch, the
+--     item is missing from it, its status is one this site does not know): its last send is at least
+--     7 days old and PayPal lists no status it holds money in for its item (SUCCESS, PENDING, ONHOLD;
+--     an UNCLAIMED item is cancelled at PayPal instead).
+-- Then, as fail_paypal_affiliate_payout() does, the refund work owed to its commissions is applied, the
+-- rest go back to the cleared balance and the row is FAILED with 'paypal_released_by_admin'. Nothing
+-- here moves money. Answers:
+--   {"status": "not_found"}          no such PayPal payout
+--   {"status": "already_completed"}  PayPal paid it
+--   {"status": "already_failed"}     it is FAILED already
+--   {"status": "held_by_paypal"}     PayPal lists its item as SUCCESS, PENDING, ONHOLD or UNCLAIMED
+--   {"status": "too_recent"}         its last send is less than 1 hour (unacknowledged) or 7 days old
+--   {"status": "released", "payout_id": id, "affiliate_id": id, "amount_cents": n, "currency": c,
+--    "commission_count": n, "acknowledged": bool}
+CREATE OR REPLACE FUNCTION public.release_paypal_affiliate_payout(p_payout_id uuid)
+    RETURNS jsonb
+    LANGUAGE plpgsql SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+#variable_conflict use_column
+DECLARE
+  v_affiliate uuid;
+  v_payout record;
+  v_count integer;
+BEGIN
+  SELECT po.affiliate_id INTO v_affiliate
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal';
+  IF v_affiliate IS NULL THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  PERFORM 1 FROM public.affiliate_profiles p WHERE p.id = v_affiliate FOR UPDATE;
+  PERFORM 1 FROM public.affiliate_commissions c WHERE c.payout_id = p_payout_id FOR UPDATE;
+  SELECT po.status::text AS status, po.amount_cents, po.currency, po.paypal_batch_id, po.paypal_item_status, po.last_attempt_at
+    INTO v_payout
+    FROM public.affiliate_payouts po
+   WHERE po.id = p_payout_id AND po.method = 'paypal'
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('status', 'not_found');
+  END IF;
+  IF v_payout.status = 'COMPLETED' THEN
+    RETURN jsonb_build_object('status', 'already_completed');
+  END IF;
+  IF v_payout.status <> 'PROCESSING' THEN
+    RETURN jsonb_build_object('status', 'already_failed');
+  END IF;
+  IF v_payout.paypal_batch_id IS NOT NULL
+     AND coalesce(v_payout.paypal_item_status, '') IN ('SUCCESS', 'PENDING', 'ONHOLD', 'UNCLAIMED') THEN
+    RETURN jsonb_build_object('status', 'held_by_paypal');
+  END IF;
+  IF (v_payout.paypal_batch_id IS NULL AND v_payout.last_attempt_at > now() - interval '1 hour')
+     OR (v_payout.paypal_batch_id IS NOT NULL AND v_payout.last_attempt_at > now() - interval '7 days') THEN
+    RETURN jsonb_build_object('status', 'too_recent');
+  END IF;
+
+  PERFORM private.affiliate_apply_pending_payout_work(p_payout_id);
+  UPDATE public.affiliate_commissions c SET payout_id = NULL WHERE c.payout_id = p_payout_id;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+  UPDATE public.affiliate_payouts
+     SET status = 'FAILED'::public.affiliate_payout_status, failure_reason = 'paypal_released_by_admin'
+   WHERE id = p_payout_id;
+
+  RETURN jsonb_build_object('status', 'released', 'payout_id', p_payout_id, 'affiliate_id', v_affiliate,
+                            'amount_cents', v_payout.amount_cents, 'currency', v_payout.currency, 'commission_count', v_count,
+                            'acknowledged', v_payout.paypal_batch_id IS NOT NULL);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.release_paypal_affiliate_payout(uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.release_paypal_affiliate_payout(uuid) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. private.affiliate_alert_refund_after_payout: PayPal payouts get their own advice
+-- ---------------------------------------------------------------------------
+-- 02036's definition with one change: a PayPal payout. While PayPal still has it (PROCESSING) the
+-- refund is flagged on its commission (void_requested_at / refund_pending_cents) and applied if PayPal
+-- returns it or it fails (fail_paypal_affiliate_payout); if it completes, the partner was paid for a
+-- refunded sale and the admin recovers the amount. After a completed PayPal payout, the admin recovers
+-- the amount from the partner (a PayPal payout cannot be taken back, and nothing in the ledger deducts
+-- it from a later payout). The metadata names payout_method 'paypal' and the status. Signature,
+-- SECURITY DEFINER, search_path, grants and the one-unresolved-alert-per-commission rule are 02030's.
+--
+-- One unresolved affiliate_refund_after_payout alert per commission (A19 text and metadata).
+CREATE OR REPLACE FUNCTION private.affiliate_alert_refund_after_payout(
+    p_commission_id uuid, p_affiliate_id uuid, p_order_id uuid, p_payout_id uuid, p_reason text)
+    RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_method text;
+  v_status text;
+  v_manual boolean := false;
+  v_paypal boolean := false;
+  v_advice text;
+BEGIN
+  IF p_commission_id IS NULL THEN
+    RETURN;
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM public.system_alerts a
+     WHERE a.alert_type = 'affiliate_refund_after_payout'
+       AND a.is_resolved = false
+       AND a.metadata ->> 'commission_id' = p_commission_id::text
+  ) THEN
+    RETURN;
+  END IF;
+  IF p_payout_id IS NOT NULL THEN
+    SELECT po.method, po.status::text INTO v_method, v_status FROM public.affiliate_payouts po WHERE po.id = p_payout_id;
+    v_manual := coalesce(v_method = 'manual', false);
+    v_paypal := coalesce(v_method = 'paypal', false);
+  END IF;
+  v_advice := CASE
+    WHEN v_manual AND v_status = 'PROCESSING' THEN 'Its manual payout is prepared but not recorded yet: if you have not sent it, cancel it under Pay manually and prepare it again; if you already sent it, record it, then recover the amount from the partner, for example by asking them to send it back.'
+    WHEN v_manual THEN 'Recover the amount from the partner, for example by asking them to send it back.'
+    WHEN v_paypal AND v_status = 'PROCESSING' THEN 'Its PayPal payout is still in flight: if PayPal returns it or it fails, the refund is applied then; if it completes, recover the amount from the partner, for example by asking them to send it back.'
+    WHEN v_paypal THEN 'Recover the amount from the partner, for example by asking them to send it back.'
+    ELSE 'Reverse the transfer in Stripe if needed.'
+  END;
+  INSERT INTO public.system_alerts (alert_type, title, message, metadata)
+  VALUES (
+    'affiliate_refund_after_payout',
+    'Refund after an affiliate payout',
+    CASE
+      WHEN p_reason = 'order_deleted' THEN
+        format('Order %s was deleted after its commission was paid or queued. %s', coalesce(p_order_id::text, 'unknown'), v_advice)
+      ELSE
+        format('Order %s was refunded after its commission was paid or queued. %s', coalesce(p_order_id::text, 'unknown'), v_advice)
+    END,
+    jsonb_build_object(
+      'commission_id', p_commission_id,
+      'affiliate_id', p_affiliate_id,
+      'order_id', p_order_id,
+      'payout_id', p_payout_id,
+      'payout_method', CASE WHEN v_manual THEN 'manual' WHEN v_paypal THEN 'paypal' ELSE 'stripe_connect' END,
+      'payout_status', v_status,
+      'reason', p_reason,
+      'action_url', '/cms/affiliates/payouts',
+      'action_label', 'Review payouts'
+    )
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION private.affiliate_alert_refund_after_payout(uuid, uuid, uuid, uuid, text) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. site_settings.affiliates_paypal_secret: service role only
+-- ---------------------------------------------------------------------------
+-- The CMS-saved PayPal credentials: {"environment": "sandbox" | "live", "sandbox": {"clientId": …,
+-- "secret": <encrypted envelope>}, "live": {…}, "updatedAt": …}. The read and write tiers of 02021 /
+-- 02028 already keep a key they do not list ADMIN-only on a satisfied second factor; a RESTRICTIVE
+-- policy (AND-ed with every permissive one) takes it from the API roles altogether, so neither an aal2
+-- ADMIN session nor the public sandbox's factor-less demo admin can read the encrypted envelope or
+-- plant credentials over the Data API. The service role bypasses RLS: the app reads and writes the
+-- row after requireCmsAdmin(), never on the sandbox. No grant changes.
+DROP POLICY IF EXISTS site_settings_paypal_secret_service_only_policy ON public.site_settings;
+CREATE POLICY site_settings_paypal_secret_service_only_policy ON public.site_settings
+  AS RESTRICTIVE
+  FOR ALL TO anon, authenticated
+  USING (key <> 'affiliates_paypal_secret')
+  WITH CHECK (key <> 'affiliates_paypal_secret');
+
+-- ---------------------------------------------------------------------------
+-- 6. Comments
+-- ---------------------------------------------------------------------------
+COMMENT ON TABLE public.affiliate_payouts IS 'Payouts to partners: Stripe Connect transfers (method stripe_connect), PayPal Payouts items sent from the operator''s PayPal balance (method paypal, 02037) and payouts the operator sends outside Stripe (method manual, 02036), each claimed before the money moves (PROCESSING). A manual payout is COMPLETED when an admin records it and deleted when cancelled, never FAILED; a PayPal payout is COMPLETED when PayPal paid its item and FAILED, its commissions handed back, when PayPal will not. Written only by the service-role RPCs; the partner reads its own rows.';
+COMMENT ON COLUMN public.affiliate_payouts.method IS 'stripe_connect (a Stripe Connect transfer from the platform balance), paypal (a PayPal Payouts item from the operator''s PayPal balance: claim_paypal_affiliate_payout, then complete_ or fail_paypal_affiliate_payout on PayPal''s answer, or release_paypal_affiliate_payout from the CMS; 02037) or manual (money sent outside Stripe: prepared with claim_manual_affiliate_payout, recorded with record_manual_affiliate_payout, cancelled with cancel_manual_affiliate_payout). Only a Stripe payout carries a destination or a transfer id, only a PayPal one the paypal_* columns.';
+COMMENT ON COLUMN public.affiliate_payouts.livemode IS 'Mode of the money: for a Stripe payout the destination account''s key mode at claim, for a PayPal payout the PayPal environment (false: the PayPal sandbox). A payout holds only commissions of its mode; a Stripe one is retried only with a key of the same mode.';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_receiver IS 'A PayPal payout''s recipient: the partner''s PayPal payout email when it was claimed (at most 127 characters, PayPal''s receiver limit).';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_sender_batch_id IS 'The sender_batch_id (and PayPal-Request-Id) of the PayPal batch carrying the payout, saved before the create call: a create that timed out is retried with the same id.';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_batch_id IS 'PayPal''s payout_batch_id, once the create call answered.';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_item_id IS 'PayPal''s payout_item_id of this payout''s item (unique).';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_transaction_id IS 'PayPal''s transaction id once the item reached SUCCESS (unique; required once COMPLETED).';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_item_status IS 'The item''s last transaction_status as PayPal wrote it (SUCCESS, PENDING, UNCLAIMED, ONHOLD, RETURNED, …).';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_fee_cents IS 'PayPal''s fee for the item, minor units of the payout currency (NULL when unknown or charged in another currency). The partner receives the full amount.';
+COMMENT ON COLUMN public.affiliate_payouts.paypal_checked_at IS 'When PayPal was last asked about the payout.';
+COMMENT ON COLUMN public.affiliate_payouts.failure_reason IS 'Why the last attempt failed (a Stripe error code, stale, nothing_to_pay, below_minimum, released; for a PayPal payout always paypal_…: paypal_<status> or paypal_<error name>, paypal_cancelled, paypal_released_by_admin).';
+COMMENT ON COLUMN public.affiliate_profiles.payout_email_saved_at IS 'When the partner last saved the payout email (the portal stamps every save, the same address included). A PayPal payout returned from an address keeps the run off it until a save after that return. Server-written like payout_email; no Data API grant, and the profile guard refuses it from a partner session (02037).';
+COMMENT ON COLUMN public.affiliate_profiles.payout_email_kind IS 'What payout_email is: paypal (the email of a PayPal account: automatic PayPal payouts and the PayPal payouts file can use it; the default) or interac (an Interac e-Transfer address, paid by hand). Written like payout_email (the server after requireRetailer(), or an admin); no Data API grant, and the profile guard refuses it from a partner session (02037).';
+COMMENT ON FUNCTION public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text) IS 'Service role: before any PayPal call, attaches an ACTIVE, approved partner''s CLEARED, unattached, undisputed commissions of one currency, of the PayPal gateways and of the PayPal environment''s mode to a new PROCESSING PayPal payout to their PayPal payout email; one in flight per partner, currency and mode. Returns {status, ...}: invalid_input, not_found, not_eligible, no_paypal_email, already_in_flight, nothing_owed, below_minimum or claimed.';
+COMMENT ON FUNCTION public.record_paypal_affiliate_payout_batch(uuid[], text, text) IS 'Service role: saves a PayPal batch''s sender_batch_id (before the create call) and payout_batch_id (after it) on its PROCESSING PayPal payouts, never overwriting a different id. Returns {status, count}: recorded or invalid_input.';
+COMMENT ON FUNCTION public.note_paypal_affiliate_payout_item(uuid, text, text, bigint) IS 'Service role: records what a sync learned about an in-flight PayPal payout (item id, transaction_status, fee, check time). Returns {status}: noted, not_found or invalid_input.';
+COMMENT ON FUNCTION public.complete_paypal_affiliate_payout(uuid, text, text, bigint, text) IS 'Service role: PayPal paid the item: the PROCESSING PayPal payout becomes COMPLETED with its transaction id and fee, its commissions PAID, total_paid_cents up by its amount, exactly once. Returns {status, ...}: invalid_input, not_found, already_completed, not_processing, item_mismatch, duplicate_transaction or completed.';
+COMMENT ON FUNCTION public.fail_paypal_affiliate_payout(uuid, text, text) IS 'Service role: PayPal will not pay the item: the PROCESSING PayPal payout becomes FAILED with the reason, the refund work owed to its commissions is applied and the rest go back to the cleared balance. Returns {status, ...}: not_found, already_completed, already_failed or failed.';
+COMMENT ON FUNCTION public.release_paypal_affiliate_payout(uuid) IS 'Service role: the CMS Release of a PayPal payout PayPal has not settled, checked under the payout lock: an unacknowledged batch 1 hour after its last send, an acknowledged one 7 days after it while PayPal lists no SUCCESS, PENDING, ONHOLD or UNCLAIMED status; then FAILED (paypal_released_by_admin) with its commissions handed back. Returns {status, ...}: not_found, already_completed, already_failed, held_by_paypal, too_recent or released.';
+COMMENT ON POLICY site_settings_paypal_secret_service_only_policy ON public.site_settings IS 'affiliates_paypal_secret (the CMS-saved PayPal credentials, 02037) is service-role only: no API role reads or writes it, an aal2 ADMIN included.';
+
+-- ---------------------------------------------------------------------------
+-- 7. UI copy of the partner side (the forms the 02031 generator header prescribes)
+-- ---------------------------------------------------------------------------
+-- Data only (public.translations, which already has its grants): no schema object, no grant. The
+-- partner portal's payouts page asks PayPal or Interac e-Transfer first (payout_email_kind) and takes a
+-- PayPal email twice; payout_email_label is now the question above that choice and payout_email_help
+-- the PayPal warning (keys kept, reworded below). It says when PayPal sends the next payout ("Sent by
+-- PayPal on the next daily run once you reach {min}."), reads PayPal payouts in the history as
+-- "PayPal · {status}" with the transaction id once paid and where to claim one PayPal holds, and warns
+-- a partner whose PayPal payout came back (with "I checked it: try PayPal again", which saves the same
+-- address again: payout_email_saved_at lifts the block). Its header and FAQ name Stripe and PayPal, or
+-- PayPal and the store's own payouts, for programs that mix them; an empty PayPal email confirmation
+-- has its own message. The built-in terms name PayPal Payouts per kind of sale (the
+-- Program details method and schedule rows), say what PayPal does with an unclaimed payout, that
+-- Interac e-Transfers are sent by hand and that PayPal has its own agreement; the payout, schedule and
+-- recovery clauses name PayPal. The partner emails of PayPal payouts are internal copy (not seeded).
+-- libs/affiliates/src/lib/i18n/translations-migration.test.ts replays this section with every other
+-- migration and fails until the seeded copy matches the dictionaries.
+--
+-- New keys, never overwriting a row that already exists.
+INSERT INTO public.translations (key, translations, created_at, updated_at)
+VALUES
+  ('affiliates.portal.balance_cleared_paypal_hint', jsonb_build_object('en', 'Sent by PayPal once it reaches {min}.', 'fr', 'Envoyé par PayPal une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.balance_cleared_paypal_manual_hint', jsonb_build_object('en', '{paypal} goes by PayPal and {manual} is paid by {site}, each once it reaches {min}.', 'fr', '{paypal} part par PayPal et {manual} est versé par {site}, chacun une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.balance_cleared_stripe_paypal_hint', jsonb_build_object('en', '{stripe} goes by Stripe transfer and {paypal} by PayPal, each once it reaches {min}.', 'fr', '{stripe} part par virement Stripe et {paypal} par PayPal, chacun une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.balance_next_paypal_payout', jsonb_build_object('en', 'Next PayPal payout', 'fr', 'Prochain versement PayPal'), now(), now()),
+  ('affiliates.portal.balance_processing_paypal_hint', jsonb_build_object('en', '{amount} is on its way to your PayPal account.', 'fr', '{amount} est en route vers votre compte PayPal.'), now(), now()),
+  ('affiliates.portal.balance_unclaimed_paypal_hint', jsonb_build_object('en', '{amount} is waiting for you to claim it in PayPal.', 'fr', '{amount} attend que vous le réclamiez dans PayPal.'), now(), now()),
+  ('affiliates.portal.commission_payout_paypal', jsonb_build_object('en', 'PayPal', 'fr', 'PayPal'), now(), now()),
+  ('affiliates.portal.error_payout_email_confirm_empty', jsonb_build_object('en', 'Type your PayPal email again to confirm it.', 'fr', 'Entrez de nouveau votre courriel PayPal pour le confirmer.'), now(), now()),
+  ('affiliates.portal.error_payout_email_mismatch', jsonb_build_object('en', 'The two email addresses don''t match.', 'fr', 'Les deux adresses courriel ne correspondent pas.'), now(), now()),
+  ('affiliates.portal.faq_payout_answer_paypal', jsonb_build_object('en', 'Once your cleared balance reaches {min}, the next daily payout run sends it to your PayPal account. If you chose Interac e-Transfer, {site} sends it by hand instead.', 'fr', 'Dès que votre solde confirmé atteint {min}, le prochain versement quotidien l''envoie dans votre compte PayPal. Si vous avez choisi le virement Interac, {site} vous l''envoie plutôt manuellement.'), now(), now()),
+  ('affiliates.portal.faq_payout_answer_paypal_manual', jsonb_build_object('en', 'It depends on the order: “How you get paid” above says which commissions go to PayPal. Those are sent to your PayPal account in the daily payout run once they reach {min}, or by hand if you chose Interac e-Transfer. {site} sends you the others directly, once they reach the same minimum.', 'fr', 'Cela dépend de la commande : la section « Comment vous êtes payé » ci-dessus indique quelles commissions vont à PayPal. Celles-ci sont envoyées dans votre compte PayPal lors du versement quotidien dès qu''elles atteignent {min}, ou manuellement si vous avez choisi le virement Interac. {site} vous envoie les autres directement, une fois ce même minimum atteint.'), now(), now()),
+  ('affiliates.portal.faq_payout_answer_stripe_paypal', jsonb_build_object('en', 'It depends on the order: “How you get paid” above says which commissions go through Stripe and which go to PayPal. Each kind is sent in the daily payout run once it reaches {min}: to your bank through Stripe, or to your PayPal account. If you chose Interac e-Transfer, {site} sends the PayPal ones by hand instead.', 'fr', 'Cela dépend de la commande : la section « Comment vous êtes payé » ci-dessus indique quelles commissions passent par Stripe et lesquelles vont à PayPal. Chacune est envoyée lors du versement quotidien dès qu''elle atteint {min} : dans votre compte bancaire par Stripe, ou dans votre compte PayPal. Si vous avez choisi le virement Interac, {site} vous envoie plutôt manuellement celles de PayPal.'), now(), now()),
+  ('affiliates.portal.next_payout_paypal_hint', jsonb_build_object('en', 'Sent by PayPal on the next daily run once you reach {min}.', 'fr', 'Envoyé par PayPal au prochain versement quotidien, une fois le minimum de {min} atteint.'), now(), now()),
+  ('affiliates.portal.next_payout_paypal_sending', jsonb_build_object('en', 'On its way', 'fr', 'En route'), now(), now()),
+  ('affiliates.portal.payout_email_interac_help', jsonb_build_object('en', 'Interac e-Transfers are sent by {site} by hand, usually less often.', 'fr', 'Les virements Interac sont envoyés manuellement par {site}, habituellement moins souvent.'), now(), now()),
+  ('affiliates.portal.payout_email_interac_help_manual', jsonb_build_object('en', '{site} sends Interac e-Transfers by hand.', 'fr', '{site} envoie les virements Interac manuellement.'), now(), now()),
+  ('affiliates.portal.payout_email_interac_label', jsonb_build_object('en', 'Email for Interac e-Transfers', 'fr', 'Courriel pour les virements Interac'), now(), now()),
+  ('affiliates.portal.payout_email_paypal_confirm_hint', jsonb_build_object('en', 'A new PayPal email is typed twice: confirm it in the next field.', 'fr', 'Un nouveau courriel PayPal doit être entré deux fois : confirmez-le dans le champ suivant.'), now(), now()),
+  ('affiliates.portal.payout_email_paypal_confirm_label', jsonb_build_object('en', 'Confirm your PayPal email', 'fr', 'Confirmez votre courriel PayPal'), now(), now()),
+  ('affiliates.portal.payout_email_paypal_label', jsonb_build_object('en', 'Email of your PayPal account', 'fr', 'Courriel de votre compte PayPal'), now(), now()),
+  ('affiliates.portal.payout_email_retry_paypal', jsonb_build_object('en', 'I checked it: try PayPal again', 'fr', 'Je l''ai vérifié : réessayer PayPal'), now(), now()),
+  ('affiliates.portal.payout_email_retry_saved', jsonb_build_object('en', 'Saved: PayPal is tried at this address again with your next payout.', 'fr', 'Enregistré : PayPal sera réessayé à cette adresse lors de votre prochain versement.'), now(), now()),
+  ('affiliates.portal.payout_kind_interac', jsonb_build_object('en', 'Interac e-Transfer', 'fr', 'Virement Interac'), now(), now()),
+  ('affiliates.portal.payout_kind_paypal', jsonb_build_object('en', 'PayPal', 'fr', 'PayPal'), now(), now()),
+  ('affiliates.portal.payout_methods_by_paypal', jsonb_build_object('en', 'Your commissions are sent to your PayPal account automatically, or by Interac e-Transfer if you choose it.', 'fr', 'Vos commissions sont envoyées automatiquement dans votre compte PayPal, ou par virement Interac si vous le choisissez.'), now(), now()),
+  ('affiliates.portal.payout_paypal_back_in_balance', jsonb_build_object('en', 'The amount went back to your balance.', 'fr', 'Le montant est retourné dans votre solde.'), now(), now()),
+  ('affiliates.portal.payout_paypal_claim_hint', jsonb_build_object('en', 'Claim it in PayPal: check the email PayPal sent to {email}.', 'fr', 'Réclamez-le dans PayPal : consultez le courriel que PayPal a envoyé à {email}.'), now(), now()),
+  ('affiliates.portal.payout_paypal_returned_notice', jsonb_build_object('en', 'PayPal returned the last payout sent to {email}. Check that it is the email of your PayPal account (or open and confirm a PayPal account with it), then save it again below, or choose Interac e-Transfer. Until you do, {site} pays you by hand.', 'fr', 'PayPal a retourné le dernier versement envoyé à {email}. Vérifiez qu''il s''agit bien du courriel de votre compte PayPal (ou ouvrez et confirmez un compte PayPal avec ce courriel), puis enregistrez-le de nouveau ci-dessous, ou choisissez le virement Interac. D''ici là, {site} vous paie manuellement.'), now(), now()),
+  ('affiliates.portal.payout_paypal_status', jsonb_build_object('en', 'PayPal · {status}', 'fr', 'PayPal · {status}'), now(), now()),
+  ('affiliates.portal.payout_paypal_status_not_sent', jsonb_build_object('en', 'Not sent', 'fr', 'Non envoyé'), now(), now()),
+  ('affiliates.portal.payout_paypal_status_paid', jsonb_build_object('en', 'Paid', 'fr', 'Payé'), now(), now()),
+  ('affiliates.portal.payout_paypal_status_returned', jsonb_build_object('en', 'Returned', 'fr', 'Retourné'), now(), now()),
+  ('affiliates.portal.payout_paypal_status_sent', jsonb_build_object('en', 'Sent', 'fr', 'Envoyé'), now(), now()),
+  ('affiliates.portal.payout_paypal_status_unclaimed', jsonb_build_object('en', 'Waiting for you to claim it', 'fr', 'En attente que vous le réclamiez'), now(), now()),
+  ('affiliates.portal.payout_paypal_transaction', jsonb_build_object('en', 'Transaction {reference}', 'fr', 'Transaction {reference}'), now(), now()),
+  ('affiliates.portal.payouts_description_paypal', jsonb_build_object('en', 'Your commissions clear after the refund window, then go to your PayPal account automatically, or by Interac e-Transfer if you choose it.', 'fr', 'Vos commissions sont confirmées après la période de remboursement, puis envoyées automatiquement dans votre compte PayPal, ou par virement Interac si vous le choisissez.'), now(), now()),
+  ('affiliates.portal.payouts_description_paypal_manual', jsonb_build_object('en', 'Your commissions clear after the refund window. Depending on the order, they then go to your PayPal account automatically (or by Interac e-Transfer if you choose it), or {site} sends them to you directly.', 'fr', 'Vos commissions sont confirmées après la période de remboursement. Selon la commande, elles sont ensuite envoyées automatiquement dans votre compte PayPal (ou par virement Interac si vous le choisissez), ou {site} vous les envoie directement.'), now(), now()),
+  ('affiliates.portal.payouts_description_stripe_paypal', jsonb_build_object('en', 'Your commissions clear after the refund window. Depending on the order, they then go to your bank through Stripe, or to your PayPal account automatically (or by Interac e-Transfer if you choose it).', 'fr', 'Vos commissions sont confirmées après la période de remboursement. Selon la commande, elles sont ensuite versées dans votre compte bancaire par Stripe, ou envoyées automatiquement dans votre compte PayPal (ou par virement Interac si vous le choisissez).'), now(), now()),
+  ('affiliates.terms.details_payout_method_paypal', jsonb_build_object('en', 'Sent to your PayPal account by PayPal Payouts, or by Interac e-Transfer if you choose it', 'fr', 'Envoyé à votre compte PayPal par PayPal Payouts, ou par virement Interac si vous le choisissez'), now(), now()),
+  ('affiliates.terms.details_schedule_paypal_daily', jsonb_build_object('en', 'PayPal payouts: automatic, every day. Interac e-Transfers: when we send them.', 'fr', 'Versements PayPal : automatiques, chaque jour. Virements Interac : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_paypal_direct_daily', jsonb_build_object('en', 'PayPal payouts: automatic, every day. Direct payouts: when we send them.', 'fr', 'Versements PayPal : automatiques, chaque jour. Versements directs : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_paypal_direct_manual', jsonb_build_object('en', 'PayPal payouts: when we run them. Direct payouts: when we send them.', 'fr', 'Versements PayPal : quand nous les lançons. Versements directs : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_paypal_manual', jsonb_build_object('en', 'PayPal payouts: when we run them. Interac e-Transfers: when we send them.', 'fr', 'Versements PayPal : quand nous les lançons. Virements Interac : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_stripe_paypal_daily', jsonb_build_object('en', 'Stripe transfers and PayPal payouts: automatic, every day. Interac e-Transfers: when we send them.', 'fr', 'Virements Stripe et versements PayPal : automatiques, chaque jour. Virements Interac : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.details_schedule_stripe_paypal_manual', jsonb_build_object('en', 'Stripe transfers and PayPal payouts: when we run them. Interac e-Transfers: when we send them.', 'fr', 'Virements Stripe et versements PayPal : quand nous les lançons. Virements Interac : quand nous les envoyons.'), now(), now()),
+  ('affiliates.terms.payouts_interac', jsonb_build_object('en', 'If you choose Interac e-Transfer, we send your payouts by hand.', 'fr', 'Si vous choisissez le virement Interac, nous envoyons vos versements manuellement.'), now(), now()),
+  ('affiliates.terms.payouts_paypal', jsonb_build_object('en', 'For payouts by PayPal, use the email of your PayPal account. A payout sent to an address without a confirmed PayPal account waits to be claimed for a limited time; then PayPal returns it, and the amount goes back to your balance.', 'fr', 'Pour les versements par PayPal, utilisez le courriel de votre compte PayPal. Un versement envoyé à une adresse sans compte PayPal confirmé attend d''être réclamé pendant un temps limité; PayPal le retourne ensuite, et le montant revient dans votre solde.'), now(), now()),
+  ('affiliates.terms.payouts_paypal_agreement', jsonb_build_object('en', 'Your PayPal account is covered by PayPal''s own agreement with you.', 'fr', 'Votre compte PayPal est soumis à l''entente que PayPal conclut avec vous.'), now(), now())
+ON CONFLICT (key) DO NOTHING;
+
+-- Changed text, each language guarded by the text 02036 seeded (its new keys, or its rewording of
+-- 02031's), so copy an operator edited (CMS > Settings > Extra Translations) stays theirs.
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{en}', to_jsonb(fix.new_en)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.portal.payout_email_label',
+     'Email for PayPal or Interac e-Transfer payouts',
+     'How do you want to receive your payouts?'),
+    ('affiliates.portal.payout_email_help',
+     'We send manual payouts to this address. Use the email of your PayPal account, or the one you use for Interac e-Transfer.',
+     'Use the email of your PayPal account. A payout to an address without a confirmed PayPal account waits 30 days to be claimed, then returns.'),
+    ('affiliates.terms.payouts_stripe',
+     'Depending on the sale, we pay you with Stripe Connect Express, into a Stripe account in your name, or we send the money to you directly, for example by PayPal or Interac e-Transfer.',
+     'Depending on the sale, we pay you into a Stripe account in your name (Stripe Connect Express), into your PayPal account with PayPal Payouts, or we send the money to you directly, for example by PayPal or Interac e-Transfer.'),
+    ('affiliates.terms.payouts_direct',
+     'For payouts we send directly, add your payout email in your partner portal. We send the money to that address, so keep it up to date.',
+     'For payouts by PayPal or sent directly, add your payout email in your partner portal and choose PayPal or Interac e-Transfer. We send the money to that address, so keep it up to date.'),
+    ('affiliates.terms.payouts_schedule',
+     'Payouts follow our schedule. A payout can be late, for example if a payment service is unavailable or our Stripe balance is too low.',
+     'Payouts follow our schedule. A payout can be late, for example if a payment service is unavailable or our Stripe or PayPal balance is too low.'),
+    ('affiliates.terms.refunds_after_payout',
+     'If a refund or a lost dispute comes after we paid you, we may take that amount back, by reversing the Stripe transfer or by deducting it from a later payout.',
+     'If a refund or a lost dispute comes after we paid you, we may take that amount back: by reversing the Stripe transfer, by asking you to send it back, or by deducting it from a later payout.')
+  ) AS fix(key, old_en, new_en)
+ WHERE t.key = fix.key AND t.translations->>'en' = fix.old_en;
+
+UPDATE public.translations AS t
+   SET translations = jsonb_set(t.translations, '{fr}', to_jsonb(fix.new_fr)), updated_at = now()
+  FROM (VALUES
+    ('affiliates.portal.payout_email_label',
+     'Courriel pour les versements par PayPal ou virement Interac',
+     'Comment voulez-vous recevoir vos versements?'),
+    ('affiliates.portal.payout_email_help',
+     'Nous envoyons les versements manuels à cette adresse. Utilisez le courriel de votre compte PayPal, ou celui que vous utilisez pour les virements Interac.',
+     'Utilisez le courriel de votre compte PayPal. Un versement envoyé à une adresse sans compte PayPal confirmé attend 30 jours d''être réclamé, puis il est retourné.'),
+    ('affiliates.terms.payouts_stripe',
+     'Selon la vente, nous vous payons avec Stripe Connect Express, dans un compte Stripe à votre nom, ou nous vous envoyons l''argent directement, par exemple par PayPal ou virement Interac.',
+     'Selon la vente, nous vous payons dans un compte Stripe à votre nom (Stripe Connect Express), dans votre compte PayPal avec PayPal Payouts, ou nous vous envoyons l''argent directement, par exemple par PayPal ou virement Interac.'),
+    ('affiliates.terms.payouts_direct',
+     'Pour les versements que nous envoyons directement, ajoutez votre courriel de versement dans votre portail partenaire. Nous envoyons l''argent à cette adresse : gardez-la à jour.',
+     'Pour les versements par PayPal ou envoyés directement, ajoutez votre courriel de versement dans votre portail partenaire et choisissez PayPal ou le virement Interac. Nous envoyons l''argent à cette adresse : gardez-la à jour.'),
+    ('affiliates.terms.payouts_schedule',
+     'Les versements suivent notre calendrier. Un versement peut être retardé, par exemple si un service de paiement est indisponible ou si notre solde Stripe est insuffisant.',
+     'Les versements suivent notre calendrier. Un versement peut être retardé, par exemple si un service de paiement est indisponible ou si notre solde Stripe ou PayPal est insuffisant.'),
+    ('affiliates.terms.refunds_after_payout',
+     'Si un remboursement ou un litige perdu survient après votre versement, nous pouvons reprendre ce montant, en annulant le virement Stripe ou en le déduisant d''un versement suivant.',
+     'Si un remboursement ou un litige perdu survient après votre versement, nous pouvons reprendre ce montant : en annulant le virement Stripe, en vous demandant de nous le renvoyer ou en le déduisant d''un versement suivant.')
+  ) AS fix(key, old_fr, new_fr)
+ WHERE t.key = fix.key AND t.translations->>'fr' = fix.old_fr;
+
+
+-- >>> FROM: 02038_site_settings_secret_rows_service_role_only.sql <<<
+-- 02038: the secret rows of site_settings are reachable only through the service role.
+-- Append-only, forward-only, idempotent: the four authenticated policies are dropped by name and
+-- recreated with the predicates 02023 (read) and 02028 (writes) left, plus one exclusion. No grant
+-- changes, so the post-apply grant pass (API_ROLE_REVOKE_SQL) is untouched.
+--
+-- The hole (2026-11-04 review of the SMTP credential handling). The ADMIN branch of every
+-- site_settings policy is \`public.is_admin_mfa()\`, which an ADMIN passes on an aal2 session, and
+-- also at aal1 when they enrolled no second factor. That branch admitted every key, the secret rows
+-- included, so such a session could read and write them straight over PostgREST:
+--   * email_secret              { user, pass }: the SMTP login (envelopes)
+--   * payment_secret            { stripeSecretKey, stripeWebhookSecret, freemiusSecretKey,
+--                                 freemiusApiKey, freemiusSandboxSecretKey } (envelopes)
+--   * bot_protection_secret     { secretKey }: the Turnstile / reCAPTCHA secret (envelope)
+--   * cortex_ai_openrouter_api_key, cortex_ai_pexels_api_key, cortex_ai_unsplash_access_key
+--                               (the row value is the envelope)
+--   * cortex_ai_mcp_settings    the MCP server's on/off switch and localhost trust (no credential,
+--                               but the database has always kept it next to the secrets)
+-- The envelopes (libs/db secret-crypto.ts, AES-256-GCM) were not bound to the row and field they
+-- were sealed for, so copying the payment_secret, bot_protection_secret or Cortex envelopes into
+-- email_secret.user / .pass, saving an SMTP host of one's own and clicking "Send test email" handed
+-- the plaintext to that host through SMTP AUTH. The CMS shows those secrets as last4 at most; an XSS
+-- running as such an admin could do the same. Not reachable on the public sandbox: mail never reads
+-- the database there (apps/nextblock/lib/config/email-settings.ts).
+--
+-- The fix, in two layers:
+--   1. This migration. The is_admin_mfa() branch of the read, insert, update and delete policies no
+--      longer reaches a secret row: the seven keys above by name, and any later key named like a
+--      secret (\`_secret\`, \`_secret_key\`, \`_api_key\`, \`_access_key\`, \`_private_key\`, \`_token\`,
+--      \`_password\`, \`_credential(s)\` at the end, case-insensitive; the same pattern Cortex's DB tools
+--      already refuse, libs/cortex ai-global-agent-db-tools.ts PROTECTED_SITE_SETTING_KEY_PATTERN).
+--      The WRITER allow-list and the first-factor ADMIN keys (02028) name no secret, so nothing else
+--      changes. Every reader and writer of these rows in the app and the libs already uses the
+--      service role after its own role check (requireCmsAdmin / requireAdminSupabaseClient /
+--      requireEcomAdmin, and the resolvers' own service client), so no screen goes empty.
+--   2. In code (same release): v2 envelopes carry their slot (\`site_settings:<key>:<field>\`) as
+--      AES-GCM associated data and each reader opens only its own slot. v1 envelopes still open and
+--      are re-sealed as v2 the next time their screen is saved.
+--
+-- What stays the same: anon reads (02021), the staff read tier, the WRITER allow-list, the first-
+-- factor ADMIN keys, and the second factor on every other ADMIN-tier key (email_public,
+-- payment_public, store_contact, the cortex_ai_* settings, ...). The service role bypasses RLS.
+--
+-- tools/scripts/security-verify.sql section 42 checks all of the above; section 16 now probes the
+-- ADMIN tier with a key that is not a secret.
+
+-- ---------------------------------------------------------------------------
+-- site_settings: the ADMIN branch stops at the secret rows
+-- ---------------------------------------------------------------------------
+DROP POLICY IF EXISTS site_settings_read_policy ON public.site_settings;
+CREATE POLICY site_settings_read_policy ON public.site_settings
+  FOR SELECT TO authenticated
+  USING (
+    (key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','footer_copyright','footer_show_attribution','global_css','language_detection_settings','seo_robots_settings','bot_protection_public','active_logo_id','is_admin_created','privacy_settings','enabled_payment_providers','ecommerce_inventory_settings','migration_baseline_generation','invoice_settings']::text[]))
+    OR ((key = ANY (ARRAY['security_settings','onboarding_state','email_public','cortex_ai_site_brief']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR (((SELECT public.is_admin_mfa()) IS TRUE)
+      AND key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+      AND key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$')
+  );
+
+DROP POLICY IF EXISTS site_settings_insert_policy ON public.site_settings;
+CREATE POLICY site_settings_insert_policy ON public.site_settings
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR (((SELECT public.is_admin_mfa()) IS TRUE)
+      AND key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+      AND key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$')
+  );
+
+DROP POLICY IF EXISTS site_settings_update_policy ON public.site_settings;
+CREATE POLICY site_settings_update_policy ON public.site_settings
+  FOR UPDATE TO authenticated
+  USING (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR (((SELECT public.is_admin_mfa()) IS TRUE)
+      AND key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+      AND key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$')
+  )
+  WITH CHECK (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR (((SELECT public.is_admin_mfa()) IS TRUE)
+      AND key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+      AND key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$')
+  );
+
+DROP POLICY IF EXISTS site_settings_delete_policy ON public.site_settings;
+CREATE POLICY site_settings_delete_policy ON public.site_settings
+  FOR DELETE TO authenticated
+  USING (
+    ((key = ANY (ARRAY['site_title','site_description','site_keywords','site_social_image','active_logo_id','footer_copyright','footer_show_attribution','onboarding_state']::text[]))
+      AND (SELECT public.get_current_user_role()) = ANY (ARRAY['ADMIN'::public.user_role,'WRITER'::public.user_role]))
+    OR ((key = ANY (ARRAY['enabled_payment_providers','ecommerce_inventory_settings']::text[]))
+      AND (SELECT public.get_current_user_role()) = 'ADMIN'::public.user_role)
+    OR (((SELECT public.is_admin_mfa()) IS TRUE)
+      AND key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+      AND key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$')
+  );
+
+COMMENT ON TABLE public.site_settings IS 'Key-value store for global site settings. The secret rows (email_secret, payment_secret, bot_protection_secret, the cortex_ai_* API keys, cortex_ai_mcp_settings, and any key ending in _secret, _api_key, _access_key, _private_key, _token, _password or _credential(s)) hold encrypted envelopes and are reachable only through the service role (02038).';
+
+
+-- >>> FROM: 02039_home_hero_heading_fit.sql <<<
+-- 02039: home hero H1, EN + FR -- the period stays with the highlighted word, the French heading
+-- fits in three lines, and the heading is sized by its column. Copy and markup only; no schema.
+--
+-- Measured in Chrome on nextblock.dev with the site's own CSS and font (2026-11-12):
+-- * The highlighted word ("Production" / "production") is a relative inline-block (the gradient
+--   pill). CSS Text 3 puts a soft wrap opportunity after every atomic inline, even right before
+--   punctuation, so with the H1's text-wrap: balance the period after the pill wrapped to the
+--   start of the next line (". The AI Website"). The pill and its period now sit in one
+--   whitespace-nowrap span, which takes that break opportunity away.
+-- * French ran to four lines at every desktop width: "Du prompt à la production." (776px at 60px)
+--   never fits the 668px column, and "Le CMS constructeur de sites web par l'IA." is 42 characters.
+--   The new second sentence, "L'IA bâtit, le CMS publie." (26: the AI builds, the CMS publishes),
+--   keeps it at three lines, like English, and carries the prompt-to-production story on; the
+--   first sentence of the copy below still holds the full keyphrase ("le CMS constructeur de sites
+--   web par l'IA"). No-break spaces keep each clause on one line ("L'IA&nbsp;bâtit," /
+--   "le&nbsp;CMS&nbsp;publie."), "The&nbsp;AI" together (narrower fonts such as Roboto otherwise
+--   end line 1 on "The") and the English last two words together ("Builder&nbsp;CMS").
+-- * The H1 was 60px (md:text-6xl) at every two-column width, where the column is 345px to 668px
+--   wide: six to eight lines on tablets, four lines in English at 1280-1365px. It is now sized by
+--   its column, clamp(2.5rem, 8.5cqi, 3.75rem) inside an @container wrapper, so it breaks the same
+--   way in every column from about 470px wide up (three lines in each language; narrower columns
+--   stay at 2.5rem and stack to four). The size sits behind a container variant
+--   (@min-[1px]:) over the old text-5xl md:text-6xl, so a stylesheet built before this migration
+--   (the deploy window) or a browser without container queries (Safari 15) keeps the old sizes. The
+--   line break after the first sentence follows the column too (@md:hidden: it stacks the two
+--   sentences in columns under 28rem) instead of the viewport (md:hidden), which left French at
+--   four lines from 640px to 767px and a dangling "The" on tablets. mb-0 keeps the gap to the copy
+--   below at 16px: the container wrapper stops the H1's bottom margin collapsing into it.
+-- * nextblock.dev's English H1 had been edited by hand to drop the period and the <br> ("Prompt
+--   to Production The AI Website Builder CMS."). It gets the same new markup, period restored.
+--
+-- How: per page (EN 'home', FR 'accueil'; never blocks.id, ids drift on every install), the hero
+-- section's H1 text block is found by its visible text -- tags dropped (a <br> counts as a space),
+-- entities decoded, compared without spaces -- so the seeded markup, a re-serialised copy of the
+-- same words (the CMS editor drops the space after a <br>) and nextblock.dev's hand edit all match,
+-- while an H1 an operator has reworded is left alone and a NOTICE names the page. Its html_content is
+-- replaced whole. Only when a page matched, the same rewrite runs on its Live Draft rows
+-- (content_drafts), so publishing a draft started before this migration cannot bring the old H1
+-- back, and every old H1 string found (plus the seeded ones) is replaced in its page_revisions, so
+-- restoring a revision cannot either. Idempotent: a second run finds nothing to change.
+--
+-- NOTE: keep the word "sandbox" OUT of this filename -- generate-sandbox-reset.ts excludes any
+-- migration whose filename contains "sandbox" from the reset bundle.
+
+-- The visible text of an HTML fragment: a <br> read as a space, other tags dropped, the entities a
+-- heading may carry decoded, whitespace (no-break spaces included) collapsed to single spaces.
+CREATE OR REPLACE FUNCTION pg_temp.nb_02039_visible_text(src text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $fn$
+  SELECT btrim(regexp_replace(
+    replace(replace(replace(replace(replace(replace(replace(
+      regexp_replace(regexp_replace(COALESCE(src, ''), '<br[^>]*>', ' ', 'gi'), '<[^>]*>', '', 'g'),
+      '&nbsp;', ' '), '&#160;', ' '), chr(160), ' '),
+      '&#39;', ''''), '&apos;', ''''), chr(8217), ''''),
+      '&amp;', '&'),
+    '\\s+', ' ', 'g'))
+$fn$;
+
+-- A string JSON-escaped exactly as Postgres prints it inside jsonb::text, without the quotes.
+CREATE OR REPLACE FUNCTION pg_temp.nb_02039_json_inner(src text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $fn$
+  SELECT substr(to_jsonb(src)::text, 2, length(to_jsonb(src)::text) - 2)
+$fn$;
+
+-- One section's content with every H1 text block whose visible text, compared without spaces, is
+-- one of p_old_texts replaced by p_new_html, plus the html it replaced. Anything that is not a hero
+-- section, or holds no such H1, comes back unchanged with an empty list.
+CREATE OR REPLACE FUNCTION pg_temp.nb_02039_section(
+  p_content jsonb, p_old_texts text[], p_new_html text,
+  OUT new_content jsonb, OUT old_html text[])
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_cols jsonb;
+  v_html text;
+  c int;
+  i int;
+BEGIN
+  new_content := p_content;
+  old_html := ARRAY[]::text[];
+  IF jsonb_typeof(p_content) IS DISTINCT FROM 'object'
+     OR (p_content ->> 'is_hero') IS DISTINCT FROM 'true' THEN
+    RETURN;
+  END IF;
+  v_cols := p_content -> 'column_blocks';
+  IF jsonb_typeof(v_cols) IS DISTINCT FROM 'array' THEN
+    RETURN;
+  END IF;
+  FOR c IN 0 .. jsonb_array_length(v_cols) - 1 LOOP
+    CONTINUE WHEN jsonb_typeof(v_cols -> c) IS DISTINCT FROM 'array';
+    FOR i IN 0 .. jsonb_array_length(v_cols -> c) - 1 LOOP
+      CONTINUE WHEN (v_cols -> c -> i ->> 'block_type') IS DISTINCT FROM 'text';
+      v_html := v_cols -> c -> i -> 'content' ->> 'html_content';
+      CONTINUE WHEN v_html IS NULL
+                 OR v_html = p_new_html
+                 OR position('<h1' IN lower(v_html)) = 0
+                 OR NOT (replace(pg_temp.nb_02039_visible_text(v_html), ' ', '')
+                         = ANY (ARRAY(SELECT replace(t, ' ', '') FROM unnest(p_old_texts) AS t)));
+      new_content := jsonb_set(new_content,
+        ARRAY['column_blocks', c::text, i::text, 'content', 'html_content'], to_jsonb(p_new_html));
+      old_html := array_append(old_html, v_html);
+    END LOOP;
+  END LOOP;
+END
+$fn$;
+
+-- Rewrites the hero H1 of one page, all or nothing: its live blocks first; only if one of them
+-- matched, its Live Draft rows and its revisions. Returns the number of live H1s rewritten.
+CREATE OR REPLACE FUNCTION pg_temp.nb_02039_page(
+  p_slug text, p_lang text, p_old_texts text[], p_new_html text, p_seeded_html text[])
+RETURNS integer
+LANGUAGE plpgsql
+AS $fn$
+DECLARE
+  v_page bigint;
+  r record;
+  s record;
+  v_blocks jsonb;
+  v_changed boolean;
+  k int;
+  v_found text[] := ARRAY[]::text[];
+  v_hits int := 0;
+  v_old text;
+  v_new_inner text := pg_temp.nb_02039_json_inner(p_new_html);
+BEGIN
+  SELECT p.id INTO v_page
+    FROM public.pages AS p
+    JOIN public.languages AS l ON l.id = p.language_id
+   WHERE p.slug = p_slug AND l.code = p_lang
+   ORDER BY p.id
+   LIMIT 1;
+  IF v_page IS NULL THEN
+    RAISE NOTICE '02039: no % page "%"; nothing to do.', p_lang, p_slug;
+    RETURN 0;
+  END IF;
+
+  FOR r IN
+    SELECT b.id, b.content
+      FROM public.blocks AS b
+     WHERE b.page_id = v_page
+       AND b.block_type = 'section'
+       AND b.content ->> 'is_hero' = 'true'
+     ORDER BY b."order", b.id
+  LOOP
+    SELECT * INTO s FROM pg_temp.nb_02039_section(r.content, p_old_texts, p_new_html);
+    IF cardinality(s.old_html) > 0 THEN
+      UPDATE public.blocks SET content = s.new_content, updated_at = now() WHERE id = r.id;
+      v_found := v_found || s.old_html;
+      v_hits := v_hits + cardinality(s.old_html);
+    END IF;
+  END LOOP;
+
+  IF v_hits = 0 THEN
+    -- A re-run finds the new H1 already in place: nothing to say.
+    IF NOT EXISTS (
+         SELECT 1 FROM public.blocks AS b
+          WHERE b.page_id = v_page AND b.block_type = 'section'
+            AND position(v_new_inner IN b.content::text) > 0) THEN
+      RAISE NOTICE '02039: the % page "%" has no hero H1 with the shipped wording; left unchanged.', p_lang, p_slug;
+    END IF;
+    RETURN 0;
+  END IF;
+
+  -- Live Draft rows (their on_content_drafts_update trigger stamps updated_at).
+  FOR r IN
+    SELECT d.id, d.blocks
+      FROM public.content_drafts AS d
+     WHERE d.parent_type = 'page' AND d.parent_id = v_page
+  LOOP
+    v_blocks := r.blocks;
+    v_changed := false;
+    FOR k IN 0 .. jsonb_array_length(r.blocks) - 1 LOOP
+      CONTINUE WHEN (r.blocks -> k ->> 'block_type') IS DISTINCT FROM 'section';
+      SELECT * INTO s FROM pg_temp.nb_02039_section(r.blocks -> k -> 'content', p_old_texts, p_new_html);
+      CONTINUE WHEN cardinality(s.old_html) = 0;
+      v_blocks := jsonb_set(v_blocks, ARRAY[k::text, 'content'], s.new_content);
+      v_found := v_found || s.old_html;
+      v_changed := true;
+    END LOOP;
+    IF v_changed THEN
+      UPDATE public.content_drafts SET blocks = v_blocks WHERE id = r.id;
+    END IF;
+  END LOOP;
+
+  -- Revisions (snapshots and JSON Patch diffs alike) hold the H1 as a JSON string: replace every
+  -- old string found above, and the seeded ones, wherever they appear verbatim.
+  FOR v_old IN
+    SELECT DISTINCT x FROM unnest(v_found || p_seeded_html) AS x WHERE x IS DISTINCT FROM p_new_html
+  LOOP
+    UPDATE public.page_revisions
+       SET content = replace(content::text, pg_temp.nb_02039_json_inner(v_old), v_new_inner)::jsonb
+     WHERE page_id = v_page
+       AND position(pg_temp.nb_02039_json_inner(v_old) IN content::text) > 0;
+  END LOOP;
+
+  RETURN v_hits;
+END
+$fn$;
+
+DO $nb_02039$
+BEGIN
+  PERFORM pg_temp.nb_02039_page(
+    'home', 'en',
+    ARRAY[
+      'Prompt to Production. The AI Website Builder CMS.',
+      'Prompt to Production The AI Website Builder CMS.'
+    ],
+    replace($en_h1$<div class='@container'><h1 class='text-5xl md:text-6xl @min-[1px]:text-[length:clamp(2.5rem,8.5cqi,3.75rem)] mb-0 font-extrabold tracking-tight text-white text-center leading-tight'>Prompt to <span class='whitespace-nowrap'><span class='relative inline-block mx-1 group'><span class='absolute inset-0 bg-gradient-to-r from-blue-600 to-cyan-400 translate-y-1 md:translate-y-2 transform -skew-x-12 rounded-sm shadow-lg group-hover:skew-x-0 transition-transform duration-300 ease-out'></span><span class='relative text-white italic px-1'>Production</span></span>.</span><br class='@md:hidden' /> The&nbsp;AI Website Builder&nbsp;CMS.</h1></div>$en_h1$, chr(13), ''),
+    ARRAY[replace($en_seed$<h1 class='text-5xl md:text-6xl font-extrabold tracking-tight text-white text-center leading-tight'>Prompt to <span class='relative inline-block mx-1 group'><span class='absolute inset-0 bg-gradient-to-r from-blue-600 to-cyan-400 translate-y-1 md:translate-y-2 transform -skew-x-12 rounded-sm shadow-lg group-hover:skew-x-0 transition-transform duration-300 ease-out'></span><span class='relative text-white italic px-1'>Production</span></span>.<br class='md:hidden' /> The AI Website Builder CMS.</h1>$en_seed$, chr(13), '')]);
+
+  PERFORM pg_temp.nb_02039_page(
+    'accueil', 'fr',
+    ARRAY[
+      'Du prompt à la production. Le CMS constructeur de sites web par l''IA.',
+      'Du prompt à la production Le CMS constructeur de sites web par l''IA.'
+    ],
+    replace($fr_h1$<div class='@container'><h1 class='text-5xl md:text-6xl @min-[1px]:text-[length:clamp(2.5rem,8.5cqi,3.75rem)] mb-0 font-extrabold tracking-tight text-white text-center leading-tight'>Du prompt à la <span class='whitespace-nowrap'><span class='relative inline-block mx-1 group'><span class='absolute inset-0 bg-gradient-to-r from-blue-600 to-cyan-400 translate-y-1 md:translate-y-2 transform -skew-x-12 rounded-sm shadow-lg group-hover:skew-x-0 transition-transform duration-300 ease-out'></span><span class='relative text-white italic px-1'>production</span></span>.</span><br class='@md:hidden' /> L'IA&nbsp;bâtit, le&nbsp;CMS&nbsp;publie.</h1></div>$fr_h1$, chr(13), ''),
+    ARRAY[replace($fr_seed$<h1 class='text-5xl md:text-6xl font-extrabold tracking-tight text-white text-center leading-tight'>Du prompt à la <span class='relative inline-block mx-1 group'><span class='absolute inset-0 bg-gradient-to-r from-blue-600 to-cyan-400 translate-y-1 md:translate-y-2 transform -skew-x-12 rounded-sm shadow-lg group-hover:skew-x-0 transition-transform duration-300 ease-out'></span><span class='relative text-white italic px-1'>production</span></span>.<br class='md:hidden' /> Le CMS constructeur de sites web par l'IA.</h1>$fr_seed$, chr(13), '')]);
+END
+$nb_02039$;
+
+DROP FUNCTION IF EXISTS pg_temp.nb_02039_page(text, text, text[], text, text[]);
+DROP FUNCTION IF EXISTS pg_temp.nb_02039_section(jsonb, text[], text);
+DROP FUNCTION IF EXISTS pg_temp.nb_02039_json_inner(text);
+DROP FUNCTION IF EXISTS pg_temp.nb_02039_visible_text(text);
+
+
   -- Step C2: Take the API roles' EXECUTE back off every trigger function. Step B's
   -- DEFAULT PRIVILEGES hand anon/authenticated EXECUTE on each function the migrations
   -- create; trigger functions never need it (EXECUTE is only checked at CREATE TRIGGER
@@ -17178,7 +23840,18 @@ $nb_package_activations$;
     ('02025', 'api_role_grant_hardening'),
     ('02026', 'authenticated_write_grant_hardening'),
     ('02027', 'api_role_select_grant_hardening'),
-    ('02028', 'writer_settings_allowlist_email_factor_aal_and_media_keys')
+    ('02028', 'writer_settings_allowlist_email_factor_aal_and_media_keys'),
+    ('02029', 'user_role_rtl'),
+    ('02030', 'affiliates_schema'),
+    ('02031', 'affiliates_ui_translations'),
+    ('02032', 'affiliates_store_product'),
+    ('02033', 'affiliate_tier_goals'),
+    ('02034', 'partner_program_nav_and_home'),
+    ('02035', 'affiliate_tier_rate_at_payment'),
+    ('02036', 'affiliate_manual_payouts'),
+    ('02037', 'affiliate_paypal_payouts'),
+    ('02038', 'site_settings_secret_rows_service_role_only'),
+    ('02039', 'home_hero_heading_fit')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles

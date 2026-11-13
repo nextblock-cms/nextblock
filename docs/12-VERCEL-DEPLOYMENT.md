@@ -136,11 +136,15 @@ the question entirely by resolving everything in-app, so the button prompts for 
   Draft Mode and on-demand revalidation work out of the box. Setting either env var
   overrides the derived value — do this if you want a fixed `REVALIDATE_SECRET_TOKEN`
   to paste into a Supabase revalidation webhook. (See `apps/nextblock/lib/app-secrets.ts`.)
-- **`CRON_SECRET`** — optional. The cron endpoints enforce the `Authorization: Bearer`
-  header **only when it is set**. Leave it unset for a frictionless deploy, or set it
-  in the Vercel project to lock the cron endpoints down. The destructive
-  `/api/cron/reset-sandbox` job is independently gated to sandbox-mode only (404
-  otherwise), so it never runs on a normal deploy.
+- **`CRON_SECRET`** — optional. The FX sync (`/api/cron/sync-currencies`) enforces the
+  `Authorization: Bearer` header **only when it is set** (compared as SHA-256 digests with
+  `timingSafeEqual`, `apps/nextblock/lib/cron/cron-secret.ts`). Leave it unset for a
+  frictionless deploy, or set it in the Vercel project to lock that endpoint down. The
+  destructive `/api/cron/reset-sandbox` job is gated to sandbox mode (404 otherwise), so it never
+  runs on a normal deploy, and it also fails closed (401) while `CRON_SECRET` is unset. Neither
+  of the two asks for a minimum length. The Affiliates payout route,
+  `/api/affiliates/cron/payouts`, moves money, so it fails closed and answers 503 until
+  `CRON_SECRET` is set to at least 16 characters. Payouts still run without it (see below).
 
 ## What the wizard does on Vercel
 
@@ -184,7 +188,7 @@ day** — a sub-daily schedule does not merely warn, it **fails the deployment o
 ("Hobby accounts are limited to daily cron jobs… Upgrade to the Pro plan"). A cron-free
 `vercel.json` is the only shape that deploys everywhere.
 
-The two jobs that used to be crons are handled like this:
+The two jobs that used to be crons, and the daily affiliate payouts, are handled like this:
 
 - **FX-rate sync** — no cron at all. The CMS layout refreshes exchange rates in the
   background after a CMS page loads (`after()`), at most once a day, and only when the
@@ -220,6 +224,19 @@ The two jobs that used to be crons are handled like this:
   carrying the cron was tried first and rejected: every Vercel project on the repo builds
   every branch, so each release produced a second, useless build in the other project.
   On a normal install the route returns 404 anyway.
+- **Affiliate payouts** (Affiliates package) — no Vercel cron either. The CMS and partner-portal
+  layouts run the day's payout cycle in `after()` the first time someone opens them that day
+  (the day is claimed in the database, so one instance runs it), and the CMS has a "Run
+  payouts now" button. For a fixed time, call `GET` or `POST /api/affiliates/cron/payouts` with
+  `Authorization: Bearer <CRON_SECRET>` from any scheduler, or install a pg_cron job in the
+  project's own Supabase database:
+  `npm run affiliates:schedule-payouts -- https://<your-site>`
+  (`tools/schedule-affiliate-payouts.js` of the app, so it works in a scaffolded project as well
+  as the monorepo: daily at 06:00 UTC by default, `--hour=N` or
+  `--schedule="m h * * *"` to change it, the bearer kept in Vault, `status` / `remove` /
+  `print-sql` like the sandbox script). Unlike the sandbox script it never drops anything: it
+  creates `pg_net` in `extensions` only when it is missing. Details:
+  [docs/15](./15-AFFILIATES-AND-STOREFRONTS.md) → "Scheduling".
 
 ### Debugging sandbox reset failures
 

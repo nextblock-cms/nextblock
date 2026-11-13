@@ -16,14 +16,19 @@ import {
   updateGoogleAnalyticsSettings,
   type GoogleAnalyticsSettings,
 } from '../actions';
+import { SITE_SCRIPTS_SANDBOX_MESSAGE } from '../../site-scripts/sandbox-lock';
 
 interface GoogleAnalyticsFormProps {
   initialSettings: GoogleAnalyticsSettings;
 }
 
+const SANDBOX_NOTE_ID = 'google-analytics-sandbox-note';
+
 export default function GoogleAnalyticsForm({ initialSettings }: GoogleAnalyticsFormProps) {
   const [isPending, startTransition] = useTransition();
   const [message, setMessage] = useState<Message | null>(null);
+  // Read-only on the sandbox, whose admin login is public (updateGoogleAnalyticsSettings refuses there).
+  const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
   const [gtmId, setGtmId] = useState(initialSettings.gtm_id);
   const [gaId, setGaId] = useState(initialSettings.ga_measurement_id);
@@ -99,8 +104,18 @@ export default function GoogleAnalyticsForm({ initialSettings }: GoogleAnalytics
         </div>
       </section>
 
+      {isSandbox ? (
+        <p id={SANDBOX_NOTE_ID} className="text-sm text-muted-foreground">
+          {SITE_SCRIPTS_SANDBOX_MESSAGE}
+        </p>
+      ) : null}
+
       <div className="flex items-center gap-4">
-        <Button type="submit" disabled={isPending}>
+        <Button
+          type="submit"
+          disabled={isPending || isSandbox}
+          aria-describedby={isSandbox ? SANDBOX_NOTE_ID : undefined}
+        >
           {isPending ? (
             <>
               <Spinner className="mr-2 h-4 w-4 animate-spin" /> Saving...

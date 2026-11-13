@@ -35,6 +35,10 @@ export function ConsentGatedAnalytics({
   customScripts,
   nonce,
 }: ConsentGatedAnalyticsProps) {
+  // The sandbox's admin login is public: a GTM container or custom script saved there would run
+  // with the nonce for every later visitor and could read the OpenRouter key kept in localStorage.
+  // GA4 is blocked too; the sandbox's settings reset every 15 minutes anyway.
+  const blocked = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
   const [analyticsAllowed, setAnalyticsAllowed] = useState(false);
   const injectedRef = useRef(false);
 
@@ -46,7 +50,7 @@ export function ConsentGatedAnalytics({
   }, []);
 
   useEffect(() => {
-    if (!analyticsAllowed || injectedRef.current) return;
+    if (blocked || !analyticsAllowed || injectedRef.current) return;
     const markup = customScripts?.trim();
     if (!markup) return;
     injectedRef.current = true;
@@ -55,8 +59,9 @@ export function ConsentGatedAnalytics({
     } catch (error) {
       console.error('Failed to inject consented custom scripts:', error);
     }
-  }, [analyticsAllowed, customScripts, nonce]);
+  }, [analyticsAllowed, blocked, customScripts, nonce]);
 
+  if (blocked) return null;
   if (!analyticsAllowed) return null;
   if (!gtmId && !gaMeasurementId) return null;
   return (

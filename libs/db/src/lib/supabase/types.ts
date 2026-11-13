@@ -10,10 +10,541 @@ export type Database = {
   // Allows to automatically instantiate createClient with right options
   // instead of createClient<Database, { PostgrestVersion: 'XX' }>(URL, KEY)
   __InternalSupabase: {
-    PostgrestVersion: "14.1"
+    PostgrestVersion: "14.5"
   }
   public: {
     Tables: {
+      affiliate_click_events: {
+        Row: {
+          affiliate_id: string
+          created_at: string
+          id: string
+          visitor_hash: string
+        }
+        Insert: {
+          affiliate_id: string
+          created_at?: string
+          id?: string
+          visitor_hash: string
+        }
+        Update: {
+          affiliate_id?: string
+          created_at?: string
+          id?: string
+          visitor_hash?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "affiliate_click_events_affiliate_id_fkey"
+            columns: ["affiliate_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_profiles"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      affiliate_commissions: {
+        Row: {
+          affiliate_id: string
+          cleared_at: string | null
+          clears_at: string
+          commission_amount_cents: number
+          commission_rate_snapshot: number
+          created_at: string
+          currency: string
+          disputed_at: string | null
+          exchange_rate_snapshot: number
+          gateway: Database["public"]["Enums"]["affiliate_gateway"]
+          id: string
+          livemode: boolean
+          net_order_amount_cents: number
+          notified_at: string | null
+          order_currency: string
+          order_id: string | null
+          order_net_amount_minor: number
+          paid_at: string | null
+          payout_id: string | null
+          refund_pending_cents: number
+          refunded_amount_cents: number
+          status: Database["public"]["Enums"]["affiliate_commission_status"]
+          stripe_transfer_id: string | null
+          updated_at: string
+          void_reason: string | null
+          void_requested_at: string | null
+          voided_at: string | null
+        }
+        Insert: {
+          affiliate_id: string
+          cleared_at?: string | null
+          clears_at?: string
+          commission_amount_cents: number
+          commission_rate_snapshot: number
+          created_at?: string
+          currency?: string
+          disputed_at?: string | null
+          exchange_rate_snapshot?: number
+          gateway: Database["public"]["Enums"]["affiliate_gateway"]
+          id?: string
+          livemode?: boolean
+          net_order_amount_cents: number
+          notified_at?: string | null
+          order_currency: string
+          order_id?: string | null
+          order_net_amount_minor: number
+          paid_at?: string | null
+          payout_id?: string | null
+          refund_pending_cents?: number
+          refunded_amount_cents?: number
+          status?: Database["public"]["Enums"]["affiliate_commission_status"]
+          stripe_transfer_id?: string | null
+          updated_at?: string
+          void_reason?: string | null
+          void_requested_at?: string | null
+          voided_at?: string | null
+        }
+        Update: {
+          affiliate_id?: string
+          cleared_at?: string | null
+          clears_at?: string
+          commission_amount_cents?: number
+          commission_rate_snapshot?: number
+          created_at?: string
+          currency?: string
+          disputed_at?: string | null
+          exchange_rate_snapshot?: number
+          gateway?: Database["public"]["Enums"]["affiliate_gateway"]
+          id?: string
+          livemode?: boolean
+          net_order_amount_cents?: number
+          notified_at?: string | null
+          order_currency?: string
+          order_id?: string | null
+          order_net_amount_minor?: number
+          paid_at?: string | null
+          payout_id?: string | null
+          refund_pending_cents?: number
+          refunded_amount_cents?: number
+          status?: Database["public"]["Enums"]["affiliate_commission_status"]
+          stripe_transfer_id?: string | null
+          updated_at?: string
+          void_reason?: string | null
+          void_requested_at?: string | null
+          voided_at?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "affiliate_commissions_affiliate_id_fkey"
+            columns: ["affiliate_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_profiles"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "affiliate_commissions_order_id_fkey"
+            columns: ["order_id"]
+            isOneToOne: false
+            referencedRelation: "orders"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "affiliate_commissions_payout_id_fkey"
+            columns: ["payout_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_payouts"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      affiliate_pages: {
+        Row: {
+          admin_feedback_note: string | null
+          affiliate_id: string
+          approval_status: Database["public"]["Enums"]["affiliate_page_status"]
+          created_at: string
+          draft_content: Json
+          draft_updated_at: string
+          draft_version: number
+          featured_product_ids: string[]
+          id: string
+          meta_description: string
+          published_at: string | null
+          published_content: Json | null
+          published_featured_product_ids: string[]
+          published_meta_description: string | null
+          published_profile: Json | null
+          published_title: string | null
+          reviewed_at: string | null
+          reviewed_by: string | null
+          submitted_at: string | null
+          submitted_version: number | null
+          title: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          admin_feedback_note?: string | null
+          affiliate_id: string
+          approval_status?: Database["public"]["Enums"]["affiliate_page_status"]
+          created_at?: string
+          draft_content?: Json
+          draft_updated_at?: string
+          draft_version?: number
+          featured_product_ids?: string[]
+          id?: string
+          meta_description?: string
+          published_at?: string | null
+          published_content?: Json | null
+          published_featured_product_ids?: string[]
+          published_meta_description?: string | null
+          published_profile?: Json | null
+          published_title?: string | null
+          reviewed_at?: string | null
+          reviewed_by?: string | null
+          submitted_at?: string | null
+          submitted_version?: number | null
+          title?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          admin_feedback_note?: string | null
+          affiliate_id?: string
+          approval_status?: Database["public"]["Enums"]["affiliate_page_status"]
+          created_at?: string
+          draft_content?: Json
+          draft_updated_at?: string
+          draft_version?: number
+          featured_product_ids?: string[]
+          id?: string
+          meta_description?: string
+          published_at?: string | null
+          published_content?: Json | null
+          published_featured_product_ids?: string[]
+          published_meta_description?: string | null
+          published_profile?: Json | null
+          published_title?: string | null
+          reviewed_at?: string | null
+          reviewed_by?: string | null
+          submitted_at?: string | null
+          submitted_version?: number | null
+          title?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "affiliate_pages_affiliate_owner_fkey"
+            columns: ["affiliate_id", "user_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_profiles"
+            referencedColumns: ["id", "user_id"]
+          },
+        ]
+      }
+      affiliate_payout_runs: {
+        Row: {
+          finished_at: string | null
+          run_date: string
+          started_at: string
+          summary: Json
+          trigger: string
+        }
+        Insert: {
+          finished_at?: string | null
+          run_date: string
+          started_at?: string
+          summary?: Json
+          trigger: string
+        }
+        Update: {
+          finished_at?: string | null
+          run_date?: string
+          started_at?: string
+          summary?: Json
+          trigger?: string
+        }
+        Relationships: []
+      }
+      affiliate_payouts: {
+        Row: {
+          affiliate_id: string
+          amount_cents: number
+          attempt_count: number
+          created_at: string
+          currency: string
+          external_reference: string | null
+          failure_reason: string | null
+          id: string
+          last_attempt_at: string
+          livemode: boolean
+          manual_channel: string | null
+          method: string
+          note: string | null
+          paid_at: string | null
+          paypal_batch_id: string | null
+          paypal_checked_at: string | null
+          paypal_fee_cents: number | null
+          paypal_item_id: string | null
+          paypal_item_status: string | null
+          paypal_receiver: string | null
+          paypal_sender_batch_id: string | null
+          paypal_transaction_id: string | null
+          recorded_by: string | null
+          status: Database["public"]["Enums"]["affiliate_payout_status"]
+          stripe_destination_account: string | null
+          stripe_transfer_id: string | null
+          trigger: string
+          updated_at: string
+        }
+        Insert: {
+          affiliate_id: string
+          amount_cents: number
+          attempt_count?: number
+          created_at?: string
+          currency: string
+          external_reference?: string | null
+          failure_reason?: string | null
+          id?: string
+          last_attempt_at?: string
+          livemode?: boolean
+          manual_channel?: string | null
+          method?: string
+          note?: string | null
+          paid_at?: string | null
+          paypal_batch_id?: string | null
+          paypal_checked_at?: string | null
+          paypal_fee_cents?: number | null
+          paypal_item_id?: string | null
+          paypal_item_status?: string | null
+          paypal_receiver?: string | null
+          paypal_sender_batch_id?: string | null
+          paypal_transaction_id?: string | null
+          recorded_by?: string | null
+          status?: Database["public"]["Enums"]["affiliate_payout_status"]
+          stripe_destination_account?: string | null
+          stripe_transfer_id?: string | null
+          trigger?: string
+          updated_at?: string
+        }
+        Update: {
+          affiliate_id?: string
+          amount_cents?: number
+          attempt_count?: number
+          created_at?: string
+          currency?: string
+          external_reference?: string | null
+          failure_reason?: string | null
+          id?: string
+          last_attempt_at?: string
+          livemode?: boolean
+          manual_channel?: string | null
+          method?: string
+          note?: string | null
+          paid_at?: string | null
+          paypal_batch_id?: string | null
+          paypal_checked_at?: string | null
+          paypal_fee_cents?: number | null
+          paypal_item_id?: string | null
+          paypal_item_status?: string | null
+          paypal_receiver?: string | null
+          paypal_sender_batch_id?: string | null
+          paypal_transaction_id?: string | null
+          recorded_by?: string | null
+          status?: Database["public"]["Enums"]["affiliate_payout_status"]
+          stripe_destination_account?: string | null
+          stripe_transfer_id?: string | null
+          trigger?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "affiliate_payouts_affiliate_id_fkey"
+            columns: ["affiliate_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_profiles"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      affiliate_profiles: {
+        Row: {
+          avatar_object_key: string | null
+          bio: string | null
+          created_at: string
+          display_name: string
+          first_published_at: string | null
+          handle: string
+          id: string
+          last_click_at: string | null
+          onboarding_step: Database["public"]["Enums"]["affiliate_onboarding_step"]
+          page_submitted_at: string | null
+          payout_configured_at: string | null
+          payout_email: string | null
+          payout_email_kind: string
+          payout_email_saved_at: string | null
+          preferred_locale: string
+          profile_completed_at: string | null
+          signup_ip_masked: string | null
+          social_links: Json
+          status: Database["public"]["Enums"]["affiliate_status"]
+          stripe_connect_account_id: string | null
+          stripe_connect_checked_at: string | null
+          stripe_connect_details_submitted: boolean
+          stripe_connect_livemode: boolean | null
+          stripe_connect_onboarding_complete: boolean
+          stripe_connect_payouts_enabled: boolean
+          suspended_reason: string | null
+          tier_changed_at: string | null
+          tier_id: string
+          total_clicks: number
+          total_earned_cents: number
+          total_paid_cents: number
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          avatar_object_key?: string | null
+          bio?: string | null
+          created_at?: string
+          display_name: string
+          first_published_at?: string | null
+          handle: string
+          id?: string
+          last_click_at?: string | null
+          onboarding_step?: Database["public"]["Enums"]["affiliate_onboarding_step"]
+          page_submitted_at?: string | null
+          payout_configured_at?: string | null
+          payout_email?: string | null
+          payout_email_kind?: string
+          payout_email_saved_at?: string | null
+          preferred_locale?: string
+          profile_completed_at?: string | null
+          signup_ip_masked?: string | null
+          social_links?: Json
+          status?: Database["public"]["Enums"]["affiliate_status"]
+          stripe_connect_account_id?: string | null
+          stripe_connect_checked_at?: string | null
+          stripe_connect_details_submitted?: boolean
+          stripe_connect_livemode?: boolean | null
+          stripe_connect_onboarding_complete?: boolean
+          stripe_connect_payouts_enabled?: boolean
+          suspended_reason?: string | null
+          tier_changed_at?: string | null
+          tier_id: string
+          total_clicks?: number
+          total_earned_cents?: number
+          total_paid_cents?: number
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          avatar_object_key?: string | null
+          bio?: string | null
+          created_at?: string
+          display_name?: string
+          first_published_at?: string | null
+          handle?: string
+          id?: string
+          last_click_at?: string | null
+          onboarding_step?: Database["public"]["Enums"]["affiliate_onboarding_step"]
+          page_submitted_at?: string | null
+          payout_configured_at?: string | null
+          payout_email?: string | null
+          payout_email_kind?: string
+          payout_email_saved_at?: string | null
+          preferred_locale?: string
+          profile_completed_at?: string | null
+          signup_ip_masked?: string | null
+          social_links?: Json
+          status?: Database["public"]["Enums"]["affiliate_status"]
+          stripe_connect_account_id?: string | null
+          stripe_connect_checked_at?: string | null
+          stripe_connect_details_submitted?: boolean
+          stripe_connect_livemode?: boolean | null
+          stripe_connect_onboarding_complete?: boolean
+          stripe_connect_payouts_enabled?: boolean
+          suspended_reason?: string | null
+          tier_changed_at?: string | null
+          tier_id?: string
+          total_clicks?: number
+          total_earned_cents?: number
+          total_paid_cents?: number
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "affiliate_profiles_tier_id_fkey"
+            columns: ["tier_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_tiers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      affiliate_tiers: {
+        Row: {
+          badge_color: string
+          clearance_hold_days: number
+          commission_percentage: number
+          cookie_duration_days: number
+          created_at: string
+          goal: string | null
+          goal_translations: Json
+          id: string
+          is_active: boolean
+          is_default_signup_tier: boolean
+          is_limited_time_promo: boolean
+          max_ambassadors_cap: number | null
+          member_count: number
+          name: string
+          name_translations: Json
+          slug: string
+          sort_order: number
+          updated_at: string
+        }
+        Insert: {
+          badge_color?: string
+          clearance_hold_days?: number
+          commission_percentage: number
+          cookie_duration_days?: number
+          created_at?: string
+          goal?: string | null
+          goal_translations?: Json
+          id?: string
+          is_active?: boolean
+          is_default_signup_tier?: boolean
+          is_limited_time_promo?: boolean
+          max_ambassadors_cap?: number | null
+          member_count?: number
+          name: string
+          name_translations?: Json
+          slug: string
+          sort_order?: number
+          updated_at?: string
+        }
+        Update: {
+          badge_color?: string
+          clearance_hold_days?: number
+          commission_percentage?: number
+          cookie_duration_days?: number
+          created_at?: string
+          goal?: string | null
+          goal_translations?: Json
+          id?: string
+          is_active?: boolean
+          is_default_signup_tier?: boolean
+          is_limited_time_promo?: boolean
+          max_ambassadors_cap?: number | null
+          member_count?: number
+          name?: string
+          name_translations?: Json
+          slug?: string
+          sort_order?: number
+          updated_at?: string
+        }
+        Relationships: []
+      }
       blocks: {
         Row: {
           block_type: string
@@ -1168,6 +1699,15 @@ export type Database = {
       }
       orders: {
         Row: {
+          affiliate_base_currency: string | null
+          affiliate_clearance_hold_days: number | null
+          affiliate_commission_rate: number | null
+          affiliate_disputed_at: string | null
+          affiliate_id: string | null
+          affiliate_livemode: boolean | null
+          affiliate_refund_total_minor: number | null
+          affiliate_refunded_minor: number | null
+          affiliate_source: string | null
           coupon_code: string | null
           coupon_id: string | null
           created_at: string | null
@@ -1201,6 +1741,15 @@ export type Database = {
           user_id: string | null
         }
         Insert: {
+          affiliate_base_currency?: string | null
+          affiliate_clearance_hold_days?: number | null
+          affiliate_commission_rate?: number | null
+          affiliate_disputed_at?: string | null
+          affiliate_id?: string | null
+          affiliate_livemode?: boolean | null
+          affiliate_refund_total_minor?: number | null
+          affiliate_refunded_minor?: number | null
+          affiliate_source?: string | null
           coupon_code?: string | null
           coupon_id?: string | null
           created_at?: string | null
@@ -1234,6 +1783,15 @@ export type Database = {
           user_id?: string | null
         }
         Update: {
+          affiliate_base_currency?: string | null
+          affiliate_clearance_hold_days?: number | null
+          affiliate_commission_rate?: number | null
+          affiliate_disputed_at?: string | null
+          affiliate_id?: string | null
+          affiliate_livemode?: boolean | null
+          affiliate_refund_total_minor?: number | null
+          affiliate_refunded_minor?: number | null
+          affiliate_source?: string | null
           coupon_code?: string | null
           coupon_id?: string | null
           created_at?: string | null
@@ -1267,6 +1825,13 @@ export type Database = {
           user_id?: string | null
         }
         Relationships: [
+          {
+            foreignKeyName: "orders_affiliate_id_fkey"
+            columns: ["affiliate_id"]
+            isOneToOne: false
+            referencedRelation: "affiliate_profiles"
+            referencedColumns: ["id"]
+          },
           {
             foreignKeyName: "orders_coupon_id_fkey"
             columns: ["coupon_id"]
@@ -2836,6 +3401,16 @@ export type Database = {
       }
     }
     Functions: {
+      apply_affiliate_refund: {
+        Args: {
+          p_full: boolean
+          p_gateway: Database["public"]["Enums"]["affiliate_gateway"]
+          p_order_id: string
+          p_order_total_minor: number
+          p_refunded_minor: number
+        }
+        Returns: string
+      }
       apply_order_inventory_deduction: {
         Args: { p_order_id: string }
         Returns: undefined
@@ -2862,9 +3437,164 @@ export type Database = {
         }
       }
       bump_email_2fa_attempts: { Args: { p_user_id: string }; Returns: number }
+      cancel_manual_affiliate_payout: {
+        Args: { p_payout_id: string }
+        Returns: Json
+      }
+      change_affiliate_partner_tier: {
+        Args: {
+          p_affiliate_id: string
+          p_allow_over_cap?: boolean
+          p_tier_id: string
+        }
+        Returns: string
+      }
+      claim_affiliate_commission_notifications: {
+        Args: { p_limit: number }
+        Returns: {
+          affiliate_id: string
+          cleared_at: string | null
+          clears_at: string
+          commission_amount_cents: number
+          commission_rate_snapshot: number
+          created_at: string
+          currency: string
+          disputed_at: string | null
+          exchange_rate_snapshot: number
+          gateway: Database["public"]["Enums"]["affiliate_gateway"]
+          id: string
+          livemode: boolean
+          net_order_amount_cents: number
+          notified_at: string | null
+          order_currency: string
+          order_id: string | null
+          order_net_amount_minor: number
+          paid_at: string | null
+          payout_id: string | null
+          refund_pending_cents: number
+          refunded_amount_cents: number
+          status: Database["public"]["Enums"]["affiliate_commission_status"]
+          stripe_transfer_id: string | null
+          updated_at: string
+          void_reason: string | null
+          void_requested_at: string | null
+          voided_at: string | null
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "affiliate_commissions"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
+      claim_affiliate_payout: {
+        Args: {
+          p_affiliate_id: string
+          p_currency: string
+          p_gateways?: Database["public"]["Enums"]["affiliate_gateway"][]
+          p_min_amount: number
+          p_trigger: string
+        }
+        Returns: {
+          affiliate_id: string
+          amount_cents: number
+          attempt_count: number
+          created_at: string
+          currency: string
+          external_reference: string | null
+          failure_reason: string | null
+          id: string
+          last_attempt_at: string
+          livemode: boolean
+          manual_channel: string | null
+          method: string
+          note: string | null
+          paid_at: string | null
+          paypal_batch_id: string | null
+          paypal_checked_at: string | null
+          paypal_fee_cents: number | null
+          paypal_item_id: string | null
+          paypal_item_status: string | null
+          paypal_receiver: string | null
+          paypal_sender_batch_id: string | null
+          paypal_transaction_id: string | null
+          recorded_by: string | null
+          status: Database["public"]["Enums"]["affiliate_payout_status"]
+          stripe_destination_account: string | null
+          stripe_transfer_id: string | null
+          trigger: string
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "affiliate_payouts"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
+      claim_affiliate_payout_run: {
+        Args: { p_run_date: string; p_trigger: string }
+        Returns: boolean
+      }
+      claim_manual_affiliate_payout: {
+        Args: {
+          p_affiliate_id: string
+          p_currency: string
+          p_gateways?: Database["public"]["Enums"]["affiliate_gateway"][]
+          p_min_amount?: number
+        }
+        Returns: Json
+      }
+      claim_paypal_affiliate_payout: {
+        Args: {
+          p_affiliate_id: string
+          p_currency: string
+          p_gateways: Database["public"]["Enums"]["affiliate_gateway"][]
+          p_livemode: boolean
+          p_min_amount: number
+          p_trigger?: string
+        }
+        Returns: Json
+      }
       clear_currency_price_overrides: {
         Args: { target_currency: string }
         Returns: undefined
+      }
+      complete_affiliate_payout: {
+        Args: { p_payout_id: string; p_transfer_id: string }
+        Returns: boolean
+      }
+      complete_paypal_affiliate_payout: {
+        Args: {
+          p_fee_cents?: number
+          p_item_id: string
+          p_item_status?: string
+          p_payout_id: string
+          p_transaction_id: string
+        }
+        Returns: Json
+      }
+      create_affiliate_account: {
+        Args: {
+          p_display_name: string
+          p_handle: string
+          p_locale: string
+          p_meta_description: string
+          p_signup_ip_masked: string
+          p_starter_doc: Json
+          p_title: string
+          p_user_id: string
+        }
+        Returns: {
+          affiliate_id: string
+          commission_percentage: number
+          is_limited_time_promo: boolean
+          page_id: string
+          spots_remaining: number
+          tier_id: string
+          tier_name: string
+          tier_slug: string
+        }[]
       }
       duplicate_block_definition: {
         Args: { target_id: string }
@@ -2884,11 +3614,45 @@ export type Database = {
           isSetofReturn: false
         }
       }
+      fail_affiliate_payout: {
+        Args: { p_payout_id: string; p_reason: string }
+        Returns: boolean
+      }
+      fail_paypal_affiliate_payout: {
+        Args: { p_item_status?: string; p_payout_id: string; p_reason: string }
+        Returns: Json
+      }
+      finish_affiliate_payout_run: {
+        Args: { p_run_date: string; p_summary: Json }
+        Returns: undefined
+      }
       format_order_invoice_number: {
         Args: { p_value: number }
         Returns: string
       }
       generate_order_invoice_number: { Args: never; Returns: string }
+      get_affiliate_referral_window: {
+        Args: { p_handle: string }
+        Returns: number
+      }
+      get_affiliate_storefront: {
+        Args: { p_handle: string }
+        Returns: {
+          affiliate_id: string
+          handle: string
+          published_at: string
+          published_content: Json
+          published_featured_product_ids: string[]
+          published_meta_description: string
+          published_profile: Json
+          published_title: string
+          tier_badge_color: string
+          tier_is_limited_time_promo: boolean
+          tier_name: string
+          tier_name_translations: Json
+          updated_at: string
+        }[]
+      }
       get_current_user_role: {
         Args: never
         Returns: Database["public"]["Enums"]["user_role"]
@@ -2914,10 +3678,113 @@ export type Database = {
         Args: { prices: Json; sale_prices: Json }
         Returns: boolean
       }
+      list_affiliate_storefronts: {
+        Args: { p_limit?: number }
+        Returns: {
+          handle: string
+          published_at: string
+          updated_at: string
+        }[]
+      }
+      media_storage_keys_in_use: {
+        Args: { p_exclude_id?: string; p_keys: string[] }
+        Returns: string[]
+      }
       normalize_currency_amount_map: { Args: { amounts: Json }; Returns: Json }
+      note_paypal_affiliate_payout_item: {
+        Args: {
+          p_fee_cents?: number
+          p_item_id: string
+          p_item_status: string
+          p_payout_id: string
+        }
+        Returns: Json
+      }
+      prepare_affiliate_payout_retry: {
+        Args: { p_min_amount?: number; p_payout_id: string }
+        Returns: {
+          affiliate_id: string
+          amount_cents: number
+          attempt_count: number
+          created_at: string
+          currency: string
+          external_reference: string | null
+          failure_reason: string | null
+          id: string
+          last_attempt_at: string
+          livemode: boolean
+          manual_channel: string | null
+          method: string
+          note: string | null
+          paid_at: string | null
+          paypal_batch_id: string | null
+          paypal_checked_at: string | null
+          paypal_fee_cents: number | null
+          paypal_item_id: string | null
+          paypal_item_status: string | null
+          paypal_receiver: string | null
+          paypal_sender_batch_id: string | null
+          paypal_transaction_id: string | null
+          recorded_by: string | null
+          status: Database["public"]["Enums"]["affiliate_payout_status"]
+          stripe_destination_account: string | null
+          stripe_transfer_id: string | null
+          trigger: string
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "affiliate_payouts"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
+      promote_cleared_affiliate_commissions: { Args: never; Returns: number }
+      reconcile_affiliate_commissions: {
+        Args: { p_limit?: number }
+        Returns: Json
+      }
+      record_affiliate_click: {
+        Args: { p_handle: string; p_visitor_hash: string }
+        Returns: undefined
+      }
+      record_manual_affiliate_payout: {
+        Args: {
+          p_channel: string
+          p_note: string
+          p_payout_id: string
+          p_recorded_by: string
+          p_reference: string
+        }
+        Returns: Json
+      }
+      record_paypal_affiliate_payout_batch: {
+        Args: {
+          p_payout_batch_id?: string
+          p_payout_ids: string[]
+          p_sender_batch_id: string
+        }
+        Returns: Json
+      }
       redeem_coupon_atomically: {
         Args: { p_coupon_id: string }
         Returns: boolean
+      }
+      release_affiliate_payout: {
+        Args: { p_payout_id: string }
+        Returns: boolean
+      }
+      release_paypal_affiliate_payout: {
+        Args: { p_payout_id: string }
+        Returns: Json
+      }
+      set_affiliate_commission_dispute: {
+        Args: {
+          p_gateway: Database["public"]["Enums"]["affiliate_gateway"]
+          p_open: boolean
+          p_order_id: string
+        }
+        Returns: string
       }
       sync_inventory_cache_for_sku: {
         Args: { p_sku: string }
@@ -2933,12 +3800,31 @@ export type Database = {
       }
     }
     Enums: {
+      affiliate_commission_status:
+        | "PENDING_CLEARANCE"
+        | "CLEARED"
+        | "PAID"
+        | "VOIDED_REFUND"
+      affiliate_gateway: "STRIPE" | "FREEMIUS"
+      affiliate_onboarding_step:
+        | "SIGNED_UP"
+        | "PROFILE_COMPLETED"
+        | "PAYOUT_CONFIGURED"
+        | "PAGE_SUBMITTED"
+        | "ACTIVE_PUBLISHED"
+      affiliate_page_status:
+        | "DRAFT"
+        | "PENDING_REVIEW"
+        | "PUBLISHED"
+        | "CHANGES_REQUESTED"
+      affiliate_payout_status: "PROCESSING" | "COMPLETED" | "FAILED"
+      affiliate_status: "ACTIVE" | "SUSPENDED"
       approval_status: "pending" | "approved" | "denied"
       interaction_type: "review" | "comment"
       menu_location: "HEADER" | "FOOTER" | "SIDEBAR"
       page_status: "draft" | "published" | "archived"
       revision_type: "snapshot" | "diff"
-      user_role: "ADMIN" | "WRITER" | "USER"
+      user_role: "ADMIN" | "WRITER" | "USER" | "RTL"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -3066,12 +3952,34 @@ export type CompositeTypes<
 export const Constants = {
   public: {
     Enums: {
+      affiliate_commission_status: [
+        "PENDING_CLEARANCE",
+        "CLEARED",
+        "PAID",
+        "VOIDED_REFUND",
+      ],
+      affiliate_gateway: ["STRIPE", "FREEMIUS"],
+      affiliate_onboarding_step: [
+        "SIGNED_UP",
+        "PROFILE_COMPLETED",
+        "PAYOUT_CONFIGURED",
+        "PAGE_SUBMITTED",
+        "ACTIVE_PUBLISHED",
+      ],
+      affiliate_page_status: [
+        "DRAFT",
+        "PENDING_REVIEW",
+        "PUBLISHED",
+        "CHANGES_REQUESTED",
+      ],
+      affiliate_payout_status: ["PROCESSING", "COMPLETED", "FAILED"],
+      affiliate_status: ["ACTIVE", "SUSPENDED"],
       approval_status: ["pending", "approved", "denied"],
       interaction_type: ["review", "comment"],
       menu_location: ["HEADER", "FOOTER", "SIDEBAR"],
       page_status: ["draft", "published", "archived"],
       revision_type: ["snapshot", "diff"],
-      user_role: ["ADMIN", "WRITER", "USER"],
+      user_role: ["ADMIN", "WRITER", "USER", "RTL"],
     },
   },
 } as const

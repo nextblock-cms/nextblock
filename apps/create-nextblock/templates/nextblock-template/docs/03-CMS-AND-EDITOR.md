@@ -116,7 +116,6 @@ The main exports today are:
 - `EnhancedFloatingMenu`
 - `SlashCommandList`
 - `DragHandle`
-- `HtmlContent`
 - `editorExtensions`
 
 ### Core editing capabilities

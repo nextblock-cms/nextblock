@@ -3,6 +3,7 @@ export * from './lib/stripe/client';
 export * from './lib/stripe/checkout';
 export * from './lib/stripe/order-sync';
 export * from './lib/stripe/webhooks';
+export * from './lib/stripe/webhook-events';
 export * from './lib/order-inventory';
 export * from './lib/order-tax-details';
 export * from './lib/invoice';

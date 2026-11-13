@@ -3,7 +3,7 @@
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { CORTEX_EXPORTS, ECOM_EXPORTS } = require('./lib-publish-exports');
+const { publishExportsFor } = require('./lib-publish-exports');
 const { verifyLibDist } = require('./verify-lib-dist');
 
 const args = process.argv.slice(2);
@@ -72,33 +72,39 @@ function resolveSiblingVersion(depName) {
   return 'latest';
 }
 
+// Every section npm installs from: a `workspace:` spec left in any of them fails the
+// consumer's install with EUNSUPPORTEDPROTOCOL (verify-lib-dist.js check 9 refuses it).
+const INSTALLED_DEPENDENCY_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDependencies'];
+
 function resolveWorkspaceDeps(pkg) {
-  if (pkg.dependencies) {
-    for (const depName of Object.keys(pkg.dependencies)) {
-      const spec = pkg.dependencies[depName];
+  for (const section of INSTALLED_DEPENDENCY_SECTIONS) {
+    const deps = pkg[section];
+    if (!deps) continue;
+    for (const depName of Object.keys(deps)) {
+      const spec = deps[depName];
       if (typeof spec === 'string' && spec.startsWith('workspace:')) {
         if (depName === '@nextblock-cms/ecommerce') {
-          pkg.dependencies[depName] = `npm:@nextblock-cms/ecom@${resolveSiblingVersion('@nextblock-cms/ecom')}`;
+          deps[depName] = `npm:@nextblock-cms/ecom@${resolveSiblingVersion('@nextblock-cms/ecom')}`;
           continue;
         }
-        pkg.dependencies[depName] = resolveSiblingVersion(depName);
+        deps[depName] = resolveSiblingVersion(depName);
       }
     }
   }
 }
 
-// libs/ecommerce ships source-available + license-gated (same model as Cortex AI): the
-// real module is published publicly to npmjs and gated at runtime via
-// verifyPackageOnline('ecommerce'). Its vite build copies the raw source package.json,
-// which lacks entry points and still has workspace:* deps — normalize it for publish.
-function finalizeEcomDistPackageJson(distPkgPath) {
+// The source-available premium libs (ecommerce, cortex, affiliates) are published publicly to
+// npmjs and gated at runtime via verifyPackageOnline('<package id>'). Their Vite builds copy
+// the raw source package.json, which may lack entry points and still has workspace:* deps
+// and the `nx` field, so normalize it for publish. `publishExportsFor(library)` (shared with
+// the publish check) decides which libs get this step and the exports map they ship.
+function finalizeDistPackageJson(distPkgPath, library, exportsMap) {
   const pkg = JSON.parse(fs.readFileSync(distPkgPath, 'utf8'));
 
   pkg.main = './index.cjs';
   pkg.module = './index.es.js';
   pkg.types = './index.d.ts';
-  // Defined in lib-publish-exports.js (shared with the publish check).
-  pkg.exports = ECOM_EXPORTS;
+  pkg.exports = exportsMap;
 
   resolveWorkspaceDeps(pkg);
 
@@ -107,26 +113,7 @@ function finalizeEcomDistPackageJson(distPkgPath) {
 
   fs.writeFileSync(distPkgPath, JSON.stringify(pkg, null, 2) + '\n');
   console.log(
-    '✓ Normalized ecom dist package.json (entry points + resolved sibling deps + public access)',
-  );
-}
-
-function finalizeCortexDistPackageJson(distPkgPath) {
-  const pkg = JSON.parse(fs.readFileSync(distPkgPath, 'utf8'));
-
-  pkg.main = './index.cjs';
-  pkg.module = './index.es.js';
-  pkg.types = './index.d.ts';
-  pkg.exports = CORTEX_EXPORTS;
-
-  resolveWorkspaceDeps(pkg);
-
-  pkg.publishConfig = { access: 'public' };
-  delete pkg.nx;
-
-  fs.writeFileSync(distPkgPath, JSON.stringify(pkg, null, 2) + '\n');
-  console.log(
-    '✓ Normalized cortex dist package.json (entry points + resolved sibling deps + public access)',
+    `✓ Normalized ${library} dist package.json (entry points + resolved sibling deps + public access)`,
   );
 }
 
@@ -185,19 +172,18 @@ try {
 
   // Source-available premium libs copy raw package.json files during Vite builds;
   // normalize their manifests (entry points + resolved sibling deps) before publish.
-  if (library === 'ecommerce' || library === 'ecom') {
-    finalizeEcomDistPackageJson(path.join(distDir, 'package.json'));
-  }
-  if (library === 'cortex') {
-    finalizeCortexDistPackageJson(path.join(distDir, 'package.json'));
+  const publishExports = publishExportsFor(library);
+  if (publishExports) {
+    finalizeDistPackageJson(path.join(distDir, 'package.json'), library, publishExports);
   }
 
   // Never publish a build that would break `next build` in a scaffolded project: development
   // JSX, consumed subpaths that were not emitted, or exports lost to a stale `.js` twin.
   // Runs AFTER the manifests are finalized, so it judges the package.json that actually
-  // ships. Run before, it rejected ecommerce 0.19.1: the raw manifest has no `exports` yet.
+  // ships (`manifestFinalized`: a `workspace:` spec left in it now is a real problem). Run
+  // before, it rejected ecommerce 0.19.1: the raw manifest has no `exports` yet.
   console.log('\n→ Verifying the build is publishable');
-  verifyLibDist(library);
+  verifyLibDist(library, { manifestFinalized: true });
   console.log('✓ Build verified');
 
   // -------------------------------------------------------------------------

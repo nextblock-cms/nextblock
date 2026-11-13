@@ -1,7 +1,11 @@
 // apps/nextblock/lib/storage/media-object-keys.ts
 import 'server-only';
 
-import { hasAllowedObjectKeyExtension, isSafeObjectKey } from './upload-policy';
+import { hasAllowedObjectKeyExtension, isPartnerUploadKey, isSafeObjectKey } from './upload-policy';
+
+// The partner namespaces and their predicate live in ./upload-policy (one definition for the
+// intake and the deletion side); re-exported here for the media actions and their tests.
+export { PARTNER_UPLOAD_KEY_PREFIX, PARTNER_UPLOAD_NAMESPACES, isPartnerUploadKey } from './upload-policy';
 
 /**
  * Which storage objects a media row may take with it when it is deleted or moved.
@@ -12,7 +16,7 @@ import { hasAllowedObjectKeyExtension, isSafeObjectKey } from './upload-policy';
  * their own over PostgREST (or through the record endpoints, which take the keys from the
  * client) whose `variants` name another uploader's objects, then delete that row: RLS lets
  * them delete their own row, and the action deleted the other uploader's files (2026-10-21
- * audit). Two rules close that, and both helpers here are pure so they can be tested:
+ * audit). These rules close that, and the helpers here are pure so they can be tested:
  *
  *  1. A row owns only keys derived from its own `object_key`: the upload pipeline
  *     (/api/process-image) writes every variant next to the original as
@@ -20,6 +24,19 @@ import { hasAllowedObjectKeyExtension, isSafeObjectKey } from './upload-policy';
  *     variant that does not share the primary key's folder and base is not this row's.
  *  2. A key another media row still references is never deleted (the caller asks the
  *     database with `media_storage_keys_in_use`, migration 02028).
+ *  3. A partner upload (`affiliates/avatars/…` or `affiliates/pages/…`, see
+ *     {@link isPartnerUploadKey}) is never a media key: no media row owns one, whatever it
+ *     lists, so a delete or move never touches it. The rest of `affiliates/` is an ordinary
+ *     media folder.
+ */
+
+/*
+ * Partner uploads (PARTNER_UPLOAD_NAMESPACES in ./upload-policy) belong to a partner account
+ * and no media row references them, so `media_storage_keys_in_use` never
+ * protects them: a decoy row naming a partner's avatar (inserted over PostgREST, which RLS
+ * allows for a WRITER's own row) would otherwise let the /cms/media delete or move remove it.
+ * The staff upload routes and /api/media/record refuse such keys on the way in; the helpers
+ * below are the deletion-side half of that defense.
  */
 
 /**
@@ -31,10 +48,15 @@ const VARIANT_SUFFIX_RE = /_(?:original_uploaded|original|xlarge|large|medium|sm
 
 /**
  * The `<folder>/<base>` every object of one upload shares, or null for a key that is not a
- * plain in-bucket media path (traversal, absolute, no media extension).
+ * plain in-bucket media path (traversal, absolute, no media extension, a partner upload).
  */
 export function mediaKeyStem(key: unknown): string | null {
-  if (typeof key !== 'string' || !isSafeObjectKey(key) || !hasAllowedObjectKeyExtension(key)) {
+  if (
+    typeof key !== 'string' ||
+    isPartnerUploadKey(key) ||
+    !isSafeObjectKey(key) ||
+    !hasAllowedObjectKeyExtension(key)
+  ) {
     return null;
   }
   const slash = key.lastIndexOf('/');
@@ -55,18 +77,21 @@ function listedVariantKeys(variants: unknown): string[] {
 
 /**
  * The storage keys a media row owns: its `object_key` and the listed variants that share
- * its stem, de-duplicated, primary first. A row whose `object_key` is not a media path owns
- * nothing, so the caller deletes no object for it.
+ * its stem, de-duplicated, primary first. A row whose `object_key` is not a media path (a
+ * partner upload included) owns nothing, so the caller deletes or moves no object for it.
  */
 export function ownedMediaStorageKeys(row: { object_key?: unknown; variants?: unknown }): string[] {
   const stem = mediaKeyStem(row.object_key);
   if (!stem) return [];
   const keys = [row.object_key as string, ...listedVariantKeys(row.variants)];
-  return [...new Set(keys.filter((key) => mediaKeyStem(key) === stem))];
+  return [...new Set(keys.filter((key) => !isPartnerUploadKey(key) && mediaKeyStem(key) === stem))];
 }
 
-/** `keys` minus the ones another media row still references (`inUse`). */
+/**
+ * `keys` minus the ones another media row still references (`inUse`), and minus every partner
+ * upload: a partner account always uses its own objects, and no media row stands for it.
+ */
 export function withoutKeysInUse(keys: readonly string[], inUse: Iterable<string>): string[] {
   const referenced = new Set(inUse);
-  return keys.filter((key) => !referenced.has(key));
+  return keys.filter((key) => !referenced.has(key) && !isPartnerUploadKey(key));
 }

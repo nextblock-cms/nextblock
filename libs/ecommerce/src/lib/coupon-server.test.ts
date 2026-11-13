@@ -1,9 +1,16 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@nextblock-cms/db/server', () => ({
-  createClient: () => ({}),
-  getServiceRoleSupabaseClient: () => ({}),
-}));
+vi.mock('@nextblock-cms/db/server', async () => {
+  // The real sandbox predicate (a dependency-free module), which freemius-coupons reads.
+  const { isSandboxEnvironment } = await vi.importActual<{ isSandboxEnvironment: () => boolean }>(
+    '../../../db/src/lib/config-resolve'
+  );
+  return {
+    createClient: () => ({}),
+    getServiceRoleSupabaseClient: () => ({}),
+    isSandboxEnvironment,
+  };
+});
 
 vi.mock('@nextblock-cms/utils', () => ({
   formatPrice: (amount: number, currencyCode?: string | null) =>
@@ -678,7 +685,13 @@ describe('coupon validation throttle', () => {
 describe('Freemius coupon sync', () => {
   beforeEach(() => {
     process.env.FREEMIUS_API_KEY = 'test-token';
+    // Off the sandbox, where the sync runs (freemius-coupons.test.ts covers the sandbox).
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
     vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it('creates Freemius coupons with product-scoped payloads and stores mappings', async () => {

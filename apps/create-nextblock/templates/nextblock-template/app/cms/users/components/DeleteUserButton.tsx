@@ -6,6 +6,7 @@ import { DropdownMenuItem } from "@nextblock-cms/ui";
 import { Trash2, ShieldAlert } from "lucide-react";
 import { deleteUserAndProfile } from "../actions";
 import { ConfirmationModal } from '../../components/ConfirmationModal';
+import { USERS_SANDBOX_NOTE_ID } from "../sandbox-lock";
 
 export function DeleteUserButtonClient({
   userId,
@@ -19,6 +20,10 @@ export function DeleteUserButtonClient({
   void userEmail;
   const [isPending, startTransition] = useTransition();
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // The public sandbox shares every account with every visitor, so deleteUserAndProfile refuses
+  // there: the item renders disabled, described by the note on the users list page. Read inline,
+  // as SandboxCredentialsAlert does.
+  const sandboxLocked = process.env.NEXT_PUBLIC_IS_SANDBOX === "true";
 
   const handleDelete = () => {
     if (userId === currentAdminId) {
@@ -43,9 +48,10 @@ export function DeleteUserButtonClient({
         }`}
         onSelect={(e) => {
           e.preventDefault();
-          if (userId !== currentAdminId) setIsModalOpen(true);
+          if (!sandboxLocked && userId !== currentAdminId) setIsModalOpen(true);
         }}
-        disabled={userId === currentAdminId}
+        disabled={sandboxLocked || userId === currentAdminId}
+        aria-describedby={sandboxLocked ? USERS_SANDBOX_NOTE_ID : undefined}
       >
         <Trash2 className="mr-2 h-4 w-4" />
         Delete User

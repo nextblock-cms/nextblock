@@ -1,11 +1,13 @@
 import 'server-only';
 
 // app/cms/users/[id]/edit/page.tsx
+import Link from "next/link";
 import UserForm from "../../components/UserForm";
 import { updateUserProfile } from "../../actions";
 import type { Database } from "@nextblock-cms/db";
-import { notFound } from "next/navigation";
+import { notFound, unstable_rethrow } from "next/navigation";
 import { getDefaultUserAddresses } from "@nextblock-cms/ecommerce/server";
+import { requireCmsAdmin, type ServiceRoleClient } from "../../../../../lib/auth/cms-actor";
 
 type Profile = Database['public']['Tables']['profiles']['Row'];
 type AuthUser = {
@@ -15,30 +17,14 @@ type AuthUser = {
     last_sign_in_at: string | undefined;
 };
 
-async function getUserAndProfileData(userId: string): Promise<{
+async function getUserAndProfileData(serviceSupabase: ServiceRoleClient, userId: string): Promise<{
   authUser: AuthUser;
   profile: Profile | null;
   addresses: Awaited<ReturnType<typeof getDefaultUserAddresses>>;
   isSoleAdmin: boolean;
 } | null> {
-
-  // Fetch user from auth.users
-  // For admin operations, you might need a service_role client to fetch any user.
-  // However, for just getting user details by ID, this might work if RLS allows admin to read.
-  // A more robust way for admin panel is to use supabase.auth.admin.getUserById(userId)
-  // This requires a client initialized with SERVICE_ROLE_KEY.
-
-  // Let's use the admin API for fetching the auth user.
-   const { createClient: createServiceRoleClient } = await import('@supabase/supabase-js');
-   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
-
-   if (!supabaseUrl || !serviceRoleKey) {
-     throw new Error('Missing required environment variables');
-   }
-   
-   const serviceSupabase = createServiceRoleClient(supabaseUrl, serviceRoleKey);
-
+  // The auth admin API and other accounts' profile rows need the service role; the page has
+  // authorized the ADMIN with requireCmsAdmin() first.
   const { data: { user: authUserData }, error: authUserError } = await serviceSupabase.auth.admin.getUserById(userId);
 
   if (authUserError || !authUserData) {
@@ -57,7 +43,7 @@ async function getUserAndProfileData(userId: string): Promise<{
     console.error("Error fetching profile for edit:", profileError);
     // Decide if this is a critical error. A user might exist in auth but not profiles if trigger failed.
   }
-  
+
   const simplifiedAuthUser: AuthUser = {
       id: authUserData.id,
       email: authUserData.email,
@@ -94,17 +80,42 @@ export default async function EditUserPage(props: { params: Promise<{ id: string
     return notFound();
   }
 
-  const userData = await getUserAndProfileData(userId);
+  let admin: Awaited<ReturnType<typeof requireCmsAdmin>>;
+  try {
+    admin = await requireCmsAdmin();
+  } catch (error) {
+    unstable_rethrow(error);
+    return error instanceof Error && error.message === 'Unauthorized'
+      ? <p>Access Denied. Not authenticated.</p>
+      : <p>Access Denied. Admin privileges required.</p>;
+  }
+
+  const userData = await getUserAndProfileData(admin.supabase, userId);
 
   if (!userData || !userData.authUser) {
     return notFound(); // Or a more specific "User not found" component
   }
 
   const updateUserActionWithId = updateUserProfile.bind(null, userId);
+  // `RTL` (Affiliates partner, migration 02029) is not in the generated enum type yet.
+  const isPartner = String(userData.profile?.role ?? '') === 'RTL';
 
   return (
     <div className="max-w-4xl mx-auto">
       <h1 className="text-2xl font-bold mb-6">Edit User: {userData.authUser.email}</h1>
+      {isPartner && (
+        <p className="mb-6 rounded-lg border border-border bg-card p-4 text-sm text-muted-foreground">
+          This account is an Affiliates partner. Its storefront, tier, commissions and payouts are
+          managed in{' '}
+          <Link
+            href="/cms/affiliates"
+            className="font-medium text-foreground underline underline-offset-4 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Affiliates
+          </Link>
+          ; pause the partner there to cut access while keeping their history.
+        </p>
+      )}
       <UserForm
         userToEditAuth={userData.authUser}
         userToEditProfile={userData.profile}

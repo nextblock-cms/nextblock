@@ -33,6 +33,12 @@ type PackageDefinitionShape = {
   pricing: PackagePricing;
   /** Product page on nextblock.dev, for buying outside the dashboard. */
   purchase_url: string;
+  /**
+   * Packages that must be active for this one to run. Such a package is an add-on: the dashboard
+   * sells and trials it only on top of them, and the app treats it as inactive while one of them
+   * is off (Affiliates needs Commerce Pro: `lib/affiliates/package-state.ts`).
+   */
+  requires: readonly string[];
   /** One line on what the package unlocks, for cards and dialogs. */
   tagline: string;
   trial: PackageTrial | null;
@@ -48,6 +54,7 @@ export const NEXTBLOCK_PACKAGES = {
     fm_plan_id: '41208',
     purchase_url: 'https://nextblock.dev/product/nextblock-commerce-pro-commerce-license',
     pricing: { currency: 'USD', annual: 250, monthly: 25 },
+    requires: [],
     // Both packages start with the same free, no-card 30-day trial; the checkout is
     // opened in trial mode (`trial: 'free'`) whenever this is set.
     trial: { days: 30, requiresPaymentMethod: false },
@@ -61,6 +68,23 @@ export const NEXTBLOCK_PACKAGES = {
     fm_plan_id: '47122',
     purchase_url: 'https://nextblock.dev/product/nextblock-cortex-ai-cortex-ai-license',
     pricing: { currency: 'USD', annual: 250 },
+    requires: [],
+    trial: { days: 30, requiresPaymentMethod: false },
+  },
+  affiliates: {
+    id: 'affiliates',
+    name: 'NextBlock Affiliates & Creator Storefronts',
+    tagline: 'Recruit partners who earn a commission on the sales they refer, each with an approved co-branded storefront and automatic Stripe payouts.',
+    description: 'Affiliate program with partner storefronts, commission tiers and Stripe Connect payouts.',
+    fm_product_id: '43273', // Product ID for NextBlock Affiliates & Creator Storefronts
+    fm_plan_id: '75655',
+    // Created by migration 02032 (EN; the French page is <slug>-fr).
+    purchase_url: 'https://nextblock.dev/product/nextblock-affiliates-creator-storefronts-affiliates-license',
+    // An add-on to Commerce Pro, priced as one: $450 a year for both. The Freemius plan (single-site
+    // pricing 110047) is the source of truth; keep these numbers in step with it.
+    pricing: { currency: 'USD', annual: 200, monthly: 20 },
+    // Partners earn a share of store sales: without Commerce Pro there is nothing to sell.
+    requires: ['ecommerce'],
     trial: { days: 30, requiresPaymentMethod: false },
   },
 } as const satisfies Record<string, PackageDefinitionShape>;
@@ -73,8 +97,33 @@ export function getPackageById(id: string): PackageDef | undefined {
 }
 
 export function getPackageByFreemiusId(productId: string | number): PackageDef | undefined {
-  const pid = String(productId);
+  const pid = String(productId ?? '').trim();
+  // A package without a Freemius product (fm_product_id '') must never match an empty id: `pid`
+  // is non-empty from here, so the comparison alone keeps that true.
+  if (!pid) return undefined;
   return Object.values(NEXTBLOCK_PACKAGES).find((p) => p.fm_product_id === pid);
+}
+
+/**
+ * The packages `pkg` requires that are not active, in registry order: an add-on is sold, trialed
+ * and run only on top of them. `isActive` answers for one package id.
+ */
+export function missingPackageRequirements(
+  pkg: Pick<PackageDefinitionShape, 'requires'>,
+  isActive: (packageId: string) => boolean,
+): PackageDef[] {
+  return pkg.requires
+    .map((packageId) => getPackageById(packageId))
+    .filter((required): required is PackageDef => required !== undefined && !isActive(required.id));
+}
+
+/**
+ * True when the package can be bought or trialed from the dashboard (it has a Freemius product
+ * and plan). A package without one is activated by a license key or the sandbox key only, so
+ * no checkout or trial button may open for it.
+ */
+export function hasPackageCheckout(pkg: Pick<PackageDefinitionShape, 'fm_plan_id' | 'fm_product_id'>): boolean {
+  return pkg.fm_product_id.trim() !== '' && pkg.fm_plan_id.trim() !== '';
 }
 
 /** "$250" — whole dollars, no cents, the way the offer is quoted. */

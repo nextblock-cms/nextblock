@@ -4,7 +4,13 @@ type Row = Record<string, any>;
 type Tables = Record<string, Row[]>;
 
 const mocks = vi.hoisted(() => {
-  const state: { tables: Tables } = { tables: {} };
+  const state: {
+    tables: Tables;
+    /** Refuse an insert the way PostgREST would (no row is stored): return the error. */
+    rejectInsert: ((table: string, rows: Row[]) => Record<string, unknown> | null) | null;
+    /** The configured Stripe secret key (its prefix is the payment mode an attributed order records). */
+    secretKey: string | null;
+  } = { tables: {}, rejectInsert: null, secretKey: null };
   const stripe = {
     customers: {
       list: vi.fn(async () => ({ data: [] })),
@@ -29,6 +35,7 @@ const mocks = vi.hoisted(() => {
     private ordering: { path: string; ascending: boolean } | null = null;
     private pendingUpdate: Row | null = null;
     private inserted: Row[] | null = null;
+    private insertError: Record<string, unknown> | null = null;
 
     constructor(private readonly table: string) {}
 
@@ -70,7 +77,10 @@ const mocks = vi.hoisted(() => {
         id: `${this.table}-${this.rows().length + index + 1}`,
         ...row,
       }));
-      this.rows().push(...rows);
+      this.insertError = state.rejectInsert?.(this.table, rows) ?? null;
+      if (!this.insertError) {
+        this.rows().push(...rows);
+      }
       this.inserted = rows;
       return this;
     }
@@ -86,8 +96,8 @@ const mocks = vi.hoisted(() => {
 
     single() {
       return this.resolve().then((result) => ({
-        data: result.data[0] ?? null,
-        error: result.data[0] ? null : { message: `${this.table}: no rows` },
+        data: result.error ? null : result.data[0] ?? null,
+        error: result.error ?? (result.data[0] ? null : { message: `${this.table}: no rows` }),
       }));
     }
 
@@ -95,7 +105,11 @@ const mocks = vi.hoisted(() => {
       return this.resolve().then(onFulfilled, onRejected);
     }
 
-    private async resolve(): Promise<{ data: Row[]; error: null }> {
+    private async resolve(): Promise<{ data: Row[]; error: Record<string, unknown> | null }> {
+      if (this.insertError) {
+        return { data: [], error: this.insertError };
+      }
+
       if (this.inserted) {
         return { data: this.inserted, error: null };
       }
@@ -133,7 +147,12 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock('@supabase/supabase-js', () => ({ createClient: mocks.createClient }));
-vi.mock('../stripe/client', () => ({ getStripeClient: async () => mocks.stripe }));
+// The real key-mode helpers over a mocked key; the client itself is the fake above.
+vi.mock('../stripe/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../stripe/client')>()),
+  getStripeClient: async () => mocks.stripe,
+}));
+vi.mock('../payment-config', () => ({ resolveStripeSecretKey: async () => mocks.state.secretKey }));
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => ({}),
   getServiceRoleSupabaseClient: () => ({}),
@@ -291,6 +310,8 @@ describe('StripeProvider.createCheckoutSession', () => {
     vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'http://127.0.0.1:54321');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'service-role-test-key');
     mocks.state.tables = seedTables();
+    mocks.state.rejectInsert = null;
+    mocks.state.secretKey = 'sk_test_provider';
     mocks.stripe.checkout.sessions.create.mockClear();
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
@@ -438,6 +459,94 @@ describe('StripeProvider.createCheckoutSession', () => {
 
       expect(result).toMatchObject({ url: null, errorKey: 'ecommerce.checkout_invalid_items', errorStatus: 400 });
       expect(mocks.state.tables.orders).toEqual([]);
+    });
+  });
+
+  describe('affiliate attribution', () => {
+    const AFFILIATE_ID = '11111111-1111-4111-8111-111111111111';
+    const ATTRIBUTION = { affiliateId: AFFILIATE_ID, source: 'storefront' as const, baseCurrency: 'USD' };
+
+    function sessionParams() {
+      const call = mocks.stripe.checkout.sessions.create.mock.calls[0] as unknown as [
+        { metadata: Record<string, string>; payment_intent_data?: { metadata?: Record<string, string> } },
+      ];
+      return call[0];
+    }
+
+    /** Fail every orders insert that carries affiliate columns, as a pre-02030 database would. */
+    function refuseAffiliateColumns(error: Record<string, unknown>) {
+      mocks.state.rejectInsert = (table, rows) =>
+        table === 'orders' && rows.some((row) => 'affiliate_id' in row) ? error : null;
+    }
+
+    it('records the attribution on the pending order and names the partner in the session metadata', async () => {
+      const result = await checkout({ attribution: ATTRIBUTION });
+
+      expect(result).toEqual({ url: 'https://checkout.stripe.test/cs_test' });
+      expect(mocks.state.tables.orders).toHaveLength(1);
+      expect(mocks.state.tables.orders[0]).toMatchObject({
+        status: 'pending',
+        affiliate_id: AFFILIATE_ID,
+        affiliate_source: 'storefront',
+        affiliate_base_currency: 'USD',
+      });
+      expect(sessionParams().metadata).toMatchObject({ orderId: 'orders-1', affiliateId: AFFILIATE_ID });
+      expect(sessionParams().payment_intent_data).toEqual({ metadata: { orderId: 'orders-1' } });
+    });
+
+    it.each([
+      ['a test key as test mode', 'sk_test_51abc', false],
+      ['a live key as live', 'sk_live_51abc', true],
+      ['a restricted live key as live', 'rk_live_51abc', true],
+      ['a restricted test key as test mode', 'rk_test_51abc', false],
+      ['a key of unknown shape as unknown', 'not-a-stripe-key', null],
+    ])('records %s on the attributed order', async (_label, key, livemode) => {
+      mocks.state.secretKey = key;
+
+      await checkout({ attribution: ATTRIBUTION });
+
+      expect(mocks.state.tables.orders[0]).toMatchObject({ affiliate_id: AFFILIATE_ID, affiliate_livemode: livemode });
+    });
+
+    it('adds no affiliate keys without an attribution, and still tags the PaymentIntent with the order', async () => {
+      await checkout({ attribution: null });
+
+      expect(Object.keys(mocks.state.tables.orders[0]).filter((key) => key.startsWith('affiliate'))).toEqual([]);
+      expect(sessionParams().metadata).not.toHaveProperty('affiliateId');
+      expect(sessionParams().payment_intent_data).toEqual({ metadata: { orderId: 'orders-1' } });
+    });
+
+    it.each([
+      ['PostgREST does not know the columns (PGRST204)', { code: 'PGRST204', message: "Could not find the 'affiliate_base_currency' column of 'orders' in the schema cache" }],
+      ['Postgres does not know them (42703)', { code: '42703', message: 'column "affiliate_id" of relation "orders" does not exist' }],
+    ])('saves the order without attribution when %s, and the checkout goes on', async (_label, error) => {
+      refuseAffiliateColumns(error);
+
+      const result = await checkout({ attribution: ATTRIBUTION });
+
+      expect(result).toEqual({ url: 'https://checkout.stripe.test/cs_test' });
+      expect(mocks.state.tables.orders).toHaveLength(1);
+      expect(mocks.state.tables.orders[0]).not.toHaveProperty('affiliate_id');
+      expect(mocks.state.tables.order_items).toHaveLength(1);
+      expect(sessionParams().metadata).not.toHaveProperty('affiliateId');
+      expect(sessionParams().payment_intent_data).toEqual({ metadata: { orderId: mocks.state.tables.orders[0].id } });
+    });
+
+    it('drops a malformed attribution before the insert', async () => {
+      await checkout({ attribution: { affiliateId: 'jane-doe', source: 'storefront', baseCurrency: 'USD' } });
+
+      expect(mocks.state.tables.orders[0]).not.toHaveProperty('affiliate_id');
+      expect(sessionParams().metadata).not.toHaveProperty('affiliateId');
+    });
+
+    it('still fails on an insert error that has nothing to do with attribution', async () => {
+      mocks.state.rejectInsert = (table) =>
+        table === 'orders' ? { code: '23505', message: 'duplicate key value violates unique constraint' } : null;
+
+      const result = await checkout({ attribution: ATTRIBUTION });
+
+      expect(result).toEqual({ error: 'Failed to initiate order', url: null });
+      expect(mocks.stripe.checkout.sessions.create).not.toHaveBeenCalled();
     });
   });
 });

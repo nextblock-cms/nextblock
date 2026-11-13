@@ -22,6 +22,13 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   standalone installs break while the monorepo works.
 - `npx nx build ecommerce` copies the raw `package.json` into a clean dist; only
   `tools/scripts/release-lib.js` writes the exports map. Validate commerce changes at the app level.
+- The cart's `affiliateRef` (the Affiliates storefront token) lives exactly as long as the cart:
+  set items through `withCartItems` (`cart-store.ts`) so every path that empties the cart drops
+  it, and keep `pendingAffiliateRef` (a storefront link's token, promoted by the next successful
+  add) out of `partialize`. `cart-store.test.ts` covers both (docs/15 → "The storefront token").
+- An attributed order records its payment mode (`affiliate_livemode`): Stripe from the secret
+  key's prefix (`stripeSecretKeyLivemode()`), Freemius from `FREEMIUS_SANDBOX_ENABLED`, read once
+  per checkout. A test-mode sale is then only ever paid out by a test-mode transfer.
 
 Commands: `npx vitest run libs/ecommerce`, `npx nx lint ecommerce`, `npx nx run ecommerce:build`
 (excluded from `lib-builds` on purpose); `npm run build:ecom` publishes.

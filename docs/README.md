@@ -20,11 +20,13 @@ library surfaces rather than historical planning notes.
 - One-click cloud deploy (Deploy to Vercel): [12-VERCEL-DEPLOYMENT.md](./12-VERCEL-DEPLOYMENT.md)
 - Updating an install (`npm run update`, upstream sync): [13-STAYING-UP-TO-DATE.md](./13-STAYING-UP-TO-DATE.md)
 - Messages inbox (enquiries, contact forms, reviews, comments): [14-MESSAGES-INBOX.md](./14-MESSAGES-INBOX.md)
+- Affiliates & creator storefronts (partners, commissions, Stripe Connect payouts): [15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md)
 
 ## Audience Guide
 
 - New contributors: read `01`, then `04`, then `05`.
 - Commerce work: read `02`, then `04`.
+- Affiliate program, partner portal or payout work: read `15`, then `02` and `04`.
 - Editor or page-builder work: read `03`, then `07`.
 - Custom block work: read `03`, then `10`.
 - AI / Cortex work: read `08`.

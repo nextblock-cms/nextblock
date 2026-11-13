@@ -13,7 +13,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * references is deleted: the actions ask `media_storage_keys_in_use` (service role) and keep
  * every key it returns, or every key at all when the check fails. Without that, a WRITER's decoy
  * row listing another uploader's keys deleted their files.
+ *
+ * Partner uploads (Affiliates avatars and storefront images, `affiliates/...`) are no media row's,
+ * so the in-use check cannot protect them: no delete or move ever touches such a key, and nothing
+ * is moved into that prefix (lib/storage/media-object-keys.ts, isPartnerUploadKey).
  */
+
+const PARTNER = '0f8a1c2e-3b4d-4e5f-8a9b-1c2d3e4f5a6b';
+const PARTNER_AVATAR = `affiliates/avatars/${PARTNER}/20261027101500-0a1b2c3d.jpg`;
 
 const callLog: string[] = [];
 
@@ -41,7 +48,7 @@ const s3Send = vi.fn(async (cmd: any) => {
   return {};
 });
 
-const supabaseRemoveObjects = vi.fn(async () => {
+const supabaseRemoveObjects = vi.fn<(keys: string[]) => Promise<void>>(async () => {
   callLog.push('supabase.removeObjects');
 });
 
@@ -235,6 +242,49 @@ describe('deleteMediaItem', () => {
     expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
   });
 
+  it("a decoy row naming a partner's uploads (affiliates/) deletes no object on either backend", async () => {
+    // Partner avatars and storefront images are not media rows, so the in-use check can never
+    // protect them; the row may only be removed, never take their objects with it.
+    for (const backend of ['s3', 'supabase'] as const) {
+      vi.clearAllMocks();
+      callLog.length = 0;
+      mocks.rpcCalls = [];
+      mocks.backend = backend;
+      mocks.mediaWrite = {
+        data: [
+          {
+            object_key: PARTNER_AVATAR,
+            variants: [{ objectKey: PARTNER_AVATAR }, { objectKey: `/Affiliates/pages/${PARTNER}/20261027101501-4e5f6a7b.jpg` }],
+          },
+        ],
+        error: null,
+      };
+
+      await deleteMediaItem('decoy', PARTNER_AVATAR);
+
+      expect(callLog).toEqual(['media.delete']);
+      expect(mocks.rpcCalls).toEqual([]);
+      expect(s3Send).not.toHaveBeenCalled();
+      expect(supabaseRemoveObjects).not.toHaveBeenCalled();
+      expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
+    }
+  });
+
+  it('still deletes the objects of an ordinary upload kept under affiliates/ (outside the partner namespaces)', async () => {
+    mocks.mediaWrite = {
+      data: [{ object_key: 'affiliates/banner_1.png', variants: [{ objectKey: 'affiliates/banner_1_large.avif' }] }],
+      error: null,
+    };
+
+    await deleteMediaItem('media-1', 'affiliates/banner_1.png');
+
+    expect(callLog).toEqual(['media.delete', 'rpc:media_storage_keys_in_use', 's3.send:DeleteObjects']);
+    expect(s3Send.mock.calls[0][0].input.Delete.Objects).toEqual([
+      { Key: 'affiliates/banner_1.png' },
+      { Key: 'affiliates/banner_1_large.avif' },
+    ]);
+  });
+
   it('a non-owner WRITER (zero rows deleted) touches no storage and reports not-permitted', async () => {
     mocks.mediaWrite = { data: [], error: null }; // RLS removed nothing
 
@@ -287,6 +337,28 @@ describe('deleteMultipleMediaItems', () => {
     expect(callLog).toEqual(['media.delete']);
     expect(s3Send).not.toHaveBeenCalled();
     expect(res.error).toMatch(/not found, or you do not have permission/i);
+  });
+
+  it('never sends a partner upload (affiliates/) to storage, whichever row lists it', async () => {
+    mocks.backend = 'supabase';
+    mocks.mediaWrite = {
+      data: [
+        { object_key: 'uploads/a.avif', variants: [{ objectKey: `affiliates/pages/${PARTNER}/a_small.avif` }] },
+        { object_key: `AFFILIATES/avatars/${PARTNER}/20261027101500-0a1b2c3d.jpg`, variants: [] },
+      ],
+      error: null,
+    };
+
+    await deleteMultipleMediaItems([
+      { id: 'a', objectKey: 'uploads/a.avif' },
+      { id: 'decoy', objectKey: PARTNER_AVATAR },
+    ]);
+
+    expect(mocks.rpcCalls).toEqual([
+      { fn: 'media_storage_keys_in_use', args: { p_keys: ['uploads/a.avif'], p_exclude_id: null } },
+    ]);
+    expect(supabaseRemoveObjects).toHaveBeenCalledTimes(1);
+    expect(supabaseRemoveObjects).toHaveBeenCalledWith(['uploads/a.avif']);
   });
 
   it('reports a partial result when RLS skips some of the selected rows', async () => {
@@ -374,5 +446,32 @@ describe('moveMultipleMediaItems', () => {
 
     expect(s3Send).not.toHaveBeenCalled();
     expect(res.error).toMatch(/does not point at a media file/i);
+  });
+
+  it("refuses to move a decoy row that names a partner's upload (affiliates/)", async () => {
+    mocks.mediaWrite = {
+      data: [{ id: 'decoy', object_key: PARTNER_AVATAR, file_type: 'image/jpeg', variants: [{ objectKey: PARTNER_AVATAR }] }],
+      error: null,
+    };
+
+    const res = await moveMultipleMediaItems([{ id: 'decoy', objectKey: PARTNER_AVATAR }], 'photos');
+
+    expect(s3Send).not.toHaveBeenCalled();
+    expect(mocks.rpcCalls).toEqual([]);
+    expect(res.error).toMatch(/does not point at a media file/i);
+  });
+
+  it('refuses a destination inside the partner uploads prefix before touching the row or storage', async () => {
+    mocks.mediaWrite = {
+      data: [{ id: 'a', object_key: 'uploads/a.avif', file_type: 'image/avif', variants: [] }],
+      error: null,
+    };
+
+    for (const destination of [`affiliates/pages/${PARTNER}`, `/Affiliates/avatars/${PARTNER}/`, 'AFFILIATES/PAGES']) {
+      const res = await moveMultipleMediaItems([{ id: 'a', objectKey: 'uploads/a.avif' }], destination);
+      expect(res.error, destination).toMatch(/partner uploads folder/i);
+    }
+    expect(callLog).toEqual([]);
+    expect(s3Send).not.toHaveBeenCalled();
   });
 });

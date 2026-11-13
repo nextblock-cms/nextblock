@@ -15,6 +15,16 @@ const packageJsonPath = resolveFrom('package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
 const { version, dependencies, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// peerDependencies: @nextblock-cms/utils, which the bundle imports by name (`@nextblock-cms/*`
+// stays external below), at the version libs/utils carries when this build runs. release:all
+// bumps utils before it builds ui (LIBS in tools/scripts/release-all.js), so the range names the
+// release that goes out with this one. A peer, so the app and ui share one copy. Through 0.22.5
+// ui declared none. tools/scripts/verify-lib-dist.js check 11 refuses an undeclared sibling import.
+const utilsVersion = JSON.parse(fs.readFileSync(resolveFrom('../utils/package.json'), 'utf8')).version;
+if (typeof utilsVersion !== 'string' || !/^\d+\.\d+\.\d+/.test(utilsVersion)) {
+  throw new Error("libs/utils/package.json has no version for ui's peerDependencies");
+}
+const peerDependencies = { '@nextblock-cms/utils': `^${utilsVersion}` };
 
 export default defineConfig({
   root: __dirname,
@@ -39,6 +49,7 @@ export default defineConfig({
           module: 'index.mjs',
           types: 'index.d.ts',
           ...(dependencies ? { dependencies } : {}),
+          peerDependencies,
           exports: {
             '.': {
               types: './index.d.ts',

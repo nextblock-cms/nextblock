@@ -465,6 +465,8 @@ export function CustomerProfileForm({
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="USER">User</SelectItem>
+                      {/* Affiliates partner (migration 02029); not in the generated enum type yet. */}
+                      <SelectItem value="RTL">Partner (RTL)</SelectItem>
                       <SelectItem value="WRITER">Writer</SelectItem>
                       <SelectItem value="ADMIN">Admin</SelectItem>
                     </SelectContent>

@@ -15,6 +15,7 @@ import {
   supabaseDownloadObject,
   supabaseUploadObject,
 } from '../../../lib/storage/supabase-storage';
+import { isPartnerUploadKey, isSafeObjectKey } from '../../../lib/storage/upload-policy';
 
 // Helper to convert stream to buffer
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
@@ -122,8 +123,14 @@ export async function POST(request: NextRequest) {
     if (
       typeof originalObjectKey !== 'string' ||
       originalObjectKey.includes('..') ||
+      // The shared key policy also refuses '.' segments, empty segments, backslashes and control
+      // characters, so './affiliates/pages/...' cannot slip past the partner check below.
+      !isSafeObjectKey(originalObjectKey) ||
       originalObjectKey.startsWith('/') ||
-      /^[a-z][a-z0-9+.-]*:\/\//i.test(originalObjectKey)
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(originalObjectKey) ||
+      // Partner uploads (affiliates/avatars/… and affiliates/pages/…) are not media: processing one would read a partner's
+      // object and write six variants into their prefix, which counts against their caps.
+      isPartnerUploadKey(originalObjectKey)
     ) {
       return NextResponse.json({ error: 'Invalid objectKey.' }, { status: 400 });
     }

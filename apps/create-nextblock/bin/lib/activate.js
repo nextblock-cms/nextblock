@@ -14,6 +14,9 @@ import { resolve } from 'node:path';
 /**
  * Mirrors NEXTBLOCK_PACKAGES in libs/utils/src/lib/nextblock-packages.ts (id and name);
  * activate.test.js fails on drift. `label` is the short name the guide uses in running text.
+ * `dashboardCheckout` mirrors `hasPackageCheckout()` there: false while the package has no
+ * Freemius product, so the CMS offers no trial or checkout for it. `requires` mirrors its
+ * `requires`: an add-on (Affiliates needs Commerce Pro) stays paused until its base is active.
  */
 export const PREMIUM_PACKAGES = Object.freeze({
   'cortex-ai': Object.freeze({
@@ -21,12 +24,24 @@ export const PREMIUM_PACKAGES = Object.freeze({
     name: 'NextBlock Cortex AI',
     label: 'Cortex AI',
     dependency: '@nextblock-cms/cortex',
+    dashboardCheckout: true,
+    requires: Object.freeze([]),
   }),
   ecommerce: Object.freeze({
     id: 'ecommerce',
     name: 'NextBlock™ Commerce Pro',
     label: 'Commerce Pro',
     dependency: '@nextblock-cms/ecommerce',
+    dashboardCheckout: true,
+    requires: Object.freeze([]),
+  }),
+  affiliates: Object.freeze({
+    id: 'affiliates',
+    name: 'NextBlock Affiliates & Creator Storefronts',
+    label: 'Affiliates',
+    dependency: '@nextblock-cms/affiliates',
+    dashboardCheckout: true,
+    requires: Object.freeze(['ecommerce']),
   }),
 });
 
@@ -38,12 +53,22 @@ const PACKAGE_ALIASES = Object.freeze({
   ecom: 'ecommerce',
   commerce: 'ecommerce',
   'commerce-pro': 'ecommerce',
+  affiliates: 'affiliates',
+  affiliate: 'affiliates',
+  partners: 'affiliates',
+  storefronts: 'affiliates',
+  'creator-storefronts': 'affiliates',
 });
+
+/** env-license.ts reads NEXTBLOCK_LICENSE_KEY as this package's key unless NEXTBLOCK_LICENSE_PACKAGE names another. */
+const DEFAULT_LICENSE_PACKAGE = 'cortex-ai';
 
 export const PREMIUM_DOCS_URL =
   'https://github.com/nextblock-cms/nextblock/blob/master/docs/06-CLI-AND-SCAFFOLDING.md#premium-packages';
 export const UPDATE_DOCS_URL =
   'https://github.com/nextblock-cms/nextblock/blob/master/docs/13-STAYING-UP-TO-DATE.md';
+export const AFFILIATES_DOCS_URL =
+  'https://github.com/nextblock-cms/nextblock/blob/master/docs/15-AFFILIATES-AND-STOREFRONTS.md';
 
 /**
  * Files the old command overwrote with code that breaks the build or drops features. Its
@@ -122,20 +147,45 @@ export async function findLegacyActivateWrappers(projectDir) {
 export function buildActivationGuide(packages, { missing = [], legacyFiles = [] } = {}) {
   const one = packages.length === 1;
   const everyLabel = joinNames(Object.values(PREMIUM_PACKAGES).map((pkg) => pkg.label));
-  // env-license.ts reads the key as Cortex AI's unless NEXTBLOCK_LICENSE_PACKAGE says otherwise.
-  const commerceKeyNote = packages.some((pkg) => pkg.id === 'ecommerce')
-    ? ' (a Commerce Pro key also needs NEXTBLOCK_LICENSE_PACKAGE=ecommerce)'
-    : '';
+  const trialLabels = Object.values(PREMIUM_PACKAGES)
+    .filter((pkg) => pkg.dashboardCheckout)
+    .map((pkg) => pkg.label);
+  const trialSentence =
+    trialLabels.length === Object.keys(PREMIUM_PACKAGES).length
+      ? 'each has a free 30-day trial, no credit card required'
+      : `${joinNames(trialLabels)} ${trialLabels.length === 1 ? 'has' : 'each have'} a free 30-day trial, no credit card required`;
+  // A key for any other package must say which one it unlocks.
+  const article = (label) => (/^[aeiou]/i.test(label) ? 'an' : 'a');
+  const keyNotes = packages
+    .filter((pkg) => pkg.id !== DEFAULT_LICENSE_PACKAGE)
+    .map(
+      (pkg, index) =>
+        `${article(pkg.label)} ${pkg.label} key ${index === 0 ? 'also needs ' : ''}NEXTBLOCK_LICENSE_PACKAGE=${pkg.id}`,
+    );
+  const keyNote = keyNotes.length ? ` (${keyNotes.join(', ')})` : '';
+  const withoutCheckout = packages.filter((pkg) => !pkg.dashboardCheckout);
   const lines = [
     `${joinNames(packages.map((pkg) => pkg.name))} ${one ? 'needs' : 'need'} no install and no code change: a license switches ${one ? 'it' : 'them'} on in your running site.`,
     '',
-    `NextBlock CMS is free and open source (AGPL-3.0). Premium packages add to it: today ${everyLabel}, with more to come. Their code already ships in every project, and each has a free 30-day trial, no credit card required.`,
+    `NextBlock CMS is free and open source (AGPL-3.0). Premium packages add to it: today ${everyLabel}, with more to come. Their code already ships in every project, and ${trialSentence}.`,
     '',
     "  1. Sign in to your site's CMS (/cms) as an administrator.",
     '  2. Open Administration → Packages (/cms/settings/packages).',
     '  3. Start the free trial, or paste a license key you already have.',
+    ...withoutCheckout.map(
+      (pkg) =>
+        `     ${pkg.label} cannot be bought or trialed from the dashboard yet; its guide explains how to activate it: ${
+          pkg.id === 'affiliates' ? AFFILIATES_DOCS_URL : PREMIUM_DOCS_URL
+        }`,
+    ),
+    ...packages
+      .filter((pkg) => pkg.requires.length > 0)
+      .map((pkg) => {
+        const bases = joinNames(pkg.requires.map((id) => PREMIUM_PACKAGES[id]?.label ?? id));
+        return `     ${pkg.label} is an add-on for ${bases}: activate ${bases} too, or it stays paused.`;
+      }),
     '',
-    `No browser (CI or a coding agent)? Set NEXTBLOCK_LICENSE_KEY instead${commerceKeyNote}: ${PREMIUM_DOCS_URL}`,
+    `No browser (CI or a coding agent)? Set NEXTBLOCK_LICENSE_KEY instead${keyNote}: ${PREMIUM_DOCS_URL}`,
   ];
 
   for (const pkg of missing) {

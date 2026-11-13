@@ -97,7 +97,9 @@ function json(body: Record<string, unknown>, status: number) {
 }
 
 export async function POST(request: Request) {
-  if (process.env.NEXTBLOCK_LICENSE_CLAIM_ENABLED !== 'true') {
+  // The public sandbox never mints licenses, even with the vendor flag copied into its env: a trial
+  // minted there is a real license on the operator's Freemius product.
+  if (process.env.NEXTBLOCK_LICENSE_CLAIM_ENABLED !== 'true' || process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') {
     return json({ error: 'Not found.', ok: false }, 404);
   }
 

@@ -31,6 +31,16 @@ Practical usage in the app is split by trust level:
 - public static-ish reads often use `getSsgSupabaseClient()`
 - admin or system workflows use `getServiceRoleSupabaseClient()`
 
+Whatever the client, PostgREST returns at most `max_rows` rows per request (`[api] max_rows =
+1000` in `libs/db/src/supabase/config.toml`, and 1000 on hosted Supabase) and drops the rest
+without an error. A read of a table that can grow past 1000 rows pages with
+`.order(<unique column>).range()`, and treats only an EMPTY page as the end: a hosted project's
+"Max rows" can be lowered in the dashboard, and a short page may just be capped. `translations`
+passed 1000 rows with `02031`: its readers go through `readAllTranslationRows`
+(`apps/nextblock/lib/i18n/translation-pages.ts`, which moves on by the rows it received and stops
+on an empty page), and `tools/scripts/translations-pagination.test.ts` fails on a
+`.from('translations')` read of many rows without `.range()`.
+
 ### Service-role boundary
 
 The service-role / secret key bypasses every RLS policy, so the code that holds it stays on
@@ -48,9 +58,12 @@ the server, enforced at three levels:
   `lib/setup/env-status.ts` resolves only the public names, because the proxy, `next.config.js`
   and client modules (the language REST client, the app-icon context) import it.
 - **`tools/scripts/service-role-boundary.test.ts`** (`tools/scripts/lib/service-role-boundary.js`)
-  fails when a module that uses the service role lacks `'server-only'`; when any `'use client'`
+  fails when a module that uses the service role lacks `'server-only'` (the verified helpers
+  `requireCmsAdmin()`, `requireEcomAdmin()`, `requireRetailer()`, `requireRetailerPage()` and
+  friends count as service-role use); when any `'use client'`
   file or client-safe library entry (`@nextblock-cms/db`, `/ecommerce`, `/cortex/client`, `/ui`,
-  `/editor`, `/utils`, `/sdk`) reaches server-only or service-role code through value imports
+  `/editor`, `/utils`, `/sdk`, `/affiliates`, `/affiliates/editor`; every `exports` subpath
+  except the declared server entries) reaches server-only or service-role code through value imports
   (it stops at `'use server'` modules and skips `import type`); and when a secret is named
   `NEXT_PUBLIC_*` or appears in `next.config.js` `env` (both are inlined into the browser
   bundle). The library entries matter because Vite builds them without Next's check, so a leak
@@ -100,7 +113,26 @@ The CMS shell in `app/cms/CmsClientLayout.tsx` currently expects:
 - a resolved profile role of `ADMIN` or `WRITER`
 
 Writers and admins can enter the CMS. Admin-only navigation is used for
-settings such as payments, shipping, users, and some branding/config surfaces.
+settings such as payments, shipping, users, affiliates, and some branding/config surfaces.
+
+The fourth role, `RTL` (`02029`), is an Affiliates partner. It has no CMS access: partners use
+the portal at `/portal/retailer`, whose pages, actions and routes authorize with
+`requireRetailer()` / `requireRetailerPage()` (`apps/nextblock/lib/affiliates/retailer-actor.ts`,
+the partner equivalent of `getCmsActor()`: session, enrolled second factor, own `profiles` row,
+then the service role). After sign-in `resolvePostAuthRedirect()` sends an RTL account to the
+portal. See docs/15.
+
+`/cms/users` (the list, the edit page and the three actions in `app/cms/users/actions.ts`) runs
+on `requireCmsAdmin()` since 2026-10-27; the actions' old `verifyAdmin` checked the role but not
+the enrolled second factor, and the pages read the service key from env themselves. The actions
+validate with zod (UUID ids, every field bounded), return `{ ok: false, error }` without database
+text, manage `ADMIN`, `WRITER`, `USER` and `RTL`, and keep the last-admin check. Deleting a user
+whose partner account has any payout, or any commission other than a zero-amount tombstone, is
+refused ("Pause the partner in Affiliates instead";
+`lib/affiliates/affiliate-deletion-guard.ts`, which "Remove partner" in `/cms/affiliates` asks too),
+because the affiliate tables cascade from
+`auth.users` and the delete would erase the ledger. The guard fails closed on a read error and
+runs before the account's MCP tokens are revoked.
 
 `proxy.ts`, `app/cms/layout.tsx` and every `get_current_user_role()` policy trust
 `profiles.role`, which is why that column is guarded at the database (see "Row Level
@@ -179,6 +211,20 @@ history now):
   `mcp_access_tokens`, `product_inquiries`, `message_threads` + `thread_messages`,
   `cms_redirects`, `system_alerts` — generation-1 additions (2026-07 → 2026-09)
 
+### Affiliates tables
+
+Defined in `02030_affiliates_schema.sql` (the Affiliates package, docs/15):
+`affiliate_tiers`, `affiliate_profiles`, `affiliate_pages`, `affiliate_commissions`,
+`affiliate_payouts`, `affiliate_click_events` and `affiliate_payout_runs`, plus
+`orders.affiliate_id` / `affiliate_source` / `affiliate_base_currency` / `affiliate_livemode` /
+`affiliate_refunded_minor` / `affiliate_refund_total_minor` and six affiliate `system_alerts`
+types. `02033` adds `affiliate_tiers.goal` / `goal_translations`; `02035` adds
+`orders.affiliate_commission_rate` / `affiliate_clearance_hold_days` (the tier's rate and hold
+stored when an attributed order is paid) and `affiliate_profiles.tier_changed_at`; `02036` adds
+`affiliate_payouts.method` / `manual_channel` / `external_reference` / `note` / `recorded_by`
+(payouts paid by hand: prepared before the money is sent, then recorded;
+`stripe_destination_account` becomes nullable) and `affiliate_profiles.payout_email`.
+
 ## Row Level Security Patterns
 
 `02003_baseline_security_and_grants.sql` is the consolidated RLS file.
@@ -206,7 +252,8 @@ The high-level access model is:
   Site Settings in Active Use" below); writes tiered since `02022`, and since `02028` a
   `WRITER` writes only an allow-list of keys; since `02023` the `ADMIN` tier of both requires a
   satisfied second factor (`is_admin_mfa()`), so the CMS reads and writes it with the service
-  role after its own role check
+  role after its own role check; since `02038` the secret rows answer to no API session at all,
+  only to the service role
 - `media` is readable by the public key on purpose (`media_read_policy USING (true)`, decision
   recorded in `02028`): the bucket is public-read and every rendered image carries its object
   URL, so a row adds only its file name, description and uploader id. Scoping it to media that
@@ -253,7 +300,7 @@ change):
   forward migration revokes them. Both apply paths end with a blanket
   `grant execute on all functions in schema public` to the API roles, so each path must
   take it back in the same pass: `TRIGGER_FUNCTION_REVOKE_SQL` (every `RETURNS trigger`
-  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02027`) in
+  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02028`/`02030`/`02035`–`02037`) in
   `lib/setup/schema-apply.ts` (`/setup`) and `tools/lib/migrate-core.mjs` (the build-time
   hook). The hook lacked both until 2026-10-20, so every production deploy re-granted the
   triggers and the advisor flagged them again; `02024` repairs the databases that were
@@ -370,6 +417,104 @@ admin acts on goes under a name that says so (`userIdToUpdate`).
 `tools/scripts/server-action-actors.test.ts` (in `security:check`) parses every `'use server'`
 module and inline action, follows each parameter's type into the module that declares it, and
 fails on an identity or client name.
+
+**The public sandbox refuses what would outlive its reset.** Its admin login is published, and so
+is the demo partner's once the Affiliates demo is configured (the second factor always reads
+satisfied). Every reset:
+
+- empties the bucket;
+- deletes every auth user except the two preserved demo ids (Step A of
+  `tools/scripts/generate-sandbox-reset.ts`; their factors, sessions and identities go with them);
+- rebuilds `public`;
+- restores the demo admin's password and deletes every second factor on it (`restoreDemoAdmin`),
+  right after the SQL and before every later step (a failure in the bucket wipe, the seed upload or
+  the SQL itself ends that run first);
+- re-creates the demo partners when `FREEMIUS_AFFILIATES_SANDBOX_KEY` is set (the program itself
+  runs only with `FREEMIUS_ECOMMERCE_SANDBOX_KEY` too: Affiliates needs Commerce Pro).
+
+Out of its reach: the rest of the two preserved `auth.users` rows, GoTrue's settings, mail already
+sent, coupons or money at a payment provider, and anything another visitor already read.
+
+Until 2026-11-03 a visitor could:
+
+- create accounts and mail an address they typed (sign-up, partner sign-up, `/cms/users`);
+- relay mail through the deployment's SMTP account;
+- plant a script that read other visitors' OpenRouter keys (a site script, a GTM container, or
+  markup in a product description or custom block);
+- push live coupons to the operator's real Freemius products;
+- enroll a second factor on the shared admin that survived every reset;
+- open real checkouts, export the full backup.
+
+Each of those now stops before the step that would outlive the reset:
+
+- Some refuse as their first statement, others right after their admin check.
+- Partner sign-up first runs its read-only checks (docs/15 → "What a visitor can and cannot do
+  there").
+- Mail stops at the send: `sendEmail` delivers only to `SANDBOX_CONTACT_EMAIL` and the product
+  feedback inbox.
+- Payment settings are neither saved nor read there, so a row written over PostgREST never reaches
+  `process.env`.
+- Site scripts, custom scripts and tag managers render nothing.
+- A second factor enrolled through GoTrue directly is deleted by the next reset.
+
+`tools/scripts/sandbox-guards.test.ts` (in `security:check`) holds the list, `SANDBOX_GUARDS` in
+`tools/scripts/lib/sandbox-guards.js`, and fails when:
+
+- a listed function stops reading `NEXT_PUBLIC_IS_SANDBOX` (directly, through
+  `isSandboxEnvironment()` or through a helper of its module);
+- a listed function's test never sets the flag to `'true'` (`vi.stubEnv` or a direct
+  `process.env` assignment), or never uses the function (a comment, a title or a type does not
+  count);
+- a module that creates a mail transport, calls a GoTrue account, second-factor or auth-mail API
+  (`signUp`, `createUser`, `mfa.enroll`, … on any client, stored handle or GoTrue-typed parameter,
+  aliases and `SupabaseClient['auth']` included), writes to object storage, or writes to a payment
+  provider is missing from `MAIL_SENDERS`, `ACCOUNT_WRITERS`, `STORAGE_WRITERS` or
+  `VENDOR_WRITERS`, the lists that say how each behaves there. A payment-provider write is a
+  Stripe call that is not a read (`retrieve`, `list`, `search`) on a Stripe client (a stored or
+  typed handle, a member named `stripe` such as `context.stripe` or `this.stripe`, or a Stripe
+  loader's result), a `fetch` that is not a GET or HEAD in a module that names Freemius in code
+  (unless its URL is a literal for this site or another host), or a Freemius SDK
+  `POST`/`PUT`/`PATCH`/`DELETE`, typed-service write (`api.license.update`,
+  `api.subscription.cancel`) or customer-portal processor;
+- for mail, accounts and payment providers, a call site sits outside a `SANDBOX_GUARDS` function of
+  its module, a private helper or class only those reach, or a function or class the list exempts
+  by name with a reason. Code that runs at import (a top-level initializer, an IIFE, a callback or
+  timer it starts, a class's static field or block) is never accepted that way.
+
+Uploads stay open on the sandbox because the reset empties the bucket. The same file checks that
+it still does. The reset logs an error (with a `warnings` entry in its JSON) whenever uploads
+would land somewhere it does not empty: `STORAGE_PROVIDER` / `STORAGE_BUCKET` pointing elsewhere,
+or an `R2_S3_ENDPOINT` / `R2_S3_PUBLIC_ENDPOINT` whose origin is not
+`https://<R2_ACCOUNT_ID>.r2.cloudflarestorage.com`.
+
+**Authored HTML renders through `sanitizeAuthoredBlockHtml`.** It lives in
+`@nextblock-cms/utils` (`libs/utils/src/lib/authored-html.ts`; `lib/blocks/inlineScriptNonce.ts`
+re-exports it). Text blocks, product short descriptions, string `description_json`, custom-block
+rich text, the CMS editors' previews and the editor's SVG node all pass through it. It strips
+script, meta, base, link, object and embed elements, every complete `on*` handler and `srcdoc`,
+and `javascript:` / `vbscript:` / `data:text/html` URLs in URL attributes (read the way the URL
+parser reads them: character references decoded, spaces, tabs and newlines dropped, so
+`&#x6A;avascript:` and `java&#9;script:` count), and it escapes a tag left open at the end. A handler or `srcdoc` name it
+cannot delete whole (right after a quoted value, or with a quoted value that never closes) is
+neutralised instead (`onerror` → `&#111;nerror`): the reference decodes in text and values, so
+look-alike text reads as authored, but never in an attribute name. A text block whose
+`html_content` is Tiptap JSON (`isTiptapJsonString`) skips the sanitizer in `BlockRenderer` and
+`TextBlockRenderer` and renders through React (`SimpleTiptapRenderer`, whose string fallback is
+sanitized). That exemption never goes inside the sanitizer: the raw sinks inject JSON-parseable
+strings as HTML.
+`tools/scripts/html-sinks.test.ts` (in `security:check`) fails on a module that writes HTML into a
+page without an `HTML_SINKS` entry (`tools/scripts/lib/html-sinks.js`), and on a sanitized sink
+that stops calling the sanitizer. Covered sinks: `dangerouslySetInnerHTML`, `srcDoc` / `srcdoc`
+(props, keys and `setAttribute`), html-react-parser, `innerHTML` / `outerHTML` / `srcdoc`
+assignments, `insertAdjacentHTML`, `setHTMLUnsafe` / `parseHTMLUnsafe`, `createContextualFragment`,
+`DOMParser`, `write` / `writeln` on a document, `execCommand('insertHTML')`, a `text/html` Blob. A
+module that only renders HTML its callers sanitized (`ClientTextBlockRenderer`) may be imported by
+those callers alone. `HtmlContent` (`@nextblock-cms/editor`) and `HtmlScriptExecutor` (the app),
+which ran every script in the HTML they were given, were deleted on 2026-11-04 (editor 0.23.0). A
+component like them would be listed with `noCallers`: then any import or value use of it fails
+(dynamic imports, namespace members and destructured keys included; a type-only import does not
+count; the match is by name), and a barrel in its `allowedImporters` may re-export it only under
+its own name.
 
 `02022` also carries these DB-level hardenings (second red-team pass):
 
@@ -620,6 +765,266 @@ written with the cookie client (`libs/ecommerce` payments, shipping and taxes ac
 those writes to the service role lets them join the `is_admin_mfa()` tier. A `WRITER` can still
 delete an unreferenced media-extension object whose key they guess, by inserting a row that
 names it and deleting the row.
+
+`02029` / `02030` (2026-10-27, the Affiliates & Creator Storefronts package; the full reference
+is [15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md)):
+
+- **The `RTL` role and the text-compare rule.** `02029` adds `RTL` to `public.user_role` and
+  nothing else: PostgreSQL refuses to use an enum label inside the transaction that added it
+  ("unsafe use of new value"), and every apply path runs one transaction per file. The sandbox
+  reset replays every migration in ONE transaction, though, where the label is never committed
+  before `02030` runs. So no migration resolves the label at create or apply time: policies
+  compare `(SELECT public.get_current_user_role())::text = 'RTL'`, functions
+  `role::text = 'RTL'`, and `'RTL'` is assigned only inside a plpgsql body, which resolves it
+  when the function runs. `findEnumRtlLiterals` (`tools/scripts/lib/migration-grants.js`,
+  tested in `migration-grants.test.ts`) refuses `'RTL'::public.user_role` (any quoting or
+  spacing, `CAST('RTL' AS user_role)`, a `'{…RTL…}'::user_role[]` literal) outside a plpgsql
+  function body in every forward migration of generation 02 and later. In TypeScript the
+  generated `user_role` type lacks `RTL` until `npm run db:types` runs against a migrated
+  project, so app code compares `String(role) === 'RTL'` and writes the value through an untyped
+  client or the RPC.
+- **Who reads and writes.** `anon` reads the active tiers and nothing else of the package.
+  `authenticated` reads tiers, profiles, pages, commissions and payouts through owner-or-ADMIN
+  policies (`is_admin_mfa()`), and writes only tier CRUD (ADMIN, aal2) and the self-service
+  columns: `UPDATE (display_name, bio, social_links, preferred_locale)` on `affiliate_profiles`
+  while the caller is an ACTIVE RTL, `UPDATE (title, meta_description, draft_content,
+  featured_product_ids)` on `affiliate_pages` while the caller is an RTL with an ACTIVE profile
+  and the page is not in review. No API role
+  inserts or deletes a profile or page (accounts come only from `create_affiliate_account()`;
+  deleting one would erase the ledger), the ledger has no write policy at all, and the click log
+  and the payout runs are service-role only (RLS on, no API policy).
+- **Guards behind the grants.** `private.affiliate_profile_guard()` refuses a session that is not
+  `is_admin_mfa()` changing any other profile column (42501), and changing `display_name`, `bio`
+  or `social_links` while the partner's page is `PENDING_REVIEW` (55000, the review lock; server
+  writes without a session are held by the app, whose Approve pins the profile the reviewer saw).
+  `private.affiliate_page_guard()` refuses it on review and publication columns (42501) and
+  refuses every draft write while the page is `PENDING_REVIEW` (55000, the service role
+  included).
+- **Functions.** Every definer is in `private` with `search_path ''`. The four anonymous
+  storefront reads (`get_affiliate_storefront`, `list_affiliate_storefronts`,
+  `get_affiliate_referral_window`, `record_affiliate_click`) are invoker wrappers in `public`
+  that revoke from PUBLIC only and grant the API roles (revoking from `anon` /
+  `authenticated` and granting back is not credited by the lint). The thirteen money, dispute and
+  signup RPCs are `SECURITY INVOKER` in `public`, revoked from PUBLIC, `anon` and
+  `authenticated`, and granted to `service_role`. The orders triggers record a commission once
+  when `paid_at` is set and void it on `refunded` / `cancelled` or a delete.
+- **The grant pass.** Both copies of `API_ROLE_REVOKE_SQL` carry the `02030` blocks: `anon`
+  loses SELECT on profiles, pages, commissions and payouts; `authenticated` loses INSERT, UPDATE
+  and DELETE on those four, with the two column UPDATE grants given back; every privilege on the
+  click log and the payout runs is revoked; EXECUTE is revoked on each service-role RPC by exact
+  signature (`to_regprocedure('public.apply_affiliate_refund(public.affiliate_gateway, uuid,
+  bigint, bigint, boolean)')`), including `set_affiliate_commission_dispute(public.affiliate_gateway,
+  uuid, boolean)` and `prepare_affiliate_payout_retry(uuid, bigint)` (the retry's old `(uuid)`
+  overload is dropped, so a one-argument call still resolves). `migrate-core.test.mjs` pins the
+  `02030` block.
+- **Posture.** `security-verify.sql` sections 35–38 with 37b (72 assertions; 206 in the file then,
+  218 since `02035`'s section 39)
+  check it all on a local replay: §35 grants, column pins, function privileges (the retry has one
+  overload) and one permissive policy per role and command; §36 sign-up through
+  `create_affiliate_account()`, the partner and anon seats and the profile review lock; §37 the
+  ledger (one commission per paid order, refunds that adjust, void, alert or leave a tombstone,
+  the refund share on the charge without its shipping share, the plus-address self-referral,
+  claim → complete, fail → retry → release); §37b key modes (a test-mode account claims only
+  test-mode sales, a `FAILED` payout is never retried in the other mode, an account of unknown
+  mode claims nothing), the retry minimum (`below_minimum`), a partial refund kept on the order
+  before the commission exists, and dispute holds; §38 reconcile (a refund kept while the partner
+  was suspended reduces the commission reconcile records), the notification claim, the payout-day
+  claim, order and partner deletes. The affiliate tables also joined the sensitive-table list of
+  §20 and the lists of §29. On a database before `02030`, §20 and §29 fail and §35–38 stop at
+  their first line.
+- **The app rule.** These policies are defense in depth. Portal and CMS writes run on the service
+  role after `requireRetailer()` / `requireCmsAdmin()`, where RLS is not a boundary, and every
+  reader treats `affiliate_pages.draft_content` as untrusted: a partner can PATCH it over the
+  Data API.
+- **Partner uploads are not media.** Avatars and storefront images live under
+  `affiliates/avatars/…` and `affiliates/pages/…` (`PARTNER_UPLOAD_NAMESPACES`; server-built keys,
+  `lib/affiliates/upload-keys.ts`). `/api/media/record` refuses any such key and the `/cms/media`
+  delete and move actions skip them (`isPartnerUploadKey` in `lib/storage/upload-policy.ts`,
+  re-exported by `lib/storage/media-object-keys.ts`), so the decoy-row trick `02028` closed for
+  media cannot reach a partner's files either. The rest of `affiliates/` is ordinary media.
+
+`02032` (2026-11-03) is data only: the Affiliates license product page on nextblock.dev, EN + FR.
+It runs only on a database that holds the NextBlock Commerce Pro store product (Freemius
+`24851`), which only the vendor store has, so it skips on every other install and on the sandbox
+replay (the reset route dresses the sandbox's product). It creates the English row the way the
+Freemius store sync would (SKU `FM-43273-75655`, a draft), with its plan and single-site pricing,
+the French twin in the same translation group, the bundled cover and the Software category, and
+writes the copy of `affiliates-product-copy.ts` only to rows it created, rows without
+description blocks, or rows still carrying that copy. `tools/scripts/affiliates-product-migration.test.ts`
+fails when the migration and the copy file, or the migration and the package registry, drift.
+
+`02035` (2026-11-11, the Affiliates tier move; docs/15 → "The amount" and "The CMS screens"):
+
+- **The rate at payment.** `private.affiliate_snapshot_order_rate()` (a `SECURITY DEFINER`
+  trigger function in `private`, `search_path ''`, revoked from PUBLIC, `anon` and
+  `authenticated`) runs BEFORE INSERT OR UPDATE OF `paid_at` on `orders` and copies the partner's
+  tier rate and hold onto an attributed order when it is paid; it swallows every error, so an
+  order write never fails because of it. `private.affiliate_record_commission()` is replaced with
+  02030's body except that it records the stored rate (else the current tier's), clears at
+  `paid_at` + the stored hold, and starts the commission held (`disputed_at`) when the order kept
+  a dispute from before the commission existed. The new `orders` columns ride the existing table
+  grants (an aal2 ADMIN already writes every `orders` column; customers write none).
+- **Disputes before the commission.** `public.set_affiliate_commission_dispute(...)` is replaced
+  with 02030's body (same signature, `SECURITY INVOKER`, `search_path ''`, revoke restated; its
+  `API_ROLE_REVOKE_SQL` entry dates from 02030) plus one branch: an attributed order with no
+  commission yet keeps an open dispute in `orders.affiliate_disputed_at` (cleared when it closes
+  without a loss), so a late commission whose hold, counted from the payment, has already passed
+  is not promoted and paid in the run that records it. It takes the order row lock first, then the
+  profile, like `apply_affiliate_refund`.
+- **The tier move.** `public.change_affiliate_partner_tier(uuid, uuid, boolean)` is `SECURITY
+  INVOKER`, revoked from PUBLIC, `anon` and `authenticated`, granted to `service_role`, and added
+  to both copies of `API_ROLE_REVOKE_SQL` (`migrate-core.test.mjs` pins the entry,
+  `migration-grants.test.ts` fails without it).
+- **`tier_changed_at`** is stamped by `private.affiliate_profile_guard()` (replaced, 02030's body
+  plus the stamp) for every writer, and joins the columns a non-admin session may not change; it
+  is not one of the four self-service UPDATE column grants, so the Data API never writes it.
+- **Posture.** `security-verify.sql` section 39 (12 assertions; 218 in the file) checks the RPC's
+  and the trigger function's privileges, the trigger's shape, the `tier_changed_at` pin (column
+  grant and guard), every RPC outcome on a paused partner, that a commission recorded after a
+  move and a rate edit keeps the rate of its payment, and that a dispute opened before a late
+  commission existed holds it past its hold until the dispute is won. On a database before
+  `02035`, section 39 stops at its first line.
+
+`02036` (2026-11-11, Affiliates commissions paid outside Stripe; docs/15 → "Paying partners
+manually"):
+
+- **A new claim signature.** A new parameter makes a new function, so the migration drops
+  `public.claim_affiliate_payout(uuid, text, bigint, text)` and creates
+  `claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[] DEFAULT NULL)`
+  (02030's body plus the gateway filter; `SECURITY INVOKER`, `search_path ''`, revoked from PUBLIC,
+  `anon` and `authenticated`, granted to `service_role`). A four-argument call still resolves to it.
+- **The manual payout lifecycle.** Three service-role RPCs of the same kind (`SECURITY
+  INVOKER`, `search_path ''`, revoked from PUBLIC, `anon` and `authenticated`, granted to
+  `service_role`), so the commissions a manual payout covers are fixed before any money leaves:
+  `public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[])` locks the
+  profile, then the commissions, and attaches the partner's cleared, unattached, live-mode,
+  undisputed commissions of the manual gateways to one `PROCESSING` manual payout;
+  `public.record_manual_affiliate_payout(uuid, text, text, text, uuid)` locks the profile, the
+  commissions and the payout (`complete_affiliate_payout`'s order) and completes exactly that
+  payout with its channel, reference, note and `recorded_by`; `public.cancel_manual_affiliate_payout(uuid)`
+  applies the refund work flagged while it was prepared, detaches the rest and deletes the row.
+  `recorded_by` comes from the CMS session in the app, never from the request.
+- **The grant pass.** Both copies of `API_ROLE_REVOKE_SQL` add guarded (`to_regprocedure(...)`)
+  EXECUTE revokes for the five-argument claim and the three manual payout functions, after the
+  existing four-argument claim entry, which stays: `findRevokesUndoneByGrantPass` holds 02030's
+  revoke of it to the pass, and a database before 02036 still has that overload.
+  `migrate-core.test.mjs` pins the entries.
+- **No new grant.** The new `affiliate_payouts` columns ride the table's existing grants (SELECT
+  for `authenticated`, own rows through the profile; no API write). `affiliate_profiles.payout_email`
+  gets no column grant (the four self-service UPDATE columns are unchanged), so only the service
+  role writes it (the portal's `saveRetailerPayoutEmail`, after `requireRetailer()`, on the
+  actor's own row, refused on the sandbox), and `private.affiliate_profile_guard()` (replaced:
+  02035's body plus the new column in the protected list) refuses a non-admin session changing
+  it; its CHECK refuses whitespace and a first character a spreadsheet reads as a formula (`=`
+  `+` `-` `@`), which the PayPal file could only carry by changing the address. CHECKs keep a
+  manual payout `PROCESSING` or `COMPLETED` (never `FAILED`), free of any Stripe destination or
+  transfer id, with a channel, reference and `paid_at` once `COMPLETED`, and a Stripe payout with
+  its destination; a unique index on `(affiliate_id, lower(external_reference))` refuses a reused
+  reference, and a unique partial index on `(affiliate_id, currency)` of the `PROCESSING` manual
+  payouts keeps one prepared payout per partner and currency.
+- **The refund alert.** `private.affiliate_alert_refund_after_payout()` is replaced with 02030's
+  body plus advice by the payout's method and status (recover the amount from the partner after a
+  recorded manual payout; cancel and prepare again, or record and recover, while it is only
+  prepared) and `metadata.payout_method` / `payout_status`; definer in `private`, revoked from
+  PUBLIC, `anon` and `authenticated`.
+- **Posture.** `security-verify.sql` section 40 (13 assertions; 231 in the file) checks the four
+  RPCs' privileges (one claim overload, no record overload of the first 02036 draft), the payout
+  CHECKs and the one-prepared index, the `payout_email` pin (no write grant, the guard, a CHECK on
+  the server write, a leading formula character refused), that no API role writes a payout row,
+  every refusal of the claim and of the record, the claim's exact scope, the in-flight rules while
+  a payout is prepared, the record and the cancel, that `complete_`, `fail_`,
+  `prepare_affiliate_payout_retry` and `release_affiliate_payout` never change a manual payout,
+  that the claim with `{STRIPE}` never takes a Freemius commission, and the refund advice; section
+  35 pins the five-argument claim. On a database at `02035`, sections 35 and 40 stop at their
+  first line.
+- **UI copy.** Section 7 of 02036 writes only `public.translations` (data, no grant): 48 new
+  `affiliates.portal.*` / `affiliates.terms.*` keys with `ON CONFLICT (key) DO NOTHING`, and 21
+  reworded rows, one `UPDATE … FROM (VALUES …)` per language guarded by the text 02031 seeded
+  (docs/15 → "i18n").
+
+`02037` (2026-11-11, Affiliates automatic PayPal Payouts; docs/15 → "Paying partners with
+PayPal"):
+
+- **Six service-role RPCs** (`SECURITY INVOKER`, `search_path ''`, `#variable_conflict
+  use_column`, revoked from PUBLIC, `anon` and `authenticated`, granted to `service_role`):
+  `public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean,
+  text)` (profile, then commissions; the PayPal gateways and the environment's `livemode`; the
+  payout email snapshot as `paypal_receiver`), `record_paypal_affiliate_payout_batch(uuid[], text,
+  text)` (a call without a batch id stamps the send: `last_attempt_at`, `attempt_count` on a resend),
+  `note_paypal_affiliate_payout_item(uuid, text, text, bigint)`,
+  `complete_paypal_affiliate_payout(uuid, text, text, bigint, text)` (exactly once; a transaction id
+  is never recorded twice), `fail_paypal_affiliate_payout(uuid, text, text)` (applies the refund
+  work flagged in flight, then hands the rest back; always a `paypal_` reason) and
+  `release_paypal_affiliate_payout(uuid)` (the CMS Release, with its rule checked under the payout
+  lock: an unacknowledged batch an hour after its last send, an acknowledged one a week after it while
+  PayPal holds no money for its item).
+- **The grant pass.** Both copies of `API_ROLE_REVOKE_SQL` add guarded EXECUTE revokes for the six
+  functions after the 02036 entries; `migrate-core.test.mjs` pins them (and that `GRANTS_SQL` never
+  names the PayPal columns, the payout email columns or the secret key).
+- **No new grant.** The `affiliate_payouts.paypal_*` columns and
+  `affiliate_profiles.payout_email_kind` / `payout_email_saved_at` ride the tables' existing grants
+  (no API write), the method CHECK accepts `paypal`, 02036's manual status CHECK is replaced by name
+  and scoped to `method = 'manual'` (it refused a FAILED PayPal payout, so the PayPal failure path
+  could never run), PayPal CHECKs keep the fields to PayPal rows (ids and statuses in PayPal's shape,
+  a completed payout with its transaction id, a FAILED one with a `paypal_` reason, which makes the
+  Stripe `fail_` / `release_affiliate_payout` and `prepare_affiliate_payout_retry` raise on a PayPal
+  payout), unique partial indexes keep one payout in flight per partner, currency and mode and each
+  item and transaction once, and `private.affiliate_profile_guard()` (replaced: 02036's body plus
+  `payout_email_kind` and `payout_email_saved_at`) refuses a non-admin session changing them.
+- **The secret row.** A RESTRICTIVE policy `site_settings_paypal_secret_service_only_policy` (FOR
+  ALL TO `anon`, `authenticated`) excludes the `affiliates_paypal_secret` key, so only the service
+  role reads or writes the PayPal credentials (the secret itself is the app's encrypted envelope).
+- **The refund alert.** `private.affiliate_alert_refund_after_payout()` is replaced with 02036's
+  body plus the PayPal advice (in flight: applied if PayPal returns or fails it; paid: recover it)
+  and `metadata.payout_method = 'paypal'`.
+- **Posture.** `security-verify.sql` section 41 (15 assertions; 246 in the file). On a database at
+  `02036`, section 41 stops at its first line.
+- **UI copy.** Section 7 of 02037 writes only `public.translations` (data, no grant): 48 new
+  `affiliates.portal.*` / `affiliates.terms.*` keys with `ON CONFLICT (key) DO NOTHING` (the
+  partner portal's PayPal or Interac e-Transfer choice and PayPal wording, "try PayPal again", the
+  header and FAQ of programs mixing Stripe or manual payouts with PayPal, the terms' PayPal clauses
+  and Program details rows) and 6 reworded rows, one `UPDATE … FROM (VALUES …)` per language guarded
+  by the text 02036 seeded (docs/15 → "i18n"). The CMS is English-only and the email copy is internal.
+
+`02038` (2026-11-04 review of the SMTP credential handling) takes the secret rows of
+`site_settings` away from every API session. The `is_admin_mfa()` branch of the read, insert,
+update and delete policies admitted every key, so an ADMIN on an `aal2` session (or one who never
+enrolled a factor, at `aal1`) could read and write `email_secret`, `payment_secret`,
+`bot_protection_secret` and the Cortex AI keys over PostgREST. The envelopes were not bound to
+their row, so copying the Stripe key's envelope into `email_secret.pass`, saving an SMTP host of
+their own and clicking "Send test email" delivered the plaintext through SMTP AUTH; an XSS running
+as that admin could do the same. Mail never reads the database on the sandbox, so it was not
+reachable there. Two layers close it:
+
+- **The secret rows are service-role only.** The `is_admin_mfa()` branch of all four policies now
+  stops at `email_secret`, `payment_secret`, `bot_protection_secret`,
+  `cortex_ai_openrouter_api_key`, `cortex_ai_pexels_api_key`, `cortex_ai_unsplash_access_key`,
+  `cortex_ai_mcp_settings`, and any key whose name ends like a secret (`_secret`, `_secret_key`,
+  `_api_key`, `_access_key`, `_private_key`, `_token`, `_password`, `_credential(s)`, any case;
+  the pattern Cortex's DB tools already refuse). Nothing else moves: the rest of the ADMIN tier
+  keeps the second factor, and no grant changes, so `API_ROLE_REVOKE_SQL` is untouched. Every
+  reader and writer of these rows already ran on the service role after its own role check
+  (email, payments, bot protection, the Cortex settings, wizard and MCP actions, the resolvers).
+- **Envelopes are bound to their slot** (`libs/db/src/lib/secret-crypto.ts`). A version 2
+  envelope is sealed with its slot as AES-GCM associated data: `site_settings:<key>:<field>` for a
+  field of the row (`site_settings:email_secret:pass`), `site_settings:<key>` when the row's value
+  is the envelope (the Cortex AI keys). Build slots with `siteSettingSecretSlot()`; every sealer
+  and reader must pass one (TypeScript requires it, and sealing without one throws), so each reader
+  opens only its own slot and an envelope copied elsewhere reads as missing. The tag must be 16
+  bytes, and relabelling a version 2 envelope as version 1 does not drop the binding. Version 1
+  envelopes (before 0.23.1) still open in any slot; each screen re-seals the ones it holds on
+  every save (`resealWithEnvKey`: email and payments on their form's save, bot protection when
+  its field is submitted empty, `resealStoredCortexAiSecrets` on every save of the Cortex AI
+  screen and the wizard's key steps). So after upgrading, save each of those screens once: until
+  then a copied version 1 envelope still opens, but only the service role can copy one.
+
+`security-verify.sql` section 42 (10 assertions, 256 in the file) checks that an ADMIN at `aal2`
+and one without a factor read, update, copy, insert, upsert and delete no secret row, keys named
+like a secret included, while both keep the rest of the ADMIN tier, `anon` reads none and the
+service role reads and writes all of them. With the pre-`02038` policies restored on a replay,
+seven of its lines fail. Section 16's aal2 and no-factor probes moved to `store_contact`. Not
+covered by either layer: the Bot Protection screen shows the stored captcha secret in clear
+(`getBotProtectionSettings`), where the other screens show at most its last four characters.
 
 ## Migration Structure
 
@@ -909,7 +1314,10 @@ and are what the next squash repeats with `G = 3`.
 The CMS "Full ZIP backup" (`apps/nextblock/lib/full-backup/`, routes under
 `app/api/cms/full-backup/`) is the whole-site migration path: it moves a site, accounts
 included, to another Supabase project the way an all-in-one WordPress migration plugin does.
-Export and restore are ADMIN-only and require a satisfied second factor. The archive holds:
+Export and restore are ADMIN-only and require a satisfied second factor. On the public sandbox
+both answer 403 (`FULL_BACKUP_SANDBOX_MESSAGE`, refused at the end of `requireAdminUser()`): the
+archive would hand out every account's password hash, and a restore writes accounts through
+GoTrue. The archive holds:
 
 - `database/dump.sql` — `pg_dump --clean --if-exists --no-owner` of the **application schemas
   only**: `public`, `private` and `supabase_migrations` (so the restored site knows which
@@ -994,13 +1402,20 @@ key). The two policies on `site_settings` are the only place the tiers live, so 
   block with the cookie client)
 - `ADMIN` and `WRITER`: `security_settings`, `onboarding_state`, `email_public`,
   `cortex_ai_site_brief` (loaded by the CMS shell and dashboard for every staff role)
-- `ADMIN`: everything else — the secrets (`*_secret`, `*_api_key`, `cortex_ai_mcp_settings`),
-  `interactions_notification_emails`, `payment_public`, `store_contact`, `forms_contact`,
-  the Cortex model/agent keys and any key not listed above. Since `02023` this tier (and the
+- `ADMIN`: everything else — `interactions_notification_emails`, `payment_public`,
+  `store_contact`, `forms_contact`, `affiliates_settings` (read and written with the service role:
+  the notifier and the payout runner have no session), the Cortex model/agent keys and any key not
+  listed above. Since `02023` this tier (and the
   ADMIN-only write tier) answers only to `is_admin_mfa()`: an ADMIN with a verified second factor
   must be on an `aal2` session, so CMS code reads and writes it with the service role after
   `requireCmsAdmin()` (`lib/auth/cms-actor.ts`) or `requireEcomAdmin()`, never with the cookie
   client (a "remember this device" admin is on `aal1` and would get nothing).
+- the service role only (`02038`): the secret rows, `email_secret`, `payment_secret`,
+  `bot_protection_secret`, `cortex_ai_openrouter_api_key`, `cortex_ai_pexels_api_key`,
+  `cortex_ai_unsplash_access_key`, `cortex_ai_mcp_settings`, and any key ending in `_secret`,
+  `_secret_key`, `_api_key`, `_access_key`, `_private_key`, `_token`, `_password` or
+  `_credential(s)`. No API session reads or writes them, whatever its role or second factor; each
+  holds envelopes bound to their slot (`02038` above).
 
 Server code that reads a key for the public site with the service role is unaffected; code that
 reads one with the cookie or SSG client for a visitor must use a public-tier key, or the loader
@@ -1014,9 +1429,37 @@ live, and a key on neither list is in the last tier):
   staff code writes with the cookie client (site identity, footer, the dashboard's dismiss).
 - `ADMIN`: `enabled_payment_providers`, `ecommerce_inventory_settings` — the keys ADMIN code
   still writes with the cookie client (`libs/ecommerce`).
-- `is_admin_mfa()`: everything else, the secrets and `email_public`, `bot_protection_public`,
+- `is_admin_mfa()`: everything else but the secret rows, `email_public`, `bot_protection_public`,
   `payment_public`, `invoice_settings`, `store_contact`, `forms_contact`,
   `interactions_notification_emails`, `migration_baseline_generation`, `privacy_settings`,
-  `global_css`, `security_settings` and the `cortex_ai_*` keys among them. The app writes all of
-  these with the service role after its own ADMIN check; a key a `WRITER` must write through the
-  cookie client goes on the first list in a migration, never by widening the default.
+  `global_css`, `security_settings` and the other `cortex_ai_*` keys among them. The app writes all
+  of these with the service role after its own ADMIN check; a key a `WRITER` must write through
+  the cookie client goes on the first list in a migration, never by widening the default.
+- the service role only: the secret rows of the read list above (`02038`). A new secret goes
+  under a name that ends like one (`<feature>_secret`, `<feature>_api_key`), so it lands here
+  without a migration.
+
+SMTP (`lib/config/email-settings.ts`) resolves `email_public` and `email_secret` DB-first with an
+env fallback. A stored username or password counts only when it opens from its own field
+(`site_settings:email_secret:user` / `:pass`, 2026-11-04): an envelope copied in from another row
+reads as missing, so it never reaches SMTP AUTH. Two more rules apply (2026-11-03). Whenever `SMTP_HOST` is set, a username or password
+taken from `SMTP_USER` / `SMTP_PASS` goes only to `SMTP_HOST`: SMTP AUTH hands the credentials to
+whatever server the transport connects to, so a host saved in the CMS must not carry the
+deployment's login. The port is the one saved in the CMS for that same server (no CMS host, or
+`SMTP_HOST` itself, compared without case), else `SMTP_PORT`, else 587. A value that is not a port
+(digits, 1 to 65535) counts as unset, except that with implicit TLS switched on for `SMTP_HOST` it
+reads as 465, as nodemailer read it; the Email form refuses one on save. The CMS TLS toggle counts
+only when the CMS host names `SMTP_HOST`, and it can only raise TLS above what the env alone gives.
+A CMS port that moves the login off the env's own port must be encrypted (implicit TLS, or a
+required STARTTLS; a loopback relay aside). So the database can neither move the login nor lower its
+protection. Until 2026-11-04 an unset `SMTP_PORT` there sent no mail at all, email sign-in codes
+included. Credentials saved in the CMS still go to the CMS host, and the Email screen says when a
+saved host and port are ignored. One exception is kept for existing installs: with `SMTP_HOST` unset
+(a split legacy setup, login in the env and host saved in the CMS), the env login still goes to the
+CMS host, so an ADMIN who can save that host receives it (and picks its port and TLS, as before).
+Set `SMTP_HOST`, or save the login in the CMS, to close it. On the sandbox, whose admin login is
+public, the database is never read for mail, `saveEmailSettings` refuses before writing, and test
+emails are off. `sendEmail` (`app/actions/email.ts`), the one mail transport, delivers there only to
+`SANDBOX_CONTACT_EMAIL` and the product feedback inbox (`PRODUCT_FEEDBACK_INBOX`): every address in
+`to` must be one of them, or it throws before reading the SMTP config. So a message reply, a comment
+notice or a stored form recipient cannot mail an address a visitor chose.

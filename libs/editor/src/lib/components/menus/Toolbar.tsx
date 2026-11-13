@@ -4,6 +4,7 @@ import { getOpenImagePicker } from "../../utils/mediaPicker";
 import React from 'react';
 import formatHTML from '../../utils/formatHTML';
 import type { Editor } from '@tiptap/core';
+import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
 import {
   Bold, Italic, Underline, Strikethrough, Code, Link2, Palette,
   Heading1, Heading2, Heading3, List, ListOrdered, CheckSquare,
@@ -338,24 +339,12 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor }) => {
     }
     previewBlobUrlsRef.current = [];
 
-    const rawBody = editor.getHTML();
-
-    // Rewrite inline <script> to blob URLs so CSP can allow them via script-src blob:
-    const parser = new DOMParser();
-    const docParsed = parser.parseFromString(`<div id="__content__">${rawBody}</div>`, 'text/html');
-    const wrapper = docParsed.body.querySelector('#__content__') as HTMLElement;
-    const scripts = Array.from(wrapper.querySelectorAll('script')) as HTMLScriptElement[];
-    scripts.forEach((s) => {
-      if (!s.getAttribute('src')) {
-        const code = s.textContent || '';
-        const b = new Blob([code], { type: 'text/javascript' });
-        const u = URL.createObjectURL(b);
-        s.setAttribute('src', u);
-        s.textContent = '';
-        previewBlobUrlsRef.current.push(u);
-      }
-    });
-    const bodyHTML = wrapper.innerHTML;
+    // Sanitized like the public render, which never runs authored scripts. The preview is a
+    // blob: document: same origin as the CMS, inheriting its CSP (script-src allows blob:), in an
+    // iframe that allows scripts and same-origin. Block HTML is WRITER-authored (PostgREST too),
+    // and this used to turn its inline scripts into blob: scripts, so clicking Preview ran them
+    // with the CMS session of whoever clicked.
+    const bodyHTML = sanitizeAuthoredBlockHtml(editor.getHTML());
 
     const fullDoc = `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Preview</title></head><body>${bodyHTML}</body></html>`;
     const mainBlob = new Blob([fullDoc], { type: 'text/html' });
@@ -551,8 +540,8 @@ export const EditorToolbar: React.FC<EditorToolbarProps> = ({ editor }) => {
 
         <Separator orientation="vertical" className="h-6 mx-1" />
 
-        {/* Preview (runs scripts safely in sandboxed iframe) */}
-        <ToolbarButton onClick={openPreview} title="Preview (executes scripts)">
+        {/* Preview: the sanitized HTML, as the public site renders it (no authored scripts) */}
+        <ToolbarButton onClick={openPreview} title="Preview">
           <Eye className="h-4 w-4" />
         </ToolbarButton>
 

@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 
+import { rm } from 'node:fs/promises';
 import { resolve, relative, sep, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'fs-extra';
 import chalk from 'chalk';
 import { STANDALONE_ESLINT_CONFIG } from '../bin/lib/eslint-config.js';
+import { retryTransientFsErrors } from './lib/fs-retry.js';
+import { findTemplateProblems } from './lib/template-check.js';
+import { shouldSyncTemplateDoc } from './lib/template-docs.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -73,42 +77,73 @@ async function ensureTemplateSync() {
     ),
   );
 
+  // A file this sync wrote a moment ago can still be locked by a scanner or an editor on Windows
+  // (scripts/lib/fs-retry.js). Every step is idempotent, so a step that hits a lock runs again
+  // whole instead of leaving a half-built template behind.
+  const retry = (label, action) =>
+    retryTransientFsErrors(label, action, { log: (message) => console.log(chalk.yellow(message)) });
+
   await fs.ensureDir(TARGET_DIR);
-  await emptyDirWithRetry(TARGET_DIR);
+  await retry('Emptying the template', () => emptyDirOneEntryAtATime(TARGET_DIR));
 
-  await fs.copy(SOURCE_DIR, TARGET_DIR, {
-    dereference: true,
-    filter: (src) => {
-      const rel = relative(SOURCE_DIR, src);
-      if (!rel) {
-        return true;
-      }
+  await retry('Copying apps/nextblock', () =>
+    fs.copy(SOURCE_DIR, TARGET_DIR, {
+      dereference: true,
+      filter: (src) => {
+        const rel = relative(SOURCE_DIR, src);
+        if (!rel) {
+          return true;
+        }
 
-      const segments = rel.split(sep);
-      return segments.every((segment) => !IGNORED_SEGMENTS.has(segment));
-    },
+        const segments = rel.split(sep);
+        return segments.every((segment) => !IGNORED_SEGMENTS.has(segment));
+      },
+    }),
+  );
+
+  const steps = [
+    ensureEnvExample,
+    ensureTemplateGitignore,
+    ensureGlobalStyles,
+    ensureClientTranslations,
+    ensureDocsSync,
+    sanitizeBlockEditorImports,
+    sanitizeUiImports,
+    ensureUiProxies,
+    removeBackups,
+    syncPackageVersions,
+    ensureStandaloneEslintConfig,
+    ensureDockerAssets,
+    removeTemplateProjectJson,
+    removeBuildArtifacts,
+    markTemplateAsStandalone,
+    ensureTemplateReadme,
+  ];
+  for (const step of steps) {
+    await retry(step.name, step);
+  }
+
+  // `npm publish` runs this sync in prepack, so a template that falls short of what the steps
+  // promise stops the publish here, before anything reaches npm (scripts/lib/template-check.js).
+  const problems = await findTemplateProblems(TARGET_DIR, {
+    uiProxyModules: UI_PROXY_MODULES,
+    standaloneEslintConfig: STANDALONE_ESLINT_CONFIG,
+    dockerTemplateDir: DOCKER_TEMPLATE_DIR,
   });
-
-  await ensureEnvExample();
-  await ensureTemplateGitignore();
-  await ensureGlobalStyles();
-  await ensureClientTranslations();
-  await ensureDocsSync();
-  await sanitizeBlockEditorImports();
-  await sanitizeUiImports();
-  await ensureUiProxies();
-  await removeBackups();
-  await ensureUiProxies();
-  await removeBackups();
-  await syncPackageVersions();
-  await ensureStandaloneEslintConfig();
-  await ensureDockerAssets();
-  await removeTemplateProjectJson();
-  await removeBuildArtifacts();
-  await markTemplateAsStandalone();
-  await ensureTemplateReadme();
+  if (problems.length > 0) {
+    throw new Error(`The synced template is incomplete:\n  - ${problems.join('\n  - ')}`);
+  }
 
   console.log(chalk.green('Template sync complete.'));
+}
+
+// fs-extra's emptyDir starts every removal at once and rejects on the first failure while the
+// rest keep running, so a retry would race them. One entry at a time, with Node's own per-path
+// retries (EBUSY, ENOTEMPTY, EPERM), leaves nothing running behind a failed attempt.
+async function emptyDirOneEntryAtATime(dir) {
+  for (const entry of await fs.readdir(dir)) {
+    await rm(resolve(dir, entry), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
 }
 
 /**
@@ -159,9 +194,10 @@ async function ensureDocsSync() {
   );
 
   await fs.emptyDir(destination);
+  // Internal build prompts (docs/prompts) stay in the monorepo: see scripts/lib/template-docs.js.
   await fs.copy(ROOT_DOCS_DIR, destination, {
     dereference: true,
-    filter: (src) => !src.includes('node_modules'),
+    filter: (src) => shouldSyncTemplateDoc(src, ROOT_DOCS_DIR),
   });
 }
 
@@ -355,14 +391,13 @@ async function removeBackups() {
     resolve(TARGET_DIR, 'backups'),
   ];
 
-  await Promise.all(
-    targets.map((dir) => fs.remove(dir).catch(() => undefined)),
-  );
+  // fs.remove ignores a missing path; any other failure reaches the step retry.
+  await Promise.all(targets.map((dir) => fs.remove(dir)));
 }
 
 async function removeTemplateProjectJson() {
   const projectJsonPath = resolve(TARGET_DIR, 'project.json');
-  await fs.remove(projectJsonPath).catch(() => undefined);
+  await fs.remove(projectJsonPath);
 }
 
 // The wholesale copy of apps/nextblock brings its README, which is written for the MONOREPO:
@@ -450,9 +485,7 @@ async function markTemplateAsStandalone() {
 // it shipped in the published CLI tarball and in every scaffolded project.
 async function removeBuildArtifacts() {
   const targets = ['tsconfig.tsbuildinfo', '.DS_Store', 'Thumbs.db'];
-  await Promise.all(
-    targets.map((name) => fs.remove(resolve(TARGET_DIR, name)).catch(() => undefined)),
-  );
+  await Promise.all(targets.map((name) => fs.remove(resolve(TARGET_DIR, name))));
 }
 
 // Copy the standalone Docker assets into the template and register the docker:* npm scripts so a
@@ -569,24 +602,3 @@ ensureTemplateSync().catch((error) => {
   );
   process.exit(1);
 });
-
-async function emptyDirWithRetry(dir, retries = 5, delay = 1000) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      await fs.emptyDir(dir);
-      return;
-    } catch (err) {
-      if (i === retries - 1) throw err;
-      if (err.code === 'EBUSY' || err.code === 'EPERM') {
-        console.log(
-          chalk.yellow(
-            `Locked file encountered. Retrying in ${delay}ms... (${i + 1}/${retries})`,
-          ),
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      } else {
-        throw err;
-      }
-    }
-  }
-}

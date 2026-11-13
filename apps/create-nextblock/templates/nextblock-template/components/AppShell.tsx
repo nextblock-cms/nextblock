@@ -144,6 +144,7 @@ export function AppShell({
                 <FooterNavigation
                   navItems={footerNavItems}
                   ariaLabel={label('footer_navigation', 'Footer navigation', 'Navigation du pied de page')}
+                  newBadgeLabel={label('nav.badge_new', 'New', 'Nouveau')}
                 />
                 {/* Corporate line: slate-600 alone is ~2.7:1 on the dark background (a
                     Lighthouse contrast failure in dark mode); the mailto link inherits

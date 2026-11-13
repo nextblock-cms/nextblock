@@ -11,7 +11,7 @@ import { DeleteObjectCommand, DeleteObjectsCommand, CopyObjectCommand, ListObjec
 import { getS3Client } from "@nextblock-cms/utils/server";
 import { getStorageBackend, getStorageBucket } from "../../../lib/storage/provider";
 import { supabaseRemoveObjects } from "../../../lib/storage/supabase-storage";
-import { mediaKeyStem, ownedMediaStorageKeys, withoutKeysInUse } from "../../../lib/storage/media-object-keys";
+import { isPartnerUploadKey, mediaKeyStem, ownedMediaStorageKeys, withoutKeysInUse } from "../../../lib/storage/media-object-keys";
 
 type Media = Database['public']['Tables']['media']['Row'];
 
@@ -328,6 +328,13 @@ export async function moveMultipleMediaItems(
     return cleaned || 'uploads/';
   };
   const folder = sanitizeFolder(destinationFolder);
+
+  // Partner uploads (affiliates/avatars/... and affiliates/pages/...) are not media-library objects: moving into them would
+  // write objects under a partner's folder (their upload caps count that listing) and, when a
+  // partner's file already sits at the destination key, point this row at it.
+  if (isPartnerUploadKey(folder)) {
+    return { error: "Media can't be moved into the partner uploads folder." };
+  }
 
   // Folder reorganisation uses S3 copy/list semantics that the native Supabase backend
   // doesn't replicate yet — surface a clear message instead of a generic config error.

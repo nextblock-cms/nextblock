@@ -5,6 +5,7 @@ import 'server-only';
 // endpoint — an open relay taking an arbitrary recipient, subject and HTML body.
 
 import nodemailer, { type Transporter } from 'nodemailer';
+import { isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { resolveEmailServerConfig, type ResolvedEmailConfig } from '../../lib/config/email-settings';
 import { applyEmailBranding, resolveEmailBranding } from '../../lib/email/branding';
 
@@ -145,6 +146,21 @@ export function describeSmtpError(error: unknown): string {
   return raw;
 }
 
+/** NextBlock's product feedback inbox (`submitFeedback`, app/actions/feedback.ts). */
+export const PRODUCT_FEEDBACK_INBOX = 'feedback@nextblock.dev';
+
+/**
+ * The public sandbox (published admin login) mails only inboxes no visitor can choose: its
+ * operator's (SANDBOX_CONTACT_EMAIL) and the product feedback inbox, fixed in code.
+ */
+function isSandboxRecipientAllowed(to: string): boolean {
+  const allowed = new Set([PRODUCT_FEEDBACK_INBOX]);
+  const operator = process.env['SANDBOX_CONTACT_EMAIL']?.trim().toLowerCase();
+  if (operator) allowed.add(operator);
+  const recipients = to.split(',').map((address) => address.trim().toLowerCase()).filter(Boolean);
+  return recipients.length > 0 && recipients.every((address) => allowed.has(address));
+}
+
 export async function sendEmail({
   to,
   subject,
@@ -155,6 +171,16 @@ export async function sendEmail({
   inReplyTo,
   references,
 }: EmailParams) {
+  // 2026-11-03: every visitor to the public sandbox is its admin, so a visitor chose both the
+  // recipient and the text of mail sent on the deployment's SMTP account: a contact form's sender
+  // address answered from /cms/messages, the comment notification list, a stored form recipient.
+  // There, only the operator's own inbox (SANDBOX_CONTACT_EMAIL) and the product feedback inbox
+  // are ever recipients (`to` is the only recipient field: no cc, no bcc). Any other send fails before the config is even read,
+  // and every caller already records or reports a failed send.
+  if (isSandboxEnvironment() && !isSandboxRecipientAllowed(to)) {
+    throw new Error('Email is turned off in the sandbox.');
+  }
+
   // DB-first (CMS Settings → Configuration → Email), falling back to SMTP_* env vars.
   // Resolved in parallel with branding — neither depends on the other, and both are
   // pure reads standing between the click and the first SMTP packet.

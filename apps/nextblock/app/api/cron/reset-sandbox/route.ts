@@ -17,10 +17,26 @@ import {
 import postgres from 'postgres';
 
 import { CORTEX_AI_PACKAGE_ID } from '@nextblock-cms/cortex';
+import { AFFILIATES_PACKAGE_ID } from '@nextblock-cms/affiliates';
+import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
 import { SANDBOX_RESET_SQL } from './sandboxResetSql';
 import { COMMERCE_PRODUCT_COPY } from './commerce-product-copy';
 import { CORTEX_PRODUCT_COPY } from './cortex-product-copy';
+import {
+  AFFILIATES_DEMO_URLS,
+  AFFILIATES_PRODUCT_COPY,
+  AFFILIATES_PRODUCT_URL_PLACEHOLDER,
+} from './affiliates-product-copy';
 import { activateSandboxPackage } from './activate-package';
+import {
+  SANDBOX_AFFILIATE_DEMO_FR_HANDLE,
+  SANDBOX_AFFILIATE_DEMO_HANDLE,
+  seedSandboxAffiliateDemo,
+} from './affiliate-demo';
+import { evictAffiliateStorefrontCache, evictAffiliateTiersCache } from '../../../../lib/affiliates/cache';
+import { isCronRequestAuthorized } from '../../../../lib/cron/cron-secret';
+import { resolveSupabaseAnonKey, resolveSupabaseUrl } from '../../../../lib/setup/env-status';
+import { getStorageBackend, getStorageBucket } from '../../../../lib/storage/provider';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -35,6 +51,8 @@ type SeedAsset = {
   fileName: string;
   contentType: string;
   description?: string;
+  /** Logged and skipped when it cannot be fetched or stored, instead of aborting the reset. */
+  optional?: boolean;
 };
 
 type UploadedSeedAsset = SeedAsset & {
@@ -175,6 +193,15 @@ const SEEDED_ASSETS: SeedAsset[] = [
     fileName: 'cortex-ai-square.webp',
     contentType: 'image/webp',
     description: 'Sandbox seed asset: Cortex AI cover image.',
+  },
+  {
+    source: 'images/affiliates-square.webp',
+    dest: 'images/affiliates-square.webp',
+    fileName: 'affiliates-square.webp',
+    contentType: 'image/webp',
+    description: 'Sandbox seed asset: Affiliates & Creator Storefronts cover image.',
+    // The reset wipes the bucket before this upload: a deploy without the file must not stop it.
+    optional: true,
   },
   // Feature images introduced by migration 00000000000037 (the migration owns the
   // media rows; uploading here just keeps the R2 copy in step with public/images).
@@ -587,73 +614,82 @@ const APPAREL_PRODUCT_SEEDS: ApparelProductSeed[] = [
   },
 ];
 
-async function uploadSeedAssets(params: {
+type SeedAssetUploadParams = {
   s3: S3Client;
   bucketName: string;
   siteUrl: string;
-}) {
+};
+
+async function uploadSeedAssets(params: SeedAssetUploadParams) {
   const uploadedAssets = new Map<string, UploadedSeedAsset>();
 
   for (const asset of SEEDED_ASSETS) {
-    let buffer: Buffer | undefined;
-    const fetchUrl = `${params.siteUrl}/${asset.source}`;
+    try {
+      const sizeBytes = await uploadSeedAsset(params, asset);
+      uploadedAssets.set(asset.dest, { ...asset, sizeBytes });
+      console.log(`[Sandbox Reset] Uploaded ${asset.dest}`);
+    } catch (err: any) {
+      if (!asset.optional) throw err;
+      console.warn(`[Sandbox Reset] Skipping optional seed asset ${asset.dest}:`, err?.message || err);
+    }
+  }
 
-    // Optimization: If fetching from localhost, try to read from disk first to avoid ECONNRESET
-    if (fetchUrl.includes('localhost') || fetchUrl.includes('127.0.0.1')) {
+  return uploadedAssets;
+}
+
+/** Fetches one seed asset (from disk on localhost) and stores it in R2; returns its size in bytes. */
+async function uploadSeedAsset(params: SeedAssetUploadParams, asset: SeedAsset): Promise<number> {
+  let buffer: Buffer | undefined;
+  const fetchUrl = `${params.siteUrl}/${asset.source}`;
+
+  // Optimization: If fetching from localhost, try to read from disk first to avoid ECONNRESET
+  if (fetchUrl.includes('localhost') || fetchUrl.includes('127.0.0.1')) {
+    try {
+      const localPath = path.join(process.cwd(), 'apps/nextblock/public', asset.source);
+      if (fs.existsSync(localPath)) {
+        console.log(`[Sandbox Reset] Loading local asset: ${localPath}`);
+        buffer = fs.readFileSync(localPath);
+      }
+    } catch (err) {
+      console.warn(`[Sandbox Reset] Failed to read local asset: ${asset.source}`, err);
+    }
+  }
+
+  if (!buffer) {
+    console.log(`[Sandbox Reset] Fetching ${fetchUrl}...`);
+
+    let lastErr: any;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const localPath = path.join(process.cwd(), 'apps/nextblock/public', asset.source);
-        if (fs.existsSync(localPath)) {
-          console.log(`[Sandbox Reset] Loading local asset: ${localPath}`);
-          buffer = fs.readFileSync(localPath);
+        const res = await fetch(fetchUrl);
+        if (!res.ok) {
+          throw new Error(`Failed to fetch asset: ${fetchUrl} (${res.status})`);
         }
+        buffer = Buffer.from(await res.arrayBuffer());
+        break;
       } catch (err) {
-        console.warn(`[Sandbox Reset] Failed to read local asset: ${asset.source}`, err);
+        lastErr = err;
+        if (attempt === 3) break;
+        console.warn(`[Sandbox Reset] Fetch failed (attempt ${attempt}): ${fetchUrl}. Retrying in 1s...`);
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }
 
     if (!buffer) {
-      console.log(`[Sandbox Reset] Fetching ${fetchUrl}...`);
-      
-      let lastErr: any;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const res = await fetch(fetchUrl);
-          if (!res.ok) {
-            throw new Error(`Failed to fetch asset: ${fetchUrl} (${res.status})`);
-          }
-          buffer = Buffer.from(await res.arrayBuffer());
-          break;
-        } catch (err) {
-          lastErr = err;
-          if (attempt === 3) break;
-          console.warn(`[Sandbox Reset] Fetch failed (attempt ${attempt}): ${fetchUrl}. Retrying in 1s...`);
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-      }
-      
-      if (!buffer) {
-        throw new Error(`Failed to fetch asset after 3 attempts: ${fetchUrl}. Last error: ${lastErr?.message}`);
-      }
+      throw new Error(`Failed to fetch asset after 3 attempts: ${fetchUrl}. Last error: ${lastErr?.message}`);
     }
-
-    await params.s3.send(
-      new PutObjectCommand({
-        Bucket: params.bucketName,
-        Key: asset.dest,
-        Body: buffer,
-        ContentType: asset.contentType,
-      })
-    );
-
-    uploadedAssets.set(asset.dest, {
-      ...asset,
-      sizeBytes: buffer.byteLength,
-    });
-
-    console.log(`[Sandbox Reset] Uploaded ${asset.dest}`);
   }
 
-  return uploadedAssets;
+  await params.s3.send(
+    new PutObjectCommand({
+      Bucket: params.bucketName,
+      Key: asset.dest,
+      Body: buffer,
+      ContentType: asset.contentType,
+    })
+  );
+
+  return buffer.byteLength;
 }
 
 async function upsertMediaRecord(
@@ -1064,6 +1100,185 @@ async function enrichCortexAiProducts(params: {
   }
 
   console.log('[Sandbox Reset] Successfully enriched Cortex AI products (EN & FR).');
+}
+
+/** `value` with every string's product-page placeholder replaced: a copy, the shared constant stays as is. */
+function withAffiliatesProductUrl(value: unknown, productUrl: string): unknown {
+  if (typeof value === 'string') {
+    return value.split(AFFILIATES_PRODUCT_URL_PLACEHOLDER).join(productUrl);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => withAffiliatesProductUrl(item, productUrl));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, withAffiliatesProductUrl(item, productUrl)])
+    );
+  }
+  return value;
+}
+
+/** `sections` without the hero's live-demo button (an absolute link to the demo's partner pages) unless `keep`. */
+function withoutDemoButtonUnless(keep: boolean, sections: unknown): Array<Record<string, unknown>> {
+  const all = sections as Array<Record<string, unknown>>;
+  if (keep) return all;
+  return all.map((section) => ({
+    ...section,
+    column_blocks: (section['column_blocks'] as Array<Array<{ block_type?: string; content?: { url?: unknown } }>>).map(
+      (column) =>
+        column.filter(
+          (block) =>
+            !(block.block_type === 'button' && AFFILIATES_DEMO_URLS.includes(String(block.content?.url ?? '')))
+        )
+    ),
+  }));
+}
+
+/**
+ * Dresses NextBlock™ Affiliates & Creator Storefronts like Cortex AI: cover image, EN copy and
+ * blocks, and the FR twin. Its Freemius ids come from the package registry, which carries none
+ * until the vendor creates the product, so a missing id or a product the sync did not bring is a
+ * warning and a return, never a throw (the call site also catches anything else).
+ */
+async function enrichAffiliatesProducts(params: {
+  sql: SqlClient;
+  affiliatesAsset: UploadedSeedAsset | undefined;
+  enLangId: LanguageId;
+  frLangId: LanguageId;
+}) {
+  // Read when the step runs (typed as plain strings: the registry is `as const`).
+  const productId: string = NEXTBLOCK_PACKAGES.affiliates.fm_product_id;
+  const planId: string = NEXTBLOCK_PACKAGES.affiliates.fm_plan_id;
+
+  if (!productId) {
+    console.warn(
+      '[Sandbox Reset] Skipping the Affiliates product: NEXTBLOCK_PACKAGES.affiliates has no Freemius product id.'
+    );
+    return;
+  }
+
+  console.log('[Sandbox Reset] Enriching NextBlock™ Affiliates & Creator Storefronts...');
+
+  // The sync turns every Freemius plan into a product row of its own: prefer the registry's plan.
+  const [product] = await params.sql`
+    SELECT *
+    FROM public.products
+    WHERE freemius_product_id = ${productId} AND language_id = ${params.enLangId}
+    ORDER BY (freemius_plan_id = ${planId}) DESC NULLS LAST
+    LIMIT 1
+  `;
+
+  if (!product) {
+    console.warn(
+      `[Sandbox Reset] Skipping the Affiliates product: product ${productId} was not found after Freemius sync.`
+    );
+    return;
+  }
+
+  // The cover is an optional seed asset: without it the product is dressed all the same.
+  const affiliatesMediaId = params.affiliatesAsset
+    ? await upsertMediaRecord(
+        params.sql,
+        params.affiliatesAsset,
+        'Sandbox seed asset: NextBlock™ Affiliates & Creator Storefronts.'
+      )
+    : null;
+  if (!affiliatesMediaId) {
+    console.warn('[Sandbox Reset] The Affiliates cover was not uploaded: dressing the product without it.');
+  }
+
+  // Copy (EN + FR) lives in ./affiliates-product-copy.ts. Its final call to action links to the
+  // nextblock.dev store page once `purchase_url` is one (like Commerce Pro and Cortex AI); until
+  // then, to this product's own page, whose slug exists only now that Freemius has synced it.
+  const enSlug = String(product.slug);
+  const frSlug = `${enSlug}-fr`;
+  const purchaseUrl: string = NEXTBLOCK_PACKAGES.affiliates.purchase_url;
+  const storePage = /\/product\/[^/?#]+$/.test(purchaseUrl) ? purchaseUrl : null;
+  const copyEn = AFFILIATES_PRODUCT_COPY.en;
+  const copyFr = AFFILIATES_PRODUCT_COPY.fr;
+  // The hero's live-demo button opens this sandbox's own partner pages, which exist only while it
+  // runs the program (FREEMIUS_AFFILIATES_SANDBOX_KEY); without the key they would answer 404.
+  const keepDemoButton = Boolean(process.env.FREEMIUS_AFFILIATES_SANDBOX_KEY);
+  const sectionsEn = withoutDemoButtonUnless(
+    keepDemoButton,
+    withAffiliatesProductUrl(copyEn.sections, storePage ?? `/product/${encodeURIComponent(enSlug)}`)
+  );
+  const sectionsFr = withoutDemoButtonUnless(
+    keepDemoButton,
+    withAffiliatesProductUrl(copyFr.sections, storePage ? `${storePage}-fr` : `/product/${encodeURIComponent(frSlug)}`)
+  );
+
+  await params.sql`
+    UPDATE public.products
+    SET
+      title = ${copyEn.title},
+      short_description = ${copyEn.short_description},
+      meta_title = ${copyEn.meta_title},
+      meta_description = ${copyEn.meta_description},
+      description_json = NULL,
+      product_type = 'digital',
+      payment_provider = 'freemius'
+    WHERE id = ${product.id}
+  `;
+
+  if (affiliatesMediaId) {
+    await attachProductMedia(params.sql, product.id as string, affiliatesMediaId);
+  }
+
+  await params.sql`DELETE FROM public.blocks WHERE product_id = ${product.id}`;
+  for (let i = 0; i < sectionsEn.length; i++) {
+    await params.sql`
+      INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
+      VALUES (${product.id}, ${params.enLangId}, 'section', ${params.sql.json(sectionsEn[i] as any)}, ${i})
+    `;
+  }
+
+  const [frProduct] = await params.sql`
+    INSERT INTO public.products (
+      sku, title, slug, price, sale_price, stock, status,
+      short_description, meta_title, meta_description, description_json,
+      product_type, payment_provider,
+      language_id, translation_group_id,
+      freemius_product_id, freemius_plan_id,
+      trial_period_days, trial_requires_payment_method
+    )
+    VALUES (
+      ${product.sku}, ${copyFr.title}, ${frSlug},
+      ${product.price}, ${product.sale_price}, ${product.stock || 99}, ${product.status},
+      ${copyFr.short_description}, ${copyFr.meta_title}, ${copyFr.meta_description}, NULL,
+      'digital', 'freemius',
+      ${params.frLangId}, ${product.translation_group_id},
+      ${product.freemius_product_id}, ${product.freemius_plan_id},
+      ${product.trial_period_days ?? 0}, ${product.trial_requires_payment_method ?? false}
+    )
+    ON CONFLICT ON CONSTRAINT products_language_id_slug_key DO UPDATE
+    SET
+      title = EXCLUDED.title,
+      short_description = EXCLUDED.short_description,
+      meta_title = EXCLUDED.meta_title,
+      meta_description = EXCLUDED.meta_description,
+      description_json = NULL,
+      product_type = EXCLUDED.product_type,
+      payment_provider = EXCLUDED.payment_provider,
+      trial_period_days = EXCLUDED.trial_period_days,
+      trial_requires_payment_method = EXCLUDED.trial_requires_payment_method
+    RETURNING id
+  `;
+
+  if (frProduct?.id) {
+    if (affiliatesMediaId) {
+      await attachProductMedia(params.sql, frProduct.id as string, affiliatesMediaId);
+    }
+    await params.sql`DELETE FROM public.blocks WHERE product_id = ${frProduct.id}`;
+    for (let i = 0; i < sectionsFr.length; i++) {
+      await params.sql`
+        INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
+        VALUES (${frProduct.id}, ${params.frLangId}, 'section', ${params.sql.json(sectionsFr[i] as any)}, ${i})
+      `;
+    }
+  }
+
+  console.log('[Sandbox Reset] Successfully enriched Affiliates products (EN & FR).');
 }
 
 
@@ -1679,11 +1894,18 @@ async function seedCategoriesAndMappings(sql: SqlClient) {
     }
   }
 
-  // Fetch all seeded products across both languages to ensure all translations are mapped.
+  // Fetch all seeded products across both languages to ensure all translations are mapped. The
+  // Affiliates product joins once the package registry carries its Freemius id.
+  const affiliatesProductId: string = NEXTBLOCK_PACKAGES.affiliates.fm_product_id;
+  const freemiusProductIds = [
+    SANDBOX_COMMERCE_PRODUCT_ID,
+    SANDBOX_CORTEX_AI_PRODUCT_ID,
+    affiliatesProductId,
+  ].filter(Boolean);
   const products = await sql`
     SELECT id, sku, freemius_product_id
     FROM public.products
-    WHERE freemius_product_id IN ('24851', '28609')
+    WHERE freemius_product_id = ANY(${freemiusProductIds})
        OR sku IN ('NB-STUDIO-TEE', 'NB-SIGNAL-CAP', 'NB-UTILITY-PANTS')
   `;
 
@@ -1699,10 +1921,12 @@ async function seedCategoriesAndMappings(sql: SqlClient) {
 
   for (const prod of products) {
     const slugs: string[] = [];
-    if (prod.freemius_product_id === '24851') {
+    if (prod.freemius_product_id === SANDBOX_COMMERCE_PRODUCT_ID) {
       slugs.push('software', 'featured');
-    } else if (prod.freemius_product_id === '28609') {
+    } else if (prod.freemius_product_id === SANDBOX_CORTEX_AI_PRODUCT_ID) {
       slugs.push('software', 'ai');
+    } else if (affiliatesProductId && prod.freemius_product_id === affiliatesProductId) {
+      slugs.push('software');
     } else if (prod.sku === 'NB-STUDIO-TEE') {
       slugs.push('apparel', 'featured');
     } else if (prod.sku === 'NB-SIGNAL-CAP') {
@@ -1736,23 +1960,64 @@ async function seedCategoriesAndMappings(sql: SqlClient) {
   console.log('[Sandbox Reset] Successfully completed categories seeding.');
 }
 
-async function seedFakeStoreData(sql: SqlClient, supabaseAdmin: any) {
-  console.log('[Sandbox Reset] Starting fake store data seeding...');
-  
-  // 1. Ensure Demo User
-  const email = 'demo@nextblock.dev';
-  console.log(`[Sandbox Reset] Checking for demo user: ${email}`);
+/**
+ * Deletes every second factor of the demo admin. Its session is public, so anyone can enroll a
+ * factor through GoTrue's own MFA API, and auth.mfa_factors is untouched by the SQL reset: one
+ * enrollment would survive every reset, and is_admin_mfa() then wants aal2 from every visitor's
+ * session. Non-fatal, like the password restore.
+ */
+async function removeDemoUserFactors(supabaseAdmin: any, userId: string) {
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.mfa.listFactors({ userId });
+    if (error) {
+      console.error('[Sandbox Reset] Could not list the demo user second factors:', error);
+      return;
+    }
+    const factors: Array<{ id: string }> = data?.factors ?? [];
+    let removed = 0;
+    for (const factor of factors) {
+      const { error: deleteError } = await supabaseAdmin.auth.admin.mfa.deleteFactor({ id: factor.id, userId });
+      if (deleteError) {
+        console.error('[Sandbox Reset] Could not remove a second factor from the demo user:', deleteError);
+      } else {
+        removed += 1;
+      }
+    }
+    if (removed > 0) console.log(`[Sandbox Reset] Removed ${removed} second factor(s) from the demo user.`);
+  } catch (error) {
+    // A thrown network or client error must not stop the store data from seeding.
+    console.error('[Sandbox Reset] Could not remove the demo user second factors:', error);
+  }
+}
+
+/** The shared demo admin. Its login is published (README, the sign-in alert): every visitor can be it. */
+const DEMO_ADMIN_EMAIL = 'demo@nextblock.dev';
+
+/** The demo admin's auth user id, or null when GoTrue has none. Throws when GoTrue cannot list users. */
+async function findDemoAdminId(supabaseAdmin: any): Promise<string | null> {
   const { data: userData, error: userError } = await supabaseAdmin.auth.admin.listUsers();
   if (userError) {
     console.error('[Sandbox Reset] Auth listUsers error:', userError);
     throw userError;
   }
+  const demoUser = userData.users.find((u: any) => u.email === DEMO_ADMIN_EMAIL);
+  return demoUser ? demoUser.id : null;
+}
 
-  let demoUser = userData.users.find((u: any) => u.email === email);
-  if (!demoUser) {
+/**
+ * Puts the demo admin back as published: created when missing, otherwise its password restored and
+ * every second factor removed. GET runs it right after the SQL reset (whose Step A deletes every
+ * auth user but two fixed ids) and before any step that can throw, so a failing later step cannot
+ * leave a visitor's password or factor in place. Returns the user id; throws when GoTrue cannot
+ * list or create the user.
+ */
+async function restoreDemoAdmin(supabaseAdmin: any): Promise<string> {
+  console.log(`[Sandbox Reset] Checking for demo user: ${DEMO_ADMIN_EMAIL}`);
+  const existingId = await findDemoAdminId(supabaseAdmin);
+  if (!existingId) {
     console.log('[Sandbox Reset] Demo user missing in Auth, creating...');
     const { data: newUser, error: createError } = await supabaseAdmin.auth.admin.createUser({
-      email: email,
+      email: DEMO_ADMIN_EMAIL,
       password: 'password',
       email_confirm: true,
       user_metadata: { full_name: 'Nextblock CMS' }
@@ -1761,27 +2026,38 @@ async function seedFakeStoreData(sql: SqlClient, supabaseAdmin: any) {
       console.error('[Sandbox Reset] Auth createUser error:', createError);
       throw createError;
     }
-    demoUser = newUser.user;
-    console.log(`[Sandbox Reset] Created new demo user with ID: ${demoUser.id}`);
-  } else {
-    console.log(`[Sandbox Reset] Found existing demo user with ID: ${demoUser.id}`);
-    // The demo credentials are published (README + community posts), so any visitor can
-    // change this account's password and lock everyone else out. The SQL reset below does
-    // not touch auth.users, so re-assert the known-good password on every run — otherwise a
-    // single password change survives every future reset.
-    const { error: resetPwError } = await supabaseAdmin.auth.admin.updateUserById(demoUser.id, {
-      password: 'password',
-      email_confirm: true,
-    });
-    if (resetPwError) {
-      // Non-fatal: the rest of the sandbox reset is still worth doing.
-      console.error('[Sandbox Reset] Failed to restore demo password:', resetPwError);
-    } else {
-      console.log('[Sandbox Reset] Restored demo user password to the published default.');
-    }
+    console.log(`[Sandbox Reset] Created new demo user with ID: ${newUser.user.id}`);
+    return newUser.user.id;
   }
 
-  const userId = demoUser.id;
+  console.log(`[Sandbox Reset] Found existing demo user with ID: ${existingId}`);
+  // The demo credentials are published (README + community posts), so any visitor can
+  // change this account's password and lock everyone else out. The SQL reset keeps this
+  // account's auth.users row as it is, so re-assert the known-good password on every run —
+  // otherwise a single password change survives every future reset.
+  const { error: resetPwError } = await supabaseAdmin.auth.admin.updateUserById(existingId, {
+    password: 'password',
+    email_confirm: true,
+  });
+  if (resetPwError) {
+    // Non-fatal: the factors below and the rest of the sandbox reset are still worth doing.
+    console.error('[Sandbox Reset] Failed to restore demo password:', resetPwError);
+  } else {
+    console.log('[Sandbox Reset] Restored demo user password to the published default.');
+  }
+  await removeDemoUserFactors(supabaseAdmin, existingId);
+  return existingId;
+}
+
+async function seedFakeStoreData(sql: SqlClient, supabaseAdmin: any, demoAdminId: string | null) {
+  console.log('[Sandbox Reset] Starting fake store data seeding...');
+
+  // 1. The demo admin restoreDemoAdmin() put back right after the SQL reset. When that failed,
+  // look it up again by email, without restoring it a second time.
+  const userId = demoAdminId ?? (await findDemoAdminId(supabaseAdmin));
+  if (!userId) {
+    throw new Error(`Demo user ${DEMO_ADMIN_EMAIL} is missing in Auth.`);
+  }
 
   // 2. Seed Invoice Branding
   console.log('[Sandbox Reset] Seeding invoice branding...');
@@ -1852,7 +2128,7 @@ async function seedFakeStoreData(sql: SqlClient, supabaseAdmin: any) {
           ) VALUES (
             ${orderId}, ${userId}, 'paid', ${total}, ${total}, 0, 'USD',
             ${invoiceNumber}, now() - ${hoursAgo}::interval, now() - ${hoursAgo}::interval,
-            ${sql.json({ email, name: 'Nextblock CMS' })}, 'stripe'
+            ${sql.json({ email: DEMO_ADMIN_EMAIL, name: 'Nextblock CMS' })}, 'stripe'
           )
         `;
 
@@ -1912,6 +2188,111 @@ async function removeSandboxPromoSections(sql: SqlClient) {
   );
 }
 
+const PUBLIC_SIGNUPS_WARNING =
+  'GoTrue accepts public sign-ups: turn off "Allow new users to sign up" on the sandbox project.';
+const GOTRUE_SETTINGS_TIMEOUT_MS = 5000;
+
+/**
+ * The app refuses sign-ups on the sandbox, but the project's GoTrue still serves
+ * `POST /auth/v1/signup` to anyone holding the public key while "Allow new users to sign up" is on:
+ * that creates accounts and mails addresses visitors type. The operator turns it off on the
+ * sandbox project, and `npm run db:push:sandbox` (`supabase config push`, `enable_signup = true` in
+ * config.toml) can silently turn it back on, so every reset asks GoTrue's public settings.
+ *
+ * The URL and the publishable key come from the environment only (never from the request), and
+ * the key goes nowhere else: a redirect fails the check. Never throws, and settles within the
+ * timeout: the warning when sign-ups are open, null when they are off or the check could not run.
+ */
+async function checkSandboxPublicSignups(supabaseUrl: string, publishableKey: string | undefined): Promise<string | null> {
+  const couldNotCheck = '[Sandbox Reset] Could not check whether GoTrue accepts public sign-ups:';
+  if (!publishableKey) {
+    console.warn(couldNotCheck, 'no publishable key is configured.');
+    return null;
+  }
+  try {
+    const response = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/auth/v1/settings`, {
+      headers: { apikey: publishableKey },
+      cache: 'no-store',
+      redirect: 'error',
+      signal: AbortSignal.timeout(GOTRUE_SETTINGS_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`GoTrue answered ${response.status}.`);
+    }
+    const settings: unknown = await response.json();
+    if (typeof settings === 'object' && settings !== null && (settings as { disable_signup?: unknown }).disable_signup === true) {
+      return null;
+    }
+    console.error(`[Sandbox Reset] ${PUBLIC_SIGNUPS_WARNING}`);
+    return PUBLIC_SIGNUPS_WARNING;
+  } catch (error) {
+    // A network failure is "fetch failed" with the reason in its cause (ENOTFOUND, ECONNREFUSED…).
+    const code = error instanceof Error ? (error.cause as { code?: unknown } | undefined)?.code : undefined;
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(couldNotCheck, typeof code === 'string' ? `${reason} (${code})` : reason);
+    return null;
+  }
+}
+
+/**
+ * The endpoint variables uploads sign against (libs/utils/src/server.ts): server uploads
+ * R2_S3_ENDPOINT, presigned uploads R2_S3_PUBLIC_ENDPOINT, else R2_S3_ENDPOINT. Unset, both fall
+ * back to the account's R2 endpoint, the one the reset empties.
+ */
+const UPLOAD_ENDPOINT_ENV = ['R2_S3_ENDPOINT', 'R2_S3_PUBLIC_ENDPOINT'] as const;
+
+/** `value`'s origin (scheme, lower-case host, non-default port), or null when it has none. */
+function urlOrigin(value: string): string | null {
+  try {
+    const { origin } = new URL(value);
+    return origin === 'null' ? null : origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The reset empties R2_BUCKET_NAME at `resetEndpoint` (the account's R2 endpoint) with its own S3
+ * client, while uploads pick their target with getStorageBackend() / getStorageBucket()
+ * (STORAGE_PROVIDER, the R2 keys, STORAGE_BUCKET || R2_BUCKET_NAME) and sign against
+ * R2_S3_ENDPOINT (server uploads) or R2_S3_PUBLIC_ENDPOINT (presigned uploads) when set. Uploads
+ * keep working on the sandbox only because every reset empties their bucket, so a target this
+ * reset does not empty is an alarm: another backend or bucket, or, on the S3 backend, an endpoint
+ * variable whose origin is not `resetEndpoint`'s (origins, so a trailing slash, letter case or a
+ * /<bucket> path on the same host is the same endpoint). Each is logged and returned as a warning.
+ * Reads the environment only and never fails the reset: the warnings, none when everything matches.
+ */
+function checkSandboxUploadTarget(resetBucket: string, resetEndpoint: string): string[] {
+  const backend = getStorageBackend();
+  const bucket = getStorageBucket();
+  const warnings: string[] = [];
+  if (backend !== 's3' || bucket !== resetBucket) {
+    warnings.push(
+      `Uploads go to ${backend}:${bucket}, not the bucket this reset empties (${resetBucket}): visitor uploads would outlive the reset.`
+    );
+  }
+  // Only the S3 backend uses the endpoints: another backend is the warning above already.
+  if (backend === 's3') {
+    const resetOrigin = urlOrigin(resetEndpoint) ?? resetEndpoint;
+    for (const name of UPLOAD_ENDPOINT_ENV) {
+      const value = process.env[name];
+      if (!value) continue;
+      const origin = urlOrigin(value);
+      if (origin === resetOrigin) continue;
+      // The warning shows an origin (never credentials or a path); a value without one, only its name.
+      warnings.push(
+        origin
+          ? `Uploads go to ${origin} (${name}), not the endpoint this reset empties (${resetOrigin}): visitor uploads would outlive the reset.`
+          : `${name} is not a valid endpoint URL, so uploads cannot reach the endpoint this reset empties (${resetOrigin}).`
+      );
+    }
+  }
+  for (const warning of warnings) {
+    console.error(`[Sandbox Reset] ${warning}`);
+  }
+  return warnings;
+}
+
 export async function GET(request: NextRequest) {
   // 1. Guard: fail closed anywhere that is not explicitly the sandbox.
   const isSandboxResetEnabled = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
@@ -1920,18 +2301,16 @@ export async function GET(request: NextRequest) {
     return new NextResponse('Not Found', { status: 404 });
   }
 
-  // 2. Guard: Verify Cron Secret. Fail CLOSED when the secret is unset — otherwise the template
-  // literal below becomes the string "Bearer undefined", which an attacker can send verbatim to
-  // trigger a destructive reset on a misconfigured sandbox.
-  const cronSecret = process.env.CRON_SECRET?.trim();
-  const authHeader = request.headers.get('authorization');
-  if (!cronSecret || authHeader !== `Bearer ${cronSecret}`) {
+  // 2. Guard: Verify Cron Secret. Fail CLOSED when CRON_SECRET is unset: an unset secret must never
+  // become a guessable bearer ("Bearer undefined") that triggers a destructive reset on a
+  // misconfigured sandbox. The bearer is compared as SHA-256 digests in constant time.
+  if (!isCronRequestAuthorized(request, { whenUnset: 'deny' })) {
     return new NextResponse('Unauthorized', {
       status: 401,
     });
   }
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+  const supabaseUrl = resolveSupabaseUrl();
   const supabaseServiceKey =
     process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
@@ -1963,9 +2342,25 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Missing environment variables' }, { status: 500 });
   }
 
+  // The reset's own S3 client talks to the account's R2 endpoint, never R2_S3_ENDPOINT; the upload
+  // target check compares the endpoints uploads sign against with this same value.
+  const resetEndpoint = `https://${r2AccountId}.r2.cloudflarestorage.com`;
+
+  // Alongside the reset, not in front of it: the check never throws and settles within its
+  // timeout, and its warning joins the response.
+  const publicSignupsCheck = checkSandboxPublicSignups(supabaseUrl, resolveSupabaseAnonKey());
+  // An upload target this reset does not empty joins the response too, and never stops the reset.
+  const uploadTargetWarnings = checkSandboxUploadTarget(r2BucketName, resetEndpoint);
+  const responseWarnings = async () => {
+    const warnings = [await publicSignupsCheck, ...uploadTargetWarnings].filter(
+      (warning): warning is string => warning !== null
+    );
+    return warnings.length > 0 ? { warnings } : {};
+  };
+
   const s3 = new S3Client({
     region: 'auto',
-    endpoint: `https://${r2AccountId}.r2.cloudflarestorage.com`,
+    endpoint: resetEndpoint,
     credentials: {
       accessKeyId: r2AccessKeyId,
       secretAccessKey: r2SecretAccessKey,
@@ -2021,6 +2416,24 @@ export async function GET(request: NextRequest) {
         throw dbError;
       }
 
+      const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false,
+        },
+      });
+
+      // The demo admin first: right after the SQL (whose Step A deletes every auth user but two
+      // fixed ids) and before any step that can throw. A visitor's password or second factor lives
+      // in auth.users / auth.mfa_factors, which the SQL does not reset, so a later failure must not
+      // skip this. Never fatal: the reset goes on, and the store data looks the account up again.
+      let demoAdminId: string | null = null;
+      try {
+        demoAdminId = await restoreDemoAdmin(supabaseAdmin);
+      } catch (restoreErr: any) {
+        console.error('[Sandbox Reset] Failed to restore the demo admin:', restoreErr?.message || restoreErr);
+      }
+
       // The replayed migrations re-add the "Live Demo" home-page promo that points at this
       // sandbox — strip it here so the demo does not advertise itself to itself.
       await removeSandboxPromoSections(db);
@@ -2038,12 +2451,6 @@ export async function GET(request: NextRequest) {
       });
 
       console.log('[Sandbox Reset] Pre-activating premium packages...');
-      const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
-        auth: {
-          autoRefreshToken: false,
-          persistSession: false,
-        },
-      });
 
       if (process.env.FREEMIUS_ECOMMERCE_SANDBOX_KEY) {
         await activateSandboxPackage(
@@ -2096,6 +2503,25 @@ export async function GET(request: NextRequest) {
               enLangId,
               frLangId,
             });
+
+            // Affiliates & Creator Storefronts, never fatal: a throw here would abort the reset
+            // before the package activations and the demo-partner seed below. Its own
+            // transaction, so a failure leaves the product as the Freemius sync wrote it.
+            try {
+              await db.begin(async (sql: any) => {
+                await enrichAffiliatesProducts({
+                  sql: sql as SqlClient,
+                  affiliatesAsset: uploadedAssets.get('images/affiliates-square.webp'),
+                  enLangId,
+                  frLangId,
+                });
+              });
+            } catch (affiliatesErr: any) {
+              console.error(
+                '[Sandbox Reset] Affiliates product enrichment failed:',
+                affiliatesErr?.message || affiliatesErr
+              );
+            }
 
             await db.begin(async (sql: any) => {
               const tx = sql as SqlClient;
@@ -2604,21 +3030,55 @@ export async function GET(request: NextRequest) {
         console.log('[Sandbox Reset] Successfully activated Cortex AI package.');
       }
 
-      // Seed additional store data: Branding, Demo Account, and Fake Orders
+      // Seed additional store data: Branding, the demo admin's profile, and Fake Orders
       try {
-        await seedFakeStoreData(db, supabaseAdmin);
+        await seedFakeStoreData(db, supabaseAdmin, demoAdminId);
         console.log('[Sandbox Reset] Successfully seeded fake store data.');
       } catch (storeSeedErr: any) {
         console.error('[Sandbox Reset] Failed to seed store data:', storeSeedErr.message || storeSeedErr);
+      }
+
+      // Affiliates & Creator Storefronts: activate the package, then seed the demo partner
+      // (partner@nextblock.dev, /partners/studio-nova) on the orders seeded above. This runs after
+      // the reset transaction committed (the 'RTL' role label is only usable then), in a transaction
+      // of its own. The partner is never one of Step A's preserved users: every reset recreates it.
+      const affiliatesSandboxKey = process.env.FREEMIUS_AFFILIATES_SANDBOX_KEY;
+      if (affiliatesSandboxKey) {
+        await activateSandboxPackage(db, AFFILIATES_PACKAGE_ID, affiliatesSandboxKey, siteUrl);
+        console.log('[Sandbox Reset] Successfully activated Affiliates package.');
+
+        try {
+          // Logs and reports { seeded: false } instead of throwing; this catch is a last guard.
+          await seedSandboxAffiliateDemo(db, supabaseAdmin, { siteUrl });
+        } catch (affiliateSeedErr: any) {
+          console.error('[Sandbox Reset] Failed to seed the demo partner:', affiliateSeedErr?.message || affiliateSeedErr);
+        }
+
+        // The reset gave the partners, their pages and the catalog new ids: drop the cached public
+        // storefronts (both demo partners) and tier reads (revalidateTag(tag, { expire: 0 }) plus
+        // their paths).
+        try {
+          evictAffiliateStorefrontCache([SANDBOX_AFFILIATE_DEMO_HANDLE, SANDBOX_AFFILIATE_DEMO_FR_HANDLE], 'route');
+          evictAffiliateTiersCache('route');
+        } catch (cacheErr: any) {
+          console.warn('[Sandbox Reset] Failed to evict the affiliate caches:', cacheErr?.message || cacheErr);
+        }
       }
     } finally {
       await db.end();
     }
 
     console.log('[Sandbox Reset] Complete.');
-    return NextResponse.json({ success: true, message: 'Sandbox hard reset completed successfully' });
+    return NextResponse.json({
+      success: true,
+      message: 'Sandbox hard reset completed successfully',
+      ...(await responseWarnings()),
+    });
   } catch (err: any) {
     console.error('[Sandbox Reset] Unexpected error:', err);
-    return NextResponse.json({ error: err.message || 'Internal Server Error', stack: err.stack }, { status: 500 });
+    return NextResponse.json(
+      { error: err.message || 'Internal Server Error', stack: err.stack, ...(await responseWarnings()) },
+      { status: 500 }
+    );
   }
 }

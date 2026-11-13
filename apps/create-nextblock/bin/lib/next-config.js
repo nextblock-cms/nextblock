@@ -18,6 +18,7 @@ export const STANDALONE_TRANSPILE_PACKAGES = [
   '@nextblock-cms/sdk',
   '@nextblock-cms/ecommerce',
   '@nextblock-cms/cortex',
+  '@nextblock-cms/affiliates',
 ];
 
 const TYPESCRIPT_BLOCK = [
@@ -55,9 +56,9 @@ export const STANDALONE_NEXT_CONFIG_PATCHES = [
     name: 'transpilePackages',
     // Transpile ALL @nextblock-cms packages so Next applies React Server Component layer
     // semantics to them ('server-only', 'use client' / 'use server'). Without db/sdk/
-    // ecommerce/cortex here, db/server's `import 'server-only'` throws even from a Server
-    // Component, because Next treats the prebuilt package as an external and skips the
-    // server-layer processing the monorepo gets for free from source.
+    // ecommerce/cortex/affiliates here, db/server's (or affiliates/server's) `import 'server-only'`
+    // throws even from a Server Component, because Next treats the prebuilt package as an
+    // external and skips the server-layer processing the monorepo gets for free from source.
     regex: /transpilePackages:\s*\[[^\]]*\],/,
     to: `transpilePackages: [\n${STANDALONE_TRANSPILE_PACKAGES.map((name) => `    '${name}',`).join('\n')}\n  ],`,
     required: true,

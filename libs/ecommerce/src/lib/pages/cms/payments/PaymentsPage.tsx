@@ -6,7 +6,11 @@ import {
 import { getPaymentCredentialsView } from '../../../payment-config';
 import { PaymentsClient } from './PaymentsClient';
 
-export async function PaymentsPage() {
+/**
+ * CMS → Payments. `partnerPayouts`: the app's Affiliates program is active (the lib cannot tell),
+ * so the Stripe section also says Stripe pays the partners.
+ */
+export async function PaymentsPage({ partnerPayouts = false }: { partnerPayouts?: boolean } = {}) {
   const [initialEnabledProviders, configStatus, credentials] = await Promise.all([
     getEnabledPaymentProviders(),
     getStoreConfigStatus(),
@@ -34,6 +38,7 @@ export async function PaymentsPage() {
       credentials={credentials}
       saveAction={savePaymentSettings}
       saveCredentialsAction={savePaymentProviderCredentials}
+      partnerPayouts={partnerPayouts}
     />
   );
 }

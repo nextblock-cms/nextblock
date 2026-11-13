@@ -14,7 +14,7 @@ import { Label } from '@nextblock-cms/ui/label';
 import { Separator } from '@nextblock-cms/ui/separator';
 import { RadioGroup, RadioGroupItem } from '@nextblock-cms/ui/radio-group';
 import { Checkout as FreemiusCheckout } from '@freemius/checkout';
-import { getCartItemActivePrice } from '../cart-store';
+import { getCartItemActivePrice, normalizeCartAffiliateRef } from '../cart-store';
 import { useCart } from '../use-cart';
 import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import {
@@ -885,6 +885,9 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           currencyCode: activeCurrencyCode,
           couponCode: couponQuote?.code ?? store.appliedCoupon?.code ?? null,
           couponContextItems: items,
+          // The partner-storefront token "Add to cart" stored; the server verifies its signature
+          // and window before it attributes the order (NextBlock Affiliates).
+          affiliateRef: normalizeCartAffiliateRef(store.affiliateRef),
         }),
       });
 

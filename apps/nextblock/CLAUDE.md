@@ -8,7 +8,26 @@ first-boot wizard under `app/setup`. Standalone projects are a copy of this dire
 
 ## Map
 - `proxy.ts` (Next 16 middleware): `/setup` gate, DB redirects, CSP nonce, `/cms` session + role
-  checks (`/cms/admin|users|settings` ADMIN-only); `app/cms/layout.tsx` adds 2FA.
+  checks (`/cms/admin|users|settings|affiliates` ADMIN-only); `app/cms/layout.tsx` adds 2FA. It
+  also sets the partner referral cookie `nb_affiliate_ref` (GET document navigations to
+  `/partners/<handle>` or `?ref=`; `private, no-store` on those responses), pins `X-User-Locale`
+  to French on `/partenaires` and every path below it (`isFrenchPartnersPath`), and forwards
+  `x-nextblock-path` / `x-nextblock-search`; the rules live in the import-free
+  `lib/affiliates/referral-cookie.ts` and `partners-paths.ts`.
+- Affiliates (docs/15): `app/(public)/partners` (signup, storefronts, `/partners/terms`),
+  `app/(public)/partenaires` (the French landing and `/partenaires/conditions`),
+  `app/(portal)/portal/retailer` (partner portal, `requireRetailerPage()` / `requireRetailer()`),
+  `app/cms/affiliates`, `app/api/affiliates/*` (upload, copilot, payout cron); server modules in
+  `lib/affiliates/` (`lib/affiliates/paypal/`: PayPal Payouts, 02037: the REST client, the
+  CMS-or-env credentials, the payout run's PayPal step and `/cms/affiliates/paypal`'s work; PayPal
+  is never called on the public sandbox). Every surface gates on
+  `isAffiliatesProgramActive()` (`lib/affiliates/package-state.ts`: the package AND Commerce Pro,
+  which it is an add-on to). Partner JSON is untrusted: sanitize at read time, render with
+  `StorefrontRenderer`.
+- `lib/cron/cron-secret.ts`: `isCronRequestAuthorized()` for any route that checks `CRON_SECRET`
+  (constant-time; never compare the header with `===`).
+- `lib/i18n/translation-pages.ts`: `readAllTranslationRows()` for any read of many
+  `translations` rows (PostgREST stops at 1000).
 - `lib/blocks/blockRegistry.ts` + `blockTypes.ts`: built-in block schemas and defaults.
   `components/BlockRenderer.tsx` resolves `block_type` via `components/blocks/publicRendererLoaders.ts`,
   then the ecommerce loaders, then custom blocks; unknown types render null unless editing.

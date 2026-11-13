@@ -2,13 +2,12 @@
 
 import 'server-only';
 
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {
   applyOrderInventoryDeduction,
   assignInvoiceMetadata,
 } from '@nextblock-cms/ecommerce/server';
-import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import { getCmsActor } from '../../../lib/auth/cms-actor';
+import { getCmsActor, requireCmsAdmin, type ServiceRoleClient } from '../../../lib/auth/cms-actor';
 import { OrderWithDetails } from './types';
 
 const ITEMS_PER_PAGE = 20;
@@ -196,44 +195,35 @@ export async function getOrderDetails(orderId: string): Promise<OrderWithDetails
   } as OrderWithDetails;
 }
 
+/**
+ * Records a payment on an order. ADMIN-only, and the write goes through the service role,
+ * which no RLS policy can stop (02023 puts the orders ADMIN policies behind is_admin_mfa(),
+ * and since 02030 a paid order also records a partner's commission), so the gate below is
+ * the whole authorization.
+ *
+ * The client comes from requireCmsAdmin(), which resolves the actor through getCmsActor() and
+ * refuses a session that has not passed its enrolled second factor. Until 2026-10-27 this
+ * action checked the role with the cookie client and built a service-role client from the env
+ * keys itself, so a stolen password alone could mark an order paid. Guards: ./actions.test.ts
+ * and the "CMS server actions" check in tools/scripts/server-action-actors.test.ts.
+ */
 export async function markOrderAsPaid(orderId: string): Promise<{ success: boolean; error?: string }> {
-    const supabase = createClient();
-    
-    // 1. Verify Authentication (using user session)
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
-    
-    if (authError || !user) {
-        return { success: false, error: 'Unauthorized' };
-    }
-
-    // Recording a payment is ADMIN-only (same gate as the ecommerce lib's order
-    // server-actions). A server action is a public POST endpoint, and the write below
-    // bypasses RLS, so "signed in" alone would let any customer mark any order paid.
-    const { data: profile } = await supabase
-        .from('profiles')
-        .select('role')
-        .eq('id', user.id)
-        .maybeSingle();
-
-    if (profile?.role !== 'ADMIN') {
-        return { success: false, error: 'Forbidden' };
-    }
-
-    // 2. Perform Update using Service Role (Bypass RLS)
-    
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-
-    if (!serviceRoleKey || !supabaseUrl) {
-         return { success: false, error: 'Server configuration error' };
-    }
-
-    const adminSupabase = createSupabaseClient(supabaseUrl, serviceRoleKey, {
-        auth: {
-            autoRefreshToken: false,
-            persistSession: false
+    let adminSupabase: ServiceRoleClient;
+    try {
+        ({ supabase: adminSupabase } = await requireCmsAdmin());
+    } catch (error) {
+        const message = error instanceof Error ? error.message : '';
+        if (message === 'Unauthorized' || message === 'Forbidden') {
+            return { success: false, error: message };
         }
-    });
+        console.error('Mark Paid: the service client is unavailable:', error);
+        return { success: false, error: 'Server configuration error' };
+    }
+
+    // A server action is a public POST endpoint: accept exactly an order uuid.
+    if (typeof orderId !== 'string' || !UUID_PATTERN.test(orderId)) {
+        return { success: false, error: 'Order not found or update failed.' };
+    }
 
     const { data: updatedData, error } = await adminSupabase
         .from('orders')
@@ -252,9 +242,9 @@ export async function markOrderAsPaid(orderId: string): Promise<{ success: boole
 
     await assignInvoiceMetadata({
         orderId,
-        client: adminSupabase as any,
+        client: adminSupabase,
     });
-    await applyOrderInventoryDeduction(adminSupabase as any, orderId);
+    await applyOrderInventoryDeduction(adminSupabase, orderId);
 
     return { success: true };
 }

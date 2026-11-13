@@ -6,8 +6,12 @@ import {
 } from './ai-key-crypto';
 import {
   hasSecretEncryptionKey,
+  isEncryptedSecretEnvelope,
+  resealWithEnvKey,
   resolveSecretEncryptionKey,
+  siteSettingSecretSlot,
   tryDecryptWithEnvKey,
+  type SecretSlot,
 } from '@nextblock-cms/db/secrets';
 
 const SERVER_ONLY_ERROR_MESSAGE =
@@ -26,11 +30,41 @@ export const CORTEX_AI_PACKAGE_NAME = 'NextBlock Cortex AI';
 export const CORTEX_AI_OPENROUTER_SETTING_KEY = 'cortex_ai_openrouter_api_key';
 export const CORTEX_AI_OPENROUTER_MODEL_SELECTION_SETTING_KEY =
   'cortex_ai_openrouter_model_selection';
-// Stock-photo provider keys. Both are SECRETS and protected by the site_settings
-// sensitive-keys RLS (migration 00000000000012) — admin-only read/write, never
-// anon-readable. Stored as an encrypted envelope, same as the OpenRouter BYOK key.
+// Stock-photo provider keys. Both are SECRETS: like the OpenRouter BYOK key, their rows are
+// reachable only through the service role (migration 02038), and each holds an encrypted
+// envelope sealed for that row (cortexAiSecretSlot).
 export const CORTEX_AI_PEXELS_SETTING_KEY = 'cortex_ai_pexels_api_key';
 export const CORTEX_AI_UNSPLASH_SETTING_KEY = 'cortex_ai_unsplash_access_key';
+
+/** The Cortex AI rows that hold a key; each row's value is the envelope itself. */
+export const CORTEX_AI_SECRET_SETTING_KEYS = [
+  CORTEX_AI_OPENROUTER_SETTING_KEY,
+  CORTEX_AI_PEXELS_SETTING_KEY,
+  CORTEX_AI_UNSPLASH_SETTING_KEY,
+] as const;
+export type CortexAiSecretSettingKey = (typeof CORTEX_AI_SECRET_SETTING_KEYS)[number];
+
+const CORTEX_AI_SECRET_LABELS: Record<CortexAiSecretSettingKey, string> = {
+  cortex_ai_openrouter_api_key: 'OpenRouter key',
+  cortex_ai_pexels_api_key: 'Pexels API key',
+  cortex_ai_unsplash_access_key: 'Unsplash access key',
+};
+
+function isCortexAiSecretSettingKey(key: unknown): key is CortexAiSecretSettingKey {
+  return typeof key === 'string' && (CORTEX_AI_SECRET_SETTING_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * The slot a Cortex AI key is sealed for: its own `site_settings` row (libs/db secret-crypto).
+ * It opens nowhere else, so the OpenRouter key copied into the Pexels row, or into
+ * `email_secret.pass` where SMTP AUTH would send it out, never decrypts (2026-11-04).
+ */
+export function cortexAiSecretSlot(settingKey: CortexAiSecretSettingKey): SecretSlot {
+  if (!isCortexAiSecretSettingKey(settingKey)) {
+    throw new Error(`"${String(settingKey)}" is not a Cortex AI key row.`);
+  }
+  return siteSettingSecretSlot(settingKey);
+}
 // The operator's registered Unsplash application name, used as the utm_source on
 // Unsplash attribution links (their API guidelines require it to match the app).
 // Non-secret: stored as a plain, publicly-readable site_settings value.
@@ -168,25 +202,93 @@ function requireEncryptionKey() {
   return encryptionKey;
 }
 
-export function encryptStoredOpenRouterApiKey(apiKey: string) {
+/** Seal a key for its own row: the value to store under `settingKey`. */
+export function encryptStoredCortexAiSecret(settingKey: CortexAiSecretSettingKey, value: string) {
   return encryptOpenRouterApiKey({
-    apiKey,
+    apiKey: value,
     encryptionSecret: requireEncryptionKey(),
+    slot: cortexAiSecretSlot(settingKey),
   });
 }
 
-export function decryptStoredOpenRouterApiKey(encryptedKey: unknown) {
+/** Open the key stored under `settingKey`; throws when it was sealed for another row or key. */
+export function decryptStoredCortexAiSecret(settingKey: CortexAiSecretSettingKey, encryptedKey: unknown) {
   assertServerOnly();
   // Try every candidate key (explicit env keys + the derived fallback). This keeps a key
   // stored under one key readable if another is added later, and matches the SMTP/payment
-  // secret behaviour. The envelope is byte-compatible with the shared secret-crypto format.
-  const result = tryDecryptWithEnvKey(encryptedKey);
+  // secret behaviour. The envelope is the shared secret-crypto format.
+  const result = tryDecryptWithEnvKey(encryptedKey, cortexAiSecretSlot(settingKey));
 
   if (result === null) {
-    throw new Error('Failed to decrypt stored OpenRouter key.');
+    throw new Error(`Failed to decrypt stored ${CORTEX_AI_SECRET_LABELS[settingKey]}.`);
   }
 
   return result;
+}
+
+export function encryptStoredOpenRouterApiKey(apiKey: string) {
+  return encryptStoredCortexAiSecret(CORTEX_AI_OPENROUTER_SETTING_KEY, apiKey);
+}
+
+export function decryptStoredOpenRouterApiKey(encryptedKey: unknown) {
+  return decryptStoredCortexAiSecret(CORTEX_AI_OPENROUTER_SETTING_KEY, encryptedKey);
+}
+
+type SettingsClient = { from: (table: string) => any };
+
+/**
+ * Re-seal, each for its own row, the Cortex AI keys stored before 0.23.1: a version 1 envelope
+ * opens in any slot. Every save on the Cortex AI settings screen and the setup wizard's key steps
+ * call it with the service-role client, after their own role check, so saving anything there
+ * once binds every stored key. Each row is swapped only while it still holds the envelope that
+ * was read (the ciphertext matches), so a key saved meanwhile is never overwritten. Best effort:
+ * the keys read either way, so a failure is logged and never fails the save.
+ */
+export async function resealStoredCortexAiSecrets(supabase: SettingsClient): Promise<number> {
+  assertServerOnly();
+  let resealed = 0;
+
+  try {
+    const { data, error } = await supabase
+      .from('site_settings')
+      .select('key, value')
+      .in('key', [...CORTEX_AI_SECRET_SETTING_KEYS]);
+
+    if (error || !Array.isArray(data)) {
+      return 0;
+    }
+
+    for (const row of data as Array<{ key: unknown; value: unknown }>) {
+      if (!isCortexAiSecretSettingKey(row.key) || !isEncryptedSecretEnvelope(row.value)) {
+        continue;
+      }
+
+      const next = resealWithEnvKey(row.value, cortexAiSecretSlot(row.key));
+
+      if (next === row.value) {
+        continue;
+      }
+
+      const { error: updateError } = await supabase
+        .from('site_settings')
+        .update({ value: next })
+        .eq('key', row.key)
+        .eq('value->>ciphertext', row.value.ciphertext);
+
+      if (updateError) {
+        throw new Error(updateError.message);
+      }
+
+      resealed += 1;
+    }
+  } catch (error) {
+    console.warn(
+      '[cortex-ai] Could not re-seal the stored keys for their rows:',
+      error instanceof Error ? error.message : 'unknown error'
+    );
+  }
+
+  return resealed;
 }
 
 export function getStoredOpenRouterKeyStatus(value: unknown) {

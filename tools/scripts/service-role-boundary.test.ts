@@ -74,6 +74,13 @@ describe('service-role boundary helpers', () => {
     expect(serviceRoleMarkers("const k = process.env['SUPABASE_SECRET_KEY'];")).toEqual(['secret key read from process.env']);
     expect(serviceRoleMarkers('const k = process.env.SUPABASE_SERVICE_ROLE_KEY;')).toEqual(['secret key read from process.env']);
     expect(serviceRoleMarkers('const { supabase } = await requireCmsAdmin();')).toEqual(['verified-role-then-service-role helper']);
+    // Affiliates partner portal: both helpers hand out the service-role client after the checks.
+    expect(serviceRoleMarkers('const { supabase, actor } = await requireRetailer({ allowAdmin: true });')).toEqual([
+      'verified-role-then-service-role helper',
+    ]);
+    expect(serviceRoleMarkers("const { actor } = await requireRetailerPage('/portal/retailer');")).toEqual([
+      'verified-role-then-service-role helper',
+    ]);
     expect(serviceRoleMarkers("label: 'SUPABASE_SERVICE_ROLE_KEY'")).toEqual([]);
   });
 

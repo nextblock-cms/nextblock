@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import { sanitizeAuthoredBlockHtml as libSanitizer } from '@nextblock-cms/utils';
 import { sanitizeAuthoredBlockHtml, addNonceToInlineScripts } from './inlineScriptNonce';
 
 describe('sanitizeAuthoredBlockHtml', () => {
+  it('is the @nextblock-cms/utils sanitizer, so the app and the libs strip the same things', () => {
+    // The full suite lives in libs/utils/src/lib/authored-html.test.ts; the cases below keep
+    // exercising this import path, which every app caller uses.
+    expect(sanitizeAuthoredBlockHtml).toBe(libSanitizer);
+  });
+
   it('strips inline <script> blocks', () => {
     const out = sanitizeAuthoredBlockHtml('<p>hi</p><script>alert(1)</script><p>bye</p>');
     expect(out).toContain('<p>hi</p>');

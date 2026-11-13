@@ -7,6 +7,12 @@ export interface CurrentContent {
   type: 'page' | 'post' | 'product' | null;
   slug: string | null;
   translation_group_id?: string | null;
+  /**
+   * A code route with its own address per language (e.g. the partner program's `/partners` and
+   * `/partenaires`): language code (or `x-default`) -> site-relative path. When set, the language
+   * switcher navigates there instead of looking the path up as a CMS document.
+   */
+  localePaths?: Readonly<Partial<Record<string, string>>> | null;
 }
 
 interface CurrentContentContextType {

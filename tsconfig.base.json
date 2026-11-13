@@ -83,6 +83,15 @@
       ],
       "@nextblock-cms/cortex/client": [
         "./libs/cortex/src/client.ts"
+      ],
+      "@nextblock-cms/affiliates": [
+        "./libs/affiliates/src/index.ts"
+      ],
+      "@nextblock-cms/affiliates/editor": [
+        "./libs/affiliates/src/editor.ts"
+      ],
+      "@nextblock-cms/affiliates/server": [
+        "./libs/affiliates/src/server.ts"
       ]
     }
   },

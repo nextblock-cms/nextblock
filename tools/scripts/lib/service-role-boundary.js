@@ -84,6 +84,7 @@ const SERVER_ENTRIES = {
   utils: { './server': 'server utilities' },
   ecommerce: { './server': 'server barrel: checkout, orders, providers' },
   cortex: { '.': 'the Cortex runtime (tools, OpenRouter, MCP); ./client is the browser entry' },
+  affiliates: { './server': 'server barrel: repository, payouts, Stripe Connect, copilot tools, notifications' },
 };
 
 /** Exports that carry no runtime code. */
@@ -124,6 +125,8 @@ const SERVICE_ROLE_IDENTIFIERS = new Map([
   ['requireEcomAdmin', VERIFIED_HELPER],
   ['requireEcomStaff', VERIFIED_HELPER],
   ['requireAdminSupabaseClient', VERIFIED_HELPER],
+  ['requireRetailer', VERIFIED_HELPER],
+  ['requireRetailerPage', VERIFIED_HELPER],
 ]);
 
 const SECRET_READ = 'secret key read from process.env';

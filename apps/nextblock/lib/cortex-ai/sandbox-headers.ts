@@ -22,6 +22,19 @@ export const CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY = 'cortex_ai_sandbox_openrout
 /** localStorage key holding the visitor's serialized model selection on the sandbox. */
 export const CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY = 'cortex_ai_sandbox_openrouter_model_selection';
 
+/** localStorage key of the Cortex agent's chat threads (CortexGlobalAgentChat). */
+export const CORTEX_AGENT_CHAT_THREADS_STORAGE_KEY = 'nextblock-cortex-global-agent-chat-threads';
+
+/** sessionStorage key of the single-thread chat CortexGlobalAgentChat migrates from. */
+export const CORTEX_AGENT_CHAT_LEGACY_STORAGE_KEY = 'nextblock-cortex-global-agent-chat';
+
+/**
+ * Window event clearSandboxCortexKey() dispatches on the sandbox before it removes anything. An
+ * open CortexGlobalAgentChat aborts its request and saves nothing from then on, so a reply still
+ * streaming cannot write the chat history back after sign-out removed it.
+ */
+export const CORTEX_SANDBOX_SIGN_OUT_EVENT = 'nextblock:cortex-sandbox-sign-out';
+
 /**
  * Builds the headers for a JSON POST to a Cortex AI route, adding the sandbox
  * credential headers when — and only when — this build is the sandbox and the visitor
@@ -57,4 +70,37 @@ export function buildCortexAiRequestHeaders(): Record<string, string> {
   }
 
   return headers;
+}
+
+/**
+ * Forgets the visitor's own OpenRouter key, model selection and Cortex chat history on the
+ * sandbox. Every visitor signs in to the same demo accounts, so a key left in this browser after
+ * sign-out would be spent by the next person on a shared machine, who would also read the chat
+ * (2026-11-03). Every client-side sign-out handler calls this before `signOutAction()`. That
+ * action's redirect is a soft navigation, landing only after the server round trip, and the page
+ * keeps running until then: an open chat is told to stop first (CORTEX_SANDBOX_SIGN_OUT_EVENT),
+ * or a reply still streaming would save every thread again. Off the sandbox it touches nothing
+ * and dispatches nothing: a real install keeps no key in the browser, and its chat history
+ * belongs to the browser's own admin.
+ */
+export function clearSandboxCortexKey(): void {
+  if (process.env.NEXT_PUBLIC_IS_SANDBOX !== 'true') {
+    return;
+  }
+
+  try {
+    window.dispatchEvent(new Event(CORTEX_SANDBOX_SIGN_OUT_EVENT));
+  } catch {
+    // No window events here: nothing can be listening either. The storage below still goes.
+  }
+
+  try {
+    window.localStorage.removeItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY);
+    window.localStorage.removeItem(CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY);
+    window.localStorage.removeItem(CORTEX_AGENT_CHAT_THREADS_STORAGE_KEY);
+    window.sessionStorage.removeItem(CORTEX_AGENT_CHAT_LEGACY_STORAGE_KEY);
+  } catch {
+    // Storage is blocked (private window, blocked site data): no page here can read a key from it
+    // either. Sign-out goes ahead.
+  }
 }

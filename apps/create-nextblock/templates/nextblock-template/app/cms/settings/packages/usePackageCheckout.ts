@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { toast } from 'sonner';
 
-import { describePackageOffer, type PackageDef, type PackagePricing } from '@nextblock-cms/utils';
+import { describePackageOffer, hasPackageCheckout, type PackageDef, type PackagePricing } from '@nextblock-cms/utils';
 
 import {
   activatePackage,
@@ -134,6 +134,12 @@ export function usePackageCheckout({
   const openCheckout = useCallback(
     async (mode: 'buy' | 'trial', billingCycle: BillingCycle = 'annual') => {
       if (isPackageCheckoutSandbox) {
+        return;
+      }
+
+      // No Freemius product or plan yet (fm_product_id ''): there is nothing to open.
+      if (!hasPackageCheckout(pkg)) {
+        toast.error(`${pkg.name} cannot be bought from the dashboard yet. Activate it with its license key.`);
         return;
       }
 

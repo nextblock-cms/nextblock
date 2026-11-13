@@ -164,7 +164,8 @@ When the CLI creates a project it currently:
 8. ensures `.gitignore`, `.env.example`, layout files, and config files are in
    the expected generated-project shape (`next.config.js` is the app's own file with
    anchored standalone patches applied by `bin/lib/next-config.js` — tracing root,
-   the seven published packages to transpile, no build-time type-check of pre-built
+   the eight published packages to transpile (`STANDALONE_TRANSPILE_PACKAGES`, which includes
+   `@nextblock-cms/affiliates`), no build-time type-check of pre-built
    deps; a required anchor that disappears throws at scaffold time and fails
    `next-config.test.js`, which runs the patches against `apps/nextblock/next.config.js`)
    and `eslint.config.mjs` is replaced by the standalone config in
@@ -206,6 +207,11 @@ metadata for:
 - `@nextblock-cms/editor`
 - `@nextblock-cms/sdk`
 - `@nextblock-cms/cortex`
+- `@nextblock-cms/affiliates`
+
+The scaffold's `tailwind.config.js` `content` list also scans
+`./node_modules/@nextblock-cms/affiliates/**/*.{js,cjs,mjs}`, so the classes of the storefront
+renderer and editor are generated.
 
 The ecommerce module's npm name differs from its import name, so
 `apps/nextblock/package.json` (and therefore every scaffold) declares the alias
@@ -220,7 +226,8 @@ It currently:
 
 - copies `apps/nextblock` into `templates/nextblock-template`
 - skips `node_modules`, `.next`, backups, and other generated folders
-- copies the root `docs/` folder into the template docs directory
+- copies the root `docs/` folder into the template docs directory, except `docs/prompts/`
+  (internal build prompts; `scripts/lib/template-docs.js`)
 - copies `.env.example` (the legacy `.env.exemple` spelling is still accepted as a fallback)
 - rewrites imports for packaged library consumption
 - removes the copied `project.json`
@@ -233,15 +240,16 @@ template inherits from them later through the sync step.
 ## Premium Packages
 
 NextBlock CMS is free and open source (AGPL-3.0). Premium packages add to it, today
-**Cortex AI** and **Commerce Pro**, with more to come. There is nothing to install: every
-scaffold already depends on `@nextblock-cms/ecommerce` and `@nextblock-cms/cortex`, and
-the premium routes and UI ship in the template, gated by `verifyPackageOnline()` (the
-commerce CMS pages redirect to `/cms/settings/packages` while Commerce Pro is inactive). A
-license switches that code on at runtime:
+**Cortex AI**, **Commerce Pro** and **Affiliates & Creator Storefronts**, with more to come.
+There is nothing to install: every scaffold already depends on `@nextblock-cms/ecommerce`,
+`@nextblock-cms/cortex` and `@nextblock-cms/affiliates`, and the premium routes and UI ship in
+the template, gated by `verifyPackageOnline()` (the commerce CMS pages redirect to
+`/cms/settings/packages` while Commerce Pro is inactive). A license switches that code on at
+runtime:
 
-- **In the CMS.** Administration → Packages (`/cms/settings/packages`): start the free
-  30-day trial of Cortex AI or Commerce Pro (no credit card), buy a license, or paste a
-  key. See docs/08 → "Package Activation".
+- **In the CMS.** Administration → Packages (`/cms/settings/packages`): start a package's free
+  30-day trial (no credit card), buy a license, or paste a key. See docs/08 → "Package
+  Activation".
 - **Headless.** Set `NEXTBLOCK_LICENSE_KEY` in the env file. `--non-interactive` writes it
   for you: the key given with `--license-key`, or, in unattended mode (`--name` /
   `--email`), the Cortex AI trial key the vendor mints. The app activates it on the next
@@ -250,8 +258,18 @@ license switches that code on at runtime:
   defaults to Cortex AI; a Commerce Pro key also needs `NEXTBLOCK_LICENSE_PACKAGE=ecommerce`.
   Details: docs/08 → "Headless bootstrap" (Environment-seeded license).
 
+Affiliates is an add-on to Commerce Pro (`requires: ['ecommerce']` in `NEXTBLOCK_PACKAGES`): it
+stays paused until Commerce Pro is active too, and the dashboard offers its trial and checkout
+(Freemius product 43273) only then. An Affiliates key in `NEXTBLOCK_LICENSE_KEY` also needs
+`NEXTBLOCK_LICENSE_PACKAGE=affiliates`. See
+[15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md) → "Package gating and
+activation".
+
 `create-nextblock activate [package]` is a hidden signpost that prints these steps
-(`bin/lib/activate.js`). It installs nothing, writes no file, and exits 1 only for an
+(`bin/lib/activate.js`; `PREMIUM_PACKAGES` mirrors the registry, its `requires` included, and
+`affiliates`, `affiliate`, `partners`, `storefronts` and `creator-storefronts` all name
+Affiliates, whose guide is docs/15; the guide adds that Affiliates needs Commerce Pro).
+It installs nothing, writes no file, and exits 1 only for an
 unknown package name; it stays registered because commander would otherwise hand
 `activate` to the default `create` command and scaffold a project named "activate". It
 also names premium dependencies an older project's `package.json` lacks (update the
@@ -277,11 +295,13 @@ republish.)
 ### Release commands
 
 - `npm run release:all -- <version>` — build **and publish every package** at one
-  synchronized version, in dependency order: `utils → ui → sdk → db → editor → ecom`,
-  then `release-cli.js` (which stamps the root + template + `create-nextblock`, re-syncs
-  the template, and publishes the CLI). Pass an explicit semver (e.g. `0.10.2`);
-  `--dry-run` prints the plan only.
-- `npm run build:<lib>` (`build:utils|ui|db|editor|sdk|ecom`) and
+  synchronized version, in dependency order:
+  `utils → ui → sdk → db → editor → ecom → cortex → affiliates`, then `release-cli.js`
+  (which stamps the root + template + `create-nextblock`, re-syncs the template, and
+  publishes the CLI). Pass an explicit semver (e.g. `0.10.2`); `--dry-run` prints the plan
+  only. `affiliates` depends on `utils` and `ui` and goes after `cortex`; every lib goes
+  before the CLI, whose template depends on all of them.
+- `npm run build:<lib>` (`build:utils|ui|db|editor|sdk|ecom|cortex|affiliates`) and
   `node tools/scripts/release-lib.js <lib> <version>` — build + publish a **single** lib
   (`<lib>` is the nx project name, so use `ecommerce`, which maps to the published
   `@nextblock-cms/ecom`). `npx nx build <lib>` only *compiles*, it does not publish.
@@ -297,20 +317,25 @@ output breaks the interactive OTP prompt** — `npm run release:all -- … 2>&1 
 - capture with PowerShell `Start-Transcript -Path release.log; npm run release:all -- … ;
   Stop-Transcript`, which records the session while npm keeps its terminal.
 
-`release:all` has no "already published" guard: if it dies partway, re-running the same
-version re-publishes from the top and 403s on the first already-published lib. Finish a
-partial release by running the **remaining** libs individually
-(`node tools/scripts/release-lib.js <lib> <version>` … then `release-cli.js <version>`),
-or bump to a fresh version and re-run the whole thing.
+With an explicit version, `release:all` asks npm first and skips every lib already published at
+that version (it only stamps the local `package.json`, so later libs resolve the right sibling
+range), which makes re-running the same version after a partial failure a resume. With a bump
+keyword (`patch`, `minor`, …) it cannot pre-check: finish a partial release by running the
+**remaining** libs individually (`node tools/scripts/release-lib.js <lib> <version>` … then
+`release-cli.js <version>`), or bump to a fresh version and re-run the whole thing.
 
 ### The pre-publish check
 
 `release-lib.js` builds with `NODE_ENV=production`, finalizes the premium libraries'
-manifests, and then runs `tools/scripts/verify-lib-dist.js <lib>` before `npm publish`. A
+manifests (`ecommerce`, `cortex` and `affiliates`: entry points, the `exports` map, sibling
+`workspace:` specs resolved to published versions in `dependencies`, `optionalDependencies` and
+`peerDependencies`, public access, no `nx` field), and then runs
+`tools/scripts/verify-lib-dist.js <lib>` before `npm publish`. A
 failed check aborts the release and restores the version. The check must come AFTER the
 manifest step: `ecommerce` builds with the raw source `package.json`, which has no `exports`
 at all, so checking first rejected every subpath (that is what stopped the first 0.19.1
-attempt). The two `exports` maps live in `tools/scripts/lib-publish-exports.js`, shared by
+attempt). The three `exports` maps live in `tools/scripts/lib-publish-exports.js`
+(`publishExportsFor(<lib>)`, which also decides which libs get the finalize step), shared by
 the release script and the check, so the check also works on a plain `nx build` output. Run
 it by hand after any `nx build <lib>`:
 
@@ -362,6 +387,25 @@ An eighth check covers the npm package page, which nothing else looks at:
 | :-- | :-- |
 | Package page | Through 0.20 only `sdk` published a README. The first fix published Nx's generated "This library was generated with Nx" stubs, `editor` and `sdk` linked to `../../docs/…` (a 404 on npmjs.com), the five manifests the builds write had no `license`, and `cortex` and `ecom` pointed `repository` at `nextblock-cms/packages`, which does not exist. The check requires a README in the tarball that is not the Nx stub and uses only absolute links, plus `license` and `repository` in the manifest. Every lib now has a real README, and every manifest points at `nextblock-cms/nextblock` with its `directory`. |
 
+A ninth check (added with `affiliates`) refuses `workspace:` dependency specs in the manifest
+that will ship:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Workspace dependencies | The premium builds copy the raw source `package.json` (`"@nextblock-cms/utils": "workspace:*"`), and `release-lib.js` resolves those specs only for a lib it finalizes. A new lib without that step would publish a manifest every `npm install` refuses (`EUNSUPPORTEDPROTOCOL`), and the monorepo, which never installs from `dist/`, would not notice. `release-lib.js` runs the check with `manifestFinalized: true`, so every `workspace:` spec fails there; on a plain `nx build` the sections the finalize step rewrites are skipped. |
+
+A tenth check (also added with `affiliates`) covers the manifest's `sideEffects` list:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Side effects | A lib that declares `sideEffects` (affiliates) lets bundlers drop every module the list does not name. An entry naming a file the tarball lacks (a renamed entry, a new output extension) would silently drop that module's side effect in every scaffold: for affiliates, the server entry's `import 'server-only'` guard or the jitless zod config. Check 10 requires the dist manifest to carry the source manifest's list unchanged, and every non-`./src/` entry (or wildcard) to match a file in `npm pack --dry-run`. `verifyLibDist` runs `npm pack --dry-run` once and shares the file list with checks 5, 8, 10 and 11. |
+
+An eleventh check covers the sibling packages a lib imports:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Undeclared siblings | `@nextblock-cms/*` stays external in every lib build, but editor, ui and db published no sibling declaration through 0.22.5. When the editor started importing `sanitizeAuthoredBlockHtml` (new in utils), a user upgrading only the editor would have hit a missing named export. The editor, ui and db builds now write `peerDependencies` for the siblings they import, at the version `libs/<sibling>` carries when the build runs (`release:all` bumps utils and ui first). Check 11 parses every packed JS file and requires each `@nextblock-cms/<pkg>` it imports in `dependencies` or `peerDependencies` (a `workspace:` spec counts, a self-import needs none, and ecommerce must be declared as `npm:@nextblock-cms/ecom@<range>`). |
+
 ### How the libraries build
 
 `npx nx build <lib>` runs the `vite build` target that `@nx/vite/plugin` infers from the lib's
@@ -377,8 +421,8 @@ externalizes its siblings and reads their types from source, so it never needs t
   Set `emptyOutDir: true` too: Vite will not empty a folder outside the lib otherwise, and old
   chunks would stay in the tarball.
 - Copy files the build does not write with `copyIntoDist()` from
-  `tools/vite/lib-build-plugins.mjs`: `README.md`, and the raw `package.json` for `cortex` and
-  `ecommerce`, which `release-lib.js` finalizes. `sdk` and `db` copy their README in
+  `tools/vite/lib-build-plugins.mjs`: `README.md`, and the raw `package.json` for `cortex`,
+  `ecommerce` and `affiliates`, which `release-lib.js` finalizes. `sdk` and `db` copy their README in
   `afterBuild` instead: their configs are `.ts`, which the root lint config checks with
   `@nx/enforce-module-boundaries`, and `tools/` belongs to the root project. The executor's
   `assets` option was not in its schema and never copied anything, so only `sdk` (through
@@ -391,8 +435,8 @@ externalizes its siblings and reads their types from source, so it never needs t
   vite-plugin-dts's `afterBuild` runs after the ESM output is written but before the CommonJS
   one, so a file patch there never reaches the CommonJS entry. `preserveModules` libs keep
   their directives.
-- A `"type": "module"` lib (`cortex`, `ecommerce`) names its CommonJS files `.cjs` through
-  `build.lib.fileName`. The other libs have no `type` field, so their `.cjs.js` files are
+- A `"type": "module"` lib (`cortex`, `ecommerce`, `affiliates`) names its CommonJS files `.cjs`
+  through `build.lib.fileName`. The other libs have no `type` field, so their `.cjs.js` files are
   CommonJS already.
 - Do not write build output from `afterBuild` that the CommonJS pass also writes. Through 0.20
   `utils` overwrote `server.es.js` and `server.d.ts` with a hand-written copy there, while the

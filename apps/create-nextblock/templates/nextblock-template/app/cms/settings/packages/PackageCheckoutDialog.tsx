@@ -13,7 +13,7 @@ import {
   DialogTitle,
   Input,
 } from '@nextblock-cms/ui';
-import { formatPackagePrice, type PackageDef } from '@nextblock-cms/utils';
+import { formatPackagePrice, hasPackageCheckout, type PackageDef } from '@nextblock-cms/utils';
 
 import { CORTEX_SETUP_SITE_BUILDER_HREF } from '../../../../lib/cortex-ai/site-builder-prompt';
 import {
@@ -52,6 +52,8 @@ export function PackageCheckoutDialog({
   const checkout = usePackageCheckout({ onActivated, pkg });
   const { activateManualKey, busy, manualKey, monthlyPrice, offer, openCheckout, resendEmail, reset, setManualKey, setStage, stage, trialEndsAt } =
     checkout;
+  // A package without a Freemius product (fm_product_id '') can only be activated by key.
+  const canCheckout = hasPackageCheckout(pkg);
 
   useEffect(() => {
     if (!open) {
@@ -75,39 +77,45 @@ export function PackageCheckoutDialog({
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
                 <Sparkles className="h-5 w-5 text-primary" />
-                {pkg.trial ? `Try ${pkg.name} free` : `Get ${pkg.name}`}
+                {canCheckout && pkg.trial ? `Try ${pkg.name} free` : `Get ${pkg.name}`}
               </DialogTitle>
               <DialogDescription>{pkg.tagline}</DialogDescription>
             </DialogHeader>
 
-            <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
-              {pkg.trial ? (
-                <>
-                  <p className="text-base font-semibold text-foreground">
-                    Free {pkg.trial.days}-day trial
-                    {pkg.trial.requiresPaymentMethod ? '' : ' · No credit card required'}
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Try everything for {pkg.trial.days} days. After the trial, keep it for{' '}
-                    <strong className="text-foreground">{offer.priceLine}</strong>
-                    {pkg.trial.requiresPaymentMethod
-                      ? ' — cancel anytime before it ends.'
-                      : '. Nothing is charged during the trial; when it ends the package switches off until you buy a license.'}
-                  </p>
-                </>
-              ) : (
-                <>
-                  <p className="text-base font-semibold text-foreground">{offer.priceLine}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    One license for this site. Activation happens here automatically after checkout.
-                  </p>
-                </>
-              )}
-              <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-                <ShieldCheck className="h-3.5 w-3.5" />
-                Secure checkout by Freemius. Your license activates on this site as soon as you finish.
-              </p>
-            </div>
+            {canCheckout ? (
+              <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
+                {pkg.trial ? (
+                  <>
+                    <p className="text-base font-semibold text-foreground">
+                      Free {pkg.trial.days}-day trial
+                      {pkg.trial.requiresPaymentMethod ? '' : ' · No credit card required'}
+                    </p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Try everything for {pkg.trial.days} days. After the trial, keep it for{' '}
+                      <strong className="text-foreground">{offer.priceLine}</strong>
+                      {pkg.trial.requiresPaymentMethod
+                        ? ' — cancel anytime before it ends.'
+                        : '. Nothing is charged during the trial; when it ends the package switches off until you buy a license.'}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-base font-semibold text-foreground">{offer.priceLine}</p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      One license for this site. Activation happens here automatically after checkout.
+                    </p>
+                  </>
+                )}
+                <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                  Secure checkout by Freemius. Your license activates on this site as soon as you finish.
+                </p>
+              </div>
+            ) : (
+              <div className="rounded-lg border p-4 text-sm text-muted-foreground">
+                {pkg.name} is not sold in the dashboard yet. Activate it with its license key instead.
+              </div>
+            )}
 
             {isSandbox ? (
               <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-300">
@@ -123,18 +131,18 @@ export function PackageCheckoutDialog({
             ) : null}
 
             <DialogFooter className="flex-col gap-2 sm:flex-col sm:space-x-0">
-              {!isSandbox && pkg.trial ? (
+              {!isSandbox && canCheckout && pkg.trial ? (
                 <Button className="w-full" onClick={() => void openCheckout('trial')}>
                   <Sparkles className="mr-2 h-4 w-4" />
                   Start my free {pkg.trial.days}-day trial
                 </Button>
               ) : null}
-              {!isSandbox ? (
+              {!isSandbox && canCheckout ? (
                 <Button className="w-full" onClick={() => void openCheckout('buy', 'annual')} variant={pkg.trial ? 'outline' : 'default'}>
                   Buy now · {formatPackagePrice(pkg.pricing.annual, pkg.pricing.currency)}/year
                 </Button>
               ) : null}
-              {!isSandbox && monthlyPrice ? (
+              {!isSandbox && canCheckout && monthlyPrice ? (
                 <Button className="w-full" onClick={() => void openCheckout('buy', 'monthly')} variant="ghost">
                   Or {formatPackagePrice(monthlyPrice, pkg.pricing.currency)}/month
                 </Button>

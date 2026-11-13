@@ -10,10 +10,14 @@ interface RegistrationFormProps {
   initialSettings: { autoAcceptSignups: boolean };
 }
 
+const SANDBOX_NOTE_ID = 'registration-sandbox-note';
+
 export default function RegistrationForm({ initialSettings }: RegistrationFormProps) {
   const [isPending, startTransition] = useTransition();
   const [message, setMessage] = useState<Message | null>(null);
   const [autoAccept, setAutoAccept] = useState(initialSettings.autoAcceptSignups);
+  // Read-only on the sandbox, whose admin login is public (updateRegistrationSettings refuses there).
+  const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
   const formRef = useRef<HTMLFormElement>(null);
   useHotkeys('ctrl+s', () => formRef.current?.requestSubmit());
@@ -37,7 +41,13 @@ export default function RegistrationForm({ initialSettings }: RegistrationFormPr
   return (
     <form ref={formRef} onSubmit={handleSubmit} className="space-y-6">
       <label className="flex items-start gap-3 rounded-lg border p-4">
-        <Checkbox checked={autoAccept} onCheckedChange={(c) => setAutoAccept(c === true)} className="mt-1" />
+        <Checkbox
+          checked={autoAccept}
+          onCheckedChange={(c) => setAutoAccept(c === true)}
+          disabled={isSandbox}
+          aria-describedby={isSandbox ? SANDBOX_NOTE_ID : undefined}
+          className="mt-1"
+        />
         <span className="text-sm">
           <span className="font-medium">Auto-approve new registrations (skip email verification)</span>
           <span className="block text-xs text-muted-foreground">
@@ -48,8 +58,14 @@ export default function RegistrationForm({ initialSettings }: RegistrationFormPr
         </span>
       </label>
 
+      {isSandbox ? (
+        <p id={SANDBOX_NOTE_ID} className="text-sm text-muted-foreground">
+          Sign-up settings are disabled in the sandbox.
+        </p>
+      ) : null}
+
       <div className="flex items-center gap-4">
-        <Button type="submit" disabled={isPending}>
+        <Button type="submit" disabled={isPending || isSandbox}>
           {isPending ? (<><Spinner className="mr-2 h-4 w-4" /> Saving…</>) : 'Save settings'}
         </Button>
         {message && (

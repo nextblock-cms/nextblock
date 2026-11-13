@@ -18,16 +18,70 @@ export interface AddItemResult {
 interface CartState {
   items: CartItem[];
   appliedCoupon: AppliedCouponState | null;
+  /**
+   * The signed partner-storefront token (NextBlock Affiliates) of the last storefront a product
+   * was added from. Opaque here: checkout sends it back and the server verifies it. It belongs to
+   * the current cart: every way of emptying the cart drops it (see `withCartItems`).
+   */
+  affiliateRef: string | null;
+  /**
+   * The token of a storefront product link the shopper followed ("Select options", a card's
+   * title or image), waiting for the next successful add, which makes it `affiliateRef`. Memory
+   * only, never persisted: a click that leads to no add stores nothing.
+   */
+  pendingAffiliateRef: string | null;
   isOpen: boolean;
   addItem: (item: Omit<CartItem, 'quantity'> & { quantity?: number }) => AddItemResult;
   removeItem: (itemId: string) => void;
   updateQuantity: (itemId: string, quantity: number) => void;
   setAppliedCoupon: (coupon: AppliedCouponState | null) => void;
   removeCoupon: () => void;
+  setAffiliateRef: (affiliateRef: string | null) => void;
+  setPendingAffiliateRef: (affiliateRef: string | null) => void;
   clearCart: () => void;
   toggleCart: () => void;
   setIsOpen: (isOpen: boolean) => void;
   setItems: (items: CartItem[]) => void;
+}
+
+/** Longest storefront token the cart keeps; the app's tokens are about 95 characters. */
+export const CART_AFFILIATE_REF_MAX_LENGTH = 256;
+
+/**
+ * A storefront token as the cart stores and sends it, or null: anything that is not a short
+ * run of printable ASCII (a tampered localStorage value, an object, blanks) is dropped here,
+ * and the server still verifies the signature of whatever arrives.
+ */
+export function normalizeCartAffiliateRef(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  if (!trimmed || trimmed.length > CART_AFFILIATE_REF_MAX_LENGTH || !/^[\x21-\x7e]+$/.test(trimmed)) {
+    return null;
+  }
+
+  return trimmed;
+}
+
+/**
+ * The state update that sets the cart's lines. An empty cart also drops the storefront token:
+ * the token was carried for lines that are gone, so the paid checkout that removes the last line
+ * (the success page's `setItems`), a cart emptied by hand and `clearCart` all end it, and the
+ * next cart falls back to the referral cookie. While lines remain (the second provider step of
+ * a mixed cart) it stays.
+ */
+function withCartItems(items: CartItem[]): Pick<CartState, 'items'> & Partial<Pick<CartState, 'affiliateRef'>> {
+  return items.length === 0 ? { items, affiliateRef: null } : { items };
+}
+
+/** On a successful add: a pending storefront token (a followed storefront link) becomes the cart's. */
+function promotePendingAffiliateRef(
+  pendingAffiliateRef: string | null
+): Partial<Pick<CartState, 'affiliateRef' | 'pendingAffiliateRef'>> {
+  return pendingAffiliateRef ? { affiliateRef: pendingAffiliateRef, pendingAffiliateRef: null } : {};
 }
 
 function getAllocatedSkuQuantity(
@@ -53,9 +107,11 @@ export const useCartStore = create<CartState>()(
     (set, get) => ({
       items: [],
       appliedCoupon: null,
+      affiliateRef: null,
+      pendingAffiliateRef: null,
       isOpen: false,
       addItem: (newItem) => {
-        const { items } = get();
+        const { items, pendingAffiliateRef } = get();
         const quantityToAdd = newItem.quantity ?? 1;
         const availableStock = typeof newItem.stock === 'number' ? newItem.stock : null;
         const allocatedSkuQuantity =
@@ -79,6 +135,7 @@ export const useCartStore = create<CartState>()(
           set({
             items: [...items, { ...newItem, quantity: 1 }],
             isOpen: true,
+            ...promotePendingAffiliateRef(pendingAffiliateRef),
           });
           return { success: true };
         }
@@ -115,20 +172,20 @@ export const useCartStore = create<CartState>()(
                 : item
             ),
             isOpen: true,
+            ...promotePendingAffiliateRef(pendingAffiliateRef),
           });
         } else {
           set({
             items: [...items, { ...newItem, quantity: quantityToAdd }],
             isOpen: true,
+            ...promotePendingAffiliateRef(pendingAffiliateRef),
           });
         }
         return { success: true };
       },
       removeItem: (itemId) => {
         const { items } = get();
-        set({
-          items: items.filter((item) => item.id !== itemId),
-        });
+        set(withCartItems(items.filter((item) => item.id !== itemId)));
       },
       updateQuantity: (itemId, quantity) => {
         const { items } = get();
@@ -153,9 +210,7 @@ export const useCartStore = create<CartState>()(
         }
 
         if (quantity <= 0) {
-          set({
-            items: items.filter((item) => item.id !== itemId),
-          });
+          set(withCartItems(items.filter((item) => item.id !== itemId)));
         } else {
           set({
             items: items.map((item) =>
@@ -183,10 +238,29 @@ export const useCartStore = create<CartState>()(
 
         set({ appliedCoupon: null });
       },
-      clearCart: () => set({ items: [], appliedCoupon: null }),
+      setAffiliateRef: (affiliateRef) => {
+        const nextAffiliateRef = normalizeCartAffiliateRef(affiliateRef);
+
+        if (get().affiliateRef === nextAffiliateRef) {
+          return;
+        }
+
+        set({ affiliateRef: nextAffiliateRef });
+      },
+      setPendingAffiliateRef: (affiliateRef) => {
+        const nextPendingAffiliateRef = normalizeCartAffiliateRef(affiliateRef);
+
+        if (get().pendingAffiliateRef === nextPendingAffiliateRef) {
+          return;
+        }
+
+        set({ pendingAffiliateRef: nextPendingAffiliateRef });
+      },
+      clearCart: () =>
+        set({ items: [], appliedCoupon: null, affiliateRef: null, pendingAffiliateRef: null }),
       toggleCart: () => set((state) => ({ isOpen: !state.isOpen })),
       setIsOpen: (isOpen) => set({ isOpen }),
-      setItems: (items) => set({ items }),
+      setItems: (items) => set(withCartItems(items)),
     }),
     {
       name: 'cart-storage',
@@ -194,11 +268,42 @@ export const useCartStore = create<CartState>()(
       skipHydration: true,
       // Persist the cart, not the UI. `isOpen` used to be stored too, so a visitor who left
       // with the drawer open got it thrown open again (stealing focus) on the next page load
-      // and in every new tab.
-      partialize: (state) => ({ items: state.items, appliedCoupon: state.appliedCoupon }),
+      // and in every new tab. The storefront token is part of the cart: it has to survive the
+      // page loads between "add to cart" and checkout. The pending token is not: it only bridges
+      // a storefront link click to the next add in this tab.
+      partialize: (state) => ({
+        items: state.items,
+        appliedCoupon: state.appliedCoupon,
+        affiliateRef: state.affiliateRef,
+      }),
     }
   )
 );
+
+/**
+ * Called by a partner storefront's product links ("Select options", a card's title and image) on
+ * click: keeps the storefront token in memory until the next successful add, which stores it on
+ * the cart. A product with variants, or one the shopper opens before adding it, is then still
+ * credited to the storefront without cookies (a client-side click on a `?ref=` link sets no
+ * referral cookie). Junk is ignored, and a click that leads to no add persists nothing.
+ */
+export function rememberStorefrontAffiliateRef(affiliateRef: unknown): void {
+  const token = normalizeCartAffiliateRef(affiliateRef);
+
+  if (!token) {
+    return;
+  }
+
+  // Every store write also writes the persisted cart. A click that lands before the page's cart
+  // hook has loaded the stored cart would replace it with the empty in-memory one, so load it
+  // first (localStorage is synchronous: the cart is in memory when this returns).
+  const persistApi = useCartStore.persist;
+  if (typeof window !== 'undefined' && persistApi && !persistApi.hasHydrated()) {
+    void persistApi.rehydrate();
+  }
+
+  useCartStore.getState().setPendingAffiliateRef(token);
+}
 
 // Selectors
 export const useCartTotalItems = () => {

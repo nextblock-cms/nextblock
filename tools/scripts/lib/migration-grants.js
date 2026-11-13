@@ -31,7 +31,10 @@
 //   - an EXECUTE in a DO block or function whose statement the lint cannot read. The template
 //     of EXECUTE format('...') and of EXECUTE '...' || expr is linted like any other statement
 //     (%I / %s / non-literal parts become wildcards); anything else needs a
-//     `-- nb-lint: dynamic-sql reviewed: <why>` comment right above it.
+//     `-- nb-lint: dynamic-sql reviewed: <why>` comment right above it;
+//   - an 'RTL'::public.user_role cast (02029's enum label) outside a plpgsql function body
+//     (findEnumRtlLiterals): the sandbox reset replays every migration in one transaction, where
+//     PostgreSQL refuses a label added by ALTER TYPE ... ADD VALUE; compare roles as text.
 // findRevokesUndoneByGrantPass() and findGrantsWidenedByGrantPass() are the companion checks
 // run by migration-grants.test.ts: a revoke from anon/authenticated that the post-apply
 // GRANTS_SQL hands back on every deploy, and a new table or view whose migration grants it
@@ -43,7 +46,7 @@
 // every other string is a literal. A file the tokenizer cannot read (an unterminated quote or
 // comment, unbalanced parentheses) is refused outright, never linted half-way.
 
-const { isBaselineMigration, isCatchupMigration, parseMigrationName } = require('./migration-naming');
+const { FIRST_FORWARD_SEQUENCE, isBaselineMigration, isCatchupMigration, parseMigrationName } = require('./migration-naming');
 
 const API_ROLES = ['anon', 'authenticated', 'service_role', 'public'];
 const ROLES_HINT = 'anon, authenticated, service_role';
@@ -1751,6 +1754,95 @@ function findGrantsWidenedByGrantPass(files, readFile, grantPassSql) {
   return problems;
 }
 
+/* -------------------------------------------- 'RTL' user_role literals (A18) --- */
+
+// 02029 adds 'RTL' to public.user_role with ALTER TYPE ... ADD VALUE. PostgreSQL refuses to
+// USE such a label in the transaction that added it ("unsafe use of new value"), and the sandbox
+// reset replays every migration in ONE transaction. So no forward migration may resolve the
+// label while it applies: a cast at the top level, in a DO block or EXECUTE template that runs
+// during the apply, in a policy, or in a SQL-language function body (fully analysed at CREATE
+// when check_function_bodies is on) breaks that replay. Compare as text instead (`role::text =
+// 'RTL'`, `(SELECT public.get_current_user_role())::text = 'RTL'`) and assign the label only
+// inside a plpgsql function body, which resolves it when the function runs. Other labels of
+// user_role are as old as the type and stay castable.
+const RTL_ROLE_LABEL = 'RTL';
+
+/** The language of every function body: `LANGUAGE x` anywhere in the CREATE statement holding it. */
+function functionBodyLanguages(analysis) {
+  const languages = new Map();
+  for (const statement of analysis.statements) {
+    const tokens = statement.tokens;
+    const bodies = tokens.filter((t) => t.type === 'body' && t.region.kind === 'function');
+    if (bodies.length === 0) continue;
+    let language = null;
+    for (let i = 0; i + 1 < tokens.length; i += 1) {
+      if (!isWord(tokens[i], 'LANGUAGE')) continue;
+      const next = tokens[i + 1];
+      if (next.type === 'string') language = String(next.value).toLowerCase();
+      else if (identToken(next)) language = nameOfToken(next);
+      break;
+    }
+    for (const body of bodies) languages.set(body.region, language);
+  }
+  return languages;
+}
+
+/** `[public.]user_role` (any quoting) at tokens[i]; `array` when `[]` follows. */
+function userRoleTypeAt(tokens, i) {
+  const ref = readName(tokens, i);
+  if (!ref || ref.name !== 'user_role' || !isPublic(ref.schema)) return null;
+  return { array: isOp(tokens[ref.next], '[') && isOp(tokens[ref.next + 1], ']') };
+}
+
+/** Whether a string literal names the RTL label: 'RTL' itself, or an array literal holding it. */
+function rtlLiteral(value, array) {
+  if (!array) return value === RTL_ROLE_LABEL;
+  return /^\s*\{[^]*\}\s*$/.test(value) && /(?:^\s*\{|,)\s*"?RTL"?\s*(?=[,}])/.test(value);
+}
+
+/**
+ * 'RTL'::public.user_role (also ::user_role, ::"public"."user_role", CAST('RTL' AS ...), and
+ * '{...,RTL}'::user_role[]) in a forward migration, anywhere but a plpgsql function body (or an
+ * EXECUTE template inside one). Returns [{ name, problem }].
+ */
+function findEnumRtlLiterals(sql) {
+  const analysis = analyse(sql);
+  const languages = functionBodyLanguages(analysis);
+  const inPlpgsqlBody = (region) => {
+    for (let r = region; r; r = r.parent) if (r.kind === 'function' && languages.get(r) === 'plpgsql') return true;
+    return false;
+  };
+  const problems = [];
+  for (const statement of analysis.statements) {
+    if (inPlpgsqlBody(statement.region)) continue;
+    const tokens = statement.tokens;
+    for (let i = 0; i < tokens.length; i += 1) {
+      const t = tokens[i];
+      if (t.type !== 'string' || typeof t.value !== 'string' || !t.value.includes(RTL_ROLE_LABEL)) continue;
+      let type = null;
+      if (isOp(tokens[i + 1], ':') && isOp(tokens[i + 2], ':')) type = userRoleTypeAt(tokens, i + 3);
+      else if (isOp(tokens[i - 1], '(') && isWord(tokens[i - 2], 'CAST') && isWord(tokens[i + 1], 'AS')) type = userRoleTypeAt(tokens, i + 2);
+      if (!type || !rtlLiteral(t.value, type.array)) continue;
+      const where = statement.region.kind === 'top' ? 'at the top level' : `in a ${statement.region.kind === 'do' ? 'DO block' : statement.region.kind === 'dynamic' ? 'dynamic statement' : 'non-plpgsql function body'}`;
+      problems.push({
+        name: RTL_ROLE_LABEL,
+        problem:
+          `casts 'RTL' to public.user_role ${where} (${statement.text.trim().replace(/\s+/g, ' ').slice(0, 80)}): the label was added by ` +
+          'ALTER TYPE ... ADD VALUE (02029) and the sandbox reset replays every migration in one transaction, where PostgreSQL refuses it ' +
+          "(\"unsafe use of new value\"); compare as text (role::text = 'RTL', (SELECT public.get_current_user_role())::text = 'RTL') " +
+          'or assign the label inside a plpgsql function body',
+      });
+    }
+  }
+  return problems;
+}
+
+/** The RTL rule covers forward migrations of squash generation 02 and later (sequence >= 005). */
+function rtlRuleApplies(file) {
+  const parsed = parseMigrationName(file);
+  return Boolean(parsed && parsed.generation >= 2 && parsed.sequence >= FIRST_FORWARD_SEQUENCE);
+}
+
 /* ------------------------------------------------------------------------- lint --- */
 
 /**
@@ -1782,6 +1874,7 @@ function validateMigrationGrants(files, readFile) {
       findObjectsMovedIntoPublic,
       findRoleEscalation,
       findUnreadableDynamicSql,
+      (s) => (rtlRuleApplies(file) ? findEnumRtlLiterals(s) : []),
     ];
     for (const check of checks) {
       for (const problem of check(sql)) errors.push(`${file}: ${problem.problem}`);
@@ -1799,6 +1892,7 @@ module.exports = {
   definerFunctionsInPublic,
   findAnonWriteGrants,
   findDefinerFunctionsWithoutSearchPath,
+  findEnumRtlLiterals,
   findGrantsWidenedByGrantPass,
   findObjectsMovedIntoPublic,
   findPolicyProblems,

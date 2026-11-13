@@ -1,6 +1,6 @@
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CustomBlockDefinition } from '@nextblock-cms/utils';
 
 import { DynamicLayoutEngine } from './DynamicLayoutEngine';
@@ -181,6 +181,90 @@ describe('DynamicLayoutEngine', () => {
     expect(html).not.toContain('data-dynamic-layout-warning');
     expect(html).not.toContain('Unknown field');
   });
+
+  describe.each(['true', '', 'false', 'TRUE', '1'])(
+    'rich-text fields with NEXT_PUBLIC_IS_SANDBOX=%j',
+    (flag) => {
+      // Block content is writable by ADMIN/WRITER over PostgREST, and html-react-parser keeps every
+      // element it is given (a <script> body goes out through dangerouslySetInnerHTML), so the
+      // field is sanitized before it is parsed. The sanitizer does not read the sandbox flag.
+      const dangerous = [
+        '<script>alert(1)</script>',
+        '<script async src="https://www.googletagmanager.com/gtm.js?id=GTM-ATTACKER"></script>',
+        '<meta http-equiv="refresh" content="0;url=https://evil.example/">',
+        '<base href="https://evil.example/">',
+        '<iframe srcdoc="<p>inner</p>"></iframe>',
+        // No whitespace after the quoted src: html-react-parser still makes srcdoc an attribute.
+        '<iframe src="https://player.vimeo.com/video/1"srcdoc="&lt;script src=https://www.googletagmanager.com/gtm.js?id=GTM-ATTACKER&gt;&lt;/script&gt;"></iframe>',
+        '<img src="/x.png" onerror="alert(1)">',
+        '<img src="/y.png"onerror="alert(1)">',
+        '<a href="javascript:alert(1)">more</a>',
+      ].join('');
+      const forbidden = ['<script', 'http-equiv', '<base', 'srcdoc', 'onerror', 'javascript:'];
+      const quoteOnly = {
+        fields: [{ key: 'quote', label: 'Quote', required: false, type: 'rich-text' as const }],
+      };
+
+      beforeEach(() => {
+        vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', flag);
+      });
+
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it('renders no script, meta refresh, base, srcdoc, handler or javascript: URL, and keeps the text', () => {
+        const html = renderToStaticMarkup(
+          <DynamicLayoutEngine
+            fields={quoteOnly.fields}
+            layoutSchema={{ as: 'blockquote', field_key: 'quote', type: 'field_render' }}
+            data={{ quote: `<p>Kept quote text</p>${dangerous}<p>Closing line</p>` }}
+            showDiagnostics={false}
+          />
+        );
+
+        for (const needle of forbidden) expect(html.toLowerCase()).not.toContain(needle);
+        expect(html).toContain('<p>Kept quote text</p>');
+        expect(html).toContain('<p>Closing line</p>');
+        expect(html).toContain('more');
+      });
+
+      it('sanitizes the layout emptyFallback the same way', () => {
+        const html = renderToStaticMarkup(
+          <DynamicLayoutEngine
+            fields={quoteOnly.fields}
+            layoutSchema={{
+              emptyFallback: `<p>Fallback text</p>${dangerous}`,
+              field_key: 'quote',
+              type: 'field_render',
+            }}
+            data={{ quote: '' }}
+            showDiagnostics={false}
+          />
+        );
+
+        for (const needle of forbidden) expect(html.toLowerCase()).not.toContain(needle);
+        expect(html).toContain('<p>Fallback text</p>');
+      });
+
+      it('keeps other embeds and ordinary formatting', () => {
+        const html = renderToStaticMarkup(
+          <DynamicLayoutEngine
+            fields={quoteOnly.fields}
+            layoutSchema={{ field_key: 'quote', type: 'field_render' }}
+            data={{
+              quote:
+                '<h3>Heading</h3><p><strong>Bold</strong> <a href="/about">about</a></p><iframe src="https://player.vimeo.com/video/1" title="Clip"></iframe>',
+            }}
+            showDiagnostics={false}
+          />
+        );
+
+        expect(html).toContain('<h3>Heading</h3><p><strong>Bold</strong> <a href="/about">about</a></p>');
+        expect(html).toContain('src="https://player.vimeo.com/video/1"');
+      });
+    }
+  );
 
   it('formats relation prices for the page locale and the currency they are stored in', () => {
     const priceDefinition = {

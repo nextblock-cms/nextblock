@@ -10,10 +10,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@nextblock-cms/ui';
-import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { RefreshCw, Trash2 } from 'lucide-react';
 
 import { formatPrice } from '@nextblock-cms/utils';
+import { FREEMIUS_COUPON_SANDBOX_MESSAGE } from '../../../freemius-coupons';
 import {
   createCouponAction,
   deleteCouponAction,
@@ -127,6 +128,9 @@ export async function CouponsPage({
       product.sku?.trim().toUpperCase() || product.id,
     ])
   );
+  // No coupon reaches Freemius on the sandbox (syncCouponToFreemius records why on each row), so
+  // the card says so in place of describing a sync that never runs there.
+  const sandbox = isSandboxEnvironment();
 
   return (
     <div className="mx-auto w-full max-w-7xl space-y-6 px-6 py-8">
@@ -168,7 +172,9 @@ export async function CouponsPage({
         <CardHeader>
           <CardTitle>All Coupons</CardTitle>
           <CardDescription>
-            Freemius sync runs when a coupon is created, updated, toggled, or manually resynced.
+            {sandbox
+              ? FREEMIUS_COUPON_SANDBOX_MESSAGE
+              : 'Freemius sync runs when a coupon is created, updated, toggled, or manually resynced.'}
           </CardDescription>
         </CardHeader>
         <CardContent>

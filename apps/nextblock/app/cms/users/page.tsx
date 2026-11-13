@@ -1,8 +1,8 @@
 import 'server-only';
 
 import React from "react";
-import { createClient } from "@nextblock-cms/db/server";
 import Link from "next/link";
+import { unstable_rethrow } from "next/navigation";
 import { Button } from "@nextblock-cms/ui";
 import {
   Table,
@@ -22,7 +22,10 @@ import {
   DropdownMenuButtonTrigger,
 } from "@nextblock-cms/ui";
 import type { Database } from "@nextblock-cms/db";
+import { isSandboxEnvironment } from "@nextblock-cms/db/server";
 import { Avatar, AvatarFallback, AvatarImage } from "@nextblock-cms/ui";
+import { requireCmsAdmin, type ServiceRoleClient } from "../../../lib/auth/cms-actor";
+import { USERS_LOCKED_IN_SANDBOX, USERS_SANDBOX_NOTE_CLASS, USERS_SANDBOX_NOTE_ID } from "./sandbox-lock";
 
 type AuthUser = {
     id: string;
@@ -36,23 +39,31 @@ type UserWithProfile = {
 };
 import { DeleteUserButtonClient } from "./components/DeleteUserButton";
 
-async function getUsersData(currentAdminId: string): Promise<UserWithProfile[]> {
-  // This needs to use a service role client to list all users from auth.users
-  const { createClient: createServiceRoleClient } = await import('@supabase/supabase-js');
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
-
-  if (!supabaseUrl || !serviceRoleKey) {
-    throw new Error('Missing required environment variables');
+/**
+ * Role badge: label and variant per role. `RTL` is the Affiliates partner role (migration 02029),
+ * which the generated enum type does not know yet, so the role is compared as a string.
+ */
+function roleBadge(role: string | null | undefined): {
+  label: string;
+  variant: "default" | "secondary" | "destructive" | "outline";
+} {
+  switch (String(role ?? "")) {
+    case "ADMIN":
+      return { label: "ADMIN", variant: "destructive" };
+    case "WRITER":
+      return { label: "WRITER", variant: "secondary" };
+    case "RTL":
+      return { label: "PARTNER (RTL)", variant: "default" };
+    case "USER":
+      return { label: "USER", variant: "outline" };
+    default:
+      return { label: role ? String(role) : "N/A", variant: "outline" };
   }
-  
-  const supabaseAdmin = createServiceRoleClient(supabaseUrl, serviceRoleKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false
-    }
-  });
+}
 
+async function getUsersData(supabaseAdmin: ServiceRoleClient): Promise<UserWithProfile[]> {
+  // Listing auth.users and every profile needs the service role (other accounts' profile rows
+  // sit behind is_admin_mfa()); the caller has authorized the ADMIN with requireCmsAdmin().
   const { data: { users: authUsers }, error: usersError } = await supabaseAdmin.auth.admin.listUsers({
       page: 1,
       perPage: 1000, // Adjust as needed, handle pagination for very large user bases
@@ -93,20 +104,23 @@ async function getUsersData(currentAdminId: string): Promise<UserWithProfile[]> 
 }
 
 export default async function CmsUsersListPage() {
-  const supabase = createClient();
-  const { data: { user: currentAdmin } } = await supabase.auth.getUser();
-
-  if (!currentAdmin) {
-      // This should ideally be caught by middleware or layout auth checks
-      return <p>Access Denied. Not authenticated.</p>;
+  // The proxy and the CMS layout already gate this route; this is the check the service-role
+  // reads below rely on (session, ADMIN role, second factor satisfied).
+  let admin: Awaited<ReturnType<typeof requireCmsAdmin>>;
+  try {
+    admin = await requireCmsAdmin();
+  } catch (error) {
+    unstable_rethrow(error);
+    return error instanceof Error && error.message === 'Unauthorized'
+      ? <p>Access Denied. Not authenticated.</p>
+      : <p>Access Denied. Admin privileges required.</p>;
   }
-  // Further check if current user is admin (already done by layout, but good for direct access attempts)
-  const { data: adminProfile } = await supabase.from('profiles').select('role').eq('id', currentAdmin.id).single();
-  if (adminProfile?.role !== 'ADMIN') {
-      return <p>Access Denied. Admin privileges required.</p>;
-  }
+  const currentAdmin = { id: admin.userId };
 
-  const users = await getUsersData(currentAdmin.id);
+  const users = await getUsersData(admin.supabase);
+  // The public sandbox shares every account with every visitor: the actions refuse every change
+  // there, and each row's disabled Delete item points at this note (aria-describedby).
+  const sandboxLocked = isSandboxEnvironment();
 
   return (
     <div className="w-full">
@@ -118,6 +132,11 @@ export default async function CmsUsersListPage() {
           </Link>
         </Button>
       </div>
+      {sandboxLocked && (
+        <p id={USERS_SANDBOX_NOTE_ID} className={USERS_SANDBOX_NOTE_CLASS}>
+          {USERS_LOCKED_IN_SANDBOX}
+        </p>
+      )}
 
       {users.length === 0 ? (
         <div className="text-center py-10 border rounded-lg">
@@ -157,11 +176,8 @@ export default async function CmsUsersListPage() {
                   <TableCell className="font-medium">{authUser.email}</TableCell>
                   <TableCell className="text-muted-foreground">{profile?.full_name || "N/A"}</TableCell>
                   <TableCell>
-                    <Badge variant={
-                        profile?.role === "ADMIN" ? "destructive" :
-                        profile?.role === "WRITER" ? "secondary" : "outline"
-                    }>
-                      {profile?.role || "N/A"}
+                    <Badge variant={roleBadge(profile?.role).variant}>
+                      {roleBadge(profile?.role).label}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">

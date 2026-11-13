@@ -1,5 +1,5 @@
 import { createServerClient, type CookieOptions } from '@supabase/ssr';
-import { NextResponse, type NextRequest } from 'next/server';
+import { NextResponse, after, userAgent, type NextRequest } from 'next/server';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db';
 import {
@@ -23,6 +23,20 @@ import {
   resolveDetectedLocale,
   type LanguageDetectionSettings,
 } from './lib/i18n/detection';
+import {
+  applyAffiliateReferralCookie,
+  buildAffiliateReferralCookie,
+  computeAffiliateVisitorHash,
+  createAffiliateReferralWindowCache,
+  decideAffiliateReferral,
+  expireAffiliateReferralCookie,
+  readAffiliateVisitorIp,
+  shouldWithdrawAffiliateReferral,
+  type AffiliateReferralDecision,
+  type AffiliateReferralWindowCache,
+  type AffiliateVisitorFingerprint,
+} from './lib/affiliates/referral-cookie';
+import { frenchPartnersLocale, isFrenchPartnersPath } from './lib/affiliates/partners-paths';
 
 type Profile = Database['public']['Tables']['profiles']['Row'];
 type UserRole = Database['public']['Enums']['user_role'];
@@ -58,6 +72,8 @@ const cmsRoutePermissions: Record<string, UserRole[]> = {
   '/cms/shipping': ['ADMIN'],
   '/cms/coupons': ['ADMIN'],
   '/cms/promotions': ['ADMIN'],
+  // Affiliates: partner approvals, tiers, payouts and program settings.
+  '/cms/affiliates': ['ADMIN'],
 };
 
 const securityHeaders = [
@@ -305,7 +321,9 @@ let redirectIndexInflight: Promise<Map<string, RedirectRule> | null> | null = nu
 // table needs none of that and every one of those features would add work to a path
 // that runs in front of the whole site. It is memoised for the life of the worker
 // alongside the credentials it was built from, so a cache hit constructs nothing at
-// all and a credential change (a redeploy with new env) still rebuilds it.
+// all and a credential change (a redeploy with new env) still rebuilds it. The partner
+// referral RPCs below use the same client: they are anon-callable and must never carry
+// a visitor's JWT.
 let redirectLookupClient: { client: SupabaseClient; key: string; url: string } | null = null;
 
 function getRedirectLookupClient(supabaseUrl: string, supabaseAnonKey: string): SupabaseClient {
@@ -372,6 +390,188 @@ function getRedirectIndex(
     });
   }
   return redirectIndexInflight;
+}
+
+// ---------------------------------------------------------------------------
+// Partner referrals (Affiliates package)
+// ---------------------------------------------------------------------------
+//
+// A document navigation to /partners/<handle>, or to a public page with ?ref=<handle>,
+// stamps the first-party httpOnly `nb_affiliate_ref` cookie that checkout reads for
+// attribution. Which requests qualify, the cookie and the visitor hash are plain functions
+// in lib/affiliates/referral-cookie.ts (dependency-free, tested there); this file only
+// wires them to the request. The decision is taken once, before the first response branch,
+// and applied by `withAffiliateReferral` to exactly three responses: the managed 301/302,
+// the customer-name redirect to /profile and the final page response. Never the
+// intermediate `response` the Supabase cookie adapter rebuilds, and never an auth gate.
+//
+// The lifetime is the partner tier's `cookie_duration_days`, read through the anon RPC
+// `get_affiliate_referral_window` on the plain anon client above (the proxy has no service
+// role) and memoised per handle: 5 minutes for a window, 60 s for "no such active, approved
+// partner", one in-flight lookup per handle, at most 1000 handles. NULL means no cookie; a
+// failed lookup falls back to 30 days (fail open). An install without the Affiliates schema
+// answers "missing function", which counts as NULL, so `?ref=producthunt` on a site that does
+// not run the package sets nothing.
+//
+// A NEW cookie also counts one click: `record_affiliate_click` (anon, VOLATILE, so a POST)
+// runs in after(), off the visitor's critical path, and the definer function dedupes per
+// visitor hash per partner per day and applies the flood limits. A visitor who declines
+// marketing cookies gets no referral, and one who declines after being referred has the
+// cookie expired on their next page view. Everything here fails open.
+const AFFILIATE_REFERRAL_LOOKUP_TIMEOUT_MS = 1_500;
+
+let affiliateReferralWindowCache: AffiliateReferralWindowCache | null = null;
+
+function getAffiliateReferralWindowCache(): AffiliateReferralWindowCache {
+  if (!affiliateReferralWindowCache) {
+    affiliateReferralWindowCache = createAffiliateReferralWindowCache({
+      load: loadAffiliateReferralWindow,
+    });
+  }
+  return affiliateReferralWindowCache;
+}
+
+async function loadAffiliateReferralWindow(handle: string): Promise<unknown> {
+  const supabaseUrl = resolveSupabaseUrl();
+  const supabaseAnonKey = resolveSupabaseAnonKey();
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return null;
+  }
+
+  const { data, error } = await getRedirectLookupClient(supabaseUrl, supabaseAnonKey)
+    .rpc('get_affiliate_referral_window', { p_handle: handle })
+    .abortSignal(AbortSignal.timeout(AFFILIATE_REFERRAL_LOOKUP_TIMEOUT_MS));
+
+  if (error) {
+    // The Affiliates schema is not installed (function or table unknown): no program, no cookie.
+    if (isSchemaMissingError(error) || error.code === 'PGRST202' || error.code === '42883') {
+      return null;
+    }
+    // Anything else is transient; the cache answers with the fallback window.
+    throw new Error(error.message || 'get_affiliate_referral_window failed');
+  }
+
+  return data;
+}
+
+type PendingAffiliateReferral =
+  | {
+      kind: 'referral';
+      decision: AffiliateReferralDecision;
+      windowDays: Promise<number | null>;
+      visitor: AffiliateVisitorFingerprint;
+    }
+  | { kind: 'withdraw' };
+
+function beginAffiliateReferral(request: NextRequest): PendingAffiliateReferral | null {
+  try {
+    const decision = decideAffiliateReferral({
+      method: request.method,
+      pathname: request.nextUrl.pathname,
+      searchParams: request.nextUrl.searchParams,
+      headers: request.headers,
+      cookies: request.cookies,
+      // Parsed only once a referral handle was found, never for ordinary traffic.
+      isBot: () => userAgent(request).isBot,
+    });
+    if (!decision) {
+      return shouldWithdrawAffiliateReferral(request) ? { kind: 'withdraw' } : null;
+    }
+
+    return {
+      kind: 'referral',
+      decision,
+      // Started now, so the lookup overlaps the redirect, session and profile round trips.
+      windowDays: getAffiliateReferralWindowCache()
+        .get(decision.handle)
+        .catch(() => null),
+      visitor: {
+        now: Date.now(),
+        ip: readAffiliateVisitorIp(request.headers),
+        userAgent: request.headers.get('user-agent'),
+      },
+    };
+  } catch (error) {
+    console.error('Proxy: affiliate referral check failed; serving without it.', error);
+    return null;
+  }
+}
+
+function scheduleAffiliateReferralClick(
+  referral: Extract<PendingAffiliateReferral, { kind: 'referral' }>,
+): void {
+  const { handle } = referral.decision;
+  const { visitor } = referral;
+
+  try {
+    after(async () => {
+      try {
+        const supabaseUrl = resolveSupabaseUrl();
+        const supabaseAnonKey = resolveSupabaseAnonKey();
+        const visitorHash = await computeAffiliateVisitorHash(visitor);
+        if (!supabaseUrl || !supabaseAnonKey || !visitorHash) {
+          return;
+        }
+
+        const { error } = await getRedirectLookupClient(supabaseUrl, supabaseAnonKey).rpc(
+          'record_affiliate_click',
+          { p_handle: handle, p_visitor_hash: visitorHash },
+        );
+        if (error) {
+          console.warn(`Proxy: record_affiliate_click failed for "${handle}":`, error.message);
+        }
+      } catch (error) {
+        console.warn(`Proxy: record_affiliate_click failed for "${handle}":`, error);
+      }
+    });
+  } catch (error) {
+    console.warn('Proxy: could not schedule the referral click.', error);
+  }
+}
+
+/**
+ * The one place a referral reaches a response: the cookie, `Cache-Control: private, no-store`
+ * (a shared cache must never store one visitor's Set-Cookie) and, for a new referral, the click;
+ * or, after a withdrawn marketing consent, the cookie's expiry. Returns the same response object;
+ * never throws.
+ */
+async function withAffiliateReferral(
+  response: NextResponse,
+  referral: PendingAffiliateReferral | null,
+): Promise<NextResponse> {
+  if (!referral) {
+    return response;
+  }
+
+  try {
+    if (referral.kind === 'withdraw') {
+      expireAffiliateReferralCookie(response, process.env.NODE_ENV === 'production');
+      return response;
+    }
+
+    const days = await referral.windowDays;
+    if (days === null) {
+      return response;
+    }
+
+    const cookie = buildAffiliateReferralCookie({
+      handle: referral.decision.handle,
+      days,
+      secure: process.env.NODE_ENV === 'production',
+    });
+    if (!cookie) {
+      return response;
+    }
+
+    applyAffiliateReferralCookie(response, cookie);
+    if (referral.decision.isNewClick) {
+      scheduleAffiliateReferralClick(referral);
+    }
+  } catch (error) {
+    console.error('Proxy: affiliate referral cookie failed; serving without it.', error);
+  }
+
+  return response;
 }
 
 function getHttpOrigin(value: string | undefined): string | null {
@@ -629,6 +829,9 @@ export async function proxy(request: NextRequest) {
 
   requestHeaders.set('x-nonce', nonce);
   requestHeaders.set('x-nextblock-path', pathname);
+  // The query string of the same request (always overwritten, never trusted from the client): the
+  // partner portal layout sends a signed-out visitor to sign in and back to this exact page.
+  requestHeaders.set('x-nextblock-search', request.nextUrl.search);
   if (contentSecurityPolicy) {
     requestHeaders.set('Content-Security-Policy', contentSecurityPolicy);
   }
@@ -647,6 +850,11 @@ export async function proxy(request: NextRequest) {
     }
     return createRedirectResponse(new URL('/setup', request.url), contentSecurityPolicy);
   }
+
+  // Partner referral (Affiliates): decided once, here, so the managed redirect below can
+  // carry the cookie too. The tier-window lookup starts now and is awaited only by
+  // `withAffiliateReferral`. Null for every request that is not a referral navigation.
+  const affiliateReferral = beginAffiliateReferral(request);
 
   // Managed redirects, resolved before anything else touches Supabase.
   //
@@ -728,7 +936,9 @@ export async function proxy(request: NextRequest) {
               rule.statusCode === 301 ? 'public, max-age=3600' : 'no-cache',
             );
 
-            return redirectResponse;
+            // A referral link that points at a moved page keeps its referral: the cookie
+            // rides on the redirect (which then turns `private, no-store`).
+            return await withAffiliateReferral(redirectResponse, affiliateReferral);
           }
         }
       }
@@ -795,7 +1005,16 @@ export async function proxy(request: NextRequest) {
       cookieLocale && FALLBACK_LOCALES.includes(cookieLocale) ? cookieLocale : DEFAULT_LOCALE;
   }
 
-  requestHeaders.set('X-User-Locale', currentLocale);
+  // `/partenaires` and the paths below it (`/partenaires/conditions`, the partner terms) are the
+  // partner program's French addresses (Affiliates): they render in French whatever the visitor's
+  // language, while French is an active language. Only the render locale is pinned; the cookie below
+  // keeps the visitor's own choice, so a prefetch of these URLs never switches anyone's language (a
+  // real visit persists French client-side, as any French page does).
+  const renderLocale = isFrenchPartnersPath(pathname)
+    ? (frenchPartnersLocale(localeConfig ? localeConfig.activeCodes : FALLBACK_LOCALES) ?? currentLocale)
+    : currentLocale;
+
+  requestHeaders.set('X-User-Locale', renderLocale);
 
   const {
     data: { user },
@@ -874,7 +1093,10 @@ export async function proxy(request: NextRequest) {
       .single<Pick<Profile, 'role' | 'full_name'>>();
 
     if (profile?.role === 'USER' && !profile.full_name?.trim()) {
-      return createRedirectResponse(new URL('/profile', request.url), contentSecurityPolicy);
+      return withAffiliateReferral(
+        createRedirectResponse(new URL('/profile', request.url), contentSecurityPolicy),
+        affiliateReferral,
+      );
     }
   }
 
@@ -959,7 +1181,8 @@ export async function proxy(request: NextRequest) {
     );
   }
 
-  return finalResponse;
+  // Last, so `private, no-store` replaces the public HTML caching set above.
+  return withAffiliateReferral(finalResponse, affiliateReferral);
 }
 
 export const config = {

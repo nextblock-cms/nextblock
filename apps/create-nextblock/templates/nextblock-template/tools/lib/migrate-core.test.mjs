@@ -183,9 +183,143 @@ describe('migrate-core post-apply grant pass', () => {
     }
     expect(GRANTS_SQL).toContain('revoke select on table public.profile_cards from anon;');
     expect(GRANTS_SQL).toContain('revoke insert, update, delete on table public.profile_cards from authenticated;');
-    expect(GRANTS_SQL.match(/revoke select on table public\.\w+ from anon/g)).toHaveLength(30);
+    // 29 tables of 02027 + profile_cards + the four partner tables of 02030
+    expect(GRANTS_SQL.match(/revoke select on table public\.\w+ from anon/g)).toHaveLength(34);
     expect(GRANTS_SQL.indexOf('grant select on all tables in schema public to anon')).toBeLessThan(
       GRANTS_SQL.indexOf('revoke select on table public.orders from anon'),
     );
+  });
+
+  it('keeps the 02030 affiliates revokes after its blanket grants', () => {
+    // anon reads no partner table but the tier ladder; authenticated writes no account or ledger row
+    for (const table of ['affiliate_profiles', 'affiliate_pages', 'affiliate_commissions', 'affiliate_payouts']) {
+      expect(GRANTS_SQL).toContain(`revoke select on table public.${table} from anon;`);
+      expect(GRANTS_SQL).toContain(`revoke insert, update, delete on table public.${table} from authenticated;`);
+    }
+    expect(GRANTS_SQL).not.toContain('on table public.affiliate_tiers from');
+    // the self-service columns come back only after the table-level UPDATE is gone
+    for (const [table, columns] of [
+      ['affiliate_profiles', 'display_name, bio, social_links, preferred_locale'],
+      ['affiliate_pages', 'title, meta_description, draft_content, featured_product_ids'],
+    ]) {
+      const grant = `grant update (${columns}) on table public.${table} to authenticated;`;
+      expect(GRANTS_SQL).toContain(grant);
+      expect(GRANTS_SQL.indexOf(`revoke insert, update, delete on table public.${table} from authenticated;`)).toBeLessThan(
+        GRANTS_SQL.indexOf(grant),
+      );
+    }
+    // service role only: the click log and the payout-run claims
+    for (const table of ['affiliate_click_events', 'affiliate_payout_runs']) {
+      expect(GRANTS_SQL).toContain(`revoke all on table public.${table} from public, anon, authenticated;`);
+    }
+    // every service-role RPC, by its exact argument types, behind a guard naming the same signature
+    for (const fn of [
+      'create_affiliate_account(uuid, text, text, text, text, text, jsonb, text)',
+      'promote_cleared_affiliate_commissions()',
+      'claim_affiliate_payout(uuid, text, bigint, text)',
+      'complete_affiliate_payout(uuid, text)',
+      'fail_affiliate_payout(uuid, text)',
+      'prepare_affiliate_payout_retry(uuid, bigint)',
+      'release_affiliate_payout(uuid)',
+      'claim_affiliate_payout_run(date, text)',
+      'finish_affiliate_payout_run(date, jsonb)',
+      'claim_affiliate_commission_notifications(integer)',
+      'apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean)',
+      'set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean)',
+      'reconcile_affiliate_commissions(integer)',
+    ]) {
+      expect(GRANTS_SQL).toContain(`if to_regprocedure('public.${fn}') is not null then`);
+      expect(GRANTS_SQL).toContain(`revoke execute on function public.${fn} from public, anon, authenticated;`);
+    }
+    // a retired signature is not revoked by name: 02030 drops the (uuid) overload of the retry
+    expect(GRANTS_SQL).not.toContain('prepare_affiliate_payout_retry(uuid)');
+    // the four anonymous storefront RPCs keep the blanket EXECUTE grant
+    for (const fn of ['get_affiliate_storefront', 'list_affiliate_storefronts', 'get_affiliate_referral_window', 'record_affiliate_click']) {
+      expect(GRANTS_SQL).not.toContain(`function public.${fn}(`);
+    }
+    expect(GRANTS_SQL.indexOf('grant all on all tables in schema public to authenticated')).toBeLessThan(
+      GRANTS_SQL.indexOf('revoke insert, update, delete on table public.affiliate_commissions from authenticated'),
+    );
+  });
+
+  it('keeps the 02035 tier-move RPC service-role only after its blanket grants', () => {
+    // change_affiliate_partner_tier (the CMS "Change tier"), by its exact argument types, behind a
+    // guard naming the same signature; nothing else of 02035 needs a new pass entry: its trigger
+    // function lives in `private` (no blanket grant reaches it), its columns ride the table grants,
+    // and the set_affiliate_commission_dispute it redefines keeps 02030's signature, already revoked
+    const fn = 'change_affiliate_partner_tier(uuid, uuid, boolean)';
+    const guard = `if to_regprocedure('public.${fn}') is not null then`;
+    const revoke = `revoke execute on function public.${fn} from public, anon, authenticated;`;
+    expect(GRANTS_SQL).toContain(guard);
+    expect(GRANTS_SQL).toContain(revoke);
+    expect(GRANTS_SQL.indexOf(guard)).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+    expect(GRANTS_SQL.indexOf('grant execute on all functions in schema public')).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+    // no other overload is revoked by name, and the trigger function is not touched here
+    expect(GRANTS_SQL.match(/change_affiliate_partner_tier\(/g)).toHaveLength(2);
+    expect(GRANTS_SQL).not.toContain('affiliate_snapshot_order_rate');
+    const dispute = 'set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean)';
+    expect(GRANTS_SQL.indexOf('grant execute on all functions in schema public')).toBeLessThan(
+      GRANTS_SQL.indexOf(`revoke execute on function public.${dispute} from public, anon, authenticated;`),
+    );
+    expect(GRANTS_SQL).not.toContain('affiliate_disputed_at');
+    // affiliate_profiles keeps exactly its four self-service UPDATE columns: tier_changed_at is not one
+    expect(GRANTS_SQL).toContain('grant update (display_name, bio, social_links, preferred_locale) on table public.affiliate_profiles to authenticated;');
+    expect(GRANTS_SQL).not.toContain('tier_changed_at');
+  });
+
+  it('keeps the 02036 manual payout RPCs service-role only after its blanket grants', () => {
+    // The five-argument claim (p_gateways) and the manual payout lifecycle of the CMS "Pay
+    // manually" (prepare, record, cancel), by their exact argument types, behind guards naming the
+    // same signatures, after the blanket EXECUTE grant.
+    for (const fn of [
+      'claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[])',
+      'claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[])',
+      'record_manual_affiliate_payout(uuid, text, text, text, uuid)',
+      'cancel_manual_affiliate_payout(uuid)',
+    ]) {
+      const guard = `if to_regprocedure('public.${fn}') is not null then`;
+      const revoke = `revoke execute on function public.${fn} from public, anon, authenticated;`;
+      expect(GRANTS_SQL).toContain(guard);
+      expect(GRANTS_SQL).toContain(revoke);
+      expect(GRANTS_SQL.indexOf(guard)).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+      expect(GRANTS_SQL.indexOf('grant execute on all functions in schema public')).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+    }
+    // The four-argument claim 02036 drops stays listed (guarded) for a database that has not run
+    // 02036 yet, and 02030's revoke of it must survive the pass: two claim signatures in all.
+    expect(GRANTS_SQL.match(/revoke execute on function public\.claim_affiliate_payout\(/g)).toHaveLength(2);
+    // One signature each (guard + revoke): no stale overload of the record is kept.
+    expect(GRANTS_SQL.match(/record_manual_affiliate_payout\(/g)).toHaveLength(2);
+    expect(GRANTS_SQL.match(/claim_manual_affiliate_payout\(/g)).toHaveLength(2);
+    expect(GRANTS_SQL.match(/cancel_manual_affiliate_payout\(/g)).toHaveLength(2);
+    // payout_email is written by the server only: no column grant brings it to authenticated
+    expect(GRANTS_SQL).toContain('grant update (display_name, bio, social_links, preferred_locale) on table public.affiliate_profiles to authenticated;');
+    expect(GRANTS_SQL).not.toContain('payout_email');
+  });
+
+  it('keeps the 02037 PayPal payout RPCs service-role only after its blanket grants', () => {
+    // The PayPal payout lifecycle of the daily run and the CMS PayPal payouts screen (claim, batch
+    // ids, item notes, complete, fail, the admin release), by their exact argument types, behind
+    // guards naming the same signatures, after the blanket EXECUTE grant: one signature each (guard +
+    // revoke).
+    for (const fn of [
+      'claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text)',
+      'record_paypal_affiliate_payout_batch(uuid[], text, text)',
+      'note_paypal_affiliate_payout_item(uuid, text, text, bigint)',
+      'complete_paypal_affiliate_payout(uuid, text, text, bigint, text)',
+      'fail_paypal_affiliate_payout(uuid, text, text)',
+      'release_paypal_affiliate_payout(uuid)',
+    ]) {
+      const guard = `if to_regprocedure('public.${fn}') is not null then`;
+      const revoke = `revoke execute on function public.${fn} from public, anon, authenticated;`;
+      expect(GRANTS_SQL).toContain(guard);
+      expect(GRANTS_SQL).toContain(revoke);
+      expect(GRANTS_SQL.indexOf(guard)).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+      expect(GRANTS_SQL.indexOf('grant execute on all functions in schema public')).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+      const name = fn.slice(0, fn.indexOf('('));
+      expect(GRANTS_SQL.match(new RegExp(`${name}\\(`, 'g'))).toHaveLength(2);
+    }
+    // payout_email_kind, the PayPal payout columns and the PayPal credentials row get no grant to take back
+    expect(GRANTS_SQL).not.toContain('paypal_receiver');
+    expect(GRANTS_SQL).not.toContain('affiliates_paypal_secret');
   });
 });

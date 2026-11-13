@@ -140,7 +140,19 @@ already present are left alone (the scaffolder writes floating ranges, so `npm i
 picks up new libs on its own); new ones are added as `latest`. Your `name`, `version`,
 `overrides` and any scripts or dependencies you added are preserved, and direct
 dependencies are re-aligned to their `overrides` spec afterwards so `npm install` cannot
-fail with `EOVERRIDE`.
+fail with `EOVERRIDE`. The framework's own scripts (`dev`, `build`, `start`, `lint`, `update`,
+`deploy:supabase`, `affiliates:schedule-payouts`, the `docker:*` scripts and the rest of
+`FRAMEWORK_SCRIPTS` in `tools/update.mjs`) are taken from the template;
+`tools/scripts/schedule-affiliate-payouts.test.ts` fails when the app declares a script that
+list does not name.
+
+A release that adds a library (for example `@nextblock-cms/affiliates`, the Affiliates
+package) therefore reaches an existing project's `package.json` on its own, but the two
+generated config files do not change. The updater warns when `next.config.js` lacks a
+NextBlock package in `transpilePackages`; add it there, and add the library to
+`tailwind.config.js` `content` the way a new scaffold has it
+(`'./node_modules/@nextblock-cms/affiliates/**/*.{js,cjs,mjs}'`), or its classes are not
+generated.
 
 The exception is an override NextBlock wrote itself. `create-nextblock` gives every project
 a few `overrides` (`postcss`, `qs`, `uuid`, `glob`, …), and a later release may raise them. An

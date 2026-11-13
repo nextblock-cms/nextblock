@@ -10,6 +10,7 @@ import {
   Copyright as CopyrightIcon, ShoppingBag, ListOrdered, CreditCard, Package, Coins, MessageSquareText,
   ExternalLink, Paintbrush, Brain, TicketPercent, ShieldAlert, Folder, DatabaseBackup, Boxes, Tag,
   ShieldCheck, Code2, Cookie, LineChart, Mail, UserPlus, SlidersHorizontal, Search,
+  Handshake, BadgePercent, ClipboardCheck, Wallet, Landmark, Send,
 } from "lucide-react"
 import TwoFactorReminderBanner from "./components/TwoFactorReminderBanner"
 import SystemAlertsBanner, { type SystemAlertItem } from "./components/SystemAlertsBanner"
@@ -21,6 +22,7 @@ import { Button } from "@nextblock-cms/ui"
 import { Avatar, AvatarFallback, AvatarImage } from "@nextblock-cms/ui"
 import { cn } from "@nextblock-cms/utils"
 import { signOutAction } from "../actions"
+import { clearSandboxCortexKey } from "../../lib/cortex-ai/sandbox-headers"
 import Image from "next/image";
 import { FeedbackModal } from "./components/FeedbackModal";
 import { CortexGlobalAgentChat } from "./components/CortexGlobalAgentChat";
@@ -95,9 +97,11 @@ type CollapsibleNavItemProps = {
   isActive?: boolean
   adminOnly?: boolean
   isAdmin?: boolean
+  /** Needs-attention count shown on the group while it is collapsed (the child item shows it when open). */
+  badgeCount?: number
 }
 
-const CollapsibleNavItem = ({ icon: Icon, title, children, isActive, adminOnly, isAdmin }: CollapsibleNavItemProps) => {
+const CollapsibleNavItem = ({ icon: Icon, title, children, isActive, adminOnly, isAdmin, badgeCount = 0 }: CollapsibleNavItemProps) => {
   const [isOpen, setIsOpen] = React.useState(isActive);
 
   if (adminOnly && !isAdmin) return null
@@ -105,6 +109,8 @@ const CollapsibleNavItem = ({ icon: Icon, title, children, isActive, adminOnly, 
   return (
     <li>
       <button
+        type="button"
+        aria-expanded={Boolean(isOpen)}
         onClick={() => setIsOpen(!isOpen)}
         className={cn(
           "flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-all w-full",
@@ -115,7 +121,12 @@ const CollapsibleNavItem = ({ icon: Icon, title, children, isActive, adminOnly, 
       >
         <Icon className="h-5 w-5" />
         <span>{title}</span>
-        <ChevronRight className={cn("h-4 w-4 ml-auto transition-transform", isOpen && "rotate-90")} />
+        {badgeCount > 0 && !isOpen ? (
+          <span className="ml-auto rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-bold leading-none text-amber-700 dark:text-amber-400">
+            {badgeCount > 99 ? '99+' : badgeCount}
+          </span>
+        ) : null}
+        <ChevronRight className={cn("h-4 w-4 transition-transform", badgeCount > 0 && !isOpen ? "ml-1" : "ml-auto", isOpen && "rotate-90")} />
       </button>
       {isOpen && (
         <ul className="pl-6 space-y-1.5 mt-1.5">
@@ -133,6 +144,8 @@ export default function CmsClientLayout({
   hasCortexModelKey = true,
   hasCortexSiteBrief = false,
   isEcommerceActive = false,
+  isAffiliatesActive = false,
+  affiliateApprovalsPending = 0,
   showTwoFactorReminder = false,
   systemAlerts = [],
   paymentsReminder = null,
@@ -146,6 +159,10 @@ export default function CmsClientLayout({
   /** A site brief is saved, so the site builder opens with the plan, not the interview. */
   hasCortexSiteBrief?: boolean,
   isEcommerceActive?: boolean,
+  /** The Affiliates & Creator Storefronts package is active (the Partners group shows, ADMIN only). */
+  isAffiliatesActive?: boolean,
+  /** Partner storefronts waiting for review (sidebar badge; 0 for non-admins). */
+  affiliateApprovalsPending?: number,
   showTwoFactorReminder?: boolean,
   systemAlerts?: SystemAlertItem[],
   paymentsReminder?: PaymentsReminder | null,
@@ -199,6 +216,8 @@ export default function CmsClientLayout({
   };
 
   const handleSignOut = async () => {
+    // The sandbox's demo accounts are shared: forget the visitor's own OpenRouter key first.
+    clearSandboxCortexKey();
     await signOutAction();
   };
 
@@ -285,6 +304,13 @@ export default function CmsClientLayout({
   else if (pathname.startsWith("/cms/orders/") && pathname.endsWith("/edit")) pageTitle = "Edit Order";
   else if (pathname.startsWith("/cms/orders")) pageTitle = "Orders";
   else if (pathname.startsWith("/cms/messages")) pageTitle = "Messages";
+  else if (pathname.startsWith("/cms/affiliates/tiers")) pageTitle = "Affiliate Tiers";
+  else if (pathname.startsWith("/cms/affiliates/approvals/")) pageTitle = "Review Storefront";
+  else if (pathname.startsWith("/cms/affiliates/approvals")) pageTitle = "Storefront Approvals";
+  else if (pathname.startsWith("/cms/affiliates/payouts")) pageTitle = "Affiliate Payouts";
+  else if (pathname.startsWith("/cms/affiliates/stripe")) pageTitle = "Stripe Payouts";
+  else if (pathname.startsWith("/cms/affiliates/paypal")) pageTitle = "PayPal Payouts";
+  else if (pathname.startsWith("/cms/affiliates")) pageTitle = "Affiliates";
 
 
   return (
@@ -420,6 +446,43 @@ export default function CmsClientLayout({
                     </NavItem>
                     <NavItem href="/cms/settings/currencies" icon={Coins} isActive={pathname.startsWith("/cms/settings/currencies")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
                       Currencies
+                    </NavItem>
+                  </CollapsibleNavItem>
+                </>
+              )}
+
+              {isAffiliatesActive && isAdmin && (
+                <>
+                  <div className="mt-6 mb-2">
+                    <p className="px-3 text-xs font-semibold text-slate-500 uppercase tracking-wider dark:text-slate-400">
+                      Partners
+                    </p>
+                  </div>
+                  <CollapsibleNavItem
+                    icon={Handshake}
+                    title="Affiliates"
+                    isActive={pathname.startsWith("/cms/affiliates")}
+                    adminOnly
+                    isAdmin={isAdmin}
+                    badgeCount={affiliateApprovalsPending}
+                  >
+                    <NavItem href="/cms/affiliates" icon={LayoutDashboard} isActive={pathname === "/cms/affiliates"} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
+                      Overview
+                    </NavItem>
+                    <NavItem href="/cms/affiliates/tiers" icon={BadgePercent} isActive={pathname.startsWith("/cms/affiliates/tiers")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
+                      Tiers
+                    </NavItem>
+                    <NavItem href="/cms/affiliates/approvals" icon={ClipboardCheck} isActive={pathname.startsWith("/cms/affiliates/approvals")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile} badgeCount={affiliateApprovalsPending}>
+                      Approvals
+                    </NavItem>
+                    <NavItem href="/cms/affiliates/payouts" icon={Wallet} isActive={pathname.startsWith("/cms/affiliates/payouts")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
+                      Payouts
+                    </NavItem>
+                    <NavItem href="/cms/affiliates/stripe" icon={Landmark} isActive={pathname.startsWith("/cms/affiliates/stripe")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
+                      Stripe payouts
+                    </NavItem>
+                    <NavItem href="/cms/affiliates/paypal" icon={Send} isActive={pathname.startsWith("/cms/affiliates/paypal")} adminOnly isAdmin={isAdmin} onClick={closeSidebarOnMobile}>
+                      PayPal payouts
                     </NavItem>
                   </CollapsibleNavItem>
                 </>

@@ -156,6 +156,19 @@ travel to the AI routes as `x-sandbox-openrouter-*` headers. Everything else is
 server-backed and refused by the `NEXT_PUBLIC_IS_SANDBOX` guards in `actions.ts` and
 `mcp-actions.ts` — the disabled control is the hint, those guards are the boundary.
 
+The partner portal's storefront copilot (Affiliates, docs/15) reads the same key. On the sandbox
+its panel has a password field that saves to the same `localStorage` entry
+(`CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY` in `lib/cortex-ai/sandbox-headers.ts`), so a key saved
+in either place serves both. Because any visitor could otherwise save one that reads that
+entry, nothing on the sandbox renders site scripts, custom scripts or a tag manager
+(`SiteScripts`, `ConsentGatedAnalytics`). Every client-side sign-out calls
+`clearSandboxCortexKey()` first, which forgets the key, the model and the agent's chat history,
+since the next person on that browser signs in to the same demo account. The sign-out redirect is
+a soft navigation that lands after a round trip, so the helper first dispatches
+`CORTEX_SANDBOX_SIGN_OUT_EVENT`: an open agent chat aborts its streaming reply and stops saving,
+instead of writing the history back. Both Cortex screens import the storage keys from
+`sandbox-headers.ts`, and its test fails on any copy of them elsewhere in the app.
+
 The MCP card renders in the sandbox with `readOnly`: toggles, minting, and revoking are
 disabled, and the token list is passed in empty (those rows belong to the host, and every
 sandbox visitor shares one admin login). The endpoint URL, the client picker, and the
@@ -324,8 +337,10 @@ The package registry entry lives in `libs/utils/src/lib/nextblock-packages.ts`:
 `pricing` and `trial` are what every dashboard surface quotes (`describePackageOffer`
 renders them as one consistent sentence: "Free 30-day trial, no credit card required,
 then $250/year."). They must match the Freemius plan, which is what the checkout
-actually enforces. Both packages carry the same 30-day no-card trial; a package with
-`trial: null` is quoted as a paid license and gets no trial button.
+actually enforces. Every package carries the same 30-day no-card trial; a package with
+`trial: null` is quoted as a paid license and gets no trial button. A package without a Freemius
+product (`fm_product_id: ''`, as Affiliates was before product 43273) gets no trial, checkout or
+price line at all (`hasPackageCheckout()`); see docs/15.
 
 Activation checks use:
 
@@ -381,7 +396,8 @@ the vendor:
 
 If the claim cannot be honoured (vendor unreachable, claim refused, sandbox) the dialog
 shows the paste-your-key field and a "Resend the license email" button
-(`resendPurchasedLicenseEmail`, which only ever calls Freemius hosts). After a
+(`resendPurchasedLicenseEmail`, which only ever calls Freemius hosts, and refuses on the public
+sandbox like the activation actions beside it). After a
 Cortex AI activation the dialog offers "Build my site with Cortex AI now", which loads
 `/cms/settings/cortex-ai/setup?intent=site-builder` (the first-run wizard, which hands
 straight off to `/cms/dashboard?cortex=site-builder` once a model key exists); the welcome
@@ -452,9 +468,9 @@ Stored BYOK intentionally takes precedence over `OPENROUTER_API_KEY`. This lets 
 
 Important: `openrouter/free` is a free model-router id, not a replacement for authentication. The app still needs an OpenRouter API key from either the environment or stored BYOK.
 
-When the active credential source is `env`, Cortex AI always routes through exactly the configured `CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY` list. Non-free explicit model requests are ignored for env-only routing.
+When the active credential source is `env`, Cortex AI always routes through exactly the configured `CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY` list. Non-free explicit model requests are ignored for env-only routing. Alt text (`buildCortexAiVisionRoutingPolicy`) applies the same lock within its own list: an env credential gets only the `:free` entries of `CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY`, a requested model is dropped, and there is no paid fallback (until 2026-11-03 a 429 on the free head retried down the paid tail on the operator's key). Stored and manual keys get the requested model, then a vision-capable stored selection, then the whole vision registry.
 
-**Sandbox Behavior:** When `NEXT_PUBLIC_IS_SANDBOX=true`, the server environments won't save any OpenRouter key or model selection to the database. The user will be requested to input a key that is stored purely in their browser's `localStorage` (`cortex_ai_sandbox_openrouter_api_key`) with browser-local model selection (`cortex_ai_sandbox_openrouter_model_selection`). The inline editor and global chat pass those values as request headers (`x-sandbox-openrouter-key` and `x-sandbox-openrouter-model`) for the user's own request only.
+**Sandbox Behavior:** When `NEXT_PUBLIC_IS_SANDBOX=true`, the server environments won't save any OpenRouter key or model selection to the database. The user will be requested to input a key that is stored purely in their browser's `localStorage` (`cortex_ai_sandbox_openrouter_api_key`) with browser-local model selection (`cortex_ai_sandbox_openrouter_model_selection`). The inline editor and global chat pass those values as request headers (`x-sandbox-openrouter-key` and `x-sandbox-openrouter-model`) for the user's own request only. Without the header, a request falls back to the deployment's `OPENROUTER_API_KEY` when one is set, locked to free models for text and vision alike.
 
 OpenRouter free models can still hit free-model rate limits. A user with no credits or no credit card can see errors like `free-models-per-day`. Cortex AI catches these where possible and falls back to configured alternate models, but OpenRouter account-level limits may still block all free requests.
 
@@ -483,7 +499,7 @@ Stored OpenRouter keys are saved in:
 public.site_settings.key = cortex_ai_openrouter_api_key
 ```
 
-The value is a JSON envelope:
+The value is a JSON envelope (the shared format of `libs/db/src/lib/secret-crypto.ts`):
 
 ```ts
 {
@@ -493,15 +509,21 @@ The value is a JSON envelope:
   iv: string,
   last4: string,
   updatedAt: string,
-  version: 1
+  version: 2 // 1 before 0.23.1
 }
 ```
 
-The migration `libs/db/src/supabase/migrations/02003_baseline_security_and_grants.sql` (originally `00000000000011_setup_cortex_ai_settings`, folded in by the generation-2 squash) hardens RLS:
+Since 0.23.1 (version 2) each key is sealed for its own row: the slot `site_settings:<key>` is the
+AES-GCM associated data, so the OpenRouter, Pexels and Unsplash keys open only from their own rows
+(`cortexAiSecretSlot`, `encryptStoredCortexAiSecret`, `decryptStoredCortexAiSecret` in
+`ai-config.ts`). A version 1 key still opens, and every save on `/cms/settings/cortex-ai` or the
+wizard's key steps re-seals it (`resealStoredCortexAiSecrets`, a compare-and-swap on the
+ciphertext).
 
-- Public users can read non-sensitive site settings.
-- The sensitive Cortex AI key row is readable only by authenticated admins.
-- The sensitive row is writable/deletable only by authenticated admins.
+Access: since migration `02038` the three key rows and `cortex_ai_mcp_settings` are reachable only
+through the service role (public users still read the non-sensitive settings). Every Cortex AI
+screen and route reads and writes them with the service-role client after its own ADMIN check
+(`requireAdminSupabaseClient`, `requireCmsAdmin`).
 - Existing non-sensitive site settings remain writable by current `ADMIN`/`WRITER` policy.
 
 Stored model selection is saved separately in:
@@ -531,7 +553,7 @@ Settings UI behavior:
 - Server actions re-check authenticated user role as `ADMIN`.
 - Stored BYOK is never displayed in plaintext.
 - The UI only shows masked `**** last4` status.
-- If only `OPENROUTER_API_KEY` exists, UI states that env routing is locked to the three free models.
+- If only `OPENROUTER_API_KEY` exists, UI states that env routing is locked to the free models (`CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY`, seven today).
 - If stored BYOK exists, UI fetches compatible OpenRouter text models that support `tools` and `structured_outputs`, then allows an admin to save one selected model.
 - If `NEXT_PUBLIC_IS_SANDBOX=true`, the UI uses a client component to save keys and model selection purely to `localStorage`, and bypasses the database to prevent accidental key leaks across a shared sandbox environment.
 
@@ -1272,6 +1294,89 @@ This was added after a real issue where:
 
 The current implementation treats the DB tool result as the source of truth once a mutation succeeds.
 
+## Partner Storefront Copilot (`/api/affiliates/cortex`)
+
+The Affiliates package (docs/15) gives partners (role `RTL`) a hard-sandboxed Cortex AI
+endpoint that can only write their bio, meta description, storefront sections and rewrites of
+copy they selected. It never reaches the admin agent or the MCP server: `/api/ai/global-agent`
+and `/api/mcp` stay ADMIN-only on their own checks.
+
+Files:
+
+```txt
+apps/nextblock/app/api/affiliates/cortex/route.ts          (route)
+apps/nextblock/components/affiliates/StorefrontCopilotPanel.tsx   (portal panel)
+apps/nextblock/lib/affiliates/copilot-stock-images.ts      (stock photo search)
+libs/affiliates/src/lib/copilot/                           (tools, schemas, instructions, section conversion)
+```
+
+Route config: `runtime = 'nodejs'`, `dynamic = 'force-dynamic'`, `maxDuration = 60`. Gate order:
+
+1. `requireRetailer({ allowAdmin: true })` (session, enrolled second factor, own role `RTL` or
+   ADMIN, the Affiliates activation, an ACTIVE partner account). Any refusal is one generic 403.
+2. `enforceRetailerCopilotRequestQuotas({ role, userId })` (`lib/cortex-ai/request-quota.ts`):
+   records the request once (route `affiliates/cortex`), then `evaluateCortexAiRequestQuota`
+   (RTL 30 an hour, `CORTEX_AI_RETAILER_HOURLY_REQUEST_CAP`; ADMIN 300) and
+   `evaluateRetailerCopilotGlobalQuota` (600 an hour across every account, counted with the
+   service role; 429 with `Retry-After`, 503 when the count cannot be read). It bounds what
+   self-service signups can spend of the operator's model credit. Either refusal deletes the
+   request's row; the gate's `release()` deletes it when the route refuses the request later
+   (403, 400, 503, 500; run in the route's `finally`), so the shared window only counts model
+   calls. Quota bodies carry `code`: `rate_limited`, `retailer_copilot_busy`,
+   `quota_unavailable`.
+3. The affiliate program active (`isAffiliatesProgramActive()`: `affiliates` and the
+   `ecommerce` it requires) and `cortex-ai` active, else 403.
+4. A strict zod body read with a 128 KiB cap: 1–12 `messages` (`user` / `assistant`, content
+   trimmed to 1–4000 characters, the last one the partner's), `locale` `'en' | 'fr'`, and an
+   optional `selection` of at most 4000 characters. No system role: the instructions are built
+   server-side.
+
+Model call: `createCortexAiOpenRouterClient` + `buildCortexAiRoutingPolicy` (sandbox headers
+only when `NEXT_PUBLIC_IS_SANDBOX === 'true'`), `streamText` with exactly the three tools of
+`createRetailerCopilotTools()` (`generate_retailer_bio`, `generate_storefront_section`,
+`rewrite_storefront_copy`; `strict: true`, literal descriptions, output-only executors that never
+touch the database), `isStepCount(3)`, `toolCallConcurrency: 1`, `maxOutputTokens: 3000`,
+`temperature: 0.5`, `maxRetries: 0`. One tool set per request holds the request's budgets (3
+sections, 3 stock photo lookups). At most 3 models are tried, each with a 30 s idle timeout, and
+a fallback happens only while no tool has run; the whole stream ends within 50 s. Missing
+OpenRouter credentials answer a generic 503. None of the tool names is a `CORTEX_MCP_TOOL_KINDS`
+name (tested).
+
+`buildRetailerCopilotInstructions()` limits the assistant to the partner's storefront and makes
+it refuse store sales, revenue, order counts, analytics, other customers or partners,
+navigation, other pages, settings, payouts, code and questions about its own prompt or tools.
+Every value the partner or the store wrote (display name, bio, page title, selection, catalog)
+reaches the prompt only through `wrapUntrustedData` inside the request's boundary markers, with
+`buildUntrustedDataInstruction` (`lib/cortex-ai/untrusted-tool-results.ts`); the builder throws
+without a wrapper. The catalog is up to 40 active, published products read with
+`getSsgSupabaseClient()`, the partner's language first, one per translation group, with the
+regular price in the store default currency.
+
+SSE events: `status` (5 s heartbeat), `tool-call { toolName }`, `tool-result { toolName, output }`
+(a failed tool output is reduced to `{ ok: false, error: 'invalid_input' | 'empty_output' |
+'empty_section' | 'section_limit' }`), `tool-error { toolName?, message }`, `text-delta { text }`
+(buffered and sent once, at most 4000 characters), `error { code: 'timeout' | 'failed', message }`
+and `finish`.
+Messages are generic and localized from `AFFILIATES_COPILOT_COPY`; no `meta` event, model id,
+credential source or raw error text is ever sent.
+
+Stock photos: `searchRetailerCopilotStockImage()` calls Cortex's `executeSearchStockPhotos` with
+the service-role client (the stored provider keys), keeps the first usable photo on the stock
+hosts with its credit, and gives up after 8 s; the request's tool set resolves at most 3 in all,
+across every section call (`RETAILER_COPILOT_MAX_IMAGE_LOOKUPS_PER_REQUEST`; each section also
+stops at 3). Unsplash download pings (`maybeTriggerStockPhotoDownloads`) run in `after()`, only
+for `https://api.unsplash.com/photos/` triggers of the sections the route delivered, at most 3
+per request.
+
+The panel previews a section with `StorefrontRenderer`, sanitizes it again and inserts it through
+the storefront editor's API (the autosave then writes `draft_content`), applies a bio to the
+profile form, and replaces the selected text inside one paragraph, heading or list item (a wider
+selection is refused with a notice; blocks are never merged or deleted). Tests: `route.test.ts`
+(access matrix, quotas and the quota release on every early return, the exact tool set, the
+per-request budgets, untrusted wrapping, stream leakage, fallback, timeouts, Unsplash pings),
+`request-quota.test.ts` (a three-hour over-demand simulation through both caps), `tools.test.ts`
+and `StorefrontCopilotPanel.test.tsx`.
+
 ## Section Design Intelligence
 
 Section blocks are the layout primitive for multi-section pages (heroes, landing/marketing pages). The strict `section` schema requires every layout field, so cheap models used to either fail validation or emit bland sections. Two mechanisms now make section authoring reliable:
@@ -1332,7 +1437,7 @@ Cortex can insert real photos into pages at zero inference cost, and external im
 Unsplash has strict usage rules; Pexels' license is permissive (attribution optional, re-hosting allowed, no download trigger). Handled:
 
 - **Hotlink**: external stock URLs render via a plain `<img>` from the provider host (never proxied). `importExternalImageToMedia` **refuses to re-host `*.unsplash.com` images** (Pexels re-host is allowed).
-- **Trigger downloads**: `maybeTriggerStockPhotoDownloads(blocks, supabase)` fires each Unsplash `download_location` (with the resolved Unsplash key) when a photo is committed to a page. Wired into the create (`insertContentBlocks`), `rewrite_page_draft`, `insert_content_block`, and `update_content_block` persist paths. Best-effort/fire-and-forget; depends on the agent copying `attribution.downloadLocation` from the search result.
+- **Trigger downloads**: `maybeTriggerStockPhotoDownloads(blocks, supabase)` pings Unsplash's download trigger, with the resolved Unsplash key, when a photo is committed to a page. It pings only `https://api.unsplash.com/photos/…` (exact host, default port, no userinfo; any other `attribution.downloadLocation` is ignored), at most 20 per call, each with `redirect: 'error'` and a 5 s timeout. Until 2026-11-03 it fetched whatever string the block held, key included, so a block saved by a WRITER or a sandbox visitor could send the operator's key to any host. Wired into the create (`insertContentBlocks`), `rewrite_page_draft`, `insert_content_block`, and `update_content_block` persist paths. Best-effort/fire-and-forget; depends on the agent copying `attribution.downloadLocation` from the search result.
 - **Attribution**: `ImageAttributionSchema` on the image block + section background image carries `{ provider, photographer, photographerUrl, sourceUrl, downloadLocation }`. The shared `StockPhotoCredit` component renders "Photo by {photographer} on {Provider}" with the photographer + provider linked and `utm_source`/`utm_medium` params on Unsplash links. The system prompt requires the agent to set `attribution` (and the image caption) from the search result.
 - **App name/branding**: dashboard-side (the operator's Unsplash app registration); NextBlock uses no Unsplash branding. The `utm_source` in `StockPhotoCredit.tsx` defaults to `nextblock` — change it to the registered app name if needed.
 
@@ -2029,7 +2134,9 @@ If new warnings appear, inspect for:
 - Stored BYOK plaintext is never persisted.
 - Stored BYOK plaintext is only available transiently server-side after decrypt.
 - Settings server actions re-check admin role.
-- AI route handlers re-check authentication/role.
+- AI route handlers re-check authentication/role. The partner copilot
+  (`/api/affiliates/cortex`) admits `RTL` and ADMIN only and registers three output-only tools
+  (see "Partner Storefront Copilot").
 - Global agent DB mutations use service-role Supabase only on the server.
 - Sensitive `site_settings` row is protected by RLS.
 - Do not log plaintext API keys.
@@ -2122,7 +2229,7 @@ When modifying Cortex AI, keep these invariants:
 1. `cortex-ai` is the package id. Do not reintroduce `ai`.
 2. Never put secrets in client code.
 3. Stored BYOK overrides `OPENROUTER_API_KEY` so paid model selection can work even in sandbox.
-4. Env-only routing must stay locked to the three explicit free models.
+4. Env-only routing must stay locked to the explicit free models: `CORTEX_AI_FREE_MODEL_FALLBACK_REGISTRY` for text, the `:free` entries of `CORTEX_AI_VISION_MODEL_FALLBACK_REGISTRY` for alt text.
 5. Stored BYOK requires `CORTEX_AI_ENCRYPTION_KEY`.
 6. Stored model selection must only use models with `tools` and `structured_outputs`.
 7. Inline editor generation returns HTML fragments, not strict Tiptap JSON.
@@ -2219,9 +2326,11 @@ means "nothing obvious found", never "safe".
 The site CSP carries a nonce, and per CSP Level 2 a browser **ignores
 `'unsafe-inline'` once a nonce is present**. Consequences:
 
-- Inline `<script>` inside rich-text block HTML must be stamped by
-  `apps/nextblock/lib/blocks/inlineScriptNonce.ts`, or the browser silently drops it
-  with no server-side symptom.
+- Inline `<script>` inside rich-text block HTML never runs: block HTML is WRITER-authored, so
+  every render path strips it with `sanitizeAuthoredBlockHtml` (`@nextblock-cms/utils`,
+  re-exported by `apps/nextblock/lib/blocks/inlineScriptNonce.ts`) instead of stamping the nonce
+  (docs/04 → "Authored HTML renders through `sanitizeAuthoredBlockHtml`"). Operator scripts go
+  through site scripts, which render nothing on the public sandbox.
 - Because NextBlock nonces author scripts, an external `src` on a site script is
   authorized regardless of the CSP host allowlist. That is inherent to the feature
   and a reason it is ADMIN-only.

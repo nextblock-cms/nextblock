@@ -511,6 +511,10 @@ function SignupPolicyCard({
   onSave: (formData: FormData) => void;
 }) {
   const [enabled, setEnabled] = useState(initial);
+  // Read-only on the sandbox, whose admin login is public (updateAutoAcceptSignups refuses
+  // there). The security page shows a notice instead of this panel on the sandbox today; the
+  // card stays honest if it is ever rendered there.
+  const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
   return (
     <Card>
@@ -535,6 +539,8 @@ function SignupPolicyCard({
               id="auto_accept_signups"
               checked={enabled}
               onCheckedChange={(checked) => setEnabled(checked === true)}
+              disabled={isSandbox}
+              aria-describedby={isSandbox ? 'auto_accept_signups_sandbox_note' : undefined}
               className="mt-1"
             />
             <div className="space-y-1">
@@ -545,12 +551,17 @@ function SignupPolicyCard({
                 New accounts become active immediately, even without SMTP configured. Convenient
                 for local / self-hosted use; leave off for public production sites.
               </p>
+              {isSandbox ? (
+                <p id="auto_accept_signups_sandbox_note" className="text-xs text-slate-500">
+                  Sign-up settings are disabled in the sandbox.
+                </p>
+              ) : null}
             </div>
           </div>
 
           <Separator />
 
-          <Button type="submit" disabled={isPending}>
+          <Button type="submit" disabled={isPending || isSandbox}>
             {isPending ? <Spinner className="mr-2 h-4 w-4 animate-spin" /> : null}
             Save Policy
           </Button>

@@ -22,6 +22,31 @@ export class StripeNotConfiguredError extends Error {
   }
 }
 
+/**
+ * The mode of a Stripe secret key from its documented prefix: true for a live key (`sk_live_`,
+ * restricted `rk_live_`), false for a test key (`sk_test_`, `rk_test_`; Stripe sandboxes use
+ * test keys too), null for anything else.
+ */
+export function stripeSecretKeyLivemode(key: string | null | undefined): boolean | null {
+  const value = typeof key === 'string' ? key.trim() : '';
+  if (value.startsWith('sk_live_') || value.startsWith('rk_live_')) return true;
+  if (value.startsWith('sk_test_') || value.startsWith('rk_test_')) return false;
+  return null;
+}
+
+/**
+ * The mode of the configured secret key (the one `getStripeClient()` uses), or null when none is
+ * configured, its prefix is unknown or it cannot be read. A checkout records it on an attributed
+ * order, so a test-mode sale is never paid out with live money (or the other way around).
+ */
+export async function resolveStripeKeyLivemode(): Promise<boolean | null> {
+  try {
+    return stripeSecretKeyLivemode(await resolveStripeSecretKey());
+  } catch {
+    return null;
+  }
+}
+
 export async function getStripeClient(): Promise<Stripe> {
   // Previously this substituted the literal 'sk_test_dummy' when nothing resolved, which
   // built a REAL Stripe client around a fake key. The first API call then failed with

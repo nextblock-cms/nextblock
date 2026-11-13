@@ -7,6 +7,7 @@ import { SectionBlockContent } from '../../../../lib/blocks/blockRegistry';
 import { getBlockDefinition } from '../../../../lib/blocks/blockRegistry';
 import SectionConfigPanel from "../components/SectionConfigPanel";
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
+import { sanitizeAuthoredBlockHtml } from '../../../../lib/blocks/inlineScriptNonce';
 import { Button, Label } from "@nextblock-cms/ui";
 import BackgroundSelector from "../components/BackgroundSelector";
 
@@ -563,8 +564,11 @@ export default function SectionBlockEditor({
                 {draggedBlock.block_type === "text" && (
                   <div
                     dangerouslySetInnerHTML={{
+                      // Block HTML is WRITER-authored: sanitized like every other render of it,
+                      // then cut. The cut only shortens safe markup, and a tag it leaves open is
+                      // dropped by the parser (this overlay only renders in the browser, mid-drag).
                       __html:
-                        (
+                        sanitizeAuthoredBlockHtml(
                           draggedBlock.content.html_content || "Empty text"
                         ).substring(0, 30) + "...",
                     }}

@@ -24,6 +24,9 @@ interface SiteScriptsProps {
  * applied here so the snippets satisfy the policy without it needing 'unsafe-inline'.
  */
 export default function SiteScripts({ nonce, placement, scripts }: SiteScriptsProps) {
+  // The sandbox's admin login is public: a script saved there would run for every later visitor, /cms and the partner portal included, and could read the OpenRouter key they keep in localStorage.
+  if (process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') return null;
+
   const forPlacement = scripts.filter((script) => script.placement === placement);
 
   if (forPlacement.length === 0) {

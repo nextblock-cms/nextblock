@@ -7,6 +7,14 @@ const packageJsonPath = path.resolve(__dirname, 'package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
 const { version, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+// peerDependencies: @nextblock-cms/utils, which lib/media-actions imports (`@nextblock-cms/utils/server`;
+// `@nextblock-cms/*` stays external), at the version libs/utils carries when this build runs.
+// release:all bumps utils before it builds db (LIBS in tools/scripts/release-all.js). Through 0.22.5
+// db declared none. tools/scripts/verify-lib-dist.js check 11 refuses an undeclared sibling import.
+const utilsVersion = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../utils/package.json'), 'utf8')).version;
+if (typeof utilsVersion !== 'string' || !/^\d+\.\d+\.\d+/.test(utilsVersion)) {
+  throw new Error("libs/utils/package.json has no version for db's peerDependencies");
+}
 
 export default defineConfig({
   root: __dirname,
@@ -40,6 +48,7 @@ export default defineConfig({
           main: 'index.cjs.js',
           module: 'index.es.js',
           types: 'index.d.ts',
+          peerDependencies: { '@nextblock-cms/utils': `^${utilsVersion}` },
           // Enables tree-shaking so a client importing the browser `createClient` from
           // '@nextblock-cms/db' does NOT drag in the server module (next/headers + the
           // typeof-window guard). db uses a runtime guard, not a 'use client'/'use server'

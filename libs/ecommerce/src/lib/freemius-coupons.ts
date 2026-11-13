@@ -1,4 +1,5 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { minorUnitAmountToMajor } from '@nextblock-cms/utils';
 
 import type { CouponDiscountType, CouponProviderScope } from './coupons';
@@ -8,6 +9,15 @@ import {
   resolveFreemiusCheckoutCredentials,
 } from './providers/freemius';
 import { hydrateFreemiusEnvFromDb } from './payment-config';
+
+/**
+ * Why nothing reaches Freemius on the public sandbox (NEXT_PUBLIC_IS_SANDBOX=true), whose admin
+ * login is published. Its reset syncs the store from the operator's Freemius developer account,
+ * so its products carry the operator's real product ids: a coupon pushed from there would be live
+ * on them and outlive every reset (the reset drops only the mapping rows). Thrown by
+ * freemiusCouponRequest and recorded as the coupon's sync error; the coupons screen shows it too.
+ */
+export const FREEMIUS_COUPON_SANDBOX_MESSAGE = "Coupons aren't sent to Freemius in the sandbox: its checkout is simulated.";
 
 type SupabaseLikeClient = SupabaseClient<any>;
 
@@ -68,6 +78,11 @@ async function freemiusCouponRequest(input: {
   couponId?: string | null;
   body?: Record<string, unknown>;
 }) {
+  // Every coupon request goes through here: on the sandbox none leaves, whichever caller got here.
+  if (isSandboxEnvironment()) {
+    throw new Error(FREEMIUS_COUPON_SANDBOX_MESSAGE);
+  }
+
   // Overlay any CMS-configured Freemius credentials (DB-first) before the sync env reads.
   await hydrateFreemiusEnvFromDb();
   const apiKey = getFreemiusApiKey(input.productId);
@@ -221,6 +236,29 @@ export async function syncCouponToFreemius(input: {
   couponId: string;
   client: SupabaseLikeClient;
 }) {
+  // On the sandbox the coupon stays local (the simulated checkout still applies it) and its row
+  // says why it was not sent. Only its scope is read: no target, no mapping row written. A
+  // Stripe-only coupon needs no Freemius sync anywhere, so it ends not_required as off the sandbox.
+  if (isSandboxEnvironment()) {
+    const { data: sandboxCoupon } = await (input.client as any)
+      .from('coupons')
+      .select('provider_scope')
+      .eq('id', input.couponId)
+      .maybeSingle();
+    await (input.client as any)
+      .from('coupons')
+      .update(
+        sandboxCoupon?.provider_scope === 'stripe'
+          ? { freemius_sync_status: 'not_required', freemius_sync_error: null }
+          : { freemius_sync_status: 'not_synced', freemius_sync_error: FREEMIUS_COUPON_SANDBOX_MESSAGE }
+      )
+      .eq('id', input.couponId);
+    return {
+      success: true,
+      targetCount: 0,
+    };
+  }
+
   const { data: coupon, error } = await (input.client as any)
     .from('coupons')
     .select(
@@ -336,11 +374,16 @@ function buildSaleCouponCode(input: { sku?: string | null; productId: string }) 
  * coupon with the sale window's start/end dates lets Freemius enforce the window
  * natively at its hosted checkout. Safe to call repeatedly (idempotent upsert
  * keyed by product_id). Never throws — failures are recorded on the mapping row.
+ * On the sandbox it sends and records nothing (FREEMIUS_COUPON_SANDBOX_MESSAGE).
  */
 export async function syncProductSaleCouponToFreemius(input: {
   productId: string;
   client: SupabaseLikeClient;
 }) {
+  if (isSandboxEnvironment()) {
+    return { success: true, skipped: true, reason: 'sandbox' };
+  }
+
   const { data: product, error } = await (input.client as any)
     .from('products')
     .select(
@@ -472,6 +515,12 @@ export async function deleteCouponFromFreemius(input: {
   couponId: string;
   client: SupabaseLikeClient;
 }) {
+  // A mapping row on the sandbox can name any remote coupon (a visitor can write one as the demo
+  // admin), and the delete would carry the operator's bearer: send nothing there.
+  if (isSandboxEnvironment()) {
+    return;
+  }
+
   const { data: mappings } = await (input.client as any)
     .from('coupon_freemius_mappings')
     .select('id, freemius_product_id, freemius_coupon_id')

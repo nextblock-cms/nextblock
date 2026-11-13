@@ -32,6 +32,24 @@ describe('server-action actor check', () => {
     }
   });
 
+  it('treats a partner id as an identity (Affiliates portal actions act for the session partner)', () => {
+    for (const name of ['affiliateId', 'affiliate_id', 'AffiliateID', 'retailerId', 'retailer_id']) {
+      expect(classifyName(name)).toBe('an identity');
+    }
+    for (const name of ['affiliateIdToUpdate', 'affiliateIdToSuspend', 'retailerIdToReview', 'pageIdToApprove', 'payoutIdToRetry', 'tierIdToUpdate']) {
+      expect(classifyName(name)).toBeNull();
+    }
+  });
+
+  it('fails an action that takes affiliateId, and passes one that names its admin target', () => {
+    const source = `"use server";
+      export async function saveStorefrontDraft(affiliateId: string, formData: FormData) {}
+      export async function submitForReview(input: { retailer_id: string; note: string }) {}
+      export const approvePage = async (pageIdToApprove: string, affiliateIdToUpdate: string) => {};
+      export async function updateTier(tierIdToUpdate: string, input: { affiliateIdToUpdate: string }) {}`;
+    expect(flagged(source)).toEqual(['saveStorefrontDraft:affiliateId', 'submitForReview:input.retailer_id']);
+  });
+
   it('catches the pre-2026-10-21 recordMediaUpload (actorUserId in an inline payload type)', () => {
     const source = `"use server";
       export async function recordMediaUpload(payload: {
@@ -135,5 +153,64 @@ describe('no server action in the repository takes its principal from the caller
 
   it('takes no actor, author, uploader or user id and no database client from a parameter', () => {
     expect((findCallerSuppliedActors(modules) as Problem[]).map((p) => p.problem)).toEqual([]);
+  });
+});
+
+describe('CMS server actions take the service-role client only from a verified helper', () => {
+  // 2026-10-27: app/cms/orders/actions.ts#markOrderAsPaid read the role with the cookie client,
+  // then built a service-role client from the env keys itself, so a first factor alone could
+  // mark an order paid (and, since 02030, record a partner's commission). The ecommerce lib's
+  // order status actions had the same shape. A CMS action takes the service client from
+  // requireCmsAdmin / requireCmsStaff (app) or requireEcomAdmin / requireEcomStaff (libs), which
+  // refuse a session that has not passed its enrolled second factor; this check fails on any
+  // module under the CMS trees that has a 'use server' directive and mints the client itself.
+  const CMS_ACTION_PATH = /^(?:apps\/nextblock\/app\/cms\/|libs\/[^/]+\/src\/lib\/pages\/cms\/)/;
+  const USE_SERVER_ANYWHERE = /['"]use server['"]/;
+  const RAW_SERVICE_ROLE: ReadonlyArray<readonly [RegExp, string]> = [
+    [/^\s*import\s+(?!type\b)[^;]*\bcreateClient\b[^;]*\bfrom\s+['"]@supabase\/supabase-js['"]/m, 'builds its own supabase-js client'],
+    [/process\.env(?:\.|\[\s*['"])(?:SUPABASE_SERVICE_ROLE_KEY|SUPABASE_SECRET_KEY)\b/, 'reads the secret key from process.env'],
+    [/\bresolveSupabaseServiceKey\b/, 'resolves the secret key itself'],
+  ];
+
+  function rawServiceRoleUses(source: string): string[] {
+    return RAW_SERVICE_ROLE.filter(([re]) => re.test(source)).map(([, what]) => what);
+  }
+
+  // Scanned once at collection time, like the repository-wide check above: under a full parallel
+  // run the scan alone outlasts a test's default timeout.
+  const cmsActionModules = [...scanRepository().values()]
+    .filter((mod: { repoPath: string }) => CMS_ACTION_PATH.test(mod.repoPath))
+    .map((mod: { repoPath: string; absolute: string }) => [mod.repoPath, fs.readFileSync(mod.absolute, 'utf8')] as const)
+    .filter(([, source]) => USE_SERVER_ANYWHERE.test(source));
+
+  it('recognises the pre-2026-10-27 markOrderAsPaid shape, and not a type-only import', () => {
+    const before = [
+      "'use server';",
+      "import { createClient } from '@nextblock-cms/db/server';",
+      "import { createClient as createSupabaseClient } from '@supabase/supabase-js';",
+      'export async function markOrderAsPaid(orderId: string) {',
+      '  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;',
+      '}',
+    ].join('\n');
+    expect(rawServiceRoleUses(before)).toEqual(['builds its own supabase-js client', 'reads the secret key from process.env']);
+    expect(rawServiceRoleUses("import { resolveSupabaseServiceKey } from '../../lib/setup/service-key';")).toEqual([
+      'resolves the secret key itself',
+    ]);
+    expect(rawServiceRoleUses("import type { SupabaseClient } from '@supabase/supabase-js';")).toEqual([]);
+    expect(rawServiceRoleUses("const { supabase } = await requireCmsAdmin();")).toEqual([]);
+  });
+
+  it('finds none in the app CMS or the libraries\' CMS pages', () => {
+    // Coverage: the scan must actually see the CMS action modules, the two order modules included.
+    const paths = cmsActionModules.map(([repoPath]) => repoPath);
+    expect(paths.length).toBeGreaterThan(40);
+    expect(paths).toContain('apps/nextblock/app/cms/orders/actions.ts');
+    expect(paths).toContain('libs/ecommerce/src/lib/pages/cms/orders/server-actions.ts');
+    expect(paths).toContain('apps/nextblock/app/cms/affiliates/actions.ts');
+
+    const offenders = cmsActionModules.flatMap(([repoPath, source]) =>
+      rawServiceRoleUses(source).map((what) => repoPath + ': ' + what)
+    );
+    expect(offenders).toEqual([]);
   });
 });

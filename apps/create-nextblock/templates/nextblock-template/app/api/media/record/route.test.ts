@@ -151,6 +151,47 @@ describe('POST /api/media/record', () => {
       expect(mocks.insert).not.toHaveBeenCalled();
     });
 
+    // Affiliates: partner avatars and storefront images live under affiliates/avatars/ and
+    // affiliates/pages/. A media row that names one would let a WRITER delete a partner's file
+    // through the media library (decoy row).
+    it.each([
+      { r2OriginalKey: 'affiliates/avatars/u1/avatar_20260102030405.avif' },
+      { r2OriginalKey: '/affiliates/avatars/u1/avatar.png' },
+      { r2OriginalKey: 'Affiliates/avatars/u1/avatar.png' },
+      // The shared predicate (lib/storage/upload-policy) also drops leading whitespace.
+      { r2OriginalKey: ' affiliates/avatars/u1/avatar.png' },
+      {
+        r2OriginalKey: 'uploads/photo_20260102030405.png',
+        r2Variants: [{ objectKey: 'affiliates/pages/u1/hero_large.avif', variantLabel: 'large_avif' }],
+      },
+      {
+        r2OriginalKey: 'uploads/photo_20260102030405.png',
+        originalImageDetails: { objectKey: 'affiliates/avatars/u1/avatar.png', variantLabel: 'original_uploaded' },
+      },
+    ])('400s a payload naming a partner upload (%j) and never inserts', async (fields) => {
+      const response = await POST(request({ fileName: 'avatar.png', ...fields }));
+      expect(response.status).toBe(400);
+      expect((await json(response)).error).toBe('Invalid object key.');
+      expect(mocks.insert).not.toHaveBeenCalled();
+    });
+
+    it('still records a media key that merely contains "affiliates/" deeper in the path', async () => {
+      const response = await POST(request({ fileName: 'a.png', r2OriginalKey: 'uploads/affiliates/a_20260102030405.png' }));
+      expect(response.status).toBe(201);
+    });
+
+    it('records a media key under affiliates/ outside the partner namespaces (an ordinary folder)', async () => {
+      const response = await POST(
+        request({
+          fileName: 'banner.png',
+          r2OriginalKey: 'affiliates/banners/banner_20260102030405.png',
+          r2Variants: [{ objectKey: 'affiliates/banners/banner_20260102030405_large.avif', variantLabel: 'large_avif' }],
+        }),
+      );
+      expect(response.status).toBe(201);
+      expect(mocks.insert).toHaveBeenCalledTimes(1);
+    });
+
     it('accepts a normal image upload with avif variants', async () => {
       const response = await POST(
         request({

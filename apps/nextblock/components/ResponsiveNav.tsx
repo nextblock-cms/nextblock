@@ -9,6 +9,7 @@ import { useTranslations } from '@nextblock-cms/utils';
 import { useLabel } from '../lib/i18n/use-label';
 import { DeferredGlobalSearch } from './DeferredGlobalSearch';
 import { resolveMediaUrl } from '../lib/media/resolveMediaUrl';
+import { isPartnerProgramHeaderItem } from '../lib/affiliates/partner-program-nav';
 
 type Logo = Database['public']['Tables']['logos']['Row'] & { media: Database['public']['Tables']['media']['Row'] | null };
 type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
@@ -16,6 +17,26 @@ import Image from 'next/image'
 import { EyeOff, FilePenLine, Pencil } from 'lucide-react';
 
 const FALLBACK_LOGO_PATH = '/images/nextblock-logo-small.webp';
+
+// The partner program's seeded header link (02034, lib/affiliates/partner-program-nav.ts) as a
+// top-level entry without children: a tinted pill, never a second solid button (Sign up is the
+// solid one). Hover strengthens the border and underlines the label but keeps the background, so
+// the text contrast never drops. The "New" badge shows from lg up: between 768 and 1023 px the row
+// already holds the logo, the links and the whole account cluster, so the pill stays compact there.
+const PARTNER_PILL_CLASS_NAME =
+  'group/partner inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-sm font-semibold text-foreground motion-safe:transition-colors hover:border-primary/70 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring lg:px-3 lg:py-1.5';
+const PARTNER_PILL_LABEL_CLASS_NAME = 'underline-offset-4 group-hover/partner:underline';
+const NEW_BADGE_CLASS_NAME =
+  'rounded-full bg-primary px-1.5 text-[10px] font-bold uppercase leading-4 tracking-wide text-primary-foreground';
+const PARTNER_PILL_BADGE_CLASS_NAME = `hidden lg:inline-block ${NEW_BADGE_CLASS_NAME}`;
+// The same link in the mobile drawer: a highlighted full-width row, badge included.
+const PARTNER_MOBILE_LINK_CLASS_NAME =
+  'flex w-full items-center justify-between gap-3 rounded-md border border-primary/30 bg-primary/10 px-3 py-2 text-base font-semibold text-foreground motion-safe:transition-colors hover:border-primary/70 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring';
+
+/** The partner program link rendered as a pill (desktop) or a highlighted row (mobile drawer). */
+function isPartnerProgramPill(item: HierarchicalNavigationItem): boolean {
+  return item.children.length === 0 && isPartnerProgramHeaderItem(item);
+}
 
 // Define a type for hierarchical navigation items
 interface HierarchicalNavigationItem extends NavigationItem {
@@ -97,10 +118,13 @@ function ClientOnly({ children }: { children: React.ReactNode }) {
 function DesktopNavItem({
   item,
   isSubmenu,
+  newBadgeLabel,
   renderChildren,
 }: {
   item: HierarchicalNavigationItem;
   isSubmenu: boolean;
+  /** Text of the badge on the partner program pill ("New" / "Nouveau"). */
+  newBadgeLabel: string;
   renderChildren: (items: HierarchicalNavigationItem[]) => React.ReactNode;
 }) {
   const [isOpen, setIsOpen] = useState(false);
@@ -108,6 +132,17 @@ function DesktopNavItem({
   const linkRef = useRef<HTMLAnchorElement>(null);
   const hasChildren = item.children.length > 0;
   const linkClassName = `flex items-center justify-between hover:underline px-3 py-2 text-sm text-foreground ${isSubmenu ? 'w-full hover:bg-gray-100 dark:hover:bg-gray-700 rounded-md' : ''}`;
+
+  if (!isSubmenu && isPartnerProgramPill(item)) {
+    return (
+      <div className="relative">
+        <Link href={item.url} className={PARTNER_PILL_CLASS_NAME}>
+          <span className={PARTNER_PILL_LABEL_CLASS_NAME}>{item.label}</span>
+          <span className={PARTNER_PILL_BADGE_CLASS_NAME}>{newBadgeLabel}</span>
+        </Link>
+      </div>
+    );
+  }
 
   if (!hasChildren) {
     return (
@@ -186,6 +221,7 @@ export default function ResponsiveNav({
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const wasMobileMenuOpenRef = useRef(false);
   const closeMenuLabel = label('close_main_menu', 'Close main menu', 'Fermer le menu principal');
+  const newBadgeLabel = label('nav.badge_new', 'New', 'Nouveau');
   const [expandedMobileItems, setExpandedMobileItems] = useState<Record<string, boolean>>({});
 
   const menuButtonRef = useRef<HTMLButtonElement>(null);
@@ -343,7 +379,20 @@ export default function ResponsiveNav({
   }, [isMobileMenuOpen]);
 
   const renderMobileNavItems = (items: HierarchicalNavigationItem[], level = 0): React.JSX.Element[] => {
-    return items.map(item => (
+    return items.map(item => level === 0 && isPartnerProgramPill(item) ? (
+      <div key={item.id}>
+        <Link
+          href={item.url}
+          className={PARTNER_MOBILE_LINK_CLASS_NAME}
+          onClick={() => {
+            toggleMobileMenu();
+          }}
+        >
+          <span>{item.label}</span>
+          <span className={NEW_BADGE_CLASS_NAME}>{newBadgeLabel}</span>
+        </Link>
+      </div>
+    ) : (
       <div key={item.id} className={`${level > 0 ? 'ml-0' : ''}`}>
         <div
           className={`flex items-center justify-between w-full text-base font-medium text-foreground rounded-md hover:bg-gray-100 dark:hover:bg-gray-700 ${level > 0 ? 'px-3 py-2' : 'px-3 py-2'}`}
@@ -396,6 +445,7 @@ export default function ResponsiveNav({
         key={item.id}
         item={item}
         isSubmenu={isSubmenu}
+        newBadgeLabel={newBadgeLabel}
         renderChildren={(children) => renderDesktopNavItems(children, true)}
       />
     ));

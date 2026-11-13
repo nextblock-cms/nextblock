@@ -1,6 +1,6 @@
 'use server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import {
   getPrivacySettings as readPrivacySettings,
@@ -8,6 +8,7 @@ import {
 } from '../../../../lib/privacy/settings';
 import type { PrivacySettings } from '../../../../lib/privacy/types';
 import type { SettingsActionResult } from '../../../../lib/cms/action-result';
+import { SITE_SCRIPTS_SANDBOX_MESSAGE } from '../site-scripts/sandbox-lock';
 
 export interface GoogleAnalyticsSettings {
   gtm_id: string;
@@ -49,6 +50,10 @@ export async function updateGoogleAnalyticsSettings(
 ): Promise<SettingsActionResult> {
   const denied = await adminCheck();
   if (denied) return denied;
+
+  // The sandbox's admin login is public: a GTM container or a custom script saved there would run
+  // for every later visitor (ConsentGatedAnalytics injects nothing there either).
+  if (isSandboxEnvironment()) return { ok: false, error: SITE_SCRIPTS_SANDBOX_MESSAGE };
 
   // Only the analytics fields are touched; mergePrivacySettings preserves the
   // banner/corporate fields owned by the Privacy & Consent page.

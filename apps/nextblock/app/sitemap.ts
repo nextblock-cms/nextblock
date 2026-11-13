@@ -1,12 +1,25 @@
 import type { MetadataRoute } from 'next';
+import { AFFILIATE_TERMS_VERSION } from '@nextblock-cms/affiliates';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
 import {
+  excludeCodeRoutePaths,
   fetchAllActiveProducts,
+  fetchAllPartnerStorefronts,
   fetchAllPublishedPages,
   fetchAllPublishedPosts,
   type SitemapEntry,
 } from './lib/sitemap-utils';
+import {
+  buildPartnersLocalePaths,
+  buildPartnersTermsLocalePaths,
+  partnersHreflangPaths,
+  partnersProgramOwnedPaths,
+  partnersTermsOverrideForLocale,
+} from '../lib/affiliates/partners-paths';
+import { getActiveRequestLanguages } from '../lib/affiliates/request-locale';
+import { getPublicAffiliatesProgramSettings } from '../lib/affiliates/settings';
 import { resolveSiteUrl, hasResolvedSiteUrl } from '../lib/site-url';
+import { isAffiliatesProgramActive } from '../lib/affiliates/package-state';
 
 /**
  * Cache the generated sitemap and rebuild it at most once an hour. Crawlers get
@@ -56,6 +69,16 @@ function toSitemapItem(
   return item;
 }
 
+/** Whether a premium package verifies as active; a failed check omits its URLs (never the sitemap). */
+async function isPackageActive(packageId: string, label: string): Promise<boolean> {
+  try {
+    return await verifyPackageOnline(packageId);
+  } catch (error) {
+    console.error(`Sitemap: failed to verify the ${packageId} package; omitting ${label}.`, error);
+    return false;
+  }
+}
+
 async function safe(
   label: string,
   load: () => Promise<SitemapEntry[]>,
@@ -83,19 +106,21 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 
   // Products live behind the premium ecommerce package; their routes 404 when
   // it is inactive (see app/product/[slug]/page.tsx), so only advertise them
-  // when the package verifies as active.
-  let ecommerceActive = false;
-  try {
-    ecommerceActive = await verifyPackageOnline('ecommerce');
-  } catch (error) {
-    console.error('Sitemap: failed to verify the ecommerce package; omitting products.', error);
-  }
+  // when the package verifies as active. The partner pages (/partners and every
+  // published storefront) are gated the same way on the Affiliates package.
+  const [ecommerceActive, affiliatesActive] = await Promise.all([
+    isPackageActive('ecommerce', 'products'),
+    isAffiliatesProgramActive(),
+  ]);
 
-  const [pages, posts, products] = await Promise.all([
+  const [pages, posts, products, partnerStorefronts] = await Promise.all([
     safe('pages', fetchAllPublishedPages),
     safe('posts', fetchAllPublishedPosts),
     ecommerceActive
       ? safe('products', fetchAllActiveProducts)
+      : Promise.resolve<SitemapEntry[]>([]),
+    affiliatesActive
+      ? safe('partner storefronts', fetchAllPartnerStorefronts)
       : Promise.resolve<SitemapEntry[]>([]),
   ]);
 
@@ -109,11 +134,62 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     priority: 1,
   };
 
+  // The partner program's landing page: a code-defined route like the homepage, with one address
+  // per language (/partners, and /partenaires while French is active) that cross-link with hreflang.
+  // While the program is active it answers those addresses itself, so a CMS page with one of those
+  // slugs is not served there and leaves the sitemap; while it is inactive the CMS page is served
+  // there (and listed as any page).
+  const partnerLanguageCodes = affiliatesActive ? (await getActiveRequestLanguages()).activeCodes : null;
+  const partnerPaths = partnerLanguageCodes ? buildPartnersLocalePaths(partnerLanguageCodes) : null;
+  const partnerHreflang = partnerPaths ? partnersHreflangPaths(partnerPaths) : null;
+  const partnerLandingPaths = partnerPaths
+    ? [...new Set([partnerPaths.en, partnerPaths.fr].filter((path): path is string => Boolean(path)))]
+    : [];
+  const partnerItems: SitemapItem[] = affiliatesActive
+    ? [
+        ...partnerLandingPaths.map((path) =>
+          toSitemapItem(
+            { path, lastModified: new Date().toISOString(), ...(partnerHreflang ? { alternates: partnerHreflang } : {}) },
+            'weekly',
+            0.6,
+          ),
+        ),
+        ...partnerStorefronts.map((entry) => toSitemapItem(entry, 'weekly', 0.5)),
+      ]
+    : [];
+  const listedPages = partnerPaths ? excludeCodeRoutePaths(pages, partnersProgramOwnedPaths(partnerPaths)) : pages;
+
+  // The built-in partner terms, gated like the landing page and with one address per language the
+  // same way (/partners/terms, and /partenaires/conditions while French is active). An address whose
+  // language the operator replaced with a page of their own redirects there, so it is left out, and
+  // the two cross-link with hreflang only while both are listed. lastmod is the terms' version.
+  const termsItems: SitemapItem[] = [];
+  if (partnerLanguageCodes) {
+    const termsPaths = buildPartnersTermsLocalePaths(partnerLanguageCodes);
+    const programSettings = await getPublicAffiliatesProgramSettings();
+    const listedTerms = [
+      termsPaths.en && !partnersTermsOverrideForLocale('en', programSettings) ? termsPaths.en : null,
+      termsPaths.fr && !partnersTermsOverrideForLocale('fr', programSettings) ? termsPaths.fr : null,
+    ].filter((path): path is string => Boolean(path));
+    const termsHreflang = listedTerms.length === 2 ? partnersHreflangPaths(termsPaths) : null;
+    for (const path of listedTerms) {
+      termsItems.push(
+        toSitemapItem(
+          { path, lastModified: `${AFFILIATE_TERMS_VERSION}T00:00:00.000Z`, ...(termsHreflang ? { alternates: termsHreflang } : {}) },
+          'monthly',
+          0.3,
+        ),
+      );
+    }
+  }
+
   const items: SitemapItem[] = [
     homepage,
-    ...pages.map((entry) => toSitemapItem(entry, 'weekly', 0.8)),
+    ...listedPages.map((entry) => toSitemapItem(entry, 'weekly', 0.8)),
     ...posts.map((entry) => toSitemapItem(entry, 'weekly', 0.6)),
     ...products.map((entry) => toSitemapItem(entry, 'daily', 0.7)),
+    ...partnerItems,
+    ...termsItems,
   ];
 
   // Translations can share a slug (NextBlock has no locale path prefix), so the

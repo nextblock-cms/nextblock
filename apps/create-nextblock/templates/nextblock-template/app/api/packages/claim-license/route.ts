@@ -8,9 +8,9 @@ import { getPackageByFreemiusId } from '@nextblock-cms/utils';
  * buyer's CMS so it can activate without the operator pasting anything.
  *
  * Only the deployment that sells the packages (nextblock.dev) enables this, with
- * `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true` and the vendor Freemius credentials for
- * products 24851 / 28609. Every other install answers 404. The buyer's CMS calls it
- * server-to-server from `activatePurchasedPackage` right after the Freemius checkout
+ * `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true` and the vendor Freemius credentials for every
+ * product it sells (24851 / 28609 / 43273). Every other install answers 404. The buyer's
+ * CMS calls it server-to-server from `activatePurchasedPackage` right after the Freemius checkout
  * overlay reports success; see libs/ecommerce/src/lib/freemius-license-claim.ts for
  * the checks that decide whether a claim is honoured. Refusals are deliberately
  * uniform (same status, same message) so the endpoint is not an oracle for which

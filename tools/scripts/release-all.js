@@ -7,7 +7,8 @@
 //   npm run release:all -- 0.8.0 --dry-run  # print the plan, change/publish nothing
 //
 // Publishes in dependency order so each package's @nextblock-cms/* deps are already on
-// npmjs when it goes out: libs (utils → ui → sdk → db → editor → ecommerce) then the CLI.
+// npmjs when it goes out: libs (utils → ui → sdk → db → editor → ecommerce → cortex →
+// affiliates) then the CLI.
 // The CLI step (release-cli.js) also stamps the root + template (apps/nextblock) and the
 // create-nextblock package, syncs the template, and publishes create-nextblock.
 
@@ -41,8 +42,9 @@ const versionSpec = versionArg;
 const workspaceRoot = process.cwd();
 
 // Dependency-ordered: a package's @nextblock-cms/* deps must publish before it.
-// cortex depends on db + ecommerce + utils, so it publishes last of the libs.
-const LIBS = ['utils', 'ui', 'sdk', 'db', 'editor', 'ecommerce', 'cortex'];
+// cortex depends on db + ecommerce + utils; affiliates (utils + ui) goes after it, and every
+// lib before the CLI, whose template depends on all of them.
+const LIBS = ['utils', 'ui', 'sdk', 'db', 'editor', 'ecommerce', 'cortex', 'affiliates'];
 
 function pkgName(lib) {
   return `@nextblock-cms/${lib === 'ecommerce' ? 'ecom' : lib}`;

@@ -37,6 +37,16 @@ The commerce schema spans:
   `shipping_zone_locations`, `shipping_zone_methods`, `tax_rates`,
   `currencies`
 
+With the Affiliates package (migration `02030`), `orders` also carries `affiliate_id` (the
+partner credited, `ON DELETE SET NULL`), `affiliate_source` (`storefront` or `referral_link`),
+`affiliate_base_currency` (the store default currency at checkout, the commission currency) and
+`affiliate_livemode` (the payment mode: false for a Stripe test key or the Freemius sandbox, true
+for live, NULL when unknown and treated as live). Both providers write them only when checkout
+resolved an attribution. `affiliate_refunded_minor` and `affiliate_refund_total_minor` are
+written by the refund webhooks, not by checkout: a partial refund that arrives before the order
+has a commission is kept there and taken off when the commission is recorded. See
+[15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md) → "Attribution".
+
 `products` can be physical or digital. The current provider selection logic
 resolves:
 
@@ -156,8 +166,9 @@ The app exposes both through:
 - a daily background refresh from the CMS layout
   (`apps/nextblock/lib/commerce/currency-rates-refresh.ts`, `after()`-based so it needs
   no cron), active only while the ecommerce package is on
-- `GET /api/cron/sync-currencies`, guarded by `CRON_SECRET`, for operators who prefer an
-  explicit external schedule (it is no longer declared in `vercel.json`)
+- `GET /api/cron/sync-currencies`, guarded by `CRON_SECRET` when it is set (constant-time
+  compare, `isCronRequestAuthorized()` in `apps/nextblock/lib/cron/cron-secret.ts`), for
+  operators who prefer an explicit external schedule (it is no longer declared in `vercel.json`)
 
 ## Tax Calculation
 
@@ -238,6 +249,25 @@ The storefront calls this through
 
 Stripe is the current payment flow for physical products.
 
+The keys are entered once, under CMS → Payments (`site_settings` `payment_public` /
+`payment_secret`, DB first), with `STRIPE_SECRET_KEY`, `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` and
+`STRIPE_WEBHOOK_SECRET` as env fallbacks (`libs/ecommerce/src/lib/payment-config.ts`). The same
+Stripe account and secret key also pay affiliate partners: payouts are Stripe Connect transfers
+from the platform balance, including the commissions on Freemius sales (Freemius pays the store,
+never the partners). Payouts need only the secret key; the publishable key and the webhook secret
+serve checkout and refunds. So a store that sells only digital products still needs a Stripe
+secret key to run the partner program, and while the Affiliates program is active the Payments
+screen says so (the app passes `isAffiliatesProgramActive()` to `PaymentsPage({ partnerPayouts })`;
+a store without the add-on sees the plain "Stripe (physical products)" heading). CMS → Affiliates
+→ Stripe payouts shows the key facts (`getStripeKeyDiagnostics()`: source, mode, last 4
+characters, the publishable key's mode, the webhook secret) and runs a read-only connection test
+(docs/15 → "The CMS screens"). The event list the endpoint must send is
+`STRIPE_REQUIRED_WEBHOOK_EVENTS` (`stripe/webhook-events.ts`), shared by the Payments screen and
+that test. Locally, `stripe listen --events <those six events, comma-separated> --forward-to
+localhost:<port>/api/webhooks/stripe` forwards them (`stripeCliListenCommand()` builds it, and
+`npm run stripe` runs it for port 4200 in the monorepo); current Stripe CLI versions refuse
+`stripe listen` without `--events`. Its printed `whsec_…` secret is then the webhook secret.
+
 ### Checkout flow
 
 `app/api/checkout/route.ts`:
@@ -256,28 +286,68 @@ Stripe is the current payment flow for physical products.
 - resolves shipping cost from the selected shipping method
 - calculates tax in manual or automatic mode
 - upserts a Stripe customer when an email is available
-- inserts a pending `orders` row plus `order_items`
+- inserts a pending `orders` row plus `order_items` (with the affiliate attribution columns when
+  an attribution was resolved; the insert is retried without them on an install that lacks
+  them)
 - stores currency, subtotal, shipping, tax, and exchange-rate data
-- creates the Stripe Checkout Session and stores `stripe_session_id`
+- creates the Stripe Checkout Session and stores `stripe_session_id`; the session sets
+  `payment_intent_data.metadata.orderId` (so a refund can find the order) and
+  `metadata.affiliateId` when the order is attributed
 
 ### Webhook flow
 
-`app/api/webhooks/stripe/route.ts` passes the raw body to
-`handleStripeWebhook()`.
+The Stripe webhook endpoint must send these events (CMS → Payments lists them):
 
-On `checkout.session.completed`, the sync layer:
+- `checkout.session.completed`
+- `checkout.session.async_payment_succeeded`
+- `checkout.session.async_payment_failed`
+- `charge.refunded`
+- `charge.dispute.created`
+- `charge.dispute.closed`
+
+> **Upgrade note.** Endpoints created before the Affiliates release must add
+> `charge.refunded`, `charge.dispute.created` and `charge.dispute.closed` in the Stripe
+> dashboard; until then refunds and lost disputes reach neither the order status nor the
+> affiliate commissions, and an open dispute never holds a commission. Locally, `npm run stripe`
+> forwards exactly these events.
+
+`app/api/webhooks/stripe/route.ts` passes the raw body to
+`handleStripeWebhook()`, which verifies the signature and returns the verified event.
+
+On a settled `checkout.session.completed` or `checkout.session.async_payment_succeeded` (the
+payment has arrived), the sync layer:
 
 - reloads the session with tax breakdown details
 - finds the existing order
 - stores payment intent, customer details, and finalized totals
 - normalizes tax details from Stripe
 - updates saved customer addresses
-- assigns invoice metadata
+- assigns invoice metadata (this sets `paid_at`, which records an attributed order's affiliate
+  commission through the `orders` trigger)
 - applies inventory deduction
+
+`syncStripeOrderFromSession` never moves a `refunded` or `shipped` order back to `paid`, so a
+replayed event or a success-page revisit cannot revive it.
+
+Refunds and disputes are applied by the app route itself (`syncStripeOrderRefundFromEvent`,
+`syncStripeOrderDisputeFromEvent` and `lib/affiliates/refunds.ts`):
+
+- The order is found by `payment_intent_id`, else by the `orderId` metadata of the charge or its
+  PaymentIntent.
+- `charge.refunded` with the whole charge refunded (`refunded === true` or
+  `amount_refunded >= amount`), or `charge.dispute.closed` with `status === 'lost'`, moves a paid
+  or shipped order to `refunded` in one conditional update. Other statuses are left alone.
+- `apply_affiliate_refund` then voids or reduces the commission on every refund, whatever the
+  Affiliates package state: full refunds void it, partial refunds reduce it pro rata from the
+  charge's cumulative `amount_refunded`, measured on the charge without its shipping share, and a
+  refund after the commission was paid out raises an alert.
+- An opened dispute (`charge.dispute.created`) holds the order's affiliate commission, and one
+  closed without a loss releases it; the order status does not change.
+- A failure answers 500, so Stripe redelivers.
 
 ## NextBlock package purchases (vendor side)
 
-NextBlock's own premium packages (Commerce Pro 24851, Cortex AI 28609) are sold through
+NextBlock's own premium packages (Commerce Pro 24851, Cortex AI 28609, Affiliates 43273) are sold through
 Freemius as well, and every CMS can buy them from `/cms/settings/packages`. The buyer's
 CMS cannot read the license key from the checkout callback, so the vendor deployment
 (nextblock.dev) exposes `POST /api/packages/claim-license` — enabled only with
@@ -290,6 +360,18 @@ docs/08 → "Buying from the dashboard".
 ## Freemius Licensing and Product Sync
 
 Freemius currently handles digital-product checkout and product synchronization.
+
+### Freemius keys (CMS → Payments)
+
+Freemius gives every product its own public key, secret key and API bearer token (the product →
+Settings → API & Keys). The Payments screen holds ONE product's keys (`FREEMIUS_PUBLIC_KEY`,
+`FREEMIUS_SECRET_KEY`, `FREEMIUS_API_KEY` after hydration). A store selling several Freemius
+products also lists each product's keys in `FREEMIUS_CHECKOUT_PRODUCTS_JSON`: webhooks are signed
+with the selling product's secret key (`getFreemiusWebhookSecretCandidates` tries every known secret),
+and license and coupon calls use that product's token. The global Product ID is optional: checkout,
+orders, licenses, coupons and webhooks use the `freemius_product_id` / `freemius_plan_id` saved on
+each product, and readiness needs only the public and secret keys. The Developer ID is used only by
+Sync from Freemius (developer-scope calls). The screen says all of this beside the fields.
 
 ### Checkout behavior
 
@@ -347,11 +429,27 @@ Supported credential sources include:
 
 These flows are surfaced in the CMS product actions and the sandbox reset route.
 
-### Current webhook limitation
+### Webhook flow
 
-`app/api/webhooks/freemius/route.ts` currently verifies the webhook signature
-and acknowledges selected event types, but it does not yet reconcile license or
-order state back into the local database.
+`app/api/webhooks/freemius/route.ts` verifies the signature (`x-signature`) over the raw body
+on every install, then:
+
+- `payment.dispute.created` and `payment.dispute.won` are never synced (the order keeps its
+  status); they hold and release the order's affiliate commission
+  (`syncFreemiusOrderDisputeFromWebhookEvent`, `FREEMIUS_DISPUTE_EVENT_TYPES`).
+- `payment.refund` (Freemius' name), `payment.refunded`, `payment.dispute.lost` and
+  `payment.dispute.closed` are handled **instead of** the order sync, as full refunds: the order
+  is found by license id and moved to `refunded` when it is paid or shipped
+  (`syncFreemiusOrderRefundFromWebhookEvent`), then `apply_affiliate_refund` voids its
+  commission, whatever the Affiliates package state. The refund of a renewal payment
+  (`is_renewal`) changes nothing: affiliate commissions are earned on the first payment only.
+- Every other event goes to `syncFreemiusOrderFromWebhookEvent`, which finds the order by
+  license id and updates its status from the event and the purchase data (paid on a positive
+  payment or a trial conversion, `trial` for a no-card trial, cancelled when a pending or trial
+  license is cancelled or expires). `applyFreemiusOrderState` keeps a `paid` order paid and a
+  `refunded` order refunded.
+
+A failure answers 500, so Freemius redelivers.
 
 ## Inventory Management and Fulfillment
 
@@ -379,7 +477,19 @@ Order statuses currently supported in code are:
 - `refunded`
 
 Manual CMS order status changes also trigger invoice assignment and inventory
-deduction when an order is moved to `paid`.
+deduction when an order is moved to `paid`. The status actions
+(`libs/ecommerce/src/lib/pages/cms/orders/server-actions.ts`) authorize with
+`requireEcomStaff()` / `requireEcomAdmin()`, so the enrolled second factor is required: `paid`,
+`cancelled` and `refunded` are ADMIN-only, and a WRITER may move an order through fulfillment.
+The app's own `markOrderAsPaid` (`apps/nextblock/app/cms/orders/actions.ts`) takes its client
+from `requireCmsAdmin()` the same way; `tools/scripts/server-action-actors.test.ts` fails on any
+CMS server action that builds its own service-role client.
+
+With the Affiliates package, the `orders` triggers of `02030` follow these changes: the first
+time `paid_at` is set on an attributed order a commission is recorded, moving an order to
+`refunded` or `cancelled` voids it, and deleting an order voids it too. A commission that was
+already paid out is never voided silently: it is flagged and raises an alert, which is emailed
+to the affiliate notification addresses (docs/15).
 
 ## Invoice and Order Presentation
 

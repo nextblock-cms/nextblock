@@ -82,6 +82,7 @@ const PACKAGE_VERSION_SOURCES = {
   '@nextblock-cms/editor': resolve(REPO_ROOT, 'libs/editor/package.json'),
   '@nextblock-cms/sdk': resolve(REPO_ROOT, 'libs/sdk/package.json'),
   '@nextblock-cms/cortex': resolve(REPO_ROOT, 'libs/cortex/package.json'),
+  '@nextblock-cms/affiliates': resolve(REPO_ROOT, 'libs/affiliates/package.json'),
 };
 
 program
@@ -1779,6 +1780,7 @@ module.exports = {
     './lib/**/*.{js,ts,jsx,tsx,mdx}',
     './node_modules/@nextblock-cms/ui/**/*.{js,ts,jsx,tsx}',
     './node_modules/@nextblock-cms/editor/**/*.{js,ts,jsx,tsx}',
+    './node_modules/@nextblock-cms/affiliates/**/*.{js,cjs,mjs}',
   ],
   safelist: [
     'animate-enter',

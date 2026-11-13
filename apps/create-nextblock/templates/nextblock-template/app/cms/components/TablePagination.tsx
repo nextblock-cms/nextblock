@@ -19,6 +19,9 @@ interface TablePaginationProps {
   basePath: string;
   itemLabel?: string;
   pageSizeOptions?: number[];
+  /** Query parameters this table pages with (defaults `page` / `pageSize`): two tables on one screen need their own. */
+  pageParam?: string;
+  pageSizeParam?: string;
 }
 
 export default function TablePagination({
@@ -28,6 +31,8 @@ export default function TablePagination({
   basePath,
   itemLabel = "items",
   pageSizeOptions = [10, 25, 50, 100],
+  pageParam = "page",
+  pageSizeParam = "pageSize",
 }: TablePaginationProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -40,16 +45,16 @@ export default function TablePagination({
     const current = new URLSearchParams(Array.from(searchParams.entries()));
 
     if (newPage > 1) {
-      current.set("page", newPage.toString());
+      current.set(pageParam, newPage.toString());
     } else {
-      current.delete("page");
+      current.delete(pageParam);
     }
 
     const effectivePageSize = newPageSize ?? pageSize;
     if (effectivePageSize !== 25) {
-      current.set("pageSize", effectivePageSize.toString());
+      current.set(pageSizeParam, effectivePageSize.toString());
     } else {
-      current.delete("pageSize");
+      current.delete(pageSizeParam);
     }
 
     const query = current.toString();

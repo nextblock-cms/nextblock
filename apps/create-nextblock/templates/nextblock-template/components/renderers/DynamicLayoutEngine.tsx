@@ -2,6 +2,7 @@ import React from 'react';
 import parse from 'html-react-parser';
 import type { CustomBlockDefinition, CustomBlockField, CustomBlockLayoutNode } from '@nextblock-cms/utils';
 
+import { sanitizeAuthoredBlockHtml } from '../../lib/blocks/inlineScriptNonce';
 import { resolveMediaUrl } from '../../lib/media/resolveMediaUrl';
 import { embedSafeParserOptions } from '../media/youtube-embed-replace';
 import { rewriteYouTubeHostsInHtml } from '../../lib/media/youtube';
@@ -363,11 +364,15 @@ function renderTextField({
   if (field.type === 'rich-text' && typeof value === 'string') {
     // Parsed rather than injected raw so YouTube iframes become click-to-play
     // facades; the host rewrite is the fallback for anything left as raw markup.
+    // Sanitized first, like text blocks: html-react-parser keeps every element it is
+    // given (a <script> or <style> body is rendered through dangerouslySetInnerHTML),
+    // and block content is writable by ADMIN/WRITER over PostgREST. The layout's
+    // emptyFallback takes the same path.
     const richTextHtml = value || node.emptyFallback || '';
     return React.createElement(
       element,
       { className },
-      parse(rewriteYouTubeHostsInHtml(richTextHtml), embedSafeParserOptions)
+      parse(rewriteYouTubeHostsInHtml(sanitizeAuthoredBlockHtml(richTextHtml)), embedSafeParserOptions)
     );
   }
 

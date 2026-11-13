@@ -1,7 +1,8 @@
 'use client';
 
 import { Product } from '../types';
-import { AddToCartButton } from './AddToCartButton';
+import { rememberStorefrontAffiliateRef } from '../cart-store';
+import { AddToCartButton, withReferralParam } from './AddToCartButton';
 import { cn, majorUnitAmountToMinor, useTranslations } from '@nextblock-cms/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import Link from 'next/link';
@@ -20,11 +21,28 @@ interface ProductCardProps {
   className?: string;
   /** Above the fold (first grid row): load the image eagerly instead of lazily. */
   priority?: boolean;
+  /**
+   * Signed partner-storefront token (NextBlock Affiliates): stored on the cart by "Add to cart";
+   * the card's product links hand it to the next add (`rememberStorefrontAffiliateRef`).
+   */
+  affiliateRef?: string | null;
+  /** Partner handle: the card's product links carry `?ref=<handle>`. */
+  referralHandle?: string | null;
 }
 
-export const ProductCard = ({ product, className, priority = false }: ProductCardProps) => {
+export const ProductCard = ({
+  product,
+  className,
+  priority = false,
+  affiliateRef,
+  referralHandle,
+}: ProductCardProps) => {
   // Locale-aware: see use-price-formatter.ts.
   const formatPrice = usePriceFormatter();
+  const productHref = withReferralParam(`/product/${product.slug}`, referralHandle);
+  // A storefront card's product links hand the token to the next add (made on the product
+  // page), so opening the product first still credits the storefront without cookies.
+  const rememberStorefront = affiliateRef ? () => rememberStorefrontAffiliateRef(affiliateRef) : undefined;
   const { activeCurrencyCode, currencies } = useCurrency();
   const variantRange = resolvePriceRangeForCurrency({
     entries:
@@ -139,7 +157,8 @@ export const ProductCard = ({ product, className, priority = false }: ProductCar
           out of the tab order and hidden from assistive tech, so a keyboard user tabs once
           per card and never lands on a focus ring the card's overflow would clip. */}
       <Link
-        href={`/product/${product.slug}`}
+        href={productHref}
+        onClick={rememberStorefront}
         tabIndex={-1}
         aria-hidden="true"
         className="relative aspect-square overflow-hidden bg-muted"
@@ -174,7 +193,7 @@ export const ProductCard = ({ product, className, priority = false }: ProductCar
               .join(' • ')}
           </div>
         )}
-        <Link href={`/product/${product.slug}`} className="mb-2">
+        <Link href={productHref} onClick={rememberStorefront} className="mb-2">
            <h3 className="line-clamp-1 text-lg font-medium text-foreground group-hover:underline">
              {product.title}
            </h3>
@@ -282,8 +301,10 @@ export const ProductCard = ({ product, className, priority = false }: ProductCar
               prices: product.prices,
               sale_price: product.sale_price,
               sale_prices: product.sale_prices,
-            }} 
+            }}
             className="w-full"
+            affiliateRef={affiliateRef}
+            referralHandle={referralHandle}
           />
         </div>
       </div>

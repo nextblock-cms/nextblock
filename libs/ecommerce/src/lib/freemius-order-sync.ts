@@ -110,7 +110,7 @@ type FreemiusOrderMetadata = {
   freemius_trial_ends_at?: string | null;
 };
 
-type FreemiusWebhookEvent = {
+export type FreemiusWebhookEvent = {
   id?: string | number | null;
   type?: string;
   data?: Record<string, any> | null;
@@ -464,10 +464,15 @@ async function applyFreemiusOrderState(input: {
 }) {
   const update = buildMetadataUpdate(input.metadata, input.eventType);
   const currentStatus = input.order.status;
+  // Pinned states: a paid order is never downgraded by a later lifecycle event, and a refunded
+  // one is never revived (a replayed payment or license event, or a revisit of the checkout
+  // sync, would otherwise mark the refunded sale paid again).
   const nextStatus =
-    currentStatus === 'paid' && input.nextStatus !== 'paid'
-      ? 'paid'
-      : input.nextStatus;
+    currentStatus === 'refunded'
+      ? 'refunded'
+      : currentStatus === 'paid' && input.nextStatus !== 'paid'
+        ? 'paid'
+        : input.nextStatus;
 
   if (nextStatus !== currentStatus) {
     update.status = nextStatus;
@@ -863,6 +868,200 @@ export async function syncFreemiusOrderFromWebhookEvent(input: {
     status,
     type: input.event.type,
   };
+}
+
+/**
+ * Freemius events that take a payment back, every one a FULL refund: `payment.refund` (the name
+ * Freemius sends; `payment.refunded` is accepted too) and a dispute that was lost or closed by
+ * refunding. The webhook route handles these INSTEAD of `syncFreemiusOrderFromWebhookEvent`,
+ * whose purchase-data path would read the refunded purchase as paid.
+ */
+export const FREEMIUS_REFUND_EVENT_TYPES = [
+  'payment.refund',
+  'payment.refunded',
+  'payment.dispute.lost',
+  'payment.dispute.closed',
+] as const;
+
+/**
+ * Dispute events that refund nothing: opened, or won by the store. Never synced (their purchase
+ * data would read as paid) and the order status never changes; the app holds the order's
+ * affiliate commission while the dispute is open and releases it when the store wins
+ * (`syncFreemiusOrderDisputeFromWebhookEvent`).
+ */
+export const FREEMIUS_DISPUTE_EVENT_TYPES = ['payment.dispute.created', 'payment.dispute.won'] as const;
+
+export function isFreemiusRefundEventType(type: unknown): boolean {
+  return typeof type === 'string' && (FREEMIUS_REFUND_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+export function isFreemiusDisputeEventType(type: unknown): boolean {
+  return typeof type === 'string' && (FREEMIUS_DISPUTE_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+/** What a refund event did to its order. */
+export interface FreemiusOrderRefundSync {
+  /** False when the event is not a refund. */
+  isRefund: boolean;
+  /**
+   * The refunded payment was a renewal: the order records the first purchase, which stands,
+   * and renewals never earned a commission, so nothing is applied.
+   */
+  isRenewal: boolean;
+  /** The order of the event's license; null when none matches. */
+  orderId: string | null;
+  /** `orders.status` before this event. */
+  previousStatus: string | null;
+  /** True when this event moved the order to 'refunded'. */
+  statusUpdated: boolean;
+  /** Why nothing was applied to an order, when nothing was. */
+  reason: 'not_a_refund' | 'missing_license_id' | 'unknown_license_id' | 'renewal' | null;
+}
+
+/** Only a paid order becomes refunded; a pending, trial or cancelled one keeps its status. */
+const FREEMIUS_REFUNDABLE_ORDER_STATUSES = ['paid', 'shipped'];
+
+function isFreemiusFlagSet(value: unknown) {
+  return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+/**
+ * Applies a signed Freemius refund or lost-dispute event to the order of its license: a paid
+ * order moves to 'refunded' in one conditional update (a replay changes nothing), and the
+ * database's order trigger voids its affiliate commission. A renewal's refund changes nothing.
+ * Database errors throw so the webhook answers 5xx and Freemius redelivers.
+ */
+export async function syncFreemiusOrderRefundFromWebhookEvent(input: {
+  event: FreemiusWebhookEvent;
+  client?: SupabaseLikeClient;
+}): Promise<FreemiusOrderRefundSync> {
+  const eventType = input.event?.type ?? null;
+  const result: FreemiusOrderRefundSync = {
+    isRefund: false,
+    isRenewal: false,
+    orderId: null,
+    previousStatus: null,
+    statusUpdated: false,
+    reason: 'not_a_refund',
+  };
+
+  if (!isFreemiusRefundEventType(eventType)) {
+    return result;
+  }
+
+  const payment = input.event.objects?.payment ?? input.event.data?.payment ?? input.event.data ?? null;
+  result.isRefund = true;
+  result.isRenewal = isFreemiusFlagSet(payment?.is_renewal);
+
+  const licenseId = getEventLicenseId(input.event);
+
+  if (!licenseId) {
+    result.reason = 'missing_license_id';
+    return result;
+  }
+
+  const client = input.client ?? getServiceRoleSupabaseClient();
+  const order = await getFreemiusOrderByLicenseId(client, licenseId);
+
+  if (!order) {
+    result.reason = 'unknown_license_id';
+    return result;
+  }
+
+  result.orderId = order.id;
+  result.previousStatus = order.status ?? null;
+
+  if (result.isRenewal) {
+    result.reason = 'renewal';
+    return result;
+  }
+
+  result.reason = null;
+
+  if (!FREEMIUS_REFUNDABLE_ORDER_STATUSES.includes(order.status)) {
+    return result;
+  }
+
+  const { data, error } = await (client as any)
+    .from('orders')
+    .update({
+      status: 'refunded',
+      freemius_last_event_type: eventType,
+      freemius_last_synced_at: new Date().toISOString(),
+    })
+    .eq('id', order.id)
+    .in('status', FREEMIUS_REFUNDABLE_ORDER_STATUSES)
+    .select('id');
+
+  if (error) {
+    throw new Error(error.message || 'Failed to mark the order refunded');
+  }
+
+  result.statusUpdated = Array.isArray(data) && data.length > 0;
+  return result;
+}
+
+/** What a dispute event means for its order's affiliate commission. */
+export interface FreemiusOrderDisputeSync {
+  /** False when the event neither opens a dispute nor closes one the store won. */
+  isDispute: boolean;
+  /** True: the dispute opened (hold the commission); false: the store won it (release it). */
+  open: boolean;
+  /** The disputed payment was a renewal: the first purchase's commission is not affected. */
+  isRenewal: boolean;
+  /** The order of the event's license; null when none matches. */
+  orderId: string | null;
+  /** Why no commission is concerned, when none is. */
+  reason: 'not_a_dispute' | 'missing_license_id' | 'unknown_license_id' | 'renewal' | null;
+}
+
+/**
+ * Finds the order of a signed `payment.dispute.created` or `payment.dispute.won` event by its
+ * license, without changing it (a dispute takes no money back until it is lost or closed by a
+ * refund, which `syncFreemiusOrderRefundFromWebhookEvent` handles). A dispute on a renewal
+ * payment concerns no commission. Database errors throw so the webhook answers 5xx and
+ * Freemius redelivers.
+ */
+export async function syncFreemiusOrderDisputeFromWebhookEvent(input: {
+  event: FreemiusWebhookEvent;
+  client?: SupabaseLikeClient;
+}): Promise<FreemiusOrderDisputeSync> {
+  const eventType = input.event?.type ?? null;
+  const result: FreemiusOrderDisputeSync = {
+    isDispute: false,
+    open: false,
+    isRenewal: false,
+    orderId: null,
+    reason: 'not_a_dispute',
+  };
+
+  if (!isFreemiusDisputeEventType(eventType)) {
+    return result;
+  }
+
+  const payment = input.event.objects?.payment ?? input.event.data?.payment ?? input.event.data ?? null;
+  result.isDispute = true;
+  result.open = eventType === 'payment.dispute.created';
+  result.isRenewal = isFreemiusFlagSet(payment?.is_renewal);
+
+  const licenseId = getEventLicenseId(input.event);
+
+  if (!licenseId) {
+    result.reason = 'missing_license_id';
+    return result;
+  }
+
+  const client = input.client ?? getServiceRoleSupabaseClient();
+  const order = await getFreemiusOrderByLicenseId(client, licenseId);
+
+  if (!order) {
+    result.reason = 'unknown_license_id';
+    return result;
+  }
+
+  result.orderId = order.id;
+  result.reason = result.isRenewal ? 'renewal' : null;
+  return result;
 }
 
 export function getFreemiusWebhookSecretCandidates() {

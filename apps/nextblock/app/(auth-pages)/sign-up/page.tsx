@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { headers } from "next/headers";
 import { createClient } from "@nextblock-cms/db/server";
+import { shouldShowSandboxDemoPartner } from "../../../lib/affiliates/sandbox-demo-partner";
 import SignUpForm from "./SignUpForm";
 
 type BotProtectionProvider = 'none' | 'turnstile' | 'recaptcha';
@@ -39,9 +40,12 @@ export default async function SignUpPage() {
     console.error('[Bot Protection] Error loading settings on sign-up page:', e);
   }
 
+  // The sandbox banner lists the demo partner only while the Affiliates package is active there.
+  const showDemoPartner = await shouldShowSandboxDemoPartner();
+
   return (
     <Suspense fallback={null}>
-      <SignUpForm botProtection={botProtection} scriptNonce={scriptNonce} />
+      <SignUpForm botProtection={botProtection} scriptNonce={scriptNonce} showDemoPartner={showDemoPartner} />
     </Suspense>
   );
 }

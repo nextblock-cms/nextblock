@@ -16,6 +16,8 @@ import {
 import { AlertCircle, CheckCircle2 } from 'lucide-react';
 import { useFormStatus } from 'react-dom';
 import type { PaymentCredentialsView } from '../../../payment-config';
+// Events the Stripe endpoint must send (one list, also checked by the Affiliates connection test).
+import { STRIPE_REQUIRED_WEBHOOK_EVENTS, stripeCliListenCommand } from '../../../stripe/webhook-events';
 
 interface ConfigStatus {
   stripe: {
@@ -34,6 +36,7 @@ export function PaymentsClient({
   credentials,
   saveAction,
   saveCredentialsAction,
+  partnerPayouts = false,
 }: {
   initialEnabledProviders: {
     stripe: boolean;
@@ -43,6 +46,12 @@ export function PaymentsClient({
   credentials: PaymentCredentialsView;
   saveAction: (formData: FormData) => Promise<void>;
   saveCredentialsAction: (formData: FormData) => Promise<void>;
+  /**
+   * The Affiliates program is active (the app passes `isAffiliatesProgramActive()`): Stripe also
+   * pays the partners, and the Stripe section says so. Off by default, so a store without the
+   * add-on is never told about partners it doesn't have.
+   */
+  partnerPayouts?: boolean;
 }) {
   const router = useRouter();
   const [isSaving, startSaving] = useTransition();
@@ -87,6 +96,7 @@ export function PaymentsClient({
         <ProviderCredentialsCard
           credentials={credentials}
           saveAction={saveCredentialsAction}
+          partnerPayouts={partnerPayouts}
         />
 
         <Card className="flex h-full flex-col">
@@ -174,11 +184,19 @@ export function PaymentsClient({
   );
 }
 
-function SaveButton() {
+/** savePaymentCredentials saves nothing on the sandbox (PAYMENT_SETTINGS_SANDBOX_MESSAGE). */
+const SANDBOX_KEYS_NOTE = "Payment keys can't be changed in the sandbox: its checkout is simulated.";
+const SANDBOX_KEYS_NOTE_ID = 'payment-keys-sandbox-note';
+
+function SaveButton({ locked = false }: { locked?: boolean }) {
   const { pending } = useFormStatus();
 
   return (
-    <Button type="submit" disabled={pending}>
+    <Button
+      type="submit"
+      disabled={pending || locked}
+      aria-describedby={locked ? SANDBOX_KEYS_NOTE_ID : undefined}
+    >
       {pending ? 'Saving...' : 'Save Changes'}
     </Button>
   );
@@ -211,8 +229,13 @@ function CredentialField({
         defaultValue={defaultValue}
         placeholder={placeholder}
         autoComplete={type === 'password' ? 'new-password' : 'off'}
+        aria-describedby={hint ? `${id}-hint` : undefined}
       />
-      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+      {hint && (
+        <p id={`${id}-hint`} className="text-xs text-muted-foreground">
+          {hint}
+        </p>
+      )}
     </div>
   );
 }
@@ -220,11 +243,14 @@ function CredentialField({
 function ProviderCredentialsCard({
   credentials,
   saveAction,
+  partnerPayouts,
 }: {
   credentials: PaymentCredentialsView;
   saveAction: (formData: FormData) => Promise<void>;
+  partnerPayouts: boolean;
 }) {
   const storedPlaceholder = '•••••••• (stored — leave blank to keep)';
+  const sandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
   return (
     <Card className="flex h-full flex-col">
@@ -240,8 +266,17 @@ function ProviderCredentialsCard({
         <form action={saveAction} className="flex flex-1 flex-col gap-4">
           <div className="space-y-3">
             <h3 className="text-sm font-semibold">
-              Stripe (physical products)
+              {partnerPayouts
+                ? 'Stripe (physical products and partner payouts)'
+                : 'Stripe (physical products)'}
             </h3>
+            {partnerPayouts ? (
+              <p className="text-xs text-muted-foreground">
+                Stripe also pays your affiliate partners. Freemius doesn&rsquo;t,
+                so a store that sells only digital products still needs a Stripe
+                secret key to run the partner program.
+              </p>
+            ) : null}
             <details className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
               <summary className="cursor-pointer font-medium text-foreground">
                 Stripe webhook setup
@@ -253,13 +288,26 @@ function ProviderCredentialsCard({
                   webhook endpoint and paste its <code>whsec_…</code> signing
                   secret below.
                 </p>
+                <p>Select these events for the endpoint:</p>
+                <ul className="list-disc space-y-0.5 pl-5">
+                  {STRIPE_REQUIRED_WEBHOOK_EVENTS.map((eventType) => (
+                    <li key={eventType}>
+                      <code>{eventType}</code>
+                    </li>
+                  ))}
+                </ul>
+                <p>
+                  The refund and dispute events mark refunded orders and
+                  reverse affiliate commissions; an open dispute holds the
+                  partner&rsquo;s commission until it closes.
+                </p>
                 <p>
                   Locally, run{' '}
-                  <code>
-                    stripe listen --forward-to
-                    localhost:4200/api/webhooks/stripe
+                  <code className="break-all">
+                    {stripeCliListenCommand('localhost:3000/api/webhooks/stripe')}
                   </code>{' '}
-                  or <code>npm run stripe</code>.
+                  with your dev server&rsquo;s port, and paste
+                  the <code>whsec_…</code> secret it prints below.
                 </p>
               </div>
             </details>
@@ -297,22 +345,34 @@ function ProviderCredentialsCard({
             <h3 className="text-sm font-semibold">
               Freemius (digital products)
             </h3>
+            <p className="text-xs text-muted-foreground">
+              These fields hold the keys of one Freemius product (in Freemius:
+              the product &rarr; Settings &rarr; API &amp; Keys). Each product
+              in CMS &rarr; Products keeps its own Freemius Product ID and Plan
+              ID for checkout. Selling more than one Freemius product? Each one
+              signs its webhooks with its own secret key, so also list every
+              product&rsquo;s keys in the{' '}
+              <code>FREEMIUS_CHECKOUT_PRODUCTS_JSON</code> environment variable.
+            </p>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               <CredentialField
                 id="freemius_developerId"
-                label="Developer ID"
+                label="Developer ID (optional)"
                 defaultValue={credentials.freemius.developerId}
+                hint="Only used by Sync from Freemius (CMS → Products), which imports your products, plans and prices."
               />
               <CredentialField
                 id="freemius_productId"
-                label="Product ID"
+                label="Product ID (optional)"
                 defaultValue={credentials.freemius.productId}
+                hint="Can stay empty: checkout, licenses, coupons and webhooks use the Freemius Product ID saved on each product."
               />
               <CredentialField
                 id="freemius_publicKey"
                 label="Public key"
                 defaultValue={credentials.freemius.publicKey}
                 placeholder="pk_…"
+                hint="Opens the Freemius checkout."
               />
               <CredentialField
                 id="freemius_secretKey"
@@ -321,6 +381,7 @@ function ProviderCredentialsCard({
                 placeholder={
                   credentials.freemius.hasSecretKey ? storedPlaceholder : 'sk_…'
                 }
+                hint="Proves that webhooks really come from Freemius."
               />
               <CredentialField
                 id="freemius_apiKey"
@@ -329,6 +390,7 @@ function ProviderCredentialsCard({
                 placeholder={
                   credentials.freemius.hasApiKey ? storedPlaceholder : 'API key'
                 }
+                hint="The API bearer token from the same Freemius page. Shows license keys on orders and sends coupons to Freemius."
               />
             </div>
           </div>
@@ -340,8 +402,14 @@ function ProviderCredentialsCard({
             </p>
           )}
 
+          {sandbox && (
+            <p id={SANDBOX_KEYS_NOTE_ID} className="text-xs text-muted-foreground">
+              {SANDBOX_KEYS_NOTE}
+            </p>
+          )}
+
           <div className="mt-auto flex justify-end border-t pt-4">
-            <SaveButton />
+            <SaveButton locked={sandbox} />
           </div>
         </form>
       </CardContent>

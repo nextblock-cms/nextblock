@@ -1,6 +1,6 @@
 import 'server-only';
 
-import { NEXTBLOCK_PACKAGES } from '@nextblock-cms/utils';
+import { NEXTBLOCK_PACKAGES, missingPackageRequirements } from '@nextblock-cms/utils';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { ActivationForm } from './activation-form';
 import { PackageCard } from './package-card';
@@ -72,6 +72,11 @@ export default async function PackagesPage() {
                     isExpired={activation?.status === 'expired'}
                     licenseKey={activation?.license_key ?? undefined}
                     provenance={provenance}
+                    // An add-on runs only on top of the packages it requires (Affiliates needs Commerce Pro).
+                    missingRequirements={missingPackageRequirements(
+                        pkg,
+                        (packageId) => activationMap.get(packageId)?.status === 'active',
+                    ).map((required) => ({ id: required.id, name: required.name }))}
                 />
             );
         })}

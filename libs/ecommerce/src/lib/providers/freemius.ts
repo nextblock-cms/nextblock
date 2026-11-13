@@ -5,7 +5,11 @@ import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
 import { Freemius } from '@freemius/sdk';
 import { hydrateFreemiusEnvFromDb } from '../payment-config';
-import { CheckoutSessionInput, normalizeOrderCustomerDetails } from '../customer';
+import {
+  CheckoutSessionInput,
+  insertPendingOrderWithAttribution,
+  normalizeOrderCustomerDetails,
+} from '../customer';
 import { getCouponQuote, recordCouponRedemption } from '../coupon-server';
 import { mintOrderAccessToken } from '../order-access-token';
 import { reconcileCouponContextItems, type CouponQuote } from '../coupons';
@@ -258,6 +262,7 @@ export class FreemiusProvider implements PaymentProvider {
       currencyCode,
       couponCode,
       couponContextItems: submittedCouponContextItems,
+      attribution,
     }: CheckoutSessionInput): Promise<{
       url: string | null;
       error?: string;
@@ -424,10 +429,23 @@ export class FreemiusProvider implements PaymentProvider {
         billingAddress?.recipient_name ?? null
       );
       
-      // 3. Create Pending Order in DB
-      const { data: order, error: orderError } = await supabase
-        .from('orders')
-        .insert({
+      // Overlay any CMS-configured Freemius credentials (DB-first) onto the env reads below.
+      await hydrateFreemiusEnvFromDb();
+      // Freemius checkout sandbox is independent from the app-wide demo sandbox. Read once: the
+      // order records it as its payment mode and the checkout URL below uses the same value.
+      const isFreemiusSandboxEnabled = process.env.FREEMIUS_SANDBOX_ENABLED === 'true';
+
+      // 3. Create Pending Order in DB. The attribution columns ride along only when the app
+      // resolved a partner; a database without them (or refusing them) gets the order without
+      // attribution, never a failed checkout. A sandbox purchase is recorded as test mode, so its
+      // commission is never paid out with live money.
+      const {
+        result: { data: order, error: orderError },
+      } = await insertPendingOrderWithAttribution({
+        provider: 'Freemius',
+        attribution,
+        livemode: !isFreemiusSandboxEnabled,
+        row: {
           status: initialOrderStatus,
           total: Math.max(0, totalAmount - discountTotal),
           currency: selectedCurrency.code,
@@ -458,10 +476,10 @@ export class FreemiusProvider implements PaymentProvider {
             billing: billingAddress,
             shipping: shippingAddress,
           }),
-        })
-        .select('id')
-        .single();
-  
+        },
+        insert: (row) => supabase.from('orders').insert(row).select('id').single(),
+      });
+
       if (orderError || !order) {
         console.error('Failed to create pending order:', orderError);
         return { error: `Failed to initiate order`, url: null };
@@ -528,11 +546,7 @@ export class FreemiusProvider implements PaymentProvider {
               return { url: null, error: 'Coupon is no longer available.', errorKey: 'ecommerce.coupon_invalid' };
           }
       }
-            
-      // Overlay any CMS-configured Freemius credentials (DB-first) onto the env reads below.
-      await hydrateFreemiusEnvFromDb();
-      // Freemius checkout sandbox is independent from the app-wide demo sandbox.
-      const isFreemiusSandboxEnabled = process.env.FREEMIUS_SANDBOX_ENABLED === 'true';
+
       const checkoutCredentials = resolveFreemiusCheckoutCredentials(freemiusProductId);
       const publicKey = checkoutCredentials.publicKey;
       const secretKey = checkoutCredentials.secretKey;

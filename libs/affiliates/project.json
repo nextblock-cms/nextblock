@@ -1,0 +1,16 @@
+{
+  "name": "affiliates",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "libs/affiliates/src",
+  "projectType": "library",
+  "tags": [
+    "scope:premium"
+  ],
+  "targets": {
+    "build": {
+      "dependsOn": [
+        "typecheck"
+      ]
+    }
+  }
+}

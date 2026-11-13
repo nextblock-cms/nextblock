@@ -1,0 +1,141 @@
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import dts from 'vite-plugin-dts';
+import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
+import { copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const OUT_DIR = path.resolve(__dirname, '../../dist/libs/affiliates');
+const SRC_DIR = path.resolve(__dirname, 'src');
+
+// The bundler strips React Server Component directives ('use client' / 'use server'). With
+// preserveModules each source module emits its own file, so re-apply the directive from the
+// matching source file. The directive is only recognized at the very start of the source file
+// (a comment above it hides it), which is why src/lib/lib-structure.test.ts requires
+// 'use client' on line 1.
+function reapplyDirectives() {
+  const directiveForModule = (relNoExt: string): string | null => {
+    for (const ext of ['.tsx', '.ts', '.jsx', '.js']) {
+      const srcFile = path.join(SRC_DIR, relNoExt + ext);
+      if (fs.existsSync(srcFile)) {
+        const head = fs.readFileSync(srcFile, 'utf8').replace(/^\uFEFF/, '').trimStart();
+        if (/^['"]use client['"]/.test(head)) return "'use client';";
+        if (/^['"]use server['"]/.test(head)) return "'use server';";
+        return null;
+      }
+    }
+
+    return null;
+  };
+
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+
+      const match = entry.name.match(/^(.*)\.(?:es\.js|cjs)$/);
+      if (!match) continue;
+
+      const relNoExt = path
+        .relative(OUT_DIR, path.join(dir, match[1]))
+        .split(path.sep)
+        .join('/');
+      const directive = directiveForModule(relNoExt);
+
+      if (!directive) continue;
+
+      const contents = fs.readFileSync(full, 'utf8');
+      const trimmed = contents.replace(/^\uFEFF/, '').trimStart();
+
+      if (
+        trimmed.startsWith("'use client'") ||
+        trimmed.startsWith('"use client"') ||
+        trimmed.startsWith("'use server'") ||
+        trimmed.startsWith('"use server"')
+      ) {
+        continue;
+      }
+
+      fs.writeFileSync(full, `${directive}\n${contents}`);
+    }
+  };
+
+  if (fs.existsSync(OUT_DIR)) {
+    walk(OUT_DIR);
+  }
+}
+
+export default defineConfig({
+  root: __dirname,
+  plugins: [
+    dts({
+      entryRoot: 'src',
+      tsconfigPath: './tsconfig.lib.json',
+      // Keep `@nextblock-cms/*` imports as package names in the emitted declarations. By
+      // default the plugin rewrites tsconfig path aliases into relative paths, which for a
+      // sibling library means `../../../utils/src/index.ts`: a file that exists in this
+      // monorepo and nowhere else, so every type that mentioned a sibling library would be
+      // silently `any` for consumers (they compile with skipLibCheck).
+      aliasesExclude: [new RegExp('^@nextblock-cms/')],
+      outDirs: '../../dist/libs/affiliates',
+      afterBuild: reapplyDirectives,
+    }),
+    react(),
+    // The raw manifest; tools/scripts/release-lib.js finalizes it (entry points, exports,
+    // resolved sibling versions) right before publishing.
+    copyIntoDist(__dirname, OUT_DIR, ['package.json', 'README.md']),
+  ],
+  build: {
+    // Relative, '/'-separated: @nx/vite/plugin derives the build target's cache outputs from
+    // this, and an absolute path came out with Windows backslashes.
+    outDir: '../../dist/libs/affiliates',
+    emptyOutDir: true,
+    lib: {
+      // Relative entry paths: an absolute path.resolve entry built from a lowercase `d:` cwd
+      // emitted no .d.ts under vite-plugin-dts 5.
+      entry: {
+        // Client-safe: core, copy, storefront document + renderer.
+        index: './src/index.ts',
+        // Client-only: the restricted storefront Tiptap editor.
+        editor: './src/editor.ts',
+        // Server barrel ('server-only'): repository, notifications, copilot, attribution, payouts, connect.
+        server: './src/server.ts',
+      },
+      name: 'affiliates',
+      // CommonJS as `.cjs`: this package is "type": "module", so Node and bundlers read any
+      // `.js` file in it as ESM (cortex and ecom shipped `index.cjs.js` through 0.20 and it
+      // failed to load: "exports is not defined in ES module scope").
+      fileName: (format, entryName) => (format === 'cjs' ? `${entryName}.cjs` : `${entryName}.${format}.js`),
+      formats: ['es', 'cjs'],
+    },
+    rolldownOptions: {
+      output: {
+        // One file per source module (mirroring src/) so 'use client' modules stay separate
+        // and the consuming RSC bundler can split them; no cross-boundary shared chunks.
+        preserveModules: true,
+        preserveModulesRoot: 'src',
+      },
+      external: (id) => {
+        // Bundle only our own source; every bare specifier (react, @tiptap/*, ai, zod,
+        // @nextblock-cms/*, server-only, ...) stays a bare import that the consuming app
+        // resolves in the right (client vs server) condition. The published package.json
+        // declares them as dependencies.
+        if (id.startsWith('.')) {
+          return false;
+        }
+
+        if (path.isAbsolute(id)) {
+          return id.includes('node_modules');
+        }
+
+        return true;
+      },
+    },
+  },
+});

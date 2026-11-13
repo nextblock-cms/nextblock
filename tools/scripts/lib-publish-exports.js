@@ -44,11 +44,33 @@ const CORTEX_EXPORTS = {
   './package.json': './package.json',
 };
 
+// The source manifest carries the same map (the monorepo never reads it from dist); it is
+// restated here so the finalize step and the publish check judge one definition.
+const AFFILIATES_EXPORTS = {
+  '.': {
+    types: './index.d.ts',
+    import: './index.es.js',
+    require: './index.cjs',
+  },
+  './editor': {
+    types: './editor.d.ts',
+    import: './editor.es.js',
+    require: './editor.cjs',
+  },
+  './server': {
+    types: './server.d.ts',
+    import: './server.es.js',
+    require: './server.cjs',
+  },
+  './package.json': './package.json',
+};
+
 /** The map release-lib.js will publish for `library`, or null when the build writes its own. */
 function publishExportsFor(library) {
   if (library === 'ecommerce' || library === 'ecom') return ECOM_EXPORTS;
   if (library === 'cortex') return CORTEX_EXPORTS;
+  if (library === 'affiliates') return AFFILIATES_EXPORTS;
   return null;
 }
 
-module.exports = { CORTEX_EXPORTS, ECOM_EXPORTS, publishExportsFor };
+module.exports = { AFFILIATES_EXPORTS, CORTEX_EXPORTS, ECOM_EXPORTS, publishExportsFor };

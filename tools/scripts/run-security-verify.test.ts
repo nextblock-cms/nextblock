@@ -53,4 +53,20 @@ describe('run-security-verify verdict', () => {
     const script = readFileSync(path.join(__dirname, 'security-verify.sql'), 'utf8');
     expect(expectedAssertionCount(script)).toBeGreaterThanOrEqual(84);
   });
+
+  it('keeps every DO block of the real posture script closed (a merge that drops an END $$; stops psql with a syntax error)', () => {
+    const script = readFileSync(path.join(__dirname, 'security-verify.sql'), 'utf8');
+    const lines = script.split(/\r?\n/);
+    let open = 0;
+    for (const [index, line] of lines.entries()) {
+      if (/^DO \$\$/.test(line)) {
+        expect(open, `a DO block opens at line ${index + 1} while another is still open`).toBe(0);
+        open += 1;
+      } else if (/^END \$\$;/.test(line)) {
+        expect(open, `END $$; at line ${index + 1} closes no DO block`).toBe(1);
+        open -= 1;
+      }
+    }
+    expect(open, 'the last DO block is never closed').toBe(0);
+  });
 });

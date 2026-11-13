@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
+  AFFILIATES_DOCS_URL,
   PREMIUM_PACKAGES,
   buildActivationGuide,
   findLegacyActivateWrappers,
@@ -17,7 +18,7 @@ import {
 const here = dirname(fileURLToPath(import.meta.url));
 // The registry the CMS sells from. Loaded by URL because it lives in another Nx project; the
 // file has no imports, so it needs no aliases.
-const { NEXTBLOCK_PACKAGES } = await import(
+const { NEXTBLOCK_PACKAGES, hasPackageCheckout } = await import(
   pathToFileURL(resolve(here, '../../../../libs/utils/src/lib/nextblock-packages.ts')).href
 );
 const appDir = resolve(here, '../../../nextblock');
@@ -45,9 +46,15 @@ describe('resolvePremiumPackages', () => {
     }
   });
 
+  it('maps every Affiliates spelling to affiliates', () => {
+    for (const input of ['affiliates', 'Affiliate', ' partners ', 'storefronts', 'creator-storefronts']) {
+      expect(ids(resolvePremiumPackages(input)), input).toEqual(['affiliates']);
+    }
+  });
+
   it('explains every package when none is named', () => {
     for (const input of [undefined, '']) {
-      expect(ids(resolvePremiumPackages(input)).sort()).toEqual(['cortex-ai', 'ecommerce']);
+      expect(ids(resolvePremiumPackages(input)).sort()).toEqual(['affiliates', 'cortex-ai', 'ecommerce']);
     }
   });
 
@@ -76,6 +83,19 @@ describe('PREMIUM_PACKAGES', () => {
     }
   });
 
+  it('knows which packages are add-ons, as the registry does (Affiliates needs Commerce Pro)', () => {
+    for (const [id, pkg] of Object.entries(PREMIUM_PACKAGES)) {
+      expect([...pkg.requires], id).toEqual([...NEXTBLOCK_PACKAGES[id].requires]);
+    }
+    expect(PREMIUM_PACKAGES.affiliates.requires).toEqual(['ecommerce']);
+  });
+
+  it('knows which packages the CMS can sell (a Freemius product and plan exist)', () => {
+    for (const [id, pkg] of Object.entries(PREMIUM_PACKAGES)) {
+      expect(pkg.dashboardCheckout, id).toBe(hasPackageCheckout(NEXTBLOCK_PACKAGES[id]));
+    }
+  });
+
   it('names dependencies every scaffold already declares, so there is nothing to install', () => {
     for (const pkg of Object.values(PREMIUM_PACKAGES)) {
       expect(appDependencies, `apps/nextblock/package.json dependencies`).toHaveProperty([pkg.dependency]);
@@ -99,12 +119,18 @@ describe('findMissingPremiumDependencies', () => {
   it('reports nothing for a current project', () => {
     const manifest = {
       dependencies: {
+        '@nextblock-cms/affiliates': '^0.22.5',
         '@nextblock-cms/cortex': '^0.21.1',
         '@nextblock-cms/db': '^0.21.1',
         '@nextblock-cms/ecommerce': 'npm:@nextblock-cms/ecom@latest',
       },
     };
     expect(findMissingPremiumDependencies(manifest, Object.values(PREMIUM_PACKAGES))).toEqual([]);
+  });
+
+  it('reports Affiliates for a project created before it shipped', () => {
+    const manifest = { dependencies: { '@nextblock-cms/cortex': '^0.22.5', '@nextblock-cms/db': '^0.22.5' } };
+    expect(findMissingPremiumDependencies(manifest, [PREMIUM_PACKAGES.affiliates])).toEqual([PREMIUM_PACKAGES.affiliates]);
   });
 });
 
@@ -155,6 +181,30 @@ describe('buildActivationGuide', () => {
     expect(buildActivationGuide([PREMIUM_PACKAGES['cortex-ai']]).join('\n')).not.toContain(note);
   });
 
+  it('tells an Affiliates key to name its package, and that Affiliates needs Commerce Pro', () => {
+    const guide = buildActivationGuide([PREMIUM_PACKAGES.affiliates]).join('\n');
+    expect(guide).toContain('(an Affiliates key also needs NEXTBLOCK_LICENSE_PACKAGE=affiliates)');
+    expect(guide).toContain('each has a free 30-day trial, no credit card required');
+    expect(guide).not.toContain('cannot be bought or trialed from the dashboard');
+    expect(guide).toContain('Affiliates is an add-on for Commerce Pro: activate Commerce Pro too, or it stays paused.');
+    expect(guide).not.toContain('npm install');
+    expect(buildActivationGuide([PREMIUM_PACKAGES.ecommerce]).join('\n')).not.toContain('is an add-on for');
+
+    const all = buildActivationGuide(Object.values(PREMIUM_PACKAGES)).join('\n');
+    expect(all).toContain('a Commerce Pro key also needs NEXTBLOCK_LICENSE_PACKAGE=ecommerce, an Affiliates key NEXTBLOCK_LICENSE_PACKAGE=affiliates');
+    expect(all).toContain('today Cortex AI, Commerce Pro and Affiliates');
+  });
+
+  // Affiliates was not sold in the dashboard until 2026-10-29; a package in that state points to its guide.
+  it('points a package the dashboard cannot sell yet to its guide instead of a trial', () => {
+    const unsold = { ...PREMIUM_PACKAGES.affiliates, dashboardCheckout: false };
+    expect(buildActivationGuide([unsold]).join('\n')).toContain(
+      `Affiliates cannot be bought or trialed from the dashboard yet; its guide explains how to activate it: ${AFFILIATES_DOCS_URL}`
+    );
+    expect(buildActivationGuide([PREMIUM_PACKAGES.affiliates]).join('\n')).not.toContain(AFFILIATES_DOCS_URL);
+    expect(buildActivationGuide([PREMIUM_PACKAGES.ecommerce]).join('\n')).not.toContain(AFFILIATES_DOCS_URL);
+  });
+
   it('adds the missing-dependency and legacy-file notes only when there is something to report', () => {
     const plain = buildActivationGuide(Object.values(PREMIUM_PACKAGES)).join('\n');
     expect(plain).not.toContain('package.json has no');
@@ -172,6 +222,25 @@ describe('buildActivationGuide', () => {
 describe('create-nextblock.js', () => {
   it('no longer carries the route wrappers the old activate wrote', () => {
     expect(cliSource).not.toContain('routesToInject');
+  });
+
+  it('rewrites every workspace:* dependency of the template to a published version', () => {
+    // A `workspace:*` that reaches a scaffold's package.json fails `npm install` (EUNSUPPORTEDPROTOCOL).
+    const start = cliSource.indexOf('const PACKAGE_VERSION_SOURCES = {');
+    const block = cliSource.slice(start, cliSource.indexOf('};', start));
+    const workspaceDependencies = Object.entries(appDependencies)
+      .filter(([, spec]) => String(spec).startsWith('workspace:'))
+      .map(([name]) => name);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(workspaceDependencies).toContain('@nextblock-cms/affiliates');
+    for (const name of workspaceDependencies) {
+      expect(block, name).toContain(`'${name}': resolve(REPO_ROOT, 'libs/`);
+    }
+  });
+
+  it('lets Tailwind see the classes the affiliates renderer, editor and portal ship', () => {
+    expect(cliSource).toContain("'./node_modules/@nextblock-cms/affiliates/**/*.{js,cjs,mjs}',");
   });
 
   it('keeps `activate` registered, hidden, so it never scaffolds a project named "activate"', () => {

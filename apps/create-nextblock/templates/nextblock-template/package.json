@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/template",
-  "version": "0.22.5",
+  "version": "0.23.0",
   "description": "The open-source, full-stack AI-native CMS for Next.js 16, Supabase, and Tailwind CSS.",
   "keywords": [
     "cms",
@@ -28,6 +28,7 @@
     "update:check": "node tools/update.mjs --check",
     "deploy:supabase": "node tools/deploy-supabase.js",
     "configure:supabase-auth": "node tools/configure-supabase-auth.js",
+    "affiliates:schedule-payouts": "node tools/schedule-affiliate-payouts.js",
     "docker:setup": "node scripts/docker-setup.mjs",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
@@ -82,6 +83,7 @@
     "server-only": "^0.0.1",
     "@nextblock-cms/ecommerce": "npm:@nextblock-cms/ecom@latest",
     "@nextblock-cms/cortex": "workspace:*",
+    "@nextblock-cms/affiliates": "workspace:*",
     "@nextblock-cms/ui": "workspace:*",
     "@nextblock-cms/utils": "workspace:*",
     "@nextblock-cms/db": "workspace:*",

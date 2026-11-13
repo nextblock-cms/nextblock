@@ -24,6 +24,7 @@ export default defineConfig({
       
       // Exact anchored mappings (checked first)
       { find: /^@nextblock-cms\/db\/server$/, replacement: path.resolve(__dirname, './libs/db/src/server.ts') },
+      { find: /^@nextblock-cms\/db\/secrets$/, replacement: path.resolve(__dirname, './libs/db/src/secrets.ts') },
       { find: /^@nextblock-cms\/db$/, replacement: path.resolve(__dirname, './libs/db/src/index.ts') },
       
       { find: /^@nextblock-cms\/ecommerce\/server$/, replacement: path.resolve(__dirname, './libs/ecommerce/src/server.ts') },
@@ -42,6 +43,10 @@ export default defineConfig({
 
       { find: /^@nextblock-cms\/cortex\/client$/, replacement: path.resolve(__dirname, './libs/cortex/src/client.ts') },
       { find: /^@nextblock-cms\/cortex$/, replacement: path.resolve(__dirname, './libs/cortex/src/index.ts') },
+
+      { find: /^@nextblock-cms\/affiliates\/server$/, replacement: path.resolve(__dirname, './libs/affiliates/src/server.ts') },
+      { find: /^@nextblock-cms\/affiliates\/editor$/, replacement: path.resolve(__dirname, './libs/affiliates/src/editor.ts') },
+      { find: /^@nextblock-cms\/affiliates$/, replacement: path.resolve(__dirname, './libs/affiliates/src/index.ts') },
 
       // Wildcard fallback mappings
       { find: /^@nextblock-cms\/ui\/styles\/(.*)$/, replacement: path.resolve(__dirname, './libs/ui/src/styles/$1') },

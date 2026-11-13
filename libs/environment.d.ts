@@ -29,6 +29,11 @@ declare namespace NodeJS {
     FREEMIUS_ECOMMERCE_SANDBOX_PUBLIC_KEY?: string;
     FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY?: string;
     FREEMIUS_AI_SANDBOX_KEY?: string;
+    /**
+     * Public sandbox only: the reset cron activates the Affiliates package with this key and
+     * seeds the demo partner (partner@nextblock.dev, /partners/studio-nova).
+     */
+    FREEMIUS_AFFILIATES_SANDBOX_KEY?: string;
     /** Vendor side only: enables /api/packages/claim-license (see .env.example). */
     NEXTBLOCK_LICENSE_CLAIM_ENABLED?: string;
     /** Where a CMS fetches the key of a license it just bought; defaults to https://nextblock.dev. */

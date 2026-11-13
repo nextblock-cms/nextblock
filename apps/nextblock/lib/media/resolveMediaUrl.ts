@@ -1,5 +1,9 @@
 const BUNDLED_PUBLIC_MEDIA_KEYS = new Set([
   'images/NBcover.webp',
+  // The sandbox demo partner's avatar (app/api/cron/reset-sandbox/affiliate-demo.ts).
+  'images/affiliate-demo-avatar.png',
+  // The Affiliates license cover (migration 02032 on nextblock.dev, the sandbox reset).
+  'images/affiliates-square.webp',
   'images/cap.webp',
   'images/commerce-plan.webp',
   'images/commerce-square.webp',

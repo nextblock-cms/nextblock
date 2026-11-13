@@ -1,0 +1,68 @@
+{
+  "name": "@nextblock-cms/affiliates",
+  "version": "0.23.0",
+  "license": "AGPL-3.0-or-later",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextblock-cms/nextblock.git",
+    "directory": "libs/affiliates"
+  },
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.es.js",
+  "types": "./index.d.ts",
+  "sideEffects": [
+    "./src/server.ts",
+    "./src/lib/zod-config.ts",
+    "./server.es.js",
+    "./server.cjs",
+    "./lib/zod-config.es.js",
+    "./lib/zod-config.cjs"
+  ],
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.es.js",
+      "require": "./index.cjs"
+    },
+    "./editor": {
+      "types": "./editor.d.ts",
+      "import": "./editor.es.js",
+      "require": "./editor.cjs"
+    },
+    "./server": {
+      "types": "./server.d.ts",
+      "import": "./server.es.js",
+      "require": "./server.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "nx": {
+    "tags": [
+      "scope:premium"
+    ]
+  },
+  "dependencies": {
+    "@floating-ui/dom": "^1.8.0",
+    "@nextblock-cms/ui": "workspace:*",
+    "@nextblock-cms/utils": "workspace:*",
+    "@supabase/supabase-js": "^2.118.0",
+    "@tiptap/core": "^3.32.0",
+    "@tiptap/extension-image": "^3.32.0",
+    "@tiptap/extension-placeholder": "^3.32.0",
+    "@tiptap/pm": "^3.32.0",
+    "@tiptap/react": "^3.32.0",
+    "@tiptap/starter-kit": "^3.32.0",
+    "@tiptap/suggestion": "^3.32.0",
+    "ai": "^7.0.153",
+    "lucide-react": "^1.61.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "react": "^19.2.5"
+  }
+}

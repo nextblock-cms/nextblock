@@ -327,9 +327,15 @@ export async function activatePurchasedPackage(input: {
 
 /**
  * Ask Freemius to re-send the license email, using the tokenized endpoint the checkout
- * handed back (valid for 24 h). Only Freemius hosts are ever called.
+ * handed back (valid for 24 h). Only Freemius hosts are ever called. Refused on the sandbox,
+ * like every other license action here: its admin login is public, and this has Freemius mail
+ * a license email on a visitor's request.
  */
 export async function resendPurchasedLicenseEmail(endpoint: string): Promise<{ ok: boolean; error?: string }> {
+  if (isSandbox()) {
+    return { error: 'License emails are disabled in Sandbox mode.', ok: false };
+  }
+
   const denied = await requireAdminActor();
 
   if (denied) {

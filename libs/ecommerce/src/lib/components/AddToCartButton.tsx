@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import Link from 'next/link';
 
 import { useCart } from '../use-cart';
+import { rememberStorefrontAffiliateRef } from '../cart-store';
 import { useTranslations } from '@nextblock-cms/utils';
 
 import { getProductPaymentProvider, isDigitalProduct, Product } from '../types';
@@ -16,9 +17,55 @@ interface AddToCartButtonProps {
   product: Product;
   className?: string;
   quantity?: number;
+  /**
+   * Signed partner-storefront token (NextBlock Affiliates). Stored on the cart when this add
+   * succeeds, so checkout can attribute the sale even when cookies are blocked. The "Select
+   * options" link of a product with variants hands it to the next add instead.
+   */
+  affiliateRef?: string | null;
+  /** Partner handle: the product-page links this button renders carry `?ref=<handle>`. */
+  referralHandle?: string | null;
 }
 
-export const AddToCartButton = ({ product, className, quantity }: AddToCartButtonProps) => {
+/** A partner handle (`a-z`, `0-9`, inner `-`, 3–32 characters), the shape of the referral `?ref=` value. */
+export const REFERRAL_HANDLE_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,30}[a-z0-9])$/;
+
+/** The handle lowercased and trimmed, or null when it is not a valid partner handle. */
+export function normalizeReferralHandle(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const handle = value.trim().toLowerCase();
+  return REFERRAL_HANDLE_PATTERN.test(handle) ? handle : null;
+}
+
+/**
+ * `href` with `ref=<handle>` added to its query (before any `#fragment`), or `href` unchanged
+ * when the handle is missing or invalid. A shared or reloaded product URL then still carries
+ * the partner's referral.
+ */
+export function withReferralParam(href: string, referralHandle?: string | null): string {
+  const handle = normalizeReferralHandle(referralHandle);
+
+  if (!handle) {
+    return href;
+  }
+
+  const hashIndex = href.indexOf('#');
+  const base = hashIndex >= 0 ? href.slice(0, hashIndex) : href;
+  const hash = hashIndex >= 0 ? href.slice(hashIndex) : '';
+
+  return `${base}${base.includes('?') ? '&' : '?'}ref=${encodeURIComponent(handle)}${hash}`;
+}
+
+export const AddToCartButton = ({
+  product,
+  className,
+  quantity,
+  affiliateRef,
+  referralHandle,
+}: AddToCartButtonProps) => {
   // Use useCart to get safe hydration version of addItem, 
   // or use store directly since this action is client-side interaction anyway.
   const store = useCart((state) => state);
@@ -32,6 +79,7 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
   // product is not inventory-tracked — mirrors the cart store's stock guard.
   const isOutOfStock =
     !isDigital && typeof product.stock === 'number' && product.stock <= 0;
+  const productHref = withReferralParam(`/product/${product.slug}`, referralHandle);
 
   // The store cannot charge through this product's payment provider, so there is no
   // cart to add to. Send the shopper to the enquiry form on the detail page rather than
@@ -42,7 +90,7 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
 
     return (
       <Button asChild variant="outline" className={className}>
-        <Link href={`/product/${product.slug}#contact-seller`}>
+        <Link href={`${productHref}#contact-seller`}>
           <Mail className="mr-2 h-4 w-4" />
           {contactLabel === 'ecommerce.contact_seller' ? 'Contact the seller' : contactLabel}
         </Link>
@@ -51,9 +99,15 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
   }
 
   if (requiresVariantSelection) {
+    // On a storefront the add happens on the product page, whose button has no token: hand it
+    // over in memory so that add still credits the storefront (the `?ref=` of a client-side
+    // click sets no referral cookie).
     return (
       <Button asChild className={className}>
-        <Link href={`/product/${product.slug}`}>
+        <Link
+          href={productHref}
+          onClick={affiliateRef ? () => rememberStorefrontAffiliateRef(affiliateRef) : undefined}
+        >
           {t('ecommerce.select_options') === 'ecommerce.select_options'
             ? 'Select options'
             : t('ecommerce.select_options')}
@@ -84,7 +138,7 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
     );
   }
 
-  const { addItem } = store;
+  const { addItem, setAffiliateRef } = store;
 
   const handleAddToCart = () => {
     const provider = getProductPaymentProvider(product) ?? 'stripe';
@@ -129,6 +183,12 @@ export const AddToCartButton = ({ product, className, quantity }: AddToCartButto
     });
 
     if (success) {
+      // Last storefront wins, like the last-click referral cookie. A plain add (no token)
+      // keeps the token an earlier storefront add stored, or the store made a followed
+      // storefront link's pending token the cart's (`rememberStorefrontAffiliateRef`).
+      if (affiliateRef) {
+        setAffiliateRef(affiliateRef);
+      }
       toast.success(t('ecommerce.added_to_cart_success', { item: product.title }));
     } else {
       const translatedError = errorKey ? t(errorKey, errorParams) : null;

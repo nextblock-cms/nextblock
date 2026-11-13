@@ -1,5 +1,5 @@
 import React from 'react';
-import { cn } from '@nextblock-cms/utils';
+import { cn, sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
 
 import { toNoCookieEmbedSrc } from './SimpleTiptapRenderer';
 
@@ -21,7 +21,12 @@ interface ShortDescriptionProps {
 /**
  * Renders a product's short description the same way everywhere: HTML when the text contains
  * markup (embeds rewritten to the no-cookie host), otherwise as escaped text that keeps its
- * line breaks. Staff-authored either way; no user input reaches this field.
+ * line breaks.
+ *
+ * The HTML goes through `sanitizeAuthoredBlockHtml`, like text blocks: any ADMIN writes this
+ * field (the CMS, the Cortex tools, PostgREST; every visitor on the public sandbox), and the
+ * product page renders it for every later visitor. Iframes and their `src` stay, so legacy
+ * YouTube embeds still play on the no-cookie host.
  */
 export function ShortDescription({ value, className }: ShortDescriptionProps) {
   const text = value?.trim();
@@ -31,7 +36,7 @@ export function ShortDescription({ value, className }: ShortDescriptionProps) {
     return (
       <div
         className={className}
-        dangerouslySetInnerHTML={{ __html: toNoCookieEmbedSrc(text) ?? text }}
+        dangerouslySetInnerHTML={{ __html: sanitizeAuthoredBlockHtml(toNoCookieEmbedSrc(text) ?? text) }}
       />
     );
   }

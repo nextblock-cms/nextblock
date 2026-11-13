@@ -8,6 +8,7 @@ import { getContentTranslations, getContentMetadataBySlugAndLocale } from '../ap
 import { Language } from '../app/actions/languageActions';
 import { useCurrentContent } from '../context/CurrentContentContext';
 import { useLabel } from '../lib/i18n/use-label';
+import { contentLookupForPath, resolveLocalePathTarget } from './language-switcher-path';
 
 interface CurrentPageInfo {
   slug: string;
@@ -39,27 +40,25 @@ export default function LanguageSwitcher({ currentPageData }: LanguageSwitcherPr
 
     if (isHomePage) {
       targetPath = '/'; // For any homepage, new language path is root
+    } else if (currentContent.localePaths) {
+      // A code route that declared its own address per language (the partner program's
+      // /partners and /partenaires): go there, or refresh in place when it has none for this language.
+      targetPath = resolveLocalePathTarget(currentContent.localePaths, newLocaleCode) ?? pathname;
     } else {
-    // Extract slug from pathname (remove leading slash)
-    const segments = pathname.split('/').filter(Boolean);
-    const currentSlug = segments[segments.length - 1] || '';
-    
-    let contentMetadata = currentContent.id ? { 
-      slug: currentContent.slug || '', 
+    // Only a path shaped like a CMS document (/<slug>, /article/<slug>, /product/<slug>) is looked
+    // up by slug; any other route (a partner storefront, the portal, checkout) refreshes in place.
+    const lookup = contentLookupForPath(pathname);
+
+    let contentMetadata = currentContent.id ? {
+      slug: currentContent.slug || '',
       translation_group_id: currentContent.translation_group_id || null,
       type: currentContent.type
     } : null;
-    
-    // Fallback to fetching if context is missing but we have a slug
-    if (!contentMetadata && currentSlug && !isHomePage) {
-      try {
-        // Try pages first, then products, then posts? 
-        // Or determine from pathname prefix
-        let type: 'pages' | 'posts' | 'products' = 'pages';
-        if (pathname.includes('/product/')) type = 'products';
-        if (pathname.includes('/article/')) type = 'posts';
 
-        const fetchedMetadata = await getContentMetadataBySlugAndLocale(currentSlug, currentLocale, type);
+    // Fallback to fetching if context is missing but the path addresses a CMS document
+    if (!contentMetadata && lookup) {
+      try {
+        const fetchedMetadata = await getContentMetadataBySlugAndLocale(lookup.slug, currentLocale, lookup.type);
         if (fetchedMetadata) {
           contentMetadata = fetchedMetadata as any;
         }
@@ -89,8 +88,8 @@ export default function LanguageSwitcher({ currentPageData }: LanguageSwitcherPr
       } catch (error) {
         console.error("Error fetching translations:", error);
       }
-    } else if (!isHomePage) {
-      console.warn(`No translation_group_id for content: ${contentMetadata?.slug || currentSlug}. Current path will be used.`);
+    } else if (lookup) {
+      console.warn(`No translation_group_id for content: ${contentMetadata?.slug || lookup.slug}. Current path will be used.`);
     }
     }
 

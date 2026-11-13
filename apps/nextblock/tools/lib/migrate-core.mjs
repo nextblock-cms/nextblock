@@ -314,6 +314,19 @@ end $nb_trg$;`;
 // response) unreadable by authenticated: table SELECT goes and comes back per column, the
 // column list read from the catalog like profiles. It also keeps media_storage_keys_in_use
 // service-role only (the media delete/move actions call it after their own role check).
+// Migration 02030 (affiliates) adds its own: anon reads none of the partner tables but the
+// tiers, authenticated writes no ledger row and only the self-service columns of
+// affiliate_profiles / affiliate_pages (table writes revoked, column UPDATE granted back), the
+// click log and the payout-run claims are service-role only, and every service-role RPC of the
+// package loses EXECUTE for the API roles again. Migration 02035 adds one more such RPC,
+// change_affiliate_partner_tier (the CMS tier move). Migration 02036 replaces the claim with a
+// five-argument one (p_gateways) and adds the manual payout lifecycle (the CMS "Pay manually":
+// claim_manual_affiliate_payout, record_manual_affiliate_payout, cancel_manual_affiliate_payout);
+// the four-argument claim stays listed for a database that has not run 02036 yet (its guard skips
+// it everywhere else, and 02030's own revoke of it must survive this pass). Migration 02037 adds the
+// PayPal payout lifecycle (claim_paypal_affiliate_payout, record_paypal_affiliate_payout_batch,
+// note_paypal_affiliate_payout_item, complete_paypal_affiliate_payout, fail_paypal_affiliate_payout,
+// release_paypal_affiliate_payout).
 // To open one of these commands to a role, add the policy and the GRANT in a migration and
 // remove the table here and in schema-apply.ts.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
@@ -510,6 +523,102 @@ begin
   end if;
   if to_regprocedure('public.media_storage_keys_in_use(text[], uuid)') is not null then
     revoke execute on function public.media_storage_keys_in_use(text[], uuid) from public, anon, authenticated;
+  end if;
+  if to_regclass('public.affiliate_profiles') is not null then
+    revoke select on table public.affiliate_profiles from anon;
+    revoke insert, update, delete on table public.affiliate_profiles from authenticated;
+    grant update (display_name, bio, social_links, preferred_locale) on table public.affiliate_profiles to authenticated;
+  end if;
+  if to_regclass('public.affiliate_pages') is not null then
+    revoke select on table public.affiliate_pages from anon;
+    revoke insert, update, delete on table public.affiliate_pages from authenticated;
+    grant update (title, meta_description, draft_content, featured_product_ids) on table public.affiliate_pages to authenticated;
+  end if;
+  if to_regclass('public.affiliate_commissions') is not null then
+    revoke select on table public.affiliate_commissions from anon;
+    revoke insert, update, delete on table public.affiliate_commissions from authenticated;
+  end if;
+  if to_regclass('public.affiliate_payouts') is not null then
+    revoke select on table public.affiliate_payouts from anon;
+    revoke insert, update, delete on table public.affiliate_payouts from authenticated;
+  end if;
+  if to_regclass('public.affiliate_click_events') is not null then
+    revoke all on table public.affiliate_click_events from public, anon, authenticated;
+  end if;
+  if to_regclass('public.affiliate_payout_runs') is not null then
+    revoke all on table public.affiliate_payout_runs from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.create_affiliate_account(uuid, text, text, text, text, text, jsonb, text)') is not null then
+    revoke execute on function public.create_affiliate_account(uuid, text, text, text, text, text, jsonb, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.promote_cleared_affiliate_commissions()') is not null then
+    revoke execute on function public.promote_cleared_affiliate_commissions() from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_affiliate_payout(uuid, text, bigint, text)') is not null then
+    revoke execute on function public.claim_affiliate_payout(uuid, text, bigint, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.complete_affiliate_payout(uuid, text)') is not null then
+    revoke execute on function public.complete_affiliate_payout(uuid, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.fail_affiliate_payout(uuid, text)') is not null then
+    revoke execute on function public.fail_affiliate_payout(uuid, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.prepare_affiliate_payout_retry(uuid, bigint)') is not null then
+    revoke execute on function public.prepare_affiliate_payout_retry(uuid, bigint) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.release_affiliate_payout(uuid)') is not null then
+    revoke execute on function public.release_affiliate_payout(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_affiliate_payout_run(date, text)') is not null then
+    revoke execute on function public.claim_affiliate_payout_run(date, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.finish_affiliate_payout_run(date, jsonb)') is not null then
+    revoke execute on function public.finish_affiliate_payout_run(date, jsonb) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_affiliate_commission_notifications(integer)') is not null then
+    revoke execute on function public.claim_affiliate_commission_notifications(integer) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean)') is not null then
+    revoke execute on function public.apply_affiliate_refund(public.affiliate_gateway, uuid, bigint, bigint, boolean) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean)') is not null then
+    revoke execute on function public.set_affiliate_commission_dispute(public.affiliate_gateway, uuid, boolean) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.reconcile_affiliate_commissions(integer)') is not null then
+    revoke execute on function public.reconcile_affiliate_commissions(integer) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.change_affiliate_partner_tier(uuid, uuid, boolean)') is not null then
+    revoke execute on function public.change_affiliate_partner_tier(uuid, uuid, boolean) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[])') is not null then
+    revoke execute on function public.claim_affiliate_payout(uuid, text, bigint, text, public.affiliate_gateway[]) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[])') is not null then
+    revoke execute on function public.claim_manual_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[]) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.record_manual_affiliate_payout(uuid, text, text, text, uuid)') is not null then
+    revoke execute on function public.record_manual_affiliate_payout(uuid, text, text, text, uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.cancel_manual_affiliate_payout(uuid)') is not null then
+    revoke execute on function public.cancel_manual_affiliate_payout(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text)') is not null then
+    revoke execute on function public.claim_paypal_affiliate_payout(uuid, text, bigint, public.affiliate_gateway[], boolean, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.record_paypal_affiliate_payout_batch(uuid[], text, text)') is not null then
+    revoke execute on function public.record_paypal_affiliate_payout_batch(uuid[], text, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.note_paypal_affiliate_payout_item(uuid, text, text, bigint)') is not null then
+    revoke execute on function public.note_paypal_affiliate_payout_item(uuid, text, text, bigint) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.complete_paypal_affiliate_payout(uuid, text, text, bigint, text)') is not null then
+    revoke execute on function public.complete_paypal_affiliate_payout(uuid, text, text, bigint, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.fail_paypal_affiliate_payout(uuid, text, text)') is not null then
+    revoke execute on function public.fail_paypal_affiliate_payout(uuid, text, text) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.release_paypal_affiliate_payout(uuid)') is not null then
+    revoke execute on function public.release_paypal_affiliate_payout(uuid) from public, anon, authenticated;
   end if;
 end $nb_api$;`;
 

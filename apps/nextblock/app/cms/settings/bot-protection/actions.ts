@@ -3,7 +3,7 @@
 
 import 'server-only';
 
-import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import type { SettingsActionResult } from '../../../../lib/cms/action-result';
 import { getCmsActor, requireCmsAdmin } from '../../../../lib/auth/cms-actor';
@@ -11,8 +11,10 @@ import {
   BOT_PROTECTION_SECRET_SETTING_KEY,
   buildBotProtectionSecretValue,
   readStoredBotProtectionSecret,
+  resealStoredBotProtectionSecret,
   type BotProtectionSecretValue,
 } from '../../../../lib/botProtection/secret';
+import { SANDBOX_SECRET_REFUSED } from './sandbox';
 
 export type BotProtectionSettings = {
   provider: 'none' | 'turnstile' | 'recaptcha';
@@ -22,10 +24,13 @@ export type BotProtectionSettings = {
 
 /**
  * ADMIN only, read with the service role after the role check. `bot_protection_secret` is
- * the ADMIN tier of `site_settings`, which migration 02023 gates behind `is_admin_mfa()`, so
- * through the cookie client an ADMIN on an aal1 "remember this device" session would see an
- * empty secret on their own form (see `lib/auth/cms-actor.ts`). Throws for anyone else; the
- * page is under /cms/settings, which proxy.ts keeps ADMIN-only.
+ * a secret row of `site_settings`, which no API session reaches since migration 02038 (see
+ * `lib/auth/cms-actor.ts`). Throws for anyone else; the page is under /cms/settings, which
+ * proxy.ts keeps ADMIN-only.
+ *
+ * The public sandbox (2026-11-03) publishes its admin login, so a secret one visitor saved was
+ * put in the form of every later one. There the secret row is not read at all and `secretKey` is
+ * always empty; the form re-submits that empty value, which keeps whatever is stored.
  */
 export async function getBotProtectionSettings(): Promise<BotProtectionSettings> {
   const { supabase } = await requireCmsAdmin();
@@ -37,6 +42,14 @@ export async function getBotProtectionSettings(): Promise<BotProtectionSettings>
     .eq('key', 'bot_protection_public')
     .maybeSingle();
 
+  const publicVal = (publicData?.value || {}) as Record<string, any>;
+  const provider = (publicVal.provider as any) || 'none';
+  const siteKey = publicVal.siteKey || '';
+
+  if (isSandboxEnvironment()) {
+    return { provider, siteKey, secretKey: '' };
+  }
+
   // Fetch secret settings
   const { data: secretData } = await supabase
     .from('site_settings')
@@ -44,17 +57,11 @@ export async function getBotProtectionSettings(): Promise<BotProtectionSettings>
     .eq('key', BOT_PROTECTION_SECRET_SETTING_KEY)
     .maybeSingle();
 
-  const publicVal = (publicData?.value || {}) as Record<string, any>;
-
   // Decrypts the stored envelope (a pre-encryption plaintext row passes through; an envelope
   // the configured key cannot open reads as empty so the admin re-enters it).
   const { secretKey } = readStoredBotProtectionSecret(secretData?.value);
 
-  return {
-    provider: (publicVal.provider as any) || 'none',
-    siteKey: publicVal.siteKey || '',
-    secretKey,
-  };
+  return { provider, siteKey, secretKey };
 }
 
 export async function updateBotProtectionSettings(
@@ -70,15 +77,22 @@ export async function updateBotProtectionSettings(
     return { ok: false, error: 'You do not have permission to perform this action.' };
   }
 
-  // Everything below writes with the service role: the secret row is in the ADMIN-only
-  // write tier that migration 02023 gates behind is_admin_mfa(), which an admin on an aal1
-  // "remember this device" session cannot satisfy through the cookie client. The role
-  // check above is the authorization boundary.
+  // The sandbox refuses a submitted secret before the service-role read: every later visitor is
+  // the same admin. Provider and site key still save there (the form submits an empty secret,
+  // which keeps what is stored): both are public and change nothing outside the site. Payment
+  // settings save nothing at all on the sandbox (`savePaymentCredentials` in libs/ecommerce),
+  // since `hydrateFreemiusEnvFromDb` copies even their public row into `process.env`.
+  const submittedSecret = String(formData.get('secretKey') ?? '').trim();
+  if (submittedSecret && isSandboxEnvironment()) {
+    return { ok: false, error: SANDBOX_SECRET_REFUSED };
+  }
+
+  // Everything below writes with the service role: the secret row is service-role only since
+  // migration 02038. The role check above is the authorization boundary.
   const supabase = getServiceRoleSupabaseClient();
 
   const provider = formData.get('provider') as 'none' | 'turnstile' | 'recaptcha';
   const siteKey = String(formData.get('siteKey') ?? '');
-  const submittedSecret = String(formData.get('secretKey') ?? '').trim();
 
   // Decide what the secret row becomes BEFORE writing anything, so a missing encryption
   // key fails the whole save instead of leaving the public half updated.
@@ -89,6 +103,7 @@ export async function updateBotProtectionSettings(
   //   with '' would silently break every captcha-protected form.
   // - A pre-encryption plaintext row is re-encrypted on this save even when the field is
   //   empty, which is how existing installs migrate without a data migration.
+  // - Likewise an envelope from before 0.23.1 (not bound to its field) is re-sealed for it.
   const { data: existingSecret } = await supabase
     .from('site_settings')
     .select('value')
@@ -99,9 +114,11 @@ export async function updateBotProtectionSettings(
     submittedSecret || (stored.storage === 'legacy-plaintext' ? stored.secretKey : '');
 
   let secretValue: BotProtectionSecretValue | null = null;
-  if (secretToStore) {
+  if (secretToStore || stored.storage === 'encrypted') {
     try {
-      secretValue = buildBotProtectionSecretValue(secretToStore);
+      secretValue = secretToStore
+        ? buildBotProtectionSecretValue(secretToStore)
+        : resealStoredBotProtectionSecret(existingSecret?.value);
     } catch (error) {
       // The error names the missing env key, never the secret.
       console.error(

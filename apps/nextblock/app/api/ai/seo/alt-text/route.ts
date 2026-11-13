@@ -158,9 +158,13 @@ export async function POST(request: Request) {
       return jsonError(unusableImageUrlReason, 400);
     }
 
-    // Sandbox installs have no server-side OpenRouter credential at all: the demo
-    // visitor pastes their own key into the browser, it lives in localStorage under
-    // `cortex_ai_sandbox_openrouter_api_key`, and it rides along on these headers.
+    // On the sandbox the demo visitor pastes their own key into the browser; it lives
+    // in localStorage under `cortex_ai_sandbox_openrouter_api_key` and rides along on
+    // these headers (credential source `manual`). Without the header the call falls
+    // back to the deployment's OPENROUTER_API_KEY when one is set (credential source
+    // `env`, the operator's key behind every visitor), and the vision routing policy
+    // then reaches only the free vision models: no requested model and no paid
+    // fallback, so a visitor cannot spend that key on a paid model.
     // The env guard matters as much as the headers do — outside a sandbox the
     // server must never accept a caller-supplied credential, because that would let
     // any authenticated writer redirect generation through a key the operator never
@@ -184,12 +188,12 @@ export async function POST(request: Request) {
     }
 
     // `generateCortexAiAltText` takes a requested model id rather than a whole
-    // stored selection, because its vision routing policy has to decide for itself
-    // whether an id is plausibly multimodal before it will route an image to it.
-    // The header is still parsed through `safeParseCortexAiModelSelection` so that
-    // a malformed value is discarded rather than forwarded as a bogus id, and the
-    // id is only honoured alongside the sandbox key so that a caller-supplied model
-    // choice can never be applied to the operator's own credential.
+    // stored selection. The header is still parsed through
+    // `safeParseCortexAiModelSelection` so that a malformed value is discarded rather
+    // than forwarded as a bogus id, and the id is only passed alongside the sandbox
+    // key so that a caller-supplied model choice can never be applied to the
+    // operator's own credential; on an `env` credential the vision routing policy
+    // drops a requested id as well.
     const result = await generateCortexAiAltText({
       apiKey: sandboxKey || undefined,
       context: parsedRequest.data.context,

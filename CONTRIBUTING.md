@@ -24,6 +24,7 @@ scaffolding CLI.
 | `libs/editor` | Reusable Tiptap editor |
 | `libs/ecommerce` | Premium commerce package |
 | `libs/cortex` | Premium Cortex AI package |
+| `libs/affiliates` | Premium Affiliates & Creator Storefronts package (partner storefronts, commissions, Stripe Connect payouts; [docs/15](./docs/15-AFFILIATES-AND-STOREFRONTS.md)) |
 | `libs/ui`, `libs/utils` | Shared primitives, helpers, Zod schemas |
 
 Cross-package imports use `@nextblock-cms/*` aliases resolved by
@@ -229,8 +230,8 @@ if you add or touch any inline Supabase client factory, accept every alias. See
 
 NextBlock is licensed under **AGPL-3.0-or-later** (see [LICENSE.md](./LICENSE.md)).
 By submitting a contribution you agree that it is licensed under the same terms.
-Premium modules (`libs/ecommerce`, `libs/cortex`) are published publicly under
-the same license and gated at runtime by license-key activation — contributions
+Premium modules (`libs/ecommerce`, `libs/cortex`, `libs/affiliates`) are published
+publicly under the same license and gated at runtime by package activation — contributions
 there are treated identically.
 
 ## Questions

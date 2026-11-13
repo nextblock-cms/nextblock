@@ -74,6 +74,38 @@ describe('resolveUploadFolder', () => {
     expect(resolveUploadFolder(folder)).toBeNull();
   });
 
+  // The partner upload namespaces (Affiliates avatars and storefront images) are never a
+  // media-library folder: uploads there would count against a partner's upload caps.
+  it.each([
+    'affiliates/pages',
+    'affiliates/pages/0b7c5f6e-1111-4c2d-9e8f-123456789abc/',
+    'Affiliates/avatars/u1',
+    'AFFILIATES/PAGES',
+    '/affiliates//pages',
+    ' affiliates/avatars ',
+    'affiliates!/pages',
+  ])('returns null for the partner upload folder %j', (folder) => {
+    expect(resolveUploadFolder(folder)).toBeNull();
+  });
+
+  it.each([
+    ['uploads/affiliates', 'uploads/affiliates/'],
+    ['affiliates-archive', 'affiliates-archive/'],
+    ['affiliate/pages', 'affiliate/pages/'],
+    ['pages/affiliates/', 'pages/affiliates/'],
+    // The rest of affiliates/ is an ordinary media folder (an install may keep its own
+    // affiliate-program assets there): only avatars/ and pages/ below it are reserved.
+    ['affiliates', 'affiliates/'],
+    ['affiliates/', 'affiliates/'],
+    ['AFFILIATES', 'AFFILIATES/'],
+    [' affiliates ', 'affiliates/'],
+    ['affiliates/banners', 'affiliates/banners/'],
+    ['affiliates/pages-archive', 'affiliates/pages-archive/'],
+    ['affiliates/avatars2', 'affiliates/avatars2/'],
+  ])('still accepts %j, which is not a partner namespace', (folder, expected) => {
+    expect(resolveUploadFolder(folder)).toBe(expected);
+  });
+
   it('returns null for an over-long folder', () => {
     expect(resolveUploadFolder('a'.repeat(201))).toBeNull();
   });

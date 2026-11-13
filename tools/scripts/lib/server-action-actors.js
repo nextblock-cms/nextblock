@@ -22,14 +22,20 @@ const ts = require('typescript');
 
 const { createResolver, scanRepository } = require('./service-role-boundary.js');
 
-/** Parameter names (lowercased, underscores dropped) that make the caller the principal. */
+/**
+ * Parameter names (lowercased, underscores dropped) that make the caller the principal.
+ * `affiliateid` / `retailerid`: a partner-portal action acts for the partner the session names
+ * (`requireRetailer()`); an admin target says so (`affiliateIdToUpdate`).
+ */
 const IDENTITY_NAMES = new Set([
   'actorid',
   'actoruserid',
+  'affiliateid',
   'authorid',
   'createdby',
   'creatorid',
   'ownerid',
+  'retailerid',
   'uploaderid',
   'userid',
 ]);

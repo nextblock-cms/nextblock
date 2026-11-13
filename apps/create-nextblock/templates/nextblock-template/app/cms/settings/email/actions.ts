@@ -1,7 +1,7 @@
 // app/cms/settings/email/actions.ts
 'use server';
 
-import { createClient } from '@nextblock-cms/db/server';
+import { createClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 import { saveEmailSettings } from '../../../../lib/config/email-settings';
 import { sendEmail } from '../../../actions/email';
@@ -64,6 +64,12 @@ export async function updateEmailSettings(formData: FormData): Promise<EmailActi
 export async function sendTestEmail(formData: FormData): Promise<EmailActionResult> {
   const denied = await adminCheck();
   if (denied) return denied;
+
+  // The sandbox's admin login is public: a test send would mail any address on the
+  // deployment's SMTP account.
+  if (isSandboxEnvironment()) {
+    return { ok: false, error: 'Test emails are turned off in the sandbox.' };
+  }
 
   const to = String(formData.get('to') ?? '').trim();
   if (!to) {

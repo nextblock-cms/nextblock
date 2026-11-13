@@ -1,0 +1,17 @@
+-- 02029: add 'RTL' (retailer, shown as "partner" / "partenaire" in the UI) to public.user_role,
+-- the role held by Affiliates & Creator Storefronts accounts (02030).
+--
+-- Alone in its file on purpose. PostgreSQL refuses to USE an enum value inside the transaction
+-- that added it ("unsafe use of new value"), and every apply path (the Supabase CLI, the build
+-- hook in apps/nextblock/tools/lib/migrate-core.mjs and /setup's lib/setup/schema-apply.ts) runs
+-- one transaction per file, so 02030 and later files see the value committed.
+--
+-- The sandbox reset replays every migration in ONE transaction, where the value is never
+-- committed before 02030 runs. That is why no migration resolves the label at CREATE or apply
+-- time: policies and SQL compare roles as text (`(SELECT public.get_current_user_role())::text
+-- = 'RTL'`, `role::text = 'RTL'`), and 'RTL' is assigned only inside plpgsql bodies, which
+-- resolve it when the function runs. tools/scripts/lib/migration-grants.js (findEnumRtlLiterals)
+-- refuses an `'RTL'::public.user_role` cast anywhere else in a forward migration.
+--
+-- Idempotent: ADD VALUE IF NOT EXISTS is a no-op on a database that already has the label.
+ALTER TYPE public.user_role ADD VALUE IF NOT EXISTS 'RTL';

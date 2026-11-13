@@ -270,6 +270,33 @@ describe('POST /api/upload/proxy', () => {
       expect(mocks.s3Send).not.toHaveBeenCalled();
     });
 
+    // Partner uploads live under affiliates/ and count against that partner's upload caps
+    // (lib/affiliates/uploads.ts): a WRITER could otherwise fill them, or plant objects there.
+    it.each([
+      'affiliates/pages/0b7c5f6e-1111-4c2d-9e8f-123456789abc/',
+      'Affiliates/avatars/u1',
+      '/affiliates//pages',
+      'affiliates!/pages',
+      ' affiliates/avatars ',
+    ])('400s the partner upload folder %j and stores nothing', async (folder) => {
+      const response = await POST(multipartRequest({ file: { name: 'a.png', type: 'image/png' }, folder }));
+
+      expect(response.status).toBe(400);
+      expect((await json(response)).error).toBe('Invalid upload folder.');
+      expect(mocks.s3Send).not.toHaveBeenCalled();
+      expect(mocks.supabaseUploadObject).not.toHaveBeenCalled();
+    });
+
+    it('400s the partner upload folder on the native Supabase backend too', async () => {
+      mocks.getStorageBackend.mockReturnValue('supabase');
+      const response = await POST(
+        multipartRequest({ file: { name: 'a.png', type: 'image/png' }, folder: 'affiliates/avatars/u1/' }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(mocks.supabaseUploadObject).not.toHaveBeenCalled();
+    });
+
     it('forces the stored extension to agree with the declared content type', async () => {
       const html = await json(await POST(multipartRequest({ file: { name: 'evil.html', type: 'image/png' } })));
       expect(html.objectKey).toMatch(/^uploads\/evil_\d{14}\.png$/);

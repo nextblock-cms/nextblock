@@ -1,12 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * The app-local copy of the orders actions. `getOrders` must never splice raw input into
  * the PostgREST `.or()` DSL, reads orders with the service role only after the caller is
  * verified as ADMIN (migration 02023 gates the orders policies behind `is_admin_mfa()`),
- * and `markOrderAsPaid` writes with the service role, so it must insist on an ADMIN rather
- * than any signed-in account.
+ * and `markOrderAsPaid` writes with the service role, so it must insist on an ADMIN who has
+ * passed their enrolled second factor (requireCmsAdmin -> getCmsActor) rather than any
+ * signed-in account or a bare first factor. Until 2026-10-27 it read the role with the cookie
+ * client and built the service client from the env keys itself, with no second factor.
  */
+
+const ORDER_ID = 'dddddddd-0000-4000-8000-0000000000aa';
 
 const mocks = vi.hoisted(() => ({
   or: vi.fn(),
@@ -14,8 +18,12 @@ const mocks = vi.hoisted(() => ({
   cookieFrom: vi.fn(),
   user: null as { id: string } | null,
   role: null as string | null,
-  createServiceClient: vi.fn(),
+  twoFactorStatus: 'satisfied' as string,
+  serviceClientMissing: false,
+  serviceClientCreated: vi.fn(),
   serviceUpdate: vi.fn(),
+  serviceUpdateEq: vi.fn(),
+  updateResult: { data: [] as unknown[] | null, error: null as { message: string } | null },
   assignInvoiceMetadata: vi.fn(),
   applyOrderInventoryDeduction: vi.fn(),
 }));
@@ -34,6 +42,27 @@ function chainableQuery() {
     Promise.resolve(result).then(resolve, reject);
   return query;
 }
+
+/**
+ * The service client's query surface: reads chain to an empty page; an update records its
+ * table, values and filter, and resolves to `mocks.updateResult`.
+ */
+const serviceClient = {
+  from: (table: string) => {
+    mocks.from(table);
+    const query = chainableQuery();
+    query.update = (values: unknown) => {
+      mocks.serviceUpdate(table, values);
+      return {
+        eq: (column: string, value: unknown) => {
+          mocks.serviceUpdateEq(column, value);
+          return { select: async () => mocks.updateResult };
+        },
+      };
+    };
+    return query;
+  },
+};
 
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => ({
@@ -54,12 +83,13 @@ vi.mock('@nextblock-cms/db/server', () => ({
       };
     },
   }),
-  getServiceRoleSupabaseClient: () => ({
-    from: (table: string) => {
-      mocks.from(table);
-      return chainableQuery();
-    },
-  }),
+  getServiceRoleSupabaseClient: () => {
+    mocks.serviceClientCreated();
+    if (mocks.serviceClientMissing) {
+      throw new Error('Missing Supabase Service Role environment variables');
+    }
+    return serviceClient;
+  },
 }));
 
 vi.mock('@nextblock-cms/ecommerce/server', () => ({
@@ -67,28 +97,10 @@ vi.mock('@nextblock-cms/ecommerce/server', () => ({
   applyOrderInventoryDeduction: mocks.applyOrderInventoryDeduction,
 }));
 
-vi.mock('@supabase/supabase-js', () => ({
-  createClient: (...args: unknown[]) => {
-    mocks.createServiceClient(...args);
-    return {
-      from: () => ({
-        update: (values: unknown) => {
-          mocks.serviceUpdate(values);
-          return {
-            eq: () => ({
-              select: async () => ({ data: [{ id: 'order-1', status: 'paid' }], error: null }),
-            }),
-          };
-        },
-      }),
-    };
-  },
-}));
-
 vi.mock('server-only', () => ({}));
-// The caller has passed any enrolled second factor; 2FA itself is covered by lib/auth/cms-actor.test.ts.
+// The second factor is driven per test; its own logic is covered by lib/auth/cms-actor.test.ts.
 vi.mock('../../../lib/auth/twoFactor', () => ({
-  evaluateTwoFactor: async () => ({ status: 'satisfied', userId: null, mfaType: null }),
+  evaluateTwoFactor: async () => ({ status: mocks.twoFactorStatus, userId: null, mfaType: null }),
 }));
 
 import { getOrders, markOrderAsPaid } from './actions';
@@ -100,6 +112,8 @@ describe('getOrders search', () => {
     vi.clearAllMocks();
     mocks.user = { id: 'admin-1' };
     mocks.role = 'ADMIN';
+    mocks.twoFactorStatus = 'satisfied';
+    mocks.serviceClientMissing = false;
   });
 
   it('searches both uuid columns with the normalised uuid', async () => {
@@ -133,45 +147,98 @@ describe('getOrders search', () => {
 describe('markOrderAsPaid', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'service-key');
-    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'http://127.0.0.1:3998');
     mocks.user = null;
     mocks.role = null;
+    mocks.twoFactorStatus = 'satisfied';
+    mocks.serviceClientMissing = false;
+    mocks.updateResult = { data: [{ id: ORDER_ID, status: 'paid' }], error: null };
     mocks.assignInvoiceMetadata.mockResolvedValue(undefined);
     mocks.applyOrderInventoryDeduction.mockResolvedValue(undefined);
   });
 
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
   it('refuses an anonymous caller', async () => {
-    const result = await markOrderAsPaid('order-1');
+    const result = await markOrderAsPaid(ORDER_ID);
 
     expect(result).toEqual({ success: false, error: 'Unauthorized' });
-    expect(mocks.createServiceClient).not.toHaveBeenCalled();
+    expect(mocks.serviceClientCreated).not.toHaveBeenCalled();
   });
 
   it.each(['USER', 'WRITER'])('refuses a signed-in %s before creating the service client', async (role) => {
     mocks.user = { id: 'someone' };
     mocks.role = role;
 
-    const result = await markOrderAsPaid('order-1');
+    const result = await markOrderAsPaid(ORDER_ID);
 
     expect(result).toEqual({ success: false, error: 'Forbidden' });
-    expect(mocks.createServiceClient).not.toHaveBeenCalled();
+    expect(mocks.serviceClientCreated).not.toHaveBeenCalled();
     expect(mocks.serviceUpdate).not.toHaveBeenCalled();
   });
 
-  it('lets an ADMIN record the payment', async () => {
+  it.each(['totp_required', 'email_required'])(
+    'refuses an ADMIN whose session has not passed its second factor (%s) before creating the service client',
+    async (status) => {
+      mocks.user = { id: 'admin-1' };
+      mocks.role = 'ADMIN';
+      mocks.twoFactorStatus = status;
+
+      const result = await markOrderAsPaid(ORDER_ID);
+
+      expect(result).toEqual({ success: false, error: 'Unauthorized' });
+      expect(mocks.serviceClientCreated).not.toHaveBeenCalled();
+      expect(mocks.serviceUpdate).not.toHaveBeenCalled();
+      expect(mocks.assignInvoiceMetadata).not.toHaveBeenCalled();
+    }
+  );
+
+  it('lets an ADMIN who passed their factor record the payment with the service client', async () => {
     mocks.user = { id: 'admin-1' };
     mocks.role = 'ADMIN';
 
-    const result = await markOrderAsPaid('order-1');
+    const result = await markOrderAsPaid(ORDER_ID);
 
     expect(result).toEqual({ success: true });
-    expect(mocks.serviceUpdate).toHaveBeenCalledWith({ status: 'paid' });
-    expect(mocks.assignInvoiceMetadata).toHaveBeenCalledTimes(1);
-    expect(mocks.applyOrderInventoryDeduction).toHaveBeenCalledTimes(1);
+    expect(mocks.serviceClientCreated).toHaveBeenCalledTimes(1);
+    expect(mocks.serviceUpdate).toHaveBeenCalledWith('orders', { status: 'paid' });
+    expect(mocks.serviceUpdateEq).toHaveBeenCalledWith('id', ORDER_ID);
+    expect(mocks.assignInvoiceMetadata).toHaveBeenCalledWith({ orderId: ORDER_ID, client: serviceClient });
+    expect(mocks.applyOrderInventoryDeduction).toHaveBeenCalledWith(serviceClient, ORDER_ID);
+  });
+
+  it.each(['', 'not-a-uuid', `${ORDER_ID},status.eq.refunded`])(
+    'refuses the order id %j without writing',
+    async (orderId) => {
+      mocks.user = { id: 'admin-1' };
+      mocks.role = 'ADMIN';
+
+      const result = await markOrderAsPaid(orderId);
+
+      expect(result).toEqual({ success: false, error: 'Order not found or update failed.' });
+      expect(mocks.serviceUpdate).not.toHaveBeenCalled();
+    }
+  );
+
+  it('reports a missing order without the paid side effects', async () => {
+    mocks.user = { id: 'admin-1' };
+    mocks.role = 'ADMIN';
+    mocks.updateResult = { data: [], error: null };
+
+    const result = await markOrderAsPaid(ORDER_ID);
+
+    expect(result).toEqual({ success: false, error: 'Order not found or update failed.' });
+    expect(mocks.assignInvoiceMetadata).not.toHaveBeenCalled();
+    expect(mocks.applyOrderInventoryDeduction).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing service configuration as a configuration error', async () => {
+    mocks.user = { id: 'admin-1' };
+    mocks.role = 'ADMIN';
+    mocks.serviceClientMissing = true;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const result = await markOrderAsPaid(ORDER_ID);
+
+    expect(result).toEqual({ success: false, error: 'Server configuration error' });
+    expect(mocks.serviceUpdate).not.toHaveBeenCalled();
+    consoleError.mockRestore();
   });
 });

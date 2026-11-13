@@ -25,7 +25,9 @@ Running from source needs the CLI's own deps: `npm install --prefix apps/create-
 - `scripts/sync-template.js` (`npm run sync:create-nextblock`) empties and regenerates
   `templates/nextblock-template/` from `apps/nextblock`, root `docs/`,
   `libs/ui/src/styles/globals.css`, and `docker-template/`; it copies `CLAUDE.md`/`AGENTS.md`
-  verbatim and rewrites `@nextblock-cms/ui/<sub>` imports to the barrel.
+  verbatim and rewrites `@nextblock-cms/ui/<sub>` imports to the barrel. `docs/prompts/`
+  (internal build prompts) is never copied into the template (`scripts/lib/template-docs.test.js`,
+  run with `npx vitest run apps/create-nextblock/scripts`; CI does not collect it).
 - `templates/nextblock-template/**` is generated output: committed, shipped, and the update
   source for `apps/nextblock/tools/update.mjs`. Never edit it.
 - `prepack` runs the sync, so `npm pack` / `npm publish` regenerate the template from the working

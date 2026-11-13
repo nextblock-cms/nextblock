@@ -28,7 +28,7 @@ vi.mock('@nextblock-cms/db/server', async (importOriginal) => ({
   }),
 }));
 
-import { encryptSecret } from '@nextblock-cms/db/server';
+import { encryptSecret, siteSettingSecretSlot } from '@nextblock-cms/db/server';
 import { TURNSTILE_TOKEN_FIELD, verifyBotProtection } from './verify';
 
 const ENV_KEYS = [
@@ -40,6 +40,8 @@ const ENV_KEYS = [
   'RECAPTCHA_SECRET_KEY',
 ] as const;
 const TEST_KEY = 'bot-protection-verify-test-key';
+/** Where the captcha secret lives; an envelope sealed for any other slot does not open there. */
+const BOT_SLOT = siteSettingSecretSlot('bot_protection_secret', 'secretKey');
 const SECRET = '0x4AAAAAAABotRedteamTURNSTILE_secret_XYZ';
 
 function turnstileSubmission(): FormData {
@@ -83,7 +85,7 @@ describe('verifyBotProtection secret resolution', () => {
 
   it('decrypts the stored envelope and sends the plaintext to siteverify', async () => {
     mocks.settings.set('bot_protection_secret', {
-      secretKey: encryptSecret({ value: SECRET, encryptionSecret: TEST_KEY }),
+      secretKey: encryptSecret({ value: SECRET, encryptionSecret: TEST_KEY, slot: BOT_SLOT }),
     });
 
     await expect(verifyBotProtection(turnstileSubmission())).resolves.toEqual({ ok: true });
@@ -102,7 +104,7 @@ describe('verifyBotProtection secret resolution', () => {
 
   it('falls back to the env secret when the stored envelope cannot be opened, without leaking it', async () => {
     mocks.settings.set('bot_protection_secret', {
-      secretKey: encryptSecret({ value: SECRET, encryptionSecret: 'a-rotated-away-key' }),
+      secretKey: encryptSecret({ value: SECRET, encryptionSecret: 'a-rotated-away-key', slot: BOT_SLOT }),
     });
     process.env['TURNSTILE_SECRET_KEY'] = 'env-turnstile-secret';
 
@@ -118,9 +120,25 @@ describe('verifyBotProtection secret resolution', () => {
     expect(logged).not.toContain(SECRET);
   });
 
+  it('never sends an envelope copied in from another row to siteverify', async () => {
+    mocks.settings.set('bot_protection_secret', {
+      secretKey: encryptSecret({
+        value: 'sk_live_victim',
+        encryptionSecret: TEST_KEY,
+        slot: siteSettingSecretSlot('payment_secret', 'stripeSecretKey'),
+      }),
+    });
+    process.env['TURNSTILE_SECRET_KEY'] = 'env-turnstile-secret';
+
+    await expect(verifyBotProtection(turnstileSubmission())).resolves.toEqual({ ok: true });
+
+    expect(siteverifyBody()).toContain(`secret=${encodeURIComponent('env-turnstile-secret')}`);
+    expect(siteverifyBody()).not.toContain('sk_live_victim');
+  });
+
   it('reports a misconfiguration when neither the row nor env yields a usable secret', async () => {
     mocks.settings.set('bot_protection_secret', {
-      secretKey: encryptSecret({ value: SECRET, encryptionSecret: 'a-rotated-away-key' }),
+      secretKey: encryptSecret({ value: SECRET, encryptionSecret: 'a-rotated-away-key', slot: BOT_SLOT }),
     });
 
     const result = await verifyBotProtection(turnstileSubmission());

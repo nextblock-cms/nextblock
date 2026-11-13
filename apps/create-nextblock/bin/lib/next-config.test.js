@@ -54,6 +54,25 @@ describe('patchNextConfigForStandalone', () => {
     expect(patched).toContain('allowedDevOrigins');
   });
 
+  it('transpiles every published @nextblock-cms package a scaffold depends on', () => {
+    // Each of these ships 'server-only' / 'use client' modules that Next only processes when it
+    // transpiles the package; the premium ones are dependencies of every scaffold.
+    expect(STANDALONE_TRANSPILE_PACKAGES).toEqual(
+      expect.arrayContaining(['@nextblock-cms/db', '@nextblock-cms/ecommerce', '@nextblock-cms/cortex', '@nextblock-cms/affiliates']),
+    );
+    expect(new Set(STANDALONE_TRANSPILE_PACKAGES).size).toBe(STANDALONE_TRANSPILE_PACKAGES.length);
+
+    const appDependencies = Object.keys(
+      JSON.parse(readFileSync(resolve(here, '../../../nextblock/package.json'), 'utf8')).dependencies,
+    ).filter((name) => name.startsWith('@nextblock-cms/'));
+    for (const name of appDependencies) {
+      expect(STANDALONE_TRANSPILE_PACKAGES, name).toContain(name);
+    }
+
+    const patched = patchNextConfigForStandalone(appSource).replace(/\r\n/g, '\n');
+    expect(patched).toContain("    '@nextblock-cms/affiliates',\n  ],");
+  });
+
   it('preserves CRLF line endings when the source uses them', () => {
     const crlf = appSource.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
     const patched = patchNextConfigForStandalone(crlf);

@@ -175,6 +175,28 @@ describe('POST /api/upload/presigned-url', () => {
     },
   );
 
+  // Partner uploads live under affiliates/ and count against that partner's upload caps
+  // (lib/affiliates/uploads.ts): no signed upload URL may point there.
+  it.each([
+    'affiliates/pages/0b7c5f6e-1111-4c2d-9e8f-123456789abc/',
+    'Affiliates/avatars/u1',
+    '/affiliates//pages',
+    ' affiliates/avatars ',
+  ])('400s the partner upload folder %j without signing', async (folder) => {
+    const response = await POST(request({ ...VALID, folder }));
+    expect(response.status).toBe(400);
+    expect((await json(response)).error).toBe('Invalid upload folder.');
+    expect(mocks.getSignedUrl).not.toHaveBeenCalled();
+    expect(mocks.supabaseCreateSignedUpload).not.toHaveBeenCalled();
+  });
+
+  it('400s the partner upload folder on the native Supabase backend too', async () => {
+    mocks.getStorageBackend.mockReturnValue('supabase');
+    const response = await POST(request({ ...VALID, folder: 'affiliates/avatars/u1/' }));
+    expect(response.status).toBe(400);
+    expect(mocks.supabaseCreateSignedUpload).not.toHaveBeenCalled();
+  });
+
   it('400s a body that is not a JSON object', async () => {
     expect((await POST(request('not json'))).status).toBe(400);
     expect((await POST(request([1, 2]))).status).toBe(400);

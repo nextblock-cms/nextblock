@@ -3,6 +3,35 @@ import { getStripeClient } from './client';
 import { resolveStripeWebhookSecret } from '../payment-config';
 import { syncStripeOrderFromSession } from './order-sync';
 
+/** A Stripe event whose signature `handleStripeWebhook` verified. */
+export type StripeWebhookEvent = Stripe.Event;
+
+/**
+ * Events that refund an order: a refund on its charge (full or partial), or a dispute the store
+ * lost. Required in the Stripe webhook endpoint's event list (CMS → Payments).
+ */
+export const STRIPE_REFUND_EVENT_TYPES = ['charge.refunded', 'charge.dispute.closed'] as const;
+
+export type StripeRefundEventType = (typeof STRIPE_REFUND_EVENT_TYPES)[number];
+
+export function isStripeRefundEventType(type: unknown): type is StripeRefundEventType {
+  return typeof type === 'string' && (STRIPE_REFUND_EVENT_TYPES as readonly string[]).includes(type);
+}
+
+/**
+ * Events that open a dispute on an order's charge: they refund nothing (the order keeps its
+ * status), but the app holds the order's affiliate commission until the dispute closes
+ * (`syncStripeOrderDisputeFromEvent`). `charge.dispute.closed`, a refund event, releases the hold
+ * when the store did not lose. Required in the endpoint's event list (CMS → Payments).
+ */
+export const STRIPE_DISPUTE_EVENT_TYPES = ['charge.dispute.created'] as const;
+
+export type StripeDisputeEventType = (typeof STRIPE_DISPUTE_EVENT_TYPES)[number];
+
+export function isStripeDisputeEventType(type: unknown): type is StripeDisputeEventType {
+  return typeof type === 'string' && (STRIPE_DISPUTE_EVENT_TYPES as readonly string[]).includes(type);
+}
+
 /**
  * Only a session whose money has actually arrived may mark an order paid (which also issues the
  * invoice and deducts stock). With a delayed payment method enabled in the Stripe dashboard
@@ -15,10 +44,25 @@ export function isStripeSessionSettled(session: Pick<Stripe.Checkout.Session, 'p
   return session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
 }
 
+/** True for the events `handleStripeWebhook` turns into a paid order (a settled checkout session). */
+export function isStripeSettledCheckoutEvent(event: Pick<Stripe.Event, 'type' | 'data'>): boolean {
+  if (event.type !== 'checkout.session.completed' && event.type !== 'checkout.session.async_payment_succeeded') {
+    return false;
+  }
+
+  return isStripeSessionSettled(event.data.object as Stripe.Checkout.Session);
+}
+
+/**
+ * Verifies the signature over the raw body, then marks orders paid from settled checkout
+ * sessions. The verified `event` is returned too: the app's route applies refunds and disputes
+ * (`charge.refunded`, `charge.dispute.created`, `charge.dispute.closed`) itself, because they
+ * also reach the affiliate commissions, which this package does not know about.
+ */
 export const handleStripeWebhook = async (
   signature: string,
   body: string | Buffer
-): Promise<{ received: boolean; error?: string }> => {
+): Promise<{ received: boolean; error?: string; event?: StripeWebhookEvent }> => {
   // Resolve the webhook secret DB-first (CMS), falling back to STRIPE_WEBHOOK_SECRET.
   const webhookSecret = await resolveStripeWebhookSecret();
 
@@ -54,7 +98,7 @@ export const handleStripeWebhook = async (
         await syncStripeOrderFromSession(session);
       } catch (error: any) {
         console.error('[Stripe Webhook Error] Failed to sync completed session:', error);
-        return { received: false, error: error.message || 'Failed to sync Stripe session' };
+        return { received: false, error: error.message || 'Failed to sync Stripe session', event };
       }
       break;
     }
@@ -65,8 +109,13 @@ export const handleStripeWebhook = async (
       break;
     }
     default:
+      if (isStripeRefundEventType(event.type) || isStripeDisputeEventType(event.type)) {
+        // Applied by the caller (syncStripeOrderRefundFromEvent / syncStripeOrderDisputeFromEvent
+        // plus the affiliate ledger).
+        break;
+      }
       console.log(`Unhandled event type ${event.type}`);
   }
 
-  return { received: true };
+  return { received: true, event };
 };

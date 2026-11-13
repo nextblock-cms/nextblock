@@ -4,7 +4,7 @@ import 'server-only';
 // Freemius developer/public/product ids) lives in the public `payment_public` row;
 // secret keys live encrypted in the ADMIN-only `payment_secret` row. Resolution is
 // DB-first with an env fallback so existing deployments keep working until the keys are
-// moved into the CMS.
+// moved into the CMS. The public sandbox neither saves nor reads the rows: env only.
 //
 // Stripe is resolved through getStripeClient() (a lazy client) and direct getters.
 // Freemius credentials are read synchronously throughout the package, so rather than an
@@ -16,14 +16,37 @@ import {
   encryptWithEnvKey,
   getSecretEnvelopeStatus,
   isSandboxEnvironment,
+  resealWithEnvKey,
   resolveConfigValue,
+  siteSettingSecretSlot,
   tryDecryptWithEnvKey,
+  type SecretSlot,
 } from '@nextblock-cms/db/server';
 import type { Json } from '@nextblock-cms/db';
 import { getEcomActorRole, requireEcomAdmin } from './server-actions/require-ecom-role';
 
 const PAYMENT_SECRET_KEY = 'payment_secret';
 const PAYMENT_PUBLIC_KEY = 'payment_public';
+
+/** Every encrypted field of the `payment_secret` row (the sandbox Freemius key is read, never saved here). */
+const PAYMENT_SECRET_FIELDS = [
+  'stripeSecretKey',
+  'stripeWebhookSecret',
+  'freemiusSecretKey',
+  'freemiusApiKey',
+  'freemiusSandboxSecretKey',
+] as const;
+type PaymentSecretField = (typeof PAYMENT_SECRET_FIELDS)[number];
+
+/**
+ * Each key opens only from its own field (libs/db secret-crypto), so an envelope copied between
+ * fields or in from another row never decrypts here (2026-11-04).
+ */
+function paymentSecretSlot(field: PaymentSecretField): SecretSlot {
+  return siteSettingSecretSlot(PAYMENT_SECRET_KEY, field);
+}
+/** Thrown by savePaymentCredentials on the sandbox; the payments screen shows the same note. */
+export const PAYMENT_SETTINGS_SANDBOX_MESSAGE = "Payment keys can't be changed in the sandbox: its checkout is simulated.";
 const CACHE_TTL_MS = 60_000;
 
 type Row = Record<string, unknown>;
@@ -35,6 +58,15 @@ function asRecord(value: unknown): Row {
 }
 
 async function loadPaymentRows(force = false): Promise<{ secret: Row; public: Row }> {
+  // The sandbox neither saves nor reads the payment rows, so Stripe and Freemius resolve from its
+  // env only. Its admin login is public: a visitor can write `payment_public` over PostgREST (the
+  // factor-less demo admin passes is_admin_mfa()) or through Cortex's DB tool, and
+  // hydrateFreemiusEnvFromDb would copy their Freemius ids into process.env for every later
+  // request. No read and no cache entry (like resolveEmailServerConfig).
+  if (isSandboxEnvironment()) {
+    return { secret: {}, public: {} };
+  }
+
   const now = Date.now();
   if (!force && cache && now - cache.at < CACHE_TTL_MS) {
     return { secret: cache.secret, public: cache.public };
@@ -63,8 +95,8 @@ export function clearPaymentConfigCache(): void {
   cache = null;
 }
 
-function decryptField(row: Row, field: string): string | null {
-  return tryDecryptWithEnvKey(row[field]);
+function decryptField(row: Row, field: PaymentSecretField): string | null {
+  return tryDecryptWithEnvKey(row[field], paymentSecretSlot(field));
 }
 
 // --- Stripe -------------------------------------------------------------------
@@ -88,12 +120,112 @@ export async function resolveStripePublishableKey(): Promise<string | null> {
   );
 }
 
+// --- Stripe key diagnostics (never key material) --------------------------------
+
+/** Where a Stripe credential comes from: saved in the CMS (Payments), the environment, or nowhere. */
+export type StripeCredentialSource = 'cms' | 'env' | null;
+
+export type StripeKeyMode = 'test' | 'live';
+
+/**
+ * Facts about the Stripe keys the store uses (checkout, refunds and affiliate payouts share them),
+ * for the CMS. Nothing of a key leaves this module but the last 4 characters of the secret key.
+ */
+export interface StripeKeyDiagnostics {
+  /** The public sandbox: nothing was read (its keys belong to the operator); every fact is empty. */
+  sandbox: boolean;
+  /** Where the secret key `getStripeClient()` uses comes from (CMS first, then `STRIPE_SECRET_KEY`). */
+  secretKeySource: StripeCredentialSource;
+  /** A secret key is saved in the CMS but this deployment cannot decrypt it, so it is not the one in use. */
+  storedSecretKeyUnreadable: boolean;
+  /** From the secret key's prefix (`sk_test_` / `rk_test_`, `sk_live_` / `rk_live_`); null when absent or unknown. */
+  mode: StripeKeyMode | null;
+  /** A restricted key (`rk_…`), which must allow every call payouts and checkout make. */
+  restricted: boolean;
+  /** Last 4 characters of the secret key in use, null without one. */
+  secretKeyLast4: string | null;
+  /** Where the publishable key comes from (CMS first, then `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`). */
+  publishableKeySource: StripeCredentialSource;
+  /** From the publishable key's prefix (`pk_test_` / `pk_live_`); null when absent or unknown. */
+  publishableKeyMode: StripeKeyMode | null;
+  /** Both keys are present and of the same mode (checkout needs the pair). */
+  publishableKeyMatchesMode: boolean;
+  /** Where the webhook signing secret comes from (CMS first, then `STRIPE_WEBHOOK_SECRET`). */
+  webhookSecretSource: StripeCredentialSource;
+}
+
+/** The value `resolveConfigValue` resolves and where it came from (no env-fallback warning). */
+function resolveWithSource(dbValue: string | null, envName: string): { value: string | null; source: StripeCredentialSource } {
+  const value = resolveConfigValue(dbValue, envName, { warnOnEnvFallback: false });
+  if (!value) return { value: null, source: null };
+  return { value, source: typeof dbValue === 'string' && dbValue.trim() ? 'cms' : 'env' };
+}
+
+/** The key mode from a documented prefix (the same rule as `stripeSecretKeyLivemode` in stripe/client.ts). */
+function keyModeFromPrefix(key: string | null, live: readonly string[], test: readonly string[]): StripeKeyMode | null {
+  if (!key) return null;
+  if (live.some((prefix) => key.startsWith(prefix))) return 'live';
+  if (test.some((prefix) => key.startsWith(prefix))) return 'test';
+  return null;
+}
+
+/**
+ * What the CMS Affiliates → Stripe payouts screen shows about the keys entered under CMS →
+ * Payments (there is no second key store): where each comes from, the mode, the last 4 characters
+ * of the secret key, whether the publishable key is present and of the same mode, and whether a
+ * webhook secret is set. Resolution matches the resolvers above (DB first, env fallback, the same
+ * cached rows). Returns the empty facts on the sandbox before any read. Callers authorize first:
+ * the screen calls `requireCmsAdmin()`.
+ */
+export async function getStripeKeyDiagnostics(): Promise<StripeKeyDiagnostics> {
+  if (isSandboxEnvironment()) {
+    return {
+      sandbox: true,
+      secretKeySource: null,
+      storedSecretKeyUnreadable: false,
+      mode: null,
+      restricted: false,
+      secretKeyLast4: null,
+      publishableKeySource: null,
+      publishableKeyMode: null,
+      publishableKeyMatchesMode: false,
+      webhookSecretSource: null,
+    };
+  }
+
+  const { secret, public: pub } = await loadPaymentRows();
+  const storedSecret = decryptField(secret, 'stripeSecretKey');
+  const secretKey = resolveWithSource(storedSecret, 'STRIPE_SECRET_KEY');
+  const storedPublishable = asRecord(pub['stripe'])['publishableKey'];
+  const publishable = resolveWithSource(typeof storedPublishable === 'string' ? storedPublishable : null, 'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY');
+  const webhook = resolveWithSource(decryptField(secret, 'stripeWebhookSecret'), 'STRIPE_WEBHOOK_SECRET');
+
+  const mode = keyModeFromPrefix(secretKey.value, ['sk_live_', 'rk_live_'], ['sk_test_', 'rk_test_']);
+  const publishableKeyMode = keyModeFromPrefix(publishable.value, ['pk_live_'], ['pk_test_']);
+  const key = secretKey.value;
+
+  return {
+    sandbox: false,
+    secretKeySource: secretKey.source,
+    storedSecretKeyUnreadable: getSecretEnvelopeStatus(secret['stripeSecretKey']).hasStoredValue && !storedSecret,
+    mode,
+    restricted: Boolean(key && key.startsWith('rk_')),
+    // Only a real-length key shows its tail; anything shorter is never echoed.
+    secretKeyLast4: key && key.length >= 12 ? key.slice(-4) : null,
+    publishableKeySource: publishable.source,
+    publishableKeyMode,
+    publishableKeyMatchesMode: mode !== null && publishableKeyMode === mode,
+    webhookSecretSource: webhook.source,
+  };
+}
+
 // --- Freemius (env hydration) --------------------------------------------------
 
 /**
  * Make the synchronous FREEMIUS_* env reads DB-aware by writing any configured DB
  * values into process.env (DB wins). Idempotent and cheap (cached); call at async
- * entry points before the package's sync credential helpers run.
+ * entry points before the package's sync credential helpers run. Writes nothing on
+ * the sandbox, where loadPaymentRows reads no row.
  */
 export async function hydrateFreemiusEnvFromDb(): Promise<void> {
   // Best-effort overlay: a failure here must never break checkout/webhook/coupon flows,
@@ -203,11 +335,19 @@ export interface PaymentCredentialsView {
 }
 
 export async function getPaymentCredentialsView(): Promise<PaymentCredentialsView> {
-  // `payment_secret` is the ADMIN tier of site_settings, which migration 02023 gates behind
-  // is_admin_mfa(): an ADMIN reads it with the service role after the role check, because
-  // through the cookie client an admin on an aal1 "remember this device" session would see
-  // "no key stored" on their own form. Anyone else keeps the cookie client, which (as before)
-  // returns the public row only — a WRITER can open the payments screen.
+  // The sandbox neither saves nor reads the payment rows, so its form shows none of what a visitor wrote.
+  if (isSandboxEnvironment()) {
+    return {
+      stripe: { publishableKey: '', hasSecretKey: false, hasWebhookSecret: false },
+      freemius: { developerId: '', publicKey: '', productId: '', hasSecretKey: false, hasApiKey: false },
+      envFallbackActive: false,
+    };
+  }
+
+  // `payment_secret` is a secret row of site_settings, which no API session reaches since
+  // migration 02038: an ADMIN reads it with the service role after the role check (second factor
+  // included, getEcomActorRole). Anyone else keeps the cookie client, which (as before) returns
+  // the public row only — a WRITER can open the payments screen.
   const role = await getEcomActorRole();
   const supabase = role === 'ADMIN' ? getServiceRoleSupabaseClient() : createClient();
   const [{ data: secretData }, { data: publicData }] = await Promise.all([
@@ -234,9 +374,9 @@ export async function getPaymentCredentialsView(): Promise<PaymentCredentialsVie
       hasSecretKey: getSecretEnvelopeStatus(secret['freemiusSecretKey']).hasStoredValue,
       hasApiKey: getSecretEnvelopeStatus(secret['freemiusApiKey']).hasStoredValue,
     },
-    envFallbackActive: Boolean(
-      !secret['stripeSecretKey'] && process.env['STRIPE_SECRET_KEY']
-    ),
+    // Off the sandbox only (it returned above: saving refuses there, so the "saving here moves
+    // them into the database" hint would be wrong): the env holds a Stripe secret the row lacks.
+    envFallbackActive: Boolean(!secret['stripeSecretKey'] && process.env['STRIPE_SECRET_KEY']),
   };
 }
 
@@ -258,13 +398,21 @@ export interface SavePaymentCredentialsInput {
 /**
  * Persist payment credentials. Public fields always overwrite; secret fields are
  * encrypted and only written when a new value is supplied (blank keeps the stored
- * secret). Refuses to store real secrets in the sandbox. Enforces ADMIN itself (throws
- * otherwise) and writes with the service role: `payment_secret` is in the ADMIN-only write
- * tier that migration 02023 gates behind `is_admin_mfa()`, which a "remember this device"
- * (aal1) admin cannot satisfy through the cookie client.
+ * secret), and every stored key from before 0.23.1 is re-sealed for its field on each save.
+ * Saves nothing on the sandbox (throws). Enforces ADMIN itself (throws otherwise) and writes
+ * with the service role: `payment_secret` is a secret row of `site_settings`, which no API
+ * session can write since migration 02038.
  */
 export async function savePaymentCredentials(input: SavePaymentCredentialsInput): Promise<void> {
   const supabase = await requireEcomAdmin();
+
+  // The sandbox's admin login is public and its checkout is simulated, so it neither saves nor
+  // reads the payment rows (loadPaymentRows returns none there; Stripe and Freemius resolve from
+  // its env). Nothing is saved, not even the public row: a row a visitor saved would otherwise
+  // reach every later visitor, its Freemius ids through hydrateFreemiusEnvFromDb into process.env.
+  if (isSandboxEnvironment()) {
+    throw new Error(PAYMENT_SETTINGS_SANDBOX_MESSAGE);
+  }
 
   const publicValue = {
     stripe: { publishableKey: input.stripe.publishableKey.trim() },
@@ -284,38 +432,50 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
     throw new Error('Failed to save payment settings.');
   }
 
-  const incomingSecrets: Array<[string, string | undefined]> = [
+  const supplied = new Map<PaymentSecretField, string>();
+  for (const [field, value] of [
     ['stripeSecretKey', input.stripe.secretKey],
     ['stripeWebhookSecret', input.stripe.webhookSecret],
     ['freemiusSecretKey', input.freemius.secretKey],
     ['freemiusApiKey', input.freemius.apiKey],
-  ];
-  const hasNewSecret = incomingSecrets.some(([, v]) => v && v.trim());
+  ] as const) {
+    if (value && value.trim()) supplied.set(field, value.trim());
+  }
 
-  if (hasNewSecret) {
-    if (isSandboxEnvironment()) {
-      throw new Error('The sandbox cannot store live payment credentials.');
-    }
-
-    const { data: existing } = await supabase
-      .from('site_settings')
-      .select('value')
-      .eq('key', PAYMENT_SECRET_KEY)
-      .maybeSingle();
+  // Read-merge: a blank field keeps its stored key. What is kept is re-sealed for its own field:
+  // an envelope from before 0.23.1 opens in any slot (libs/db secret-crypto), so every save, one
+  // that changes no key included, leaves each key bound to where it is stored.
+  const { data: existing, error: readError } = await supabase
+    .from('site_settings')
+    .select('value')
+    .eq('key', PAYMENT_SECRET_KEY)
+    .maybeSingle();
+  if (readError) {
+    console.error('Error reading payment_secret settings:', readError.message);
+    // Writing now could drop the keys that were not re-entered.
+    if (supplied.size > 0) throw new Error('Failed to save payment credentials.');
+  } else {
     const current = asRecord(existing?.value);
     const nextValue: Row = { ...current };
-    for (const [field, value] of incomingSecrets) {
-      if (value && value.trim()) {
-        nextValue[field] = encryptWithEnvKey(value.trim());
+    let changed = false;
+    for (const field of PAYMENT_SECRET_FIELDS) {
+      const value = supplied.get(field);
+      const slot = paymentSecretSlot(field);
+      const next = value ? encryptWithEnvKey(value, slot) : resealWithEnvKey(current[field], slot);
+      if (next !== current[field]) {
+        nextValue[field] = next;
+        changed = true;
       }
     }
 
-    const { error: secretError } = await supabase
-      .from('site_settings')
-      .upsert({ key: PAYMENT_SECRET_KEY, value: nextValue as Json });
-    if (secretError) {
-      console.error('Error saving payment_secret settings:', secretError.message);
-      throw new Error('Failed to save payment credentials.');
+    if (changed) {
+      const { error: secretError } = await supabase
+        .from('site_settings')
+        .upsert({ key: PAYMENT_SECRET_KEY, value: nextValue as Json });
+      if (secretError) {
+        console.error('Error saving payment_secret settings:', secretError.message);
+        throw new Error('Failed to save payment credentials.');
+      }
     }
   }
 

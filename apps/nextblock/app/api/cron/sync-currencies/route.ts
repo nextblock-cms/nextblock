@@ -2,17 +2,18 @@ import { NextRequest, NextResponse } from 'next/server';
 
 import { syncStoreCurrencyRates } from '@nextblock-cms/ecommerce/server';
 
+import { isCronRequestAuthorized } from '../../../../lib/cron/cron-secret';
+
+export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 30;
 
 export async function GET(request: NextRequest) {
   // CRON_SECRET is optional: when set we enforce Vercel's `Authorization: Bearer`
-  // header, but a zero-config deploy can leave it unset (the job only does low-harm
-  // FX-rate sync). Set CRON_SECRET in the project env to lock the endpoint down.
-  const cronSecret = process.env.CRON_SECRET?.trim();
-  const authHeader = request.headers.get('authorization');
-
-  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+  // header (compared in constant time), but a zero-config deploy can leave it unset (the
+  // job only does low-harm FX-rate sync). Set CRON_SECRET in the project env to lock the
+  // endpoint down.
+  if (!isCronRequestAuthorized(request, { whenUnset: 'allow' })) {
     return new NextResponse('Unauthorized', {
       status: 401,
     });
@@ -26,14 +27,9 @@ export async function GET(request: NextRequest) {
       ...result,
     });
   } catch (error) {
-    return NextResponse.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : 'Failed to sync currency exchange rates.',
-      },
-      { status: 500 }
-    );
+    // The route can be open (CRON_SECRET unset), so the provider's or the database's error text is
+    // logged on the server only and the caller gets a fixed message.
+    console.error('[sync-currencies] FX rate sync failed:', error instanceof Error ? error.message : String(error));
+    return NextResponse.json({ error: 'Failed to sync currency exchange rates.' }, { status: 500 });
   }
 }

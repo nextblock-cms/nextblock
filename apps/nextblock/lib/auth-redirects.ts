@@ -8,6 +8,15 @@ const PROFILE_PATH = '/profile';
 const PASSWORD_RESET_PATH = '/profile/password';
 
 /**
+ * The partner (Affiliates) role and its home. Mirrors `AFFILIATE_RETAILER_ROLE` and
+ * `AFFILIATE_PORTAL_PATH` from `@nextblock-cms/affiliates` (auth-redirects.test.ts pins the
+ * parity): this module stays import-light because every auth path loads it. The generated
+ * `user_role` type predates migration 02029's `RTL`, so the role is compared as a string.
+ */
+const RETAILER_ROLE = 'RTL';
+const RETAILER_PORTAL_PATH = '/portal/retailer';
+
+/**
  * True only for a safe SITE-RELATIVE path: starts with `/`, is not scheme-relative (`//`), has no
  * backslash (browsers treat `/\host` as an authority), no control/whitespace characters, and no
  * encoded leading `//`. Exported so every redirect-target check in the app shares one rule
@@ -53,6 +62,12 @@ export function resolvePostAuthRedirect(
 
   if (safePath === PASSWORD_RESET_PATH) {
     return PASSWORD_RESET_PATH;
+  }
+
+  // Partners land in their portal. A partner has no CMS access, so a stale dashboard link is
+  // replaced by the portal rather than ending on /unauthorized.
+  if (String(role) === RETAILER_ROLE) {
+    return safePath && !isDashboardPath(safePath) ? safePath : RETAILER_PORTAL_PATH;
   }
 
   if (role === 'ADMIN' || role === 'WRITER') {

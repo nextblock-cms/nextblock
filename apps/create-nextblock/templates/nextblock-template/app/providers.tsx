@@ -54,6 +54,7 @@ export function Providers({ children, ...props }: { children: React.ReactNode;[k
   const {
     serverUser,
     serverProfile,
+    isPartnerPortalActive,
     serverLocale,
     initialCurrencies,
     initialCurrencyCode,
@@ -76,7 +77,7 @@ export function Providers({ children, ...props }: { children: React.ReactNode;[k
     typeof initialTheme === 'string' && resolvedThemes.includes(initialTheme) ? initialTheme : 'light';
 
   return (
-    <AuthProvider serverUser={serverUser} serverProfile={serverProfile}>
+    <AuthProvider serverUser={serverUser} serverProfile={serverProfile} isPartnerPortalActive={isPartnerPortalActive === true}>
       <LanguageProvider
         serverLocale={serverLocale}
         initialAvailableLanguages={initialAvailableLanguages}

@@ -22,6 +22,10 @@ import {
   updateSiteScript,
   type SiteScriptInput,
 } from '../actions';
+import { SITE_SCRIPTS_SANDBOX_MESSAGE } from '../sandbox-lock';
+
+/** The sandbox note every write control points at there (each site-scripts action refuses). */
+const SANDBOX_NOTE_ID = 'site-scripts-sandbox-note';
 
 const REVISION_LABELS: Record<string, string> = {
   create: 'Created',
@@ -109,6 +113,7 @@ function SafetyReview({ review }: { review: ScriptReview }) {
 
 function ScriptEditor({
   draft,
+  locked = false,
   onCancel,
   onChange,
   onSave,
@@ -116,6 +121,8 @@ function ScriptEditor({
   title,
 }: {
   draft: SiteScriptInput;
+  /** On the sandbox: Save is disabled and described by the sandbox note. */
+  locked?: boolean;
   onCancel: () => void;
   onChange: (next: SiteScriptInput) => void;
   onSave: () => void;
@@ -247,7 +254,11 @@ function ScriptEditor({
       </div>
 
       <div className="flex gap-2">
-        <Button onClick={onSave} disabled={saving}>
+        <Button
+          onClick={onSave}
+          disabled={saving || locked}
+          aria-describedby={locked ? SANDBOX_NOTE_ID : undefined}
+        >
           {saving ? 'Saving…' : 'Save script'}
         </Button>
         <Button variant="outline" onClick={onCancel} disabled={saving}>
@@ -259,10 +270,13 @@ function ScriptEditor({
 }
 
 function RevisionHistory({
+  locked = false,
   onRestore,
   pending,
   revisions,
 }: {
+  /** On the sandbox: Restore is disabled and described by the sandbox note. */
+  locked?: boolean;
   onRestore: (revisionId: string, label: string) => void;
   pending: boolean;
   revisions: SiteScriptRevision[];
@@ -323,7 +337,8 @@ function RevisionHistory({
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={pending}
+                    disabled={pending || locked}
+                    aria-describedby={locked ? SANDBOX_NOTE_ID : undefined}
                     onClick={() =>
                       onRestore(
                         revision.id,
@@ -354,6 +369,9 @@ export default function SiteScriptManager({
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState<SiteScriptInput>(EMPTY_DRAFT);
+  // Read-only on the sandbox, whose admin login is public (every site-scripts action refuses there).
+  const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+  const describedBySandboxNote = isSandbox ? SANDBOX_NOTE_ID : undefined;
 
   const run = (action: () => Promise<{ ok: boolean; message?: string; error?: string }>) => {
     startTransition(async () => {
@@ -386,8 +404,16 @@ export default function SiteScriptManager({
 
   return (
     <div className="space-y-6">
+      {isSandbox ? (
+        <p id={SANDBOX_NOTE_ID} className="text-sm text-muted-foreground">
+          {SITE_SCRIPTS_SANDBOX_MESSAGE}
+        </p>
+      ) : null}
+
       {!creating && !editingId && (
         <Button
+          disabled={isSandbox}
+          aria-describedby={describedBySandboxNote}
           onClick={() => {
             setCreating(true);
             setDraft(EMPTY_DRAFT);
@@ -400,6 +426,7 @@ export default function SiteScriptManager({
       {creating && (
         <ScriptEditor
           draft={draft}
+          locked={isSandbox}
           onCancel={() => setCreating(false)}
           onChange={setDraft}
           onSave={() => run(() => createSiteScript(draft))}
@@ -421,6 +448,7 @@ export default function SiteScriptManager({
             <li key={script.id}>
               <ScriptEditor
                 draft={draft}
+                locked={isSandbox}
                 onCancel={() => setEditingId(null)}
                 onChange={setDraft}
                 onSave={() => run(() => updateSiteScript(script.id, draft))}
@@ -462,7 +490,8 @@ export default function SiteScriptManager({
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={isPending}
+                  disabled={isPending || isSandbox}
+                  aria-describedby={describedBySandboxNote}
                   onClick={() => run(() => setSiteScriptActive(script.id, !script.is_active))}
                 >
                   {script.is_active ? 'Disable' : 'Enable'}
@@ -473,7 +502,8 @@ export default function SiteScriptManager({
                 <Button
                   variant="destructive"
                   size="sm"
-                  disabled={isPending}
+                  disabled={isPending || isSandbox}
+                  aria-describedby={describedBySandboxNote}
                   onClick={() => {
                     if (!window.confirm(`Delete “${script.name}”? This cannot be undone.`)) return;
                     run(() => deleteSiteScript(script.id));
@@ -488,6 +518,7 @@ export default function SiteScriptManager({
       </ul>
 
       <RevisionHistory
+        locked={isSandbox}
         pending={isPending}
         revisions={initialRevisions}
         onRestore={(revisionId, label) => {

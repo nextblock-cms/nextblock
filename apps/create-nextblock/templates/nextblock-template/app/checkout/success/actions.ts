@@ -13,6 +13,7 @@ import {
   verifyOrderAccessToken,
 } from '@nextblock-cms/ecommerce/server';
 import { createClient } from '@nextblock-cms/db/server';
+import { scheduleAffiliateCommissionSweep } from '../../../lib/affiliates/refunds';
 import { resolveSupabaseUrl } from '../../../lib/setup/env-status';
 import { resolveSupabaseServiceKey } from '../../../lib/setup/service-key';
 
@@ -56,6 +57,9 @@ export async function fulfillOrderAction(sessionId: string, accessToken?: string
 
       const result = await syncStripeOrderFromSession(session);
       const invoice = await getInvoicePresentationData(result.orderId, getServiceRoleSupabaseClient() as any);
+      // Without a webhook (local dev, a delayed delivery) this visit is what marked the order
+      // paid: send any COMMISSION_EARNED notices it produced (NextBlock Affiliates).
+      scheduleAffiliateCommissionSweep();
       return {
         success: true,
         alreadyPaid: result.alreadyPaid,
@@ -149,6 +153,7 @@ export async function fulfillOrderAction(sessionId: string, accessToken?: string
         paidAt: order.paid_at ?? null,
         client: supabase as any,
       });
+      scheduleAffiliateCommissionSweep();
 
       return {
         success: true,

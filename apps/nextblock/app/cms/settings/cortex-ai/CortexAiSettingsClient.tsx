@@ -52,6 +52,11 @@ import {
   saveOpenRouterApiKeyAction,
   saveStockPhotoKeysAction,
 } from './actions';
+// The storage keys every sandbox reader and sign-out (clearSandboxCortexKey) share.
+import {
+  CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY,
+  CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY,
+} from '../../../../lib/cortex-ai/sandbox-headers';
 
 /**
  * The one Cortex AI settings UI — production and sandbox render the same tree.
@@ -70,8 +75,6 @@ import {
  * and travel as `x-sandbox-openrouter-*` headers) stay writable in the sandbox.
  */
 
-const CORTEX_AI_SANDBOX_KEY_LOCAL_STORAGE = 'cortex_ai_sandbox_openrouter_api_key';
-const CORTEX_AI_SANDBOX_MODEL_LOCAL_STORAGE = 'cortex_ai_sandbox_openrouter_model_selection';
 const CORTEX_AI_SETTINGS_CHANGED_EVENT = 'nextblock:cortex-ai-settings-changed';
 
 type CortexAiSettingsClientProps = {
@@ -252,12 +255,12 @@ export function CortexAiSettingsClient({
     if (!isSandbox) return;
 
     try {
-      const storedKey = window.localStorage.getItem(CORTEX_AI_SANDBOX_KEY_LOCAL_STORAGE);
+      const storedKey = window.localStorage.getItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY);
       if (storedKey) {
         setSandboxKey(storedKey);
       }
 
-      const storedModel = window.localStorage.getItem(CORTEX_AI_SANDBOX_MODEL_LOCAL_STORAGE);
+      const storedModel = window.localStorage.getItem(CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY);
       if (storedModel) {
         const parsed = JSON.parse(storedModel) as CortexAiStoredModelSelection;
         setSandboxModel(parsed);
@@ -279,7 +282,7 @@ export function CortexAiSettingsClient({
     if (!key) return;
 
     try {
-      window.localStorage.setItem(CORTEX_AI_SANDBOX_KEY_LOCAL_STORAGE, key);
+      window.localStorage.setItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY, key);
       setSandboxKey(key);
       setApiKeyInput('');
       notifyCortexAiSettingsChanged();
@@ -291,8 +294,8 @@ export function CortexAiSettingsClient({
 
   function handleSandboxClearKey() {
     try {
-      window.localStorage.removeItem(CORTEX_AI_SANDBOX_KEY_LOCAL_STORAGE);
-      window.localStorage.removeItem(CORTEX_AI_SANDBOX_MODEL_LOCAL_STORAGE);
+      window.localStorage.removeItem(CORTEX_AI_SANDBOX_API_KEY_STORAGE_KEY);
+      window.localStorage.removeItem(CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY);
       setSandboxKey(null);
       setSandboxModel(null);
       setModelInput('');
@@ -315,7 +318,7 @@ export function CortexAiSettingsClient({
     try {
       const storedSelection = createCortexAiStoredModelSelection(model);
       window.localStorage.setItem(
-        CORTEX_AI_SANDBOX_MODEL_LOCAL_STORAGE,
+        CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY,
         JSON.stringify(storedSelection)
       );
       setSandboxModel(storedSelection);
@@ -328,7 +331,7 @@ export function CortexAiSettingsClient({
 
   function handleSandboxClearModel() {
     try {
-      window.localStorage.removeItem(CORTEX_AI_SANDBOX_MODEL_LOCAL_STORAGE);
+      window.localStorage.removeItem(CORTEX_AI_SANDBOX_MODEL_STORAGE_KEY);
       setSandboxModel(null);
       setModelInput('');
       notifyCortexAiSettingsChanged();
