@@ -1,4 +1,7 @@
-import { getStoreReadiness } from '@nextblock-cms/ecommerce/server';
+// Deep subpath, not '@nextblock-cms/ecommerce/server': that barrel re-exports every CMS
+// commerce page, and each page's client components then ship on every page that renders
+// blocks (see docs/05 "Public Page Performance Budget").
+import { getStoreReadiness } from '@nextblock-cms/ecommerce/pages/cms/payments/queries';
 import { PaymentReadinessProvider } from '@nextblock-cms/ecommerce/PaymentReadinessProvider';
 
 /**

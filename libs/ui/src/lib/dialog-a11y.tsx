@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { useOptionalTranslations } from "@nextblock-cms/utils"
+import { useOptionalTranslations } from "@nextblock-cms/utils/translations-context"
 
 /**
  * Shared by dialog.tsx and sheet.tsx (both wrap Radix Dialog).

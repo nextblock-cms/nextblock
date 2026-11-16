@@ -81,7 +81,11 @@ Two safety nets exist for that case. Every flag has an environment-variable twin
 survives any shell and any npm wrapper — `NEXTBLOCK_NON_INTERACTIVE=1`, `NEXTBLOCK_NAME`,
 `NEXTBLOCK_EMAIL`, `NEXTBLOCK_MODE`, `NEXTBLOCK_PROJECT_NAME`, `NEXTBLOCK_LICENSE_KEY`,
 `NEXTBLOCK_TRIAL=false` (flags win, variables fill the gaps, and the interactive flow
-ignores them). And when npm has eaten the flag it still forwards it as
+ignores them). A value commander fills in itself is not a flag: `--no-trial` gives `trial` a
+default of true, which until 0.23.4 hid `NEXTBLOCK_TRIAL=false`. `bin/lib/create-command.js`
+defines the `create` command and drops those defaults (`readExplicitHeadlessOptions`) before
+merging the variables, so `NEXTBLOCK_TRIAL=false` (or `0`, `no`, `off`) skips the trial and an
+explicit `--no-trial` still wins over `NEXTBLOCK_TRIAL=true`. And when npm has eaten the flag it still forwards it as
 `npm_config_non_interactive=true`; the CLI detects that and exits 1 with a
 `FLAGS_NOT_DELIVERED` JSON error naming the `npx` form, instead of dropping an agent into
 prompts it cannot answer.
@@ -118,11 +122,15 @@ What happens, in order (`handleHeadlessCommand` in `bin/create-nextblock.js`, he
    (`.claudeignore` is not a mechanism Claude Code has; the permission deny rule is.)
 3. Unattended only: ask the NextBlock license service for a Cortex AI trial key —
    `POST ${NEXTBLOCK_LICENSE_SERVICE_URL:-https://nextblock.dev}/api/packages/provision-trial`
-   with the name and email, 5-second abort. A refusal (trial already used for that
-   email), a 404 (service not deployed), or a timeout is **reported, not fatal**: the
+   with the name and email, 5-second abort. The service mints Cortex AI trials only (any
+   other `packageId` answers 400 `UNKNOWN_PACKAGE`) and limits requests per client network
+   (an IPv4 /24 or IPv6 /48: 5 an hour), per email (3 a day) and per instance (10 a minute),
+   answering 429 `RATE_LIMITED` with `Retry-After`. A refusal (trial already used for that
+   email), a 429, a 404 (service not deployed), or a timeout is **reported, not fatal**: the
    site still scaffolds and boots, and the summary says the trial must be started from
-   `/cms/settings/packages`. `--license-key` skips the request; `--no-trial` skips it and
-   writes no key. Attended installs never call it: the browser trial is the real one.
+   `/cms/settings/packages`. `--license-key` skips the request; `--no-trial` (or
+   `NEXTBLOCK_TRIAL=false`) skips it and writes no key. Attended installs never call it: the
+   browser trial is the real one.
 4. Write `MCP_BEARER_TOKEN` (and, unattended, `NEXTBLOCK_LICENSE_KEY` +
    `NEXTBLOCK_LICENSE_KIND=trial`) to the env file. Docker: they travel through the
    process environment into `scripts/docker-setup.mjs`, which persists them into the
@@ -144,11 +152,14 @@ What happens, in order (`handleHeadlessCommand` in `bin/create-nextblock.js`, he
 The app side of this contract lives in `apps/nextblock`: `app/api/setup/status`,
 `app/api/setup/bootstrap`, `lib/packages/env-license.ts`, and the `MCP_BEARER_TOKEN`
 auth path in `app/api/mcp/route.ts` — see `docs/08` → "Headless bootstrap". The vendor
-side is `app/api/packages/provision-trial` (enabled only on nextblock.dev).
+side is `app/api/packages/provision-trial` (enabled only on nextblock.dev, never on the public
+sandbox; Cortex AI trials only; docs/08 → "Vendor trial provisioning").
 
 `bin/lib/headless.test.js` covers the validation, env editing, client config shapes,
-trial request handling, readiness polling and bootstrap call
-(`npx vitest run apps/create-nextblock/bin/lib/headless.test.js`).
+trial request handling, readiness polling and bootstrap call, and
+`bin/lib/create-command.test.js` parses real argv through commander with the CLI's own
+`create` definition (the flags and their NEXTBLOCK_* twins, `--no-trial` against
+`NEXTBLOCK_TRIAL`) (`npx vitest run apps/create-nextblock/bin/lib`).
 
 ## What the Create Flow Actually Does
 
@@ -167,7 +178,11 @@ When the CLI creates a project it currently:
    the eight published packages to transpile (`STANDALONE_TRANSPILE_PACKAGES`, which includes
    `@nextblock-cms/affiliates`), no build-time type-check of pre-built
    deps; a required anchor that disappears throws at scaffold time and fails
-   `next-config.test.js`, which runs the patches against `apps/nextblock/next.config.js`)
+   `next-config.test.js`, which runs the patches against `apps/nextblock/next.config.js`; no
+   patch touches `turbopack.resolveAlias`, so a scaffold keeps the app's `postcss` browser alias,
+   which that test also pins, and `npm run update` adds the same entry to projects scaffolded
+   before 0.23.4 through `tools/lib/postcss-browser-alias.mjs`, docs/13 → "The `postcss` browser
+   alias")
    and `eslint.config.mjs` is replaced by the standalone config in
    `bin/lib/eslint-config.js`. The app's own config only loads inside the monorepo (it
    imports `@nx/eslint-plugin` and a `../../` root config), so before this every scaffold's
@@ -233,6 +248,23 @@ It currently:
 - removes the copied `project.json`
 - syncs package versions
 - normalizes global styles and UI proxy files
+- ends with two checks that stop the sync, and with it `npm publish` (the package's `prepack`
+  runs the sync): `scripts/lib/template-check.js` reads the template on disk, and
+  `scripts/lib/pack-check.js` runs `npm pack --dry-run --ignore-scripts --json` in
+  `apps/create-nextblock` and fails when a template file on disk is missing from the tarball
+  (files npm never ships, `.gitignore` among them, aside) or when a `.env` / `.env.*` file other
+  than an `*.example` would ship
+
+npm packs a folder by its `.npmignore`, or by its `.gitignore` when it has none, and the sync
+copies `apps/nextblock/.gitignore` into the template, so every rule there is also a packing rule.
+Its `.env.*` kept `.env.example` and `.env.docker.example` out of the published CLI until 0.23.4,
+and `npm create nextblock` projects got the CLI's short placeholder `.env.example`. The
+negations `!.env.example` and `!.env.docker.example` in `apps/nextblock/.gitignore` fix that,
+and the same file still keeps a developer's local `.env` files out of the tarball. When the pack
+check names a file, negate the rule that drops it there, or rename the file. Do not delete the
+template's `.gitignore` or add a `.npmignore` to the template: npm would then publish any
+`.env.local` the copy brought along. npm never ships a `.gitignore` at any depth, which is why the
+template carries the scaffold's ignore file as `gitignore` and the CLI renames it.
 
 This is why the root docs and root/app README surfaces matter first: the
 template inherits from them later through the sync step.
@@ -398,13 +430,24 @@ A tenth check (also added with `affiliates`) covers the manifest's `sideEffects`
 
 | Check | What went wrong |
 | :-- | :-- |
-| Side effects | A lib that declares `sideEffects` (affiliates) lets bundlers drop every module the list does not name. An entry naming a file the tarball lacks (a renamed entry, a new output extension) would silently drop that module's side effect in every scaffold: for affiliates, the server entry's `import 'server-only'` guard or the jitless zod config. Check 10 requires the dist manifest to carry the source manifest's list unchanged, and every non-`./src/` entry (or wildcard) to match a file in `npm pack --dry-run`. `verifyLibDist` runs `npm pack --dry-run` once and shares the file list with checks 5, 8, 10 and 11. |
+| Side effects | A lib that declares `sideEffects` (affiliates) lets bundlers drop every module the list does not name. An entry naming a file the tarball lacks (a renamed entry, a new output extension) would silently drop that module's side effect in every scaffold: for affiliates, the server entry's `import 'server-only'` guard or the jitless zod config. Check 10 requires the dist manifest to carry the source manifest's list unchanged, and every non-`./src/` entry (or wildcard) to match a file in `npm pack --dry-run`. `verifyLibDist` runs `npm pack --dry-run` once and hands the file list to `collectDistProblems`, which runs every check (5, 8, 10, 11, 12, 13 and 14 read the list). A test passes `verifyLibDist` a fixture `distDir`, its own `listPackedFiles` and, for check 14, `bundledMigrationNames`, so the gate itself is tested without a build, `npm pack` or the real `/setup` bundle. |
 
 An eleventh check covers the sibling packages a lib imports:
 
 | Check | What went wrong |
 | :-- | :-- |
 | Undeclared siblings | `@nextblock-cms/*` stays external in every lib build, but editor, ui and db published no sibling declaration through 0.22.5. When the editor started importing `sanitizeAuthoredBlockHtml` (new in utils), a user upgrading only the editor would have hit a missing named export. The editor, ui and db builds now write `peerDependencies` for the siblings they import, at the version `libs/<sibling>` carries when the build runs (`release:all` bumps utils and ui first). Check 11 parses every packed JS file and requires each `@nextblock-cms/<pkg>` it imports in `dependencies` or `peerDependencies` (a `workspace:` spec counts, a self-import needs none, and ecommerce must be declared as `npm:@nextblock-cms/ecom@<range>`). |
+
+A twelfth check refuses dot paths in the tarball, a thirteenth holds `db`'s `supabase/` folder to
+what its consumers read, in the shape they read it, and a fourteenth holds the files inside
+`supabase/migrations` and `supabase/templates` to their names and the packed migration names to the
+`/setup` bundle's list:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Dot paths | `db`'s build copied `libs/db/src/supabase` into the dist whole, and through the 0.23.4 rehearsal builds that brought the Supabase CLI's local state along: `.temp/` (the linked project ref, the pooler URL, the local start secrets) and `.branches/`. Only the copied `supabase/.gitignore` kept them out of the tarball: npm honours a nested ignore file inside a `files` whitelist, so renaming it, or adding an `.npmignore` beside it (even an empty one replaces it), would have published them. `tools/scripts/copy-db-supabase.cjs` now copies an allowlist with no dot entry at any depth into a folder it empties first (next two rows), and check 12 refuses any packed path with a segment that starts with `.` (npm itself never packs `.npmrc`, `.gitignore` or `.npmignore`). No lib ships a dot path today; one that must gets an explicit, commented exception in the check, never a looser rule. |
+| Supabase folder | The first fix was a denylist (`.temp/`, `.branches/`, `.env*` but `*.example`), and the Supabase CLI also keeps local state in `supabase/` that is not a dot path, which check 12 cannot see: local Studio's saved SQL snippets (`snippets/`) and `supabase gen signing-key`'s `signing_keys.json`. Consumers read only `config.toml`, `migrations/` and `templates/` from the package (create-nextblock's `ensureSupabaseAssets`, `npm run update`, the build hook's `migrate-core`); `functions/` holds the maintainer-only migration-ingest edge function, deployed from `libs/db/src`. The copy now takes exactly those three (`SUPABASE_PACKAGE_ENTRIES`), fails the build when one is missing, and owns `dist/libs/db/supabase`: it empties the folder before copying, and refuses any other destination, a link, and a destination whose real path is, holds or sits inside the source. Its first allowlist version merged instead, and vite-plugin-dts, which declares every file `tsconfig.lib.json` includes, had already written `supabase/functions/nextblock-migration-ingest/index.d.ts` there, so check 13 (the tarball's `supabase/` holds exactly the three entries) refused every fresh `db` build; `libs/db/vite.config.ts` now also excludes `src/supabase/**` from the declarations. Check 13 counts each entry only in the shape consumers read (`config.toml` as a file, `migrations/` and `templates/` as folders with a file in them), so a regular file named `supabase/migrations` is refused, not counted. The emptying copy first checked its destination as written, so a link above it (`dist/libs/db` as a junction into `libs/db/src`) let a run of the copy empty `libs/db/src/supabase`; it now compares real paths first (the OS realpath, which also expands Windows 8.3 short names). That guards the copy step only: `nx build db` runs `vite build` before it, and Vite's `emptyOutDir` empties `../../dist/libs/db` through such a link (all of `libs/db/src` in that example) before the copy can refuse. `release-lib.js` deletes `dist/libs/db` (`fs.rmSync`, which unlinks a link there and keeps its target) before it builds, so a release is not exposed to a link at `dist/libs/db` itself; never link `dist/` or anything below it into the checkout. `copy-db-supabase.test.ts` fails when a consumer reads an entry the list leaves out, when a stale file survives the copy, and when a wrong destination, a link or a junction into, around or inside the source is not refused (a source spelled with 8.3 short names too, where the temp folder has one). |
+| Supabase files | Check 13 passes any file inside an allowed folder. Every install applies what ships in `supabase/migrations` (`migrate-core` and `npm run update` take any `<digits>_*.sql`), so a file the Supabase CLI writes with a timestamped name (`migration new`, `db diff -f`, `db pull`) left in `libs/db/src/supabase/migrations` would sort after every `GGNNN` version and run on every downstream database, and the release never runs `npm run db:migrate:check`. Check 14 holds the packed migrations to `validateMigrationNames` (`GGNNN_<snake_name>.sql`, one generation, contiguous from `000`), refuses any other file or a subfolder there (a `seed.sql` too, which no applier runs and `db:migrate:check` never lists), and allows only `*.html` in `supabase/templates` (the Auth email templates new projects upload). A correctly named migration can still be a work in progress, so check 14 also compares the packed file names with the ones `apps/nextblock/lib/setup/migrations-bundle.ts` embeds (what `/setup` applies on a serverless host, read with the TypeScript parser): a migration the bundle lacks, or a bundled one the tarball lacks, stops the release (take a file not meant for it out of the folder, otherwise run `npm run generate:migrations-bundle`), and a `migrations/` folder that holds no top-level `<digits>_*.sql` file (only stray files, a subfolder or dot paths) is one problem for the whole bundle. That also keeps a serverless `/setup` and `npm run update` from applying different sets of migrations; it compares names, not SQL, so a migration edited after the bundle was generated still passes. A work in progress that was bundled too still ships, so the releasing checkout must hold only the migrations meant for that release. |
 
 ### How the libraries build
 
@@ -413,8 +456,14 @@ Vite config, after the lib's `typecheck` target (`tsc --noEmit -p tsconfig.lib.j
 old `@nx/vite:build` executor also ran first). Each `project.json` only sets
 `"build": { "dependsOn": ["typecheck"] }`. That replaces the plugin's default `^build`: a lib
 externalizes its siblings and reads their types from source, so it never needs them built.
-`db`'s `build` is still `vite-build` (plain `vite build`) plus the step that copies
-`src/supabase` into the dist. What the configs must now do themselves:
+`db`'s `build` is still `vite-build` (plain `vite build`) plus the step that empties
+`dist/libs/db/supabase` and copies `config.toml`, `migrations/` and `templates/` from `src/supabase`
+into it (`tools/scripts/copy-db-supabase.cjs`: an allowlist with no dot entry at any depth, which
+refuses any other destination, a link, and one whose real path overlaps the source; checks 12 to 14
+back it up). That real-path check covers the copy only: the `vite build` before it empties its
+`outDir` through a link. Its dts plugin excludes `src/supabase/**`: vite-plugin-dts declares every
+file `tsconfig.lib.json` includes, not only what the entries import.
+What the configs must now do themselves:
 
 - Set `build.outDir: '../../dist/libs/<lib>'`, relative and with `/`. The plugin derives the
   target's cache outputs from it, and an absolute path came out with Windows backslashes.

@@ -3,7 +3,7 @@ import * as React from "react";
 import { Slot } from "@radix-ui/react-slot";
 import { cva, type VariantProps } from "class-variance-authority";
 
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 
 // Hover and pressed states move the surface AWAY from its own text colour instead of fading
 // it toward the page: a fade lowers text contrast in whichever theme has the darker page

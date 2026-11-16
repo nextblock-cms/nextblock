@@ -7,7 +7,7 @@
  * through the editor transaction.
  */
 import { Button } from '@nextblock-cms/ui';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import { NodeViewWrapper, ReactNodeViewRenderer, type NodeViewProps } from '@tiptap/react';
 import type { NodeViewRenderer } from '@tiptap/core';
 import { GripVertical, Package, ShoppingBag, Trash2, X } from 'lucide-react';

@@ -1,14 +1,15 @@
 import { Node, mergeAttributes } from '@tiptap/core';
-import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
+import { sanitizeAuthoredSvgMarkup } from '@nextblock-cms/utils';
 
 /**
  * The `html` attribute is the raw inner markup of an authored `<svg>` (block HTML is written by
  * any WRITER, PostgREST included), and both renderers below assign it with `innerHTML` inside the
  * live CMS editor. A `<foreignObject>` there holds ordinary HTML, so `<meta http-equiv=refresh>`
- * redirected whoever opened the block, with no script at all. Sanitized like every other render
- * of block HTML; paths, shapes and styles are untouched.
+ * redirected whoever opened the block, with no script at all. Sanitized by the same allowlist as
+ * every other render of block HTML, read as SVG content (where it lands), so self-closed shapes,
+ * gradients and clip paths keep their structure and casing.
  */
-const safeSvgInnerHtml = (html: unknown): string => sanitizeAuthoredBlockHtml(String(html ?? ''));
+const safeSvgInnerHtml = (html: unknown): string => sanitizeAuthoredSvgMarkup(String(html ?? ''));
 
 export interface SvgNodeOptions {
   HTMLAttributes: Record<string, any>;

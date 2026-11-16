@@ -8,12 +8,11 @@ import {
   summarizeCortexAiRoutingError,
 } from '@nextblock-cms/cortex';
 
+import { getCmsActor, isCmsStaffRole } from '../../../../../lib/auth/cms-actor';
 import { enforceCortexAiRequestQuota } from '../../../../../lib/cortex-ai/request-quota';
 import { z } from '../../../../../lib/zod-config';
 
 export const dynamic = 'force-dynamic';
-
-type SupabaseServerClient = ReturnType<typeof createClient>;
 
 /**
  * How much page copy this endpoint will accept in one request.
@@ -51,28 +50,19 @@ const seoMetadataRequestSchema = z.strictObject({
   title: z.string().max(500).optional(),
 });
 
-async function requireCmsWriterAccess(supabase: SupabaseServerClient) {
-  const {
-    data: { user },
-    error: userError,
-  } = await supabase.auth.getUser();
+const PERMISSION_MESSAGE = 'You do not have permission to generate SEO metadata.';
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
 
-  if (userError || !user) {
-    return null;
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
   }
-
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-
-  if (profileError || !profile || !['ADMIN', 'WRITER'].includes(profile.role)) {
-    return null;
-  }
-
-  // The role rides along because the request quota that follows is per role.
-  return { role: profile.role, userId: user.id };
 }
 
 function jsonError(message: string, status: number) {
@@ -81,19 +71,29 @@ function jsonError(message: string, status: number) {
 
 export async function POST(request: Request) {
   try {
-    const supabase = createClient();
-    const access = await requireCmsWriterAccess(supabase);
-
-    if (!access) {
-      return jsonError('You do not have permission to generate SEO metadata.', 403);
+    // ADMIN or WRITER past their enrolled second factor, before the quota, the package check or
+    // the body: a route handler never passes the CMS layout's 2FA redirect, and until 2026-11-14 a
+    // cookie-client role read let a staff password alone (the first factor) spend the request
+    // quota (recorded with the service role) and the operator's model key. The actor's role rides
+    // along because the quota is per role.
+    const actor = await getCmsActor();
+    if (!actor) {
+      // getCmsActor() is null without a session and while an enrolled second factor is pending.
+      // The refusal stands either way; this only picks the answer.
+      return (await hasSignedInUser())
+        ? jsonError(SECOND_FACTOR_MESSAGE, 403)
+        : jsonError(PERMISSION_MESSAGE, 401);
+    }
+    if (!isCmsStaffRole(actor.role)) {
+      return jsonError(PERMISSION_MESSAGE, 403);
     }
 
     // Per-user hourly cap (writer-openrouter-cost-abuse): one request-log row per call,
     // 429 past the role's cap. Runs before anything that can reach a model.
     const quotaResponse = await enforceCortexAiRequestQuota({
-      role: access.role,
+      role: actor.role,
       route: 'ai/seo/metadata',
-      userId: access.userId,
+      userId: actor.userId,
     });
 
     if (quotaResponse) {

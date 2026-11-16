@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const state = vi.hoisted(() => ({ query: '', lang: 'en' }));
 
 vi.mock('next/navigation', () => ({ useSearchParams: () => new URLSearchParams(state.query) }));
-vi.mock('@nextblock-cms/utils', () => ({
+vi.mock('@nextblock-cms/utils/translations-context', () => ({
   // Unseeded keys answer with the key itself, exactly like the real provider.
   useTranslations: () => ({ lang: state.lang, t: (key: string) => key }),
 }));

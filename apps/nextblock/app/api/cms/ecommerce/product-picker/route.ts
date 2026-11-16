@@ -7,6 +7,8 @@ import {
   verifyPackageOnline,
 } from '@nextblock-cms/db/server';
 
+import { getCmsActor, isCmsStaffRole } from '../../../../../lib/auth/cms-actor';
+
 export const dynamic = 'force-dynamic';
 
 /** How many products a single search returns before the UI asks for a narrower query. */
@@ -38,6 +40,20 @@ function sanitizeSearchTerm(term: string): string {
   return term.replace(/[,().*%\\]/g, ' ').trim().slice(0, 80);
 }
 
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Options for the Product Grid block pickers: every category plus a page of
  * products (optionally filtered by `search`). `ids` hydrates labels for an
@@ -45,23 +61,19 @@ function sanitizeSearchTerm(term: string): string {
  */
 export async function GET(request: Request) {
   try {
-    const supabase = createClient();
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    // Staff (ADMIN / WRITER) past their enrolled second factor, before anything else: a route
+    // handler never passes the CMS layout's 2FA redirect, and until 2026-11-14 a cookie-client role
+    // read let a staff password alone (the first factor) read the catalog, drafts included,
+    // through the service role below.
+    const actor = await getCmsActor();
+    if (!actor) {
+      // getCmsActor() is null without a session and while an enrolled second factor is pending.
+      // The refusal stands either way; this only picks the answer.
+      return (await hasSignedInUser())
+        ? NextResponse.json({ error: SECOND_FACTOR_MESSAGE }, { status: 403 })
+        : NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .single();
-
-    if (!profile || !['ADMIN', 'WRITER'].includes(profile.role)) {
+    if (!isCmsStaffRole(actor.role)) {
       return NextResponse.json(
         { error: 'Forbidden: Insufficient permissions' },
         { status: 403 }
@@ -85,7 +97,7 @@ export async function GET(request: Request) {
       .filter(Boolean)
       .slice(0, MAX_HYDRATED_IDS);
 
-    // Reading the catalog is admin work behind the role check above.
+    // Reading the catalog is admin work behind the second-factor gate and role check above.
     const admin = getServiceRoleSupabaseClient();
 
     const productColumns =

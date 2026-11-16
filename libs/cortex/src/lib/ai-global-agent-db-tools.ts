@@ -1335,6 +1335,50 @@ async function writeAudit(params: {
   }
 }
 
+/**
+ * Tables whose every update or upsert gets `updated_at` set to now, whatever value the call
+ * carries. No trigger keeps products.updated_at, and the app's pre-0.23.4 draft rule reads it, so
+ * a value the call carries would stand: read_database_records returns the column by default, and
+ * a row read, edited and upserted back carries its old timestamp.
+ */
+const ALWAYS_STAMPED_TABLES: ReadonlySet<TableName> = new Set<TableName>(['products']);
+
+/**
+ * The confirmed update or upsert with `updated_at` set to now wherever the call left it out, on
+ * every table whose config lists the column; ai-global-agent-db-tools.test.ts checks each one has
+ * it in the migrations. A value the call sets itself, null included, is kept, except on
+ * ALWAYS_STAMPED_TABLES (products), which get now whatever the call carries. An update
+ * writes only the columns it names and an upsert only its rows' keys, so a raw write used to
+ * leave `updated_at` as it was. Most of these tables set it in a BEFORE UPDATE trigger anyway;
+ * `products` and the other catalog tables (product_variants, product_attributes,
+ * product_attribute_terms, freemius_plans, freemius_pricing, shipping_zones, and
+ * shipping_zone_methods outside its cost columns) have none. The sitemap's lastModified reads
+ * products.updated_at, and the app publishes a pre-0.23.4 product draft's copy of the title,
+ * short description and description only while products.updated_at is not later than the
+ * draft's created_at (apps/nextblock/lib/visual-editing/product-draft-meta.ts), so without it
+ * such a draft could publish its copy over a title written here. An insert is written as the
+ * call sends it (the column default where it leaves `updated_at` out). Applied after the
+ * confirmation: the phrase and the audit record cover the input as the user confirmed it.
+ */
+function withUpdatedAtStamp(
+  input: z.infer<typeof executeDatabaseMutationInputSchema>,
+  table: TableName
+): Pick<z.infer<typeof executeDatabaseMutationInputSchema>, 'rows' | 'values'> {
+  if (!(getTableConfig(table).columns as readonly string[]).includes('updated_at')) {
+    return input;
+  }
+
+  const now = new Date().toISOString();
+  const always = ALWAYS_STAMPED_TABLES.has(table);
+  const stamp = (row: Record<string, unknown>) =>
+    always || row['updated_at'] === undefined ? { ...row, updated_at: now } : row;
+
+  return {
+    rows: input.operation === 'upsert' ? input.rows?.map(stamp) : input.rows,
+    values: input.operation === 'update' && input.values ? stamp(input.values) : input.values,
+  };
+}
+
 async function executePreparedMutation(
   input: z.infer<typeof executeDatabaseMutationInputSchema>,
   table: TableName,
@@ -1342,14 +1386,15 @@ async function executePreparedMutation(
 ) {
   const config = getTableConfig(table);
   const select = config.primaryKey.join(',');
+  const payload = withUpdatedAtStamp(input, table);
   let query: any;
 
   if (input.operation === 'insert') {
     query = supabase.from(table).insert(input.rows).select(select);
   } else if (input.operation === 'upsert') {
-    query = supabase.from(table).upsert(input.rows).select(select);
+    query = supabase.from(table).upsert(payload.rows).select(select);
   } else if (input.operation === 'update') {
-    query = supabase.from(table).update(input.values);
+    query = supabase.from(table).update(payload.values);
     query = applyFilters(table, query, input.filters ?? []);
     query = excludeProtectedSiteSettingRows(table, query);
     query = query.select(select);

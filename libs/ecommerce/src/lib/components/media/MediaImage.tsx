@@ -3,7 +3,7 @@
 
 import React from 'react'
 import Image from 'next/image'
-import { cn } from '@nextblock-cms/utils'
+import { cn } from '@nextblock-cms/utils/utils'
 
 interface MediaImageProps {
   src: string

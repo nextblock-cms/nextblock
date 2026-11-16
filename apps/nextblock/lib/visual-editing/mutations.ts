@@ -17,10 +17,11 @@ import type {
 
 export type VisualEditingMutationResult =
   // `warning` marks a partial success: the content is live, but something non-blocking
-  // afterwards failed (today, recording the revision). Callers should surface it without
-  // treating the publish as failed.
+  // afterwards failed or was skipped (recording the revision; a pre-0.23.4 product draft's stale
+  // title). Callers should surface it without treating the publish as failed.
   | { success: true; warning?: string }
-  | { error: string };
+  // A product publish also says `success: false` (lib/visual-editing/product-drafts.ts).
+  | { success?: false; error: string; warning?: undefined };
 
 export function isValidParentType(value: string): value is NextblockVisualDocumentType {
   return value === "page" || value === "post" || value === "product";
@@ -116,7 +117,7 @@ export async function saveVisualEditingBlockDraftMutation(
     const auth = await requireVisualEditingEditableUser();
 
     if (request.parentType === "product") {
-      const { getOrCreateProductDraft } = await import("./product-drafts");
+      const { getOrCreateProductDraft, readLiveProductSlug } = await import("./product-drafts");
       const draft = await getOrCreateProductDraft(
         auth.supabase,
         request.parentId as string,
@@ -143,7 +144,9 @@ export async function saveVisualEditingBlockDraftMutation(
         };
       }
 
-      const slug = typeof data.meta?.slug === "string" ? data.meta.slug : "";
+      // The live product's page: a draft created since 0.23.4 carries no slug (its meta starts as {}),
+      // and a form draft's slug is not live until it is published.
+      const slug = await readLiveProductSlug(auth.supabase, request.parentId as string);
       if (slug) {
         revalidateVisualEditingPath(`/product/${slug}`);
       }

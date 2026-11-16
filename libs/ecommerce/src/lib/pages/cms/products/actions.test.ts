@@ -22,6 +22,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: mocks.createClient,
   getServiceRoleSupabaseClient: mocks.getServiceRoleSupabaseClient,
+  // Off the sandbox here; the Sync refusals there are covered by actions.sandbox.test.ts.
+  isSandboxEnvironment: () => false,
 }));
 
 vi.mock('next/cache', () => ({ revalidatePath: mocks.revalidatePath }));

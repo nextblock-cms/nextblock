@@ -1,7 +1,7 @@
 import { verifyPackageOnline, getActiveLanguagesServerSide } from '@nextblock-cms/db/server';
 import { redirect, notFound } from 'next/navigation';
 import Link from 'next/link';
-import { ArrowLeft, ChevronDown, Eye, FilePenLine } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, ChevronDown, Eye, FilePenLine } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -13,6 +13,7 @@ import {
   DropdownMenuButtonTrigger,
 } from '@nextblock-cms/ui';
 import ProductFormClientShell from '../../ProductFormClientShell';
+import { ProductDraftFlagProvider } from '../../ProductDraftFlagProvider';
 import {
   getCmsProduct,
   getEnabledPaymentProviders,
@@ -29,7 +30,11 @@ import { createClient } from '@nextblock-cms/db/server';
 import {
   buildGlobalAttributesForForm,
   buildProductFormInitialData,
+  getProductDraftEditNotices,
+  mergeProductDraftMetaIntoFormInitialData,
 } from '../../productFormData';
+import { classifyProductDraftMeta } from '../../../../../lib/visual-editing/product-draft-meta';
+import { currentUserCanPublishProductDrafts } from '../../../../../lib/visual-editing/product-drafts';
 import { CortexAiPageContextRegistrar } from '../../../components/CortexAiPageContext';
 import BlockEditorArea from '../../../blocks/components/BlockEditorArea';
 import VisibilityControl from '../../../components/VisibilityControl';
@@ -74,11 +79,16 @@ export default async function EditProductPage({
     notFound();
   }
 
-  const [globalAttributesRaw, translations, allCategories, assignedCategories] = await Promise.all([
+  const [globalAttributesRaw, translations, allCategories, assignedCategories, canPublishProduct] = await Promise.all([
     getGlobalProductAttributes(),
     product.translation_group_id ? getProductTranslations(product.translation_group_id) : Promise.resolve([]),
     getCategoriesWithCount(),
     getProductCategories(product.id),
+    // Only an ADMIN past the second factor may publish a product draft (the CMS layout already
+    // resolved this actor for the request), and only an ADMIN may change a product's visibility
+    // (products_update_policy). Anyone else sees the draft bar's Publish and every visibility action
+    // disabled with a note; the server checks again whatever this page showed.
+    currentUserCanPublishProductDrafts(),
   ]);
   const supabase = createClient();
   const { data: currenciesResult } = await supabase
@@ -142,18 +152,39 @@ export default async function EditProductPage({
     .maybeSingle();
 
   const hasDraft = draftData !== null;
-  let normalizedInitialData = {
+  const liveInitialData = {
     ...buildProductFormInitialData(product, languages),
     category_ids: assignedCategories.map((c: any) => c.id),
   };
+  let normalizedInitialData = liveInitialData;
+  // Notes above the form for a draft an earlier version wrote (getProductDraftEditNotices). One that
+  // publish refuses, shown with the live values for the fields it names (findPoisonedProductDraftFields):
+  // a pre-0.23.4 form autosave over a row snapshot (amounts equal to the live minor amounts or at
+  // least 20 times the live ones, a Freemius plan price in cents, rebuilt or emptied variants, the
+  // snapshot's stock, an emptied gallery or description), or the gallery, variants or description a
+  // pre-0.23.4 CMS draft import left empty. Or a pre-0.23.4 row snapshot, or an overlay rewritten
+  // from one (its recorded legacy_snapshot_fields), whose title, short description or description
+  // publish would skip.
+  let draftNotices: string[] = [];
   if (draftData && draftData.meta && typeof draftData.meta === 'object') {
     const meta = draftData.meta as any;
+    draftNotices = getProductDraftEditNotices(meta, product, draftData.created_at);
 
+    // Only the form's own autosave (or a CMS draft import) stages product values. A draft that a
+    // block edit or the in-page editor created stages the title, short description and
+    // description at most, and one created before 0.23.4 holds the raw products row in cents:
+    // mergeProductDraftMetaIntoFormInitialData lays either over the live data instead of showing
+    // it as form values (lib/visual-editing/product-draft-meta.ts).
+    //
     // Drafts store product_media as { media_id } only, so the gallery loses the
     // file_path/object_key needed to render thumbnails. Re-hydrate from the
     // media table so the main image (and the rest of the gallery) still loads.
-    let hydratedProductMedia = meta.product_media;
-    if (Array.isArray(meta.product_media) && meta.product_media.length > 0) {
+    let hydratedProductMedia: unknown[] | undefined;
+    if (
+      classifyProductDraftMeta(meta) === 'product-values' &&
+      Array.isArray(meta.product_media) &&
+      meta.product_media.length > 0
+    ) {
       const draftMediaIds = meta.product_media
         .map((pm: any) => pm?.media_id)
         .filter(Boolean);
@@ -180,24 +211,18 @@ export default async function EditProductPage({
       }
     }
 
-    // Product drafts persist prices in major units (dollars, the ProductForm
-    // value shape), but ProductForm re-divides the top-level price/sale_price by
-    // 100 because it expects a raw product row (minor units/cents). Convert the
-    // draft's dollars back to cents so the form shows the saved amount instead of
-    // 1/100th of it (e.g. an imported $29.50 draft otherwise renders as $0.30).
-    // The prices maps and variant prices are already in the dollar shape the form
-    // consumes directly, so only these two scalars need converting.
-    const draftDollarsToStoredCents = (value: unknown) =>
-      typeof value === 'number' && Number.isFinite(value) ? Math.round(value * 100) : value;
-
-    normalizedInitialData = {
-      ...meta,
-      id: product.id,
-      price: draftDollarsToStoredCents(meta.price),
-      sale_price: draftDollarsToStoredCents(meta.sale_price),
-      product_media: hydratedProductMedia,
-      category_ids: meta.category_ids ?? assignedCategories.map((c: any) => c.id),
-    };
+    // Product values merge over the live data (a key the draft lacks keeps its live value), and
+    // their top-level price and sale price go back to the cents ProductForm reads; an overlay or a
+    // row snapshot only lends the title, short description and description publish would write.
+    // The global attributes ProductForm gets name the terms of a CMS draft import's variants, which
+    // carry their attribute terms only.
+    normalizedInitialData = mergeProductDraftMetaIntoFormInitialData(liveInitialData, meta, {
+      productId: product.id,
+      liveProduct: product,
+      draftCreatedAt: draftData.created_at,
+      hydratedProductMedia,
+      globalAttributes,
+    });
   }
 
   let descriptionBlocks: any[] = [];
@@ -220,6 +245,10 @@ export default async function EditProductPage({
       initialMetaDescription={product.meta_description}
       initialMetaTitle={product.meta_title}
     >
+      {/* One draft flag for the editor shell and the visibility control: the form's autosave creates
+          a draft without revalidating this page, so `hasDraft` is stale until a reload, and the
+          shell latches the shared flag on after an autosave (ProductDraftFlagProvider). */}
+      <ProductDraftFlagProvider serverHasDraft={hasDraft}>
       <div className="space-y-8 w-full max-w-[1400px] mx-auto px-6 py-8">
         <CortexAiPageContextRegistrar
         context={{
@@ -347,13 +376,26 @@ export default async function EditProductPage({
             languages={languages}
             hasDraft={hasDraft}
             publishWarning={publishWarning}
+            canPublishProduct={canPublishProduct}
           />
         </div>
       </div>
 
+      {draftNotices.map((notice) => (
+        <div
+          key={notice}
+          role="alert"
+          className="flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200"
+        >
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <span>{notice}</span>
+        </div>
+      ))}
+
       <ProductFormClientShell
         productId={product.id}
         serverHasDraft={hasDraft}
+        canPublishProduct={canPublishProduct}
         initialData={normalizedInitialData}
         isEdit
         availableLanguagesProp={languages}
@@ -377,6 +419,7 @@ export default async function EditProductPage({
         />
       </div>
     </div>
+    </ProductDraftFlagProvider>
     </PageSeoProvider>
   );
 }

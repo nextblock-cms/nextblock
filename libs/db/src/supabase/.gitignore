@@ -6,3 +6,8 @@
 .env.keys
 .env.local
 .env.*.local
+
+# Supabase CLI local state without a dot: `supabase gen signing-key` output and the SQL snippets
+# local Studio saves into snippets/
+signing_keys.json
+snippets/

@@ -1,4 +1,4 @@
-import { getCurrentCustomerOrderInvoice } from '@nextblock-cms/ecommerce/server';
+import { getCurrentCustomerOrderInvoice } from '@nextblock-cms/ecommerce/customer-orders';
 import { notFound } from 'next/navigation';
 
 import { requireProfileAccountContext } from '../../account-data';

@@ -27,31 +27,30 @@ import {
   type FreemiusUnitAmountResolution,
 } from '../freemius-pricing-server';
 import { createInvalidCheckoutItemsError, normalizeCheckoutItems } from './checkout-items';
+import {
+  forgetFreemiusDeveloperCaches,
+  getFreemiusProductKeys,
+  isFreemiusApiError,
+  openFreemiusCatalogReader,
+  toFreemiusId,
+} from '../freemius-developer-api';
+import {
+  createFreemiusLogThrottle,
+  decideFreemiusOneProductStandIn,
+  freemiusKeysMayBeDeveloperPair,
+  parseFreemiusCheckoutCredentialsMap,
+  readFreemiusEnvValue,
+  readFreemiusOneProductKeys,
+  type FreemiusOneProductStandInRefusal,
+} from '../freemius-key-policy';
 
-export type FreemiusCheckoutCredentialEntry = {
-    publicKey?: string;
-    secretKey?: string;
-    apiKey?: string;
-};
-
-export function readFreemiusEnvValue(name: keyof NodeJS.ProcessEnv) {
-    const raw = process.env[name];
-
-    if (!raw) {
-        return null;
-    }
-
-    const trimmed = raw.trim();
-
-    if (
-        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-        (trimmed.startsWith("'") && trimmed.endsWith("'"))
-    ) {
-        return trimmed.slice(1, -1).trim();
-    }
-
-    return trimmed;
-}
+// The env readers live with the key policy (freemius-key-policy.ts), which must not import this
+// module; they stay exported from here for the modules and installs that import them from here.
+export {
+  parseFreemiusCheckoutCredentialsMap,
+  readFreemiusEnvValue,
+  type FreemiusCheckoutCredentialEntry,
+} from '../freemius-key-policy';
 
 function splitFreemiusCustomerName(name?: string | null) {
     const trimmed = name?.trim();
@@ -154,28 +153,13 @@ function getFreemiusLicenseQuota(value: unknown) {
     return Math.round(parsed);
 }
 
-export function parseFreemiusCheckoutCredentialsMap():
-    | Record<string, FreemiusCheckoutCredentialEntry>
-    | null {
-    const raw = readFreemiusEnvValue('FREEMIUS_CHECKOUT_PRODUCTS_JSON');
-
-    if (!raw) {
-        return null;
-    }
-
-    try {
-        const parsed = JSON.parse(raw) as Record<string, FreemiusCheckoutCredentialEntry>;
-        return parsed && typeof parsed === 'object' ? parsed : null;
-    } catch (error) {
-        console.error(
-            '[Freemius Checkout] Failed to parse FREEMIUS_CHECKOUT_PRODUCTS_JSON:',
-            error
-        );
-        return null;
-    }
-}
-
-export function resolveFreemiusCheckoutCredentials(productId: string | number) {
+/**
+ * The configured keys bound to one product: its FREEMIUS_CHECKOUT_PRODUCTS_JSON entry (with a public
+ * key), or the one-product keys when FREEMIUS_PRODUCT_ID names it (their sandbox overrides in
+ * Freemius sandbox mode). Null when none are: then only the developer key pair, or the one-product
+ * keys standing in where the key policy allows it, can open its checkout.
+ */
+export function resolveFreemiusBoundCheckoutCredentials(productId: string | number) {
     const credentialsMap = parseFreemiusCheckoutCredentialsMap();
     const productKey = String(productId);
     const productScopedCredentials = credentialsMap?.[productKey];
@@ -219,11 +203,119 @@ export function resolveFreemiusCheckoutCredentials(productId: string | number) {
         };
     }
 
+    return null;
+}
+
+/**
+ * The configured keys for a product's Freemius API calls (the bearer, the product keys): its bound
+ * keys, else the one-product names (`legacy-env`). Never decides whether a checkout may open with
+ * the one-product keys; `resolveFreemiusProductCredentials` does, under the key policy.
+ */
+export function resolveFreemiusCheckoutCredentials(productId: string | number) {
+    return (
+        resolveFreemiusBoundCheckoutCredentials(productId) ?? {
+            ...readFreemiusOneProductKeys(),
+            source: 'legacy-env' as const,
+        }
+    );
+}
+
+/** The keys a product's checkout opens with; `source: 'none'` (no public key) means the keyed 503. */
+export type FreemiusProductCredentials = {
+    publicKey: string | null;
+    secretKey: string | null;
+    apiKey: string | null;
+    source:
+        | 'developer-api'
+        | 'product-map'
+        | 'single-product-sandbox-env'
+        | 'single-product-env'
+        | 'legacy-env'
+        | 'none';
+    /** With `source: 'none'`: why the one-product keys may not stand in (a log value, never key material). */
+    refusal?: FreemiusOneProductStandInRefusal;
+};
+
+/**
+ * A product's checkout lines (a failed key read, a blocked checkout) are written at most once per
+ * window per product. POST /api/checkout is public and the key read can fail on every request while
+ * Freemius throttles the developer key (the failure is remembered, so no request is even sent): a
+ * line per request let anyone fill the logs. Product ids come from the store's catalog; the cap only
+ * guards the memory.
+ */
+const shouldLogCheckoutLine = createFreemiusLogThrottle({ windowMs: 60_000, maxKeys: 100 });
+
+/**
+ * A product's checkout keys, under the key policy (freemius-key-policy.ts) the webhook check uses
+ * too. Call `hydrateFreemiusEnvFromDb()` first.
+ * 1. With a developer key pair Freemius accepts and a product the account owns, the product's own
+ *    keys read from Freemius (cached for minutes; the last ones it returned while it fails to answer).
+ * 2. Its bound keys: its FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, or the one-product keys (their
+ *    Freemius-sandbox twins in Freemius sandbox mode) when FREEMIUS_PRODUCT_ID names it, unless
+ *    those are, or may be, a developer key pair (`freemiusKeysMayBeDeveloperPair`: the webhook
+ *    check refuses that secret for the product too). When the read in step 1 failed, nothing else.
+ * 3. The one-product keys standing in for a product without bound keys, only where
+ *    `decideFreemiusOneProductStandIn` allows it: never when they are, or may be, the developer key
+ *    pair, so a failed read no longer opens a checkout (and writes its order) with the developer
+ *    public key.
+ * Otherwise no keys (`source: 'none'`): the caller answers the keyed 503 before it writes anything.
+ */
+export async function resolveFreemiusProductCredentials(productId: string | number): Promise<FreemiusProductCredentials> {
+    let keyReadFailed = false;
+
+    try {
+        const keys = await getFreemiusProductKeys(String(productId));
+
+        if (keys) {
+            return {
+                publicKey: keys.publicKey,
+                secretKey: keys.secretKey,
+                apiKey: null,
+                source: 'developer-api',
+            };
+        }
+    } catch (error) {
+        keyReadFailed = true;
+
+        if (shouldLogCheckoutLine(`read:${toFreemiusId(productId) ?? 'invalid'}`)) {
+            console.warn(
+                `[Freemius Checkout] Could not read product ${toFreemiusId(productId) ?? '(invalid id)'}'s keys with the developer key pair; only keys bound to it may open its checkout.`,
+                isFreemiusApiError(error) ? `${error.kind}: ${error.message}` : 'unexpected error'
+            );
+        }
+    }
+
+    const bound = resolveFreemiusBoundCheckoutCredentials(productId);
+
+    if (bound) {
+        // A JSON entry is the product's own. FREEMIUS_PRODUCT_ID's binding stands too, offline
+        // included (the operator declared those keys this product's), except where they are, or may
+        // be, a developer pair: its public key would reach the buyer's browser and the order would
+        // be written for a checkout that cannot work.
+        if (bound.source === 'product-map' || !(await freemiusKeysMayBeDeveloperPair({ publicKey: bound.publicKey, secretKey: bound.secretKey }))) {
+            return bound;
+        }
+
+        return { publicKey: null, secretKey: null, apiKey: null, source: 'none', refusal: 'one_product_keys_are_developer_pair' };
+    }
+
+    const standIn = await decideFreemiusOneProductStandIn(String(productId), { keyReadFailed });
+
+    if (standIn.allowed) {
+        return { ...readFreemiusOneProductKeys(), source: 'legacy-env' };
+    }
+
+    return { publicKey: null, secretKey: null, apiKey: null, source: 'none', refusal: standIn.reason };
+}
+
+/** The documented sandbox token: md5(timestamp + product id + secret key + public key + 'checkout'). */
+function buildFreemiusSandboxToken(input: { productId: string | number; publicKey: string; secretKey: string }) {
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const hashString = `${timestamp}${input.productId}${input.secretKey}${input.publicKey}checkout`;
+
     return {
-        publicKey: readFreemiusEnvValue('FREEMIUS_PUBLIC_KEY'),
-        secretKey: readFreemiusEnvValue('FREEMIUS_SECRET_KEY'),
-        apiKey: readFreemiusEnvValue('FREEMIUS_API_KEY'),
-        source: 'legacy-env' as const,
+        ctx: timestamp,
+        token: crypto.createHash('md5').update(hashString).digest('hex'),
     };
 }
 
@@ -435,6 +527,59 @@ export class FreemiusProvider implements PaymentProvider {
       // order records it as its payment mode and the checkout URL below uses the same value.
       const isFreemiusSandboxEnabled = process.env.FREEMIUS_SANDBOX_ENABLED === 'true';
 
+      // The product's checkout keys are resolved before anything is written. With the developer
+      // key pair they are read from Freemius on demand, and that read can fail (timeout, 5xx,
+      // product missing) even while store readiness is green from a cached verdict; then only keys
+      // bound to the product may stand in (never the one-product names, which may hold the
+      // developer pair). A checkout that cannot open must leave no pending order behind and spend
+      // no coupon redemption: redeem_coupon_atomically never gives a slot back.
+      const checkoutCredentials = await resolveFreemiusProductCredentials(freemiusProductId);
+      const publicKey = checkoutCredentials.publicKey;
+      const secretKey = checkoutCredentials.secretKey;
+      const apiKey = checkoutCredentials.apiKey;
+
+      if (!publicKey || (isFreemiusSandboxEnabled && !secretKey)) {
+          // The shopper cannot act on "missing FREEMIUS_PUBLIC_KEY", and naming the store's
+          // environment variables to the public is needless detail. Log the specifics (source and
+          // policy reason: enum values, never key material), once a minute per product, and return
+          // the same keyed message the Stripe path uses.
+          if (shouldLogCheckoutLine(`blocked:${toFreemiusId(freemiusProductId) ?? 'invalid'}`)) {
+              console.error(
+                  `Freemius checkout blocked for product ${toFreemiusId(freemiusProductId) ?? '(invalid id)'}: no usable keys ` +
+                      `(source ${checkoutCredentials.source}${checkoutCredentials.refusal ? `, ${checkoutCredentials.refusal}` : ''}). ` +
+                      'Check CMS → Payments (developer key pair, Product ID, keys) or the environment.'
+              );
+          }
+          return {
+              error: 'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
+              errorKey: 'ecommerce.checkout_payments_unavailable',
+              errorStatus: 503,
+              url: null,
+          };
+      }
+
+      if (isFreemiusSandboxEnabled && checkoutCredentials.source === 'legacy-env') {
+          const configuredProductId = readFreemiusEnvValue('FREEMIUS_PRODUCT_ID');
+          const hasSandboxOverridePublicKey = Boolean(
+              readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_PUBLIC_KEY')
+          );
+          const hasSandboxOverrideSecretKey = Boolean(
+              readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY')
+          );
+          console.warn(
+              `[Freemius Checkout] Sandbox is enabled for product ${freemiusProductId}, but no product-scoped checkout credentials were selected. Falling back to legacy FREEMIUS_PUBLIC_KEY/FREEMIUS_SECRET_KEY may open live checkout instead of sandbox.`,
+              {
+                  configuredProductId,
+                  productIdsMatch: configuredProductId === String(freemiusProductId),
+                  hasSandboxOverridePublicKey,
+                  hasSandboxOverrideSecretKey,
+                  hasCheckoutProductsJson: Boolean(
+                      readFreemiusEnvValue('FREEMIUS_CHECKOUT_PRODUCTS_JSON')
+                  ),
+              }
+          );
+      }
+
       // 3. Create Pending Order in DB. The attribution columns ride along only when the app
       // resolved a partner; a database without them (or refusing them) gets the order without
       // attribution, never a failed checkout. A sandbox purchase is recorded as test mode, so its
@@ -547,80 +692,32 @@ export class FreemiusProvider implements PaymentProvider {
           }
       }
 
-      const checkoutCredentials = resolveFreemiusCheckoutCredentials(freemiusProductId);
-      const publicKey = checkoutCredentials.publicKey;
-      const secretKey = checkoutCredentials.secretKey;
-      const apiKey = checkoutCredentials.apiKey;
-
-      if (!publicKey || (isFreemiusSandboxEnabled && !secretKey)) {
-          // The shopper cannot act on "missing FREEMIUS_PUBLIC_KEY", and naming the store's
-          // environment variables to the public is needless detail. Log the specifics,
-          // return the same keyed message the Stripe path uses.
-          console.error(
-              'Freemius checkout blocked: missing credentials (PUBLIC_KEY or SECRET_KEY) in CMS → Payments or environment.'
-          );
-          return {
-              error: 'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
-              errorKey: 'ecommerce.checkout_payments_unavailable',
-              errorStatus: 503,
-              url: null,
-          };
-      }
-
-      if (isFreemiusSandboxEnabled && checkoutCredentials.source === 'legacy-env') {
-          const configuredProductId = readFreemiusEnvValue('FREEMIUS_PRODUCT_ID');
-          const hasSandboxOverridePublicKey = Boolean(
-              readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_PUBLIC_KEY')
-          );
-          const hasSandboxOverrideSecretKey = Boolean(
-              readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY')
-          );
-          console.warn(
-              `[Freemius Checkout] Sandbox is enabled for product ${freemiusProductId}, but no product-scoped checkout credentials were selected. Falling back to legacy FREEMIUS_PUBLIC_KEY/FREEMIUS_SECRET_KEY may open live checkout instead of sandbox.`,
-              {
-                  configuredProductId,
-                  productIdsMatch: configuredProductId === String(freemiusProductId),
-                  hasSandboxOverridePublicKey,
-                  hasSandboxOverrideSecretKey,
-                  hasCheckoutProductsJson: Boolean(
-                      readFreemiusEnvValue('FREEMIUS_CHECKOUT_PRODUCTS_JSON')
-                  ),
-              }
-          );
-      }
-      
       let sandboxPayload: any = false;
-      
-      // Prefer the official Freemius SDK sandbox API. Fall back to the documented
-      // MD5 token flow if the SDK path is unavailable or fails.
-      if (isFreemiusSandboxEnabled && secretKey && publicKey) {
-          try {
-              sandboxPayload = await getFreemiusSandboxParamsViaSdk({
-                  productId: freemiusProductId,
-                  publicKey,
-                  secretKey,
-                  apiKey,
-              });
-          } catch (sdkSandboxError) {
-              console.warn(
-                  'Freemius Checkout - SDK sandbox generation failed. Falling back to manual token generation.',
-                  sdkSandboxError,
-                  {
-                      credentialSource: checkoutCredentials.source,
-                      hasApiKey: !!apiKey,
-                  }
-              );
 
-              const timestamp = Math.floor(Date.now() / 1000).toString();
-              
-              // MD5 String format: timestamp + plugin_id + secret_key + public_key + 'checkout'
-              const hashString = `${timestamp}${freemiusProductId}${secretKey}${publicKey}checkout`;
-              const hash = crypto.createHash('md5').update(hashString).digest('hex');
-              
-              sandboxPayload = {
-                  ctx: timestamp,
-                  token: hash
-              };
+      // With an API key, the official Freemius SDK sandbox API first; otherwise (the developer
+      // key pair reads no API key) or when it fails, the documented MD5 token, which is the same.
+      if (isFreemiusSandboxEnabled && secretKey && publicKey) {
+          if (apiKey) {
+              try {
+                  sandboxPayload = await getFreemiusSandboxParamsViaSdk({
+                      productId: freemiusProductId,
+                      publicKey,
+                      secretKey,
+                      apiKey,
+                  });
+              } catch (sdkSandboxError) {
+                  console.warn(
+                      'Freemius Checkout - SDK sandbox generation failed. Falling back to manual token generation.',
+                      sdkSandboxError instanceof Error ? sdkSandboxError.message : 'unexpected error',
+                      {
+                          credentialSource: checkoutCredentials.source,
+                      }
+                  );
+              }
+          }
+
+          if (!sandboxPayload) {
+              sandboxPayload = buildFreemiusSandboxToken({ productId: freemiusProductId, publicKey, secretKey });
           }
       }
       
@@ -698,64 +795,44 @@ export class FreemiusProvider implements PaymentProvider {
 }
 
 /**
- * Internal helper for Freemius API calls with correct signature
+ * Imports every product of the Freemius developer account (plans and pricing) as store products.
+ * Reads with the developer key pair (CMS developer fields first, then FREEMIUS_DEVELOPER_PUBLIC_KEY /
+ * FREEMIUS_DEVELOPER_SECRET_KEY, then the legacy FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY) through
+ * the GET-only catalog reader, the one developer-scope use the sandbox reset keeps. A product added
+ * in Freemius then works everywhere at once: the cached product list and keys are dropped. A first
+ * product list Freemius did not answer (a 2xx that is not a list included) stops it before anything
+ * is written or dropped.
+ *
+ * The CMS Sync from Freemius (triggerFreemiusSync / triggerSingleProductSync) refuses on the public
+ * sandbox, so there only the demo's 15-minute reset runs this. This function and
+ * syncSingleFreemiusProduct are relays named in DEVELOPER_KEY_CALLERS
+ * (tools/scripts/lib/sandbox-guards.js), which checks each of their callers: renaming either breaks
+ * that entry (security:check fails until it is updated).
  */
-async function fetchFreemiusHelper(path: string, devId: string, publicKey: string, secretKey: string) {
-    const method = 'GET';
-    const date = new Date().toUTCString().replace('GMT', '+0000');
-    
-    // HMAC-SHA256 signature format: METHOD \n CONTENT_MD5 \n CONTENT_TYPE \n DATE \n URL
-    const stringToSign = `${method}\n\n\n${date}\n${path}`;
-    
-    const hexHash = crypto.createHmac('sha256', secretKey).update(stringToSign).digest('hex');
-    const signature = Buffer.from(hexHash)
-        .toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=/g, '');
-    
-    const authHeader = `FS ${devId}:${publicKey}:${signature}`;
-
-    const response = await fetch(`https://api.freemius.com${path}`, {
-        headers: {
-            'Authorization': authHeader,
-            'Date': date,
-            'Accept': 'application/json'
-        }
-    });
-
-    if (!response.ok) {
-        const errText = await response.text();
-        console.error(`[Freemius API] [ERROR] ${path} returned ${response.status}: ${errText}`);
-        throw new Error(`Freemius API failed on ${path}: ${response.status} - ${errText}`);
-    }
-
-    return response.json();
-}
-
 export async function syncFreemiusProductsToSupabase() {
-    const devId = readFreemiusEnvValue('FREEMIUS_DEVELOPER_ID');
-    const publicKey = readFreemiusEnvValue('FREEMIUS_PUBLIC_KEY');
-    const secretKey = readFreemiusEnvValue('FREEMIUS_SECRET_KEY');
+    // CMS-saved developer ids and keys count too (the sandbox reads no row and syncs from its env).
+    await hydrateFreemiusEnvFromDb();
     // Accept the Vercel Marketplace integration's new key names too.
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
-    if (!devId || !publicKey || !secretKey || !supabaseUrl || !supabaseServiceKey) {
+    if (!supabaseUrl || !supabaseServiceKey) {
         throw new Error('Missing necessary environment variables for Freemius Sync.');
     }
 
+    const catalog = await openFreemiusCatalogReader();
+    const devId = catalog.developerId;
     const supabase = createClient(supabaseUrl, supabaseServiceKey, {
         auth: { autoRefreshToken: false, persistSession: false }
     });
 
-    const fetcher = (path: string) => fetchFreemiusHelper(path, devId, publicKey, secretKey);
+    const fetcher = (path: string) => catalog.read(path);
 
     try {
         console.log(`[Freemius Sync] Fetching all plugins for developer ${devId}...`);
-        const pluginsData = await fetcher(`/v1/developers/${devId}/plugins.json`);
+        const pluginsData = await fetcher('/plugins.json');
         const plugins = getFirstFreemiusCollection(pluginsData, ['plugins', 'plugin']);
-        
+
         console.log(`[Freemius Sync] Found ${plugins.length} plugins. Syncing plans...`);
 
         let totalSyncCount = 0;
@@ -768,16 +845,16 @@ export async function syncFreemiusProductsToSupabase() {
         }
 
         for (const plugin of plugins) {
-            const pluginId = plugin.id?.toString();
+            const pluginId = toFreemiusId(plugin?.id);
 
             if (!pluginId) {
-                console.warn('[Freemius Sync] Skipping plugin without an id:', plugin);
+                // Never log the plugin itself: at developer scope it carries the product's keys.
+                console.warn('[Freemius Sync] Skipping a plugin without an id.');
                 continue;
             }
 
             const count = await syncSingleFreemiusProductInternal(
                 supabase,
-                devId,
                 pluginId,
                 plugin.title || plugin.name || `Freemius Product ${pluginId}`,
                 fetcher,
@@ -786,6 +863,7 @@ export async function syncFreemiusProductsToSupabase() {
             totalSyncCount += count;
         }
 
+        forgetFreemiusDeveloperCaches();
         return { success: true, count: totalSyncCount };
     } catch (err: any) {
         console.error('[Freemius Sync] Global Error:', err);
@@ -794,19 +872,25 @@ export async function syncFreemiusProductsToSupabase() {
 }
 
 export async function syncSingleFreemiusProduct(productId: string) {
-    const devId = readFreemiusEnvValue('FREEMIUS_DEVELOPER_ID');
-    const publicKey = readFreemiusEnvValue('FREEMIUS_PUBLIC_KEY');
-    const secretKey = readFreemiusEnvValue('FREEMIUS_SECRET_KEY');
+    const freemiusProductId = toFreemiusId(productId);
+
+    if (!freemiusProductId) {
+        throw new Error('This is not a Freemius product id.');
+    }
+
+    // CMS-saved developer ids and keys count too (the sandbox reads no row and syncs from its env).
+    await hydrateFreemiusEnvFromDb();
     // Accept the Vercel Marketplace integration's new key names too.
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
-    if (!devId || !publicKey || !secretKey || !supabaseUrl || !supabaseServiceKey) {
+    if (!supabaseUrl || !supabaseServiceKey) {
         throw new Error('Missing environment variables for Freemius Sync.');
     }
 
+    const catalog = await openFreemiusCatalogReader();
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
-    const fetcher = (path: string) => fetchFreemiusHelper(path, devId, publicKey, secretKey);
+    const fetcher = (path: string) => catalog.read(path);
 
     // Get English language ID for default product language
     const { data: enLang } = await supabase.from('languages').select('id').eq('code', 'en').single();
@@ -816,24 +900,23 @@ export async function syncSingleFreemiusProduct(productId: string) {
     }
 
     // First fetch the plugin details to get the title
-    const pluginResponse = await fetcher(`/v1/developers/${devId}/plugins/${productId}.json`);
-    const plugin = pluginResponse.plugin ?? pluginResponse;
-    
+    const pluginResponse = await fetcher(`/plugins/${freemiusProductId}.json`);
+    const plugin = pluginResponse?.plugin ?? pluginResponse ?? {};
+
     const count = await syncSingleFreemiusProductInternal(
         supabase,
-        devId,
-        productId,
-        plugin.title || plugin.name || `Freemius Product ${productId}`,
+        freemiusProductId,
+        plugin.title || plugin.name || `Freemius Product ${freemiusProductId}`,
         fetcher,
         enLangId
     );
+    forgetFreemiusDeveloperCaches();
     return { success: true, count };
 }
 
 async function syncSingleFreemiusProductInternal(
-    supabase: any, 
-    devId: string, 
-    productId: string, 
+    supabase: any,
+    productId: string,
     pluginTitle: string,
     fetchFreemius: (path: string) => Promise<any>,
     languageId: number
@@ -842,16 +925,16 @@ async function syncSingleFreemiusProductInternal(
     let syncCount = 0;
 
     try {
-        const plansPath = `/v1/developers/${devId}/plugins/${productId}/plans.json`;
+        const plansPath = `/plugins/${productId}/plans.json`;
         const plansData = await fetchFreemius(plansPath);
         const plans = getFirstFreemiusCollection(plansData, ['plans', 'plan']);
         console.log(`[Freemius Sync] Received ${plans.length} plans for plugin ${productId}.`);
 
         for (const plan of plans) {
-            const planIdStr = plan.id?.toString();
+            const planIdStr = toFreemiusId(plan?.id);
 
             if (!planIdStr) {
-                console.warn('[Freemius Sync] Skipping plan without an id:', plan);
+                console.warn('[Freemius Sync] Skipping a plan without an id.');
                 continue;
             }
 
@@ -866,7 +949,7 @@ async function syncSingleFreemiusProductInternal(
                 planDetails.is_require_subscription === undefined
             ) {
                 try {
-                    const planDetailsPath = `/v1/developers/${devId}/plugins/${productId}/plans/${planIdStr}.json`;
+                    const planDetailsPath = `/plugins/${productId}/plans/${planIdStr}.json`;
                     const fetchedPlanDetails = await fetchFreemius(planDetailsPath);
                     const fetchedPlanPayload = fetchedPlanDetails.plan ?? fetchedPlanDetails;
                     planDetails = {
@@ -891,7 +974,7 @@ async function syncSingleFreemiusProductInternal(
             let price = 0;
             let fullPricing: any[] = [];
             try {
-                const pricingPath = `/v1/developers/${devId}/plugins/${productId}/plans/${planIdStr}/pricing.json`;
+                const pricingPath = `/plugins/${productId}/plans/${planIdStr}/pricing.json`;
                 const pricingData = await fetchFreemius(pricingPath);
                 fullPricing = getFirstFreemiusCollection(pricingData, [
                     'pricing',
@@ -933,6 +1016,11 @@ async function syncSingleFreemiusProductInternal(
                 stock: 999, 
                 sku: `FM-${productId}-${planIdStr}`,
                 language_id: languageId,
+                // No trigger maintains products.updated_at. The visual editor publishes the title and
+                // short description of a pre-0.23.4 draft that holds a copy of the products row only
+                // while the row is unchanged since the draft was created (updated_at at or before
+                // product_drafts.created_at): a sync that left it alone was reverted by that publish.
+                updated_at: new Date().toISOString(),
             };
 
             // 2. Upsert Core Product

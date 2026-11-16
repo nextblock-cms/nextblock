@@ -6,20 +6,38 @@ import { createClient as createSupabaseClient, type SupabaseClient } from '@supa
 
 import {
   evaluateFreemiusLicenseClaim,
+  logFreemiusCredentialsRefused,
   parseFreemiusTimestamp,
   retrieveFreemiusLicenseRecords,
+  watchFreemiusAnswers,
   type FreemiusLicenseClaimRejection,
   type FreemiusLicenseRecordLike,
   type FreemiusLicenseRecords,
   type FreemiusUserRecordLike,
 } from './freemius-license-claim';
-import { assignInvoiceMetadata } from './invoice-server';
-import { applyOrderInventoryDeduction } from './order-inventory';
 import {
+  FREEMIUS_USER_FIELDS,
+  FREEMIUS_WEBHOOK_SECRET_MAX_AGE_MS,
+  freemiusDeveloperRequest,
+  getFreemiusProductKeys,
+  isFreemiusApiError,
+  orNullWhenNotFound,
+  toFreemiusId,
+  withFreemiusDeveloperScope,
+  type FreemiusDeveloperStatus,
+  type FreemiusProductKeys,
+} from './freemius-developer-api';
+import {
+  createFreemiusLogThrottle,
+  decideFreemiusOneProductStandIn,
+  freemiusKeysMayBeDeveloperPair,
+  isUnboundFreemiusProduct,
   parseFreemiusCheckoutCredentialsMap,
   readFreemiusEnvValue,
-  resolveFreemiusCheckoutCredentials,
-} from './providers/freemius';
+} from './freemius-key-policy';
+import { assignInvoiceMetadata } from './invoice-server';
+import { applyOrderInventoryDeduction } from './order-inventory';
+import { resolveFreemiusCheckoutCredentials } from './providers/freemius';
 
 export type FreemiusTrackedOrderStatus =
   | 'pending'
@@ -113,6 +131,11 @@ type FreemiusOrderMetadata = {
 export type FreemiusWebhookEvent = {
   id?: string | number | null;
   type?: string;
+  /**
+   * The product the event belongs to. Freemius sends it on every event; the webhook route refuses
+   * an event without one and stamps the id of the product whose secret verified the event here.
+   */
+  plugin_id?: string | number | null;
   data?: Record<string, any> | null;
   objects?: Record<string, any> | null;
 };
@@ -788,30 +811,359 @@ function getEventMetadata(event: FreemiusWebhookEvent, purchaseData?: Record<str
   };
 }
 
-async function retrieveFreemiusPurchaseData(productId: string | null | undefined, licenseId: string) {
-  if (!productId) {
+function freemiusIdString(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'bigint') return String(value);
+  return null;
+}
+
+/** "YYYY-MM-DD HH:mm:ss" (UTC, as Freemius sends it) → Date, as `@freemius/sdk` parses it. */
+function parseFreemiusDateTime(value: unknown): Date | null {
+  if (typeof value !== 'string' || !value) return null;
+
+  const [datePart, timePart, ...rest] = value.split(' ');
+
+  if (!datePart || !timePart || rest.length > 0) return null;
+
+  const date = datePart.split('-').map((part) => Number.parseInt(part, 10));
+  const time = timePart.split(':').map((part) => Number.parseInt(part, 10));
+
+  if (date.length !== 3 || time.length !== 3 || [...date, ...time].some((part) => Number.isNaN(part))) return null;
+
+  return new Date(Date.UTC(date[0], date[1] - 1, date[2], time[0], time[1], time[2], 0));
+}
+
+function parseFreemiusNumber(value: unknown): number | null {
+  if (typeof value === 'number') return value;
+  if (typeof value !== 'string') return null;
+
+  const parsed = Number.parseFloat(value);
+
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Purchase data exactly as `@freemius/sdk` `purchase.retrievePurchaseData()` returns it
+ * (PurchaseInfo.toData), from a license, its owner and its subscription (null for a license
+ * without one). The webhook and checkout status rules read this shape.
+ */
+function toFreemiusPurchaseData(
+  user: Record<string, any>,
+  license: Record<string, any>,
+  subscription: Record<string, any> | null
+): Record<string, any> {
+  const expiration = license.expiration ? parseFreemiusDateTime(license.expiration) : null;
+  const canceled = license.is_cancelled ?? false;
+  const billingCycle = subscription ? Number.parseInt(String(subscription.billing_cycle ?? ''), 10) : null;
+  const currency = subscription && typeof subscription.currency === 'string' ? subscription.currency.toLowerCase() : null;
+  const gateway = subscription && typeof subscription.gateway === 'string' ? subscription.gateway : null;
+
+  return {
+    email: user.email,
+    firstName: user.first ?? '',
+    lastName: user.last ?? '',
+    userId: freemiusIdString(license.user_id),
+    planId: freemiusIdString(license.plan_id),
+    pricingId: freemiusIdString(license.pricing_id),
+    licenseId: freemiusIdString(license.id),
+    expiration,
+    canceled,
+    subscriptionId: subscription ? freemiusIdString(subscription.id) : null,
+    billingCycle: subscription ? (billingCycle === 1 ? 'monthly' : billingCycle === 12 ? 'yearly' : 'oneoff') : null,
+    quota: license.quota ?? null,
+    isActive: !canceled && !(expiration && expiration < new Date()),
+    initialAmount: subscription ? parseFreemiusNumber(subscription.initial_amount) : null,
+    renewalAmount: subscription ? parseFreemiusNumber(subscription.renewal_amount) : null,
+    currency: currency === 'usd' ? 'USD' : currency === 'eur' ? 'EUR' : currency === 'gbp' ? 'GBP' : null,
+    renewalDate: subscription?.next_payment ? parseFreemiusDateTime(subscription.next_payment) : null,
+    paymentMethod: gateway?.startsWith('stripe') ? 'card' : gateway?.startsWith('paypal') ? 'paypal' : null,
+    created: parseFreemiusDateTime(license.created) ?? new Date(),
+  };
+}
+
+/** retrievePurchaseData at developer scope: the license, its subscription (404: none) and its owner. */
+async function retrieveFreemiusPurchaseDataAtDeveloperScope(productId: string, licenseId: string) {
+  const license = await orNullWhenNotFound(
+    freemiusDeveloperRequest<Record<string, any>>({ path: `/plugins/${productId}/licenses/${licenseId}.json` })
+  );
+
+  if (!license || !license.id) {
     return null;
   }
 
-  const credentials = resolveFreemiusCheckoutCredentials(productId);
+  const subscription = await orNullWhenNotFound(
+    freemiusDeveloperRequest<Record<string, any>>({ path: `/plugins/${productId}/licenses/${licenseId}/subscription.json` })
+  );
+  const userId = toFreemiusId(license.user_id);
+  const user = userId
+    ? await orNullWhenNotFound(
+        freemiusDeveloperRequest<Record<string, any>>({
+          path: `/plugins/${productId}/users/${userId}.json`,
+          query: { fields: FREEMIUS_USER_FIELDS },
+        })
+      )
+    : null;
+
+  if (!user || !user.id) {
+    return null;
+  }
+
+  return toFreemiusPurchaseData(user, license, subscription && subscription.id ? subscription : null);
+}
+
+/**
+ * The purchase behind a license: with the developer key pair when it works and the account owns
+ * the product, else with the product's bearer (`@freemius/sdk`). Null without either, or for ids
+ * that are not Freemius ids. A 401/403 on the license, subscription or user lookup is logged as a
+ * configuration error (`logFreemiusCredentialsRefused`, throttled): the developer pair then falls
+ * back to the bearer, and a refused bearer reads as no purchase data, as before, never silently.
+ */
+async function retrieveFreemiusPurchaseData(productId: string | null | undefined, licenseId: string) {
+  const freemiusProductId = toFreemiusId(productId);
+  const freemiusLicenseId = toFreemiusId(licenseId);
+
+  if (!freemiusProductId || !freemiusLicenseId) {
+    return null;
+  }
+
+  const viaDeveloper = await withFreemiusDeveloperScope(freemiusProductId, async () => {
+    try {
+      return await retrieveFreemiusPurchaseDataAtDeveloperScope(freemiusProductId, freemiusLicenseId);
+    } catch (error) {
+      if (isFreemiusApiError(error) && error.kind === 'auth') {
+        logFreemiusCredentialsRefused('developer', freemiusProductId, error.status, 'purchase data lookup');
+      }
+
+      throw error;
+    }
+  });
+
+  if (viaDeveloper.handled) {
+    return viaDeveloper.value;
+  }
+
+  const credentials = resolveFreemiusCheckoutCredentials(freemiusProductId);
 
   if (!credentials.apiKey || !credentials.secretKey || !credentials.publicKey) {
     return null;
   }
 
   const freemius = new Freemius({
-    productId: Number(productId),
+    productId: Number(freemiusProductId),
     apiKey: credentials.apiKey,
     secretKey: credentials.secretKey,
     publicKey: credentials.publicKey,
   });
+  // The SDK reads any failed lookup as "no purchase": its answers' statuses tell a refused token apart.
+  const statuses = watchFreemiusAnswers(freemius);
+  const purchaseData = await freemius.purchase.retrievePurchaseData(freemiusLicenseId);
+  const refused = statuses.find((status) => status === 401 || status === 403);
 
-  return freemius.purchase.retrievePurchaseData(licenseId);
+  if (refused !== undefined) {
+    logFreemiusCredentialsRefused('bearer', freemiusProductId, refused, 'purchase data lookup');
+  }
+
+  return purchaseData;
+}
+
+/**
+ * Which product's orders a signed webhook event may change: the product whose secret verified it.
+ * The route passes that id (`productId`, from `getFreemiusWebhookVerification`) and stamps it on the
+ * event as `plugin_id`, which the verification requires and checks the signature with; a caller
+ * that passes no id gets the event's own `plugin_id`.
+ * - `undefined`: no product at all (a caller outside the webhook route, such as a test): the order
+ *   of the license is used, as before.
+ * - `null`: the ids disagree, or one is not a Freemius id: no order matches.
+ */
+function resolveWebhookProductScope(
+  event: FreemiusWebhookEvent | null | undefined,
+  productId: string | undefined
+): string | null | undefined {
+  const named = event?.plugin_id;
+  const namedId = toFreemiusId(named);
+  const namesProduct = named !== undefined && named !== null && named !== '';
+
+  if (productId === undefined) {
+    return namesProduct ? namedId : undefined;
+  }
+
+  const verifiedId = toFreemiusId(productId);
+
+  return verifiedId && (!namesProduct || namedId === verifiedId) ? verifiedId : null;
+}
+
+/** A value from a signed event, safe to print on one log line. */
+function forLogLine(value: unknown): string {
+  const printable = String(value ?? '').replace(/[^\w.:-]/g, '').slice(0, 64);
+  return printable || '(none)';
+}
+
+/**
+ * `orderProduct` names what the order is for in the line: its stored product by default, or the
+ * products its items name (`deriveOrderFreemiusProducts`) for an order that stores none.
+ */
+function warnWebhookProductMismatch(
+  eventType: string | null | undefined,
+  licenseId: string,
+  order: FreemiusOrderRow,
+  scope: string | null,
+  orderProduct = `product ${toFreemiusId(order.freemius_product_id) ?? '(none)'}`
+) {
+  console.warn(
+    `[Freemius Webhook] Skipped ${forLogLine(eventType)} for license ${forLogLine(licenseId)}: its order ${order.id} is ` +
+      `for ${orderProduct}, not for product ${scope ?? '(none)'}, whose secret verified the event.`
+  );
+}
+
+/**
+ * An order that stores no product and whose items prove none is logged at most once a minute per
+ * order: Freemius sends several events per purchase, refund or cancellation, and each would repeat
+ * the same line. 50 orders a window at most.
+ */
+const shouldLogUnprovenOrderProduct = createFreemiusLogThrottle({ windowMs: 60_000, maxKeys: 50 });
+
+function warnWebhookOrderProductUnproven(
+  eventType: string | null | undefined,
+  licenseId: string,
+  order: FreemiusOrderRow,
+  scope: string
+) {
+  if (!shouldLogUnprovenOrderProduct(order.id)) {
+    return;
+  }
+
+  console.warn(
+    `[Freemius Webhook] Skipped ${forLogLine(eventType)} for license ${forLogLine(licenseId)}: its order ${order.id} records no ` +
+      `Freemius product and its items prove none (no items, an item whose product is gone, or a product without a Freemius ` +
+      `Product ID), so it cannot be tied to product ${scope}, whose secret verified the event. Fill in the Freemius Product ID ` +
+      'of the product it sold (CMS → Products), or the order’s freemius_product_id, for later events to apply.'
+  );
+}
+
+/**
+ * The Freemius products an order's own items name, from the database alone: each item's product,
+ * then that product's `freemius_product_id` (what checkout bound the order to). `complete` is true
+ * when the order has items and every one of them names a product with a Freemius Product ID.
+ * Database errors throw, so the webhook answers 5xx and Freemius redelivers.
+ */
+async function deriveOrderFreemiusProducts(
+  client: SupabaseLikeClient,
+  orderId: string
+): Promise<{ productIds: string[]; complete: boolean }> {
+  const { data: items, error: itemsError } = await (client as any)
+    .from('order_items')
+    .select('product_id')
+    .eq('order_id', orderId);
+
+  if (itemsError) {
+    throw new Error(itemsError.message || 'Failed to read the order items');
+  }
+
+  const localIds = (Array.isArray(items) ? items : []).map((item: { product_id?: unknown }) => toStringOrNull(item?.product_id));
+  const knownIds = Array.from(new Set(localIds.filter((id): id is string => id !== null)));
+  const freemiusIdByProduct = new Map<string, string | null>();
+
+  if (knownIds.length > 0) {
+    const { data: products, error: productsError } = await (client as any)
+      .from('products')
+      .select('id, freemius_product_id')
+      .in('id', knownIds);
+
+    if (productsError) {
+      throw new Error(productsError.message || 'Failed to read the order products');
+    }
+
+    for (const product of Array.isArray(products) ? products : []) {
+      freemiusIdByProduct.set(String(product?.id), toFreemiusId(product?.freemius_product_id));
+    }
+  }
+
+  const freemiusIds = localIds.map((id) => (id === null ? null : freemiusIdByProduct.get(id) ?? null));
+
+  return {
+    productIds: Array.from(new Set(freemiusIds.filter((id): id is string => id !== null))),
+    complete: freemiusIds.length > 0 && freemiusIds.every((id) => id !== null),
+  };
+}
+
+/**
+ * Writes the product the items proved into an order that stored none, unless something wrote one
+ * meanwhile (the update matches the value read). Throws on a database error.
+ */
+async function backfillOrderFreemiusProduct(client: SupabaseLikeClient, order: FreemiusOrderRow, productId: string) {
+  const update = (client as any).from('orders').update({ freemius_product_id: productId }).eq('id', order.id);
+  const { error } = await (order.freemius_product_id === null || order.freemius_product_id === undefined
+    ? update.is('freemius_product_id', null)
+    : update.eq('freemius_product_id', order.freemius_product_id));
+
+  if (error) {
+    throw new Error(error.message || 'Failed to record the order product');
+  }
+}
+
+/**
+ * Whether a signed event may act on the order of its license: every order for a caller that names
+ * no product (`scope` undefined), none when the ids disagree (`null`), otherwise only an order of
+ * the verified product. An order that stores no product (written before checkout stored it, or
+ * imported without it) is that product's only when its own items prove it
+ * (`deriveOrderFreemiusProducts`: every item's product carries that Freemius Product ID), never on
+ * the event's word: a forged event signed with one product's secret can name any license, and any
+ * product in its objects. The proof is then written to the order's `freemius_product_id`, whichever
+ * handler runs (a dispute or a renewal's refund included), so later events read it directly. An
+ * order out of scope is logged, without a database read when it stores a product.
+ */
+async function isOrderInWebhookProductScope(input: {
+  client: SupabaseLikeClient;
+  order: FreemiusOrderRow;
+  scope: string | null | undefined;
+  eventType: string | null | undefined;
+  licenseId: string;
+}): Promise<boolean> {
+  const { client, order, scope, eventType, licenseId } = input;
+
+  if (scope === undefined) {
+    return true;
+  }
+
+  if (scope === null || toStringOrNull(order.freemius_product_id) !== null) {
+    if (scope !== null && toFreemiusId(order.freemius_product_id) === scope) {
+      return true;
+    }
+
+    warnWebhookProductMismatch(eventType, licenseId, order, scope);
+    return false;
+  }
+
+  const derived = await deriveOrderFreemiusProducts(client, order.id);
+
+  if (derived.complete && derived.productIds.length === 1 && derived.productIds[0] === scope) {
+    await backfillOrderFreemiusProduct(client, order, scope);
+    return true;
+  }
+
+  if (derived.productIds.some((productId) => productId !== scope)) {
+    warnWebhookProductMismatch(
+      eventType,
+      licenseId,
+      order,
+      scope,
+      `${derived.productIds.length === 1 ? 'product' : 'products'} ${derived.productIds.join(', ')} (from its items)`
+    );
+    return false;
+  }
+
+  warnWebhookOrderProductUnproven(eventType, licenseId, order, scope);
+  return false;
 }
 
 export async function syncFreemiusOrderFromWebhookEvent(input: {
   event: FreemiusWebhookEvent;
   client?: SupabaseLikeClient;
+  /**
+   * The product whose secret verified the event (`getFreemiusWebhookVerification`): the order of
+   * another product is skipped. Defaults to the event's own `plugin_id`.
+   */
+  productId?: string;
 }) {
   const client = input.client ?? getServiceRoleSupabaseClient();
   const licenseId = getEventLicenseId(input.event);
@@ -837,11 +1189,24 @@ export async function syncFreemiusOrderFromWebhookEvent(input: {
     };
   }
 
+  const productScope = resolveWebhookProductScope(input.event, input.productId);
+
+  if (!(await isOrderInWebhookProductScope({ client, order, scope: productScope, eventType: input.event.type, licenseId }))) {
+    return {
+      success: true,
+      ignored: true,
+      reason: 'product_mismatch',
+      licenseId,
+      type: input.event.type,
+    };
+  }
+
   let purchaseData: Record<string, any> | null = null;
 
   try {
+    // In scope, the verified product is the order's own (stored, or proven by its items).
     purchaseData = await retrieveFreemiusPurchaseData(
-      order.freemius_product_id ?? input.event.objects?.license?.plugin_id,
+      productScope ?? order.freemius_product_id ?? input.event.objects?.license?.plugin_id,
       licenseId
     );
   } catch (error) {
@@ -849,6 +1214,12 @@ export async function syncFreemiusOrderFromWebhookEvent(input: {
   }
 
   const metadata = getEventMetadata(input.event, purchaseData);
+
+  if (productScope) {
+    // The order stays with the product that verified the event, whatever product its objects name.
+    metadata.freemius_product_id = productScope;
+  }
+
   const nextStatus = resolveFreemiusStatusFromWebhookEvent({
     event: input.event,
     currentStatus: order.status,
@@ -914,8 +1285,12 @@ export interface FreemiusOrderRefundSync {
   previousStatus: string | null;
   /** True when this event moved the order to 'refunded'. */
   statusUpdated: boolean;
-  /** Why nothing was applied to an order, when nothing was. */
-  reason: 'not_a_refund' | 'missing_license_id' | 'unknown_license_id' | 'renewal' | null;
+  /**
+   * Why nothing was applied to an order, when nothing was. `product_mismatch`: the license's order
+   * is for another product than the one whose secret verified the event, or stores no product and
+   * its items prove none (`orderId` stays null).
+   */
+  reason: 'not_a_refund' | 'missing_license_id' | 'unknown_license_id' | 'product_mismatch' | 'renewal' | null;
 }
 
 /** Only a paid order becomes refunded; a pending, trial or cancelled one keeps its status. */
@@ -928,12 +1303,17 @@ function isFreemiusFlagSet(value: unknown) {
 /**
  * Applies a signed Freemius refund or lost-dispute event to the order of its license: a paid
  * order moves to 'refunded' in one conditional update (a replay changes nothing), and the
- * database's order trigger voids its affiliate commission. A renewal's refund changes nothing.
- * Database errors throw so the webhook answers 5xx and Freemius redelivers.
+ * database's order trigger voids its affiliate commission. A renewal's refund changes nothing,
+ * and so does an event for an order of another product than the one whose secret verified it
+ * (`productId`, else the event's `plugin_id`), or for an order that stores no product and whose
+ * items prove none (`isOrderInWebhookProductScope`). Database errors throw so the webhook answers
+ * 5xx and Freemius redelivers.
  */
 export async function syncFreemiusOrderRefundFromWebhookEvent(input: {
   event: FreemiusWebhookEvent;
   client?: SupabaseLikeClient;
+  /** The product whose secret verified the event (`getFreemiusWebhookVerification`). */
+  productId?: string;
 }): Promise<FreemiusOrderRefundSync> {
   const eventType = input.event?.type ?? null;
   const result: FreemiusOrderRefundSync = {
@@ -965,6 +1345,13 @@ export async function syncFreemiusOrderRefundFromWebhookEvent(input: {
 
   if (!order) {
     result.reason = 'unknown_license_id';
+    return result;
+  }
+
+  const productScope = resolveWebhookProductScope(input.event, input.productId);
+
+  if (!(await isOrderInWebhookProductScope({ client, order, scope: productScope, eventType, licenseId }))) {
+    result.reason = 'product_mismatch';
     return result;
   }
 
@@ -1011,20 +1398,28 @@ export interface FreemiusOrderDisputeSync {
   isRenewal: boolean;
   /** The order of the event's license; null when none matches. */
   orderId: string | null;
-  /** Why no commission is concerned, when none is. */
-  reason: 'not_a_dispute' | 'missing_license_id' | 'unknown_license_id' | 'renewal' | null;
+  /**
+   * Why no commission is concerned, when none is. `product_mismatch`: the license's order is for
+   * another product than the one whose secret verified the event, or stores no product and its
+   * items prove none (`orderId` stays null).
+   */
+  reason: 'not_a_dispute' | 'missing_license_id' | 'unknown_license_id' | 'product_mismatch' | 'renewal' | null;
 }
 
 /**
  * Finds the order of a signed `payment.dispute.created` or `payment.dispute.won` event by its
- * license, without changing it (a dispute takes no money back until it is lost or closed by a
- * refund, which `syncFreemiusOrderRefundFromWebhookEvent` handles). A dispute on a renewal
- * payment concerns no commission. Database errors throw so the webhook answers 5xx and
+ * license, without changing its status (a dispute takes no money back until it is lost or closed by
+ * a refund, which `syncFreemiusOrderRefundFromWebhookEvent` handles; an order that stored no
+ * product gets the one its items prove). A dispute on a renewal payment concerns no commission, and
+ * neither does an order of another product than the one whose secret verified the event
+ * (`productId`, else the event's `plugin_id`). Database errors throw so the webhook answers 5xx and
  * Freemius redelivers.
  */
 export async function syncFreemiusOrderDisputeFromWebhookEvent(input: {
   event: FreemiusWebhookEvent;
   client?: SupabaseLikeClient;
+  /** The product whose secret verified the event (`getFreemiusWebhookVerification`). */
+  productId?: string;
 }): Promise<FreemiusOrderDisputeSync> {
   const eventType = input.event?.type ?? null;
   const result: FreemiusOrderDisputeSync = {
@@ -1059,40 +1454,394 @@ export async function syncFreemiusOrderDisputeFromWebhookEvent(input: {
     return result;
   }
 
+  const productScope = resolveWebhookProductScope(input.event, input.productId);
+
+  if (!(await isOrderInWebhookProductScope({ client, order, scope: productScope, eventType, licenseId }))) {
+    result.reason = 'product_mismatch';
+    return result;
+  }
+
   result.orderId = order.id;
   result.reason = result.isRenewal ? 'renewal' : null;
   return result;
 }
 
-export function getFreemiusWebhookSecretCandidates() {
-  const candidates = [
-    readFreemiusEnvValue('FREEMIUS_SECRET_KEY'),
-    readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY'),
-    ...Object.values(parseFreemiusCheckoutCredentialsMap() ?? {}).map(
-      (entry) => entry.secretKey ?? null
-    ),
-  ];
+/**
+ * The configured webhook secrets of ONE product (Freemius signs each product's webhooks with that
+ * product's own secret key): its FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, and the one-product secret
+ * (FREEMIUS_SECRET_KEY, with its sandbox override FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY) only when
+ * FREEMIUS_PRODUCT_ID names that product, so another product's secret never verifies its events.
+ * A `productId` that is not a Freemius id has none. Without options: every configured secret, an
+ * inventory, never a list to verify an event with. The synchronous check of older routes uses it
+ * as is; the async check (`resolveFreemiusBoundWebhookSecrets`) also drops a FREEMIUS_PRODUCT_ID-bound
+ * secret that may be a developer pair's, which a synchronous check cannot ask about.
+ */
+export function getFreemiusWebhookSecretCandidates(options?: { productId?: string | null }) {
+  const credentialsMap = parseFreemiusCheckoutCredentialsMap() ?? {};
+  let candidates: unknown[];
 
-  return Array.from(
-    new Set(candidates.filter((value): value is string => Boolean(value)))
-  );
+  if (options === undefined) {
+    candidates = [
+      readFreemiusEnvValue('FREEMIUS_SECRET_KEY'),
+      readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY'),
+      ...Object.values(credentialsMap).map((entry) => entry?.secretKey ?? null),
+    ];
+  } else {
+    const productId = toFreemiusId(options.productId);
+    const ownsSingleProductSecret =
+      productId !== null && toFreemiusId(readFreemiusEnvValue('FREEMIUS_PRODUCT_ID')) === productId;
+
+    candidates = productId
+      ? [
+          Object.prototype.hasOwnProperty.call(credentialsMap, productId) ? credentialsMap[productId]?.secretKey ?? null : null,
+          ...(ownsSingleProductSecret
+            ? [readFreemiusEnvValue('FREEMIUS_SECRET_KEY'), readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY')]
+            : []),
+        ]
+      : [];
+  }
+
+  return Array.from(new Set(candidates.filter((value): value is string => typeof value === 'string' && Boolean(value))));
 }
 
+/**
+ * The bound secrets the async check accepts for `productId` (a Freemius id): its
+ * FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, and the secrets FREEMIUS_PRODUCT_ID binds to it
+ * (FREEMIUS_SECRET_KEY, and its Freemius-sandbox override) unless the key policy finds that key set
+ * is, or may be, a developer pair (`freemiusKeysMayBeDeveloperPair`, the rule the checkout's bound
+ * keys follow): with the one-product names holding the developer pair, a Product ID let that secret,
+ * revoked or leaked included, verify the product's payments and refunds. The synchronous check of
+ * older routes keeps `getFreemiusWebhookSecretCandidates` as it was (it cannot ask).
+ */
+async function resolveFreemiusBoundWebhookSecrets(productId: string): Promise<string[]> {
+  const credentialsMap = parseFreemiusCheckoutCredentialsMap() ?? {};
+  const secrets: Array<string | null> = [
+    Object.prototype.hasOwnProperty.call(credentialsMap, productId) ? credentialsMap[productId]?.secretKey ?? null : null,
+  ];
+
+  if (toFreemiusId(readFreemiusEnvValue('FREEMIUS_PRODUCT_ID')) === productId) {
+    const keySets = [
+      { publicKey: readFreemiusEnvValue('FREEMIUS_PUBLIC_KEY'), secretKey: readFreemiusEnvValue('FREEMIUS_SECRET_KEY') },
+      {
+        publicKey: readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_PUBLIC_KEY'),
+        secretKey: readFreemiusEnvValue('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY'),
+      },
+    ];
+
+    for (const keys of keySets) {
+      if (keys.secretKey && !(await freemiusKeysMayBeDeveloperPair(keys))) {
+        secrets.push(keys.secretKey);
+      }
+    }
+  }
+
+  return Array.from(new Set(secrets.filter((value): value is string => typeof value === 'string' && Boolean(value))));
+}
+
+/**
+ * The one-product secret (FREEMIUS_SECRET_KEY) for a product without bound keys (no entry of its
+ * own, FREEMIUS_PRODUCT_ID empty: `isUnboundFreemiusProduct`); null otherwise. The Payments screen
+ * let that Product ID stay empty, and such an install sells products without an entry on the
+ * one-product keys. The async check uses it only where the key policy lets the one-product keys
+ * stand in (`decideFreemiusOneProductStandIn`); the synchronous check of older routes applies it as is.
+ */
+function getUnscopedSingleProductSecret(productId: string): string | null {
+  return isUnboundFreemiusProduct(productId) ? readFreemiusEnvValue('FREEMIUS_SECRET_KEY') : null;
+}
+
+/** A presented signature: the 64 hex characters of an HMAC-SHA256, or null. */
+function normalizeFreemiusSignature(signature: string | null | undefined): string | null {
+  const trimmed = typeof signature === 'string' ? signature.trim() : '';
+  return /^[0-9a-f]{64}$/i.test(trimmed) ? trimmed.toLowerCase() : null;
+}
+
+/** HMAC-SHA256 of the raw body with `secretKey`, compared with the presented hex signature in constant time. */
+function freemiusSignatureMatches(secretKey: string, rawBody: string, signature: string): boolean {
+  const expected = crypto.createHmac('sha256', secretKey).update(rawBody).digest();
+  const presented = Buffer.from(signature, 'hex');
+
+  return presented.length === expected.length && crypto.timingSafeEqual(expected, presented);
+}
+
+/**
+ * The product a webhook names (`plugin_id`), read only to choose which secret to check the
+ * signature with. Nothing else in the body is used before the signature checks out. An event
+ * without one is refused (Freemius always sends it), and an id only selects that product's own
+ * secret, so a forged id gains nothing without that product's secret.
+ */
+function readFreemiusWebhookProductId(rawBody: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(rawBody);
+
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? toFreemiusId((parsed as Record<string, unknown>)['plugin_id'])
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A product secret read more than this long ago is read once more when a signature fails (rotation). */
+const FREEMIUS_WEBHOOK_KEY_REFRESH_AFTER_MS = 60_000;
+
+/** What `getFreemiusWebhookVerification` concluded about a webhook. */
+export type FreemiusWebhookVerification =
+  /** Signed with the secret of `productId`, the product the event names: process it, for that product's orders only. */
+  | { outcome: 'valid'; productId: string }
+  /** Not signed for the product it names, or it names none, or the signature is malformed: answer 401. */
+  | {
+      outcome: 'invalid';
+      productId: string | null;
+      reason: 'malformed_signature' | 'missing_product_id' | 'signature_mismatch';
+    }
+  /**
+   * The app could not check it: the developer key pair owns (or may own) the product, the product's
+   * secret could not be read from Freemius, and no configured secret of THAT product matched. Answer
+   * 503 so Freemius redelivers it, and never process it.
+   * - `product_key_read_failed`: reading the product's keys failed (Freemius unreachable, throttled,
+   *   or the product list it last answered lacks the id while its re-read went unanswered), or the
+   *   last keys it returned are older than FREEMIUS_WEBHOOK_SECRET_MAX_AGE_MS.
+   * - `product_keys_unavailable`: the account lists the product, but Freemius returned no keys for it.
+   * - `developer_pair_unreachable`: Freemius could not be asked whether the pair owns the product.
+   * - `developer_pair_refused`: Freemius refuses the configured pair (rotated or revoked keys).
+   * - `one_product_keys_unconfirmed`: the event matches the one-product secret, the only configured
+   *   "pair" is those names and Freemius refuses it, and Freemius did not answer whether those keys
+   *   are this product's own (`confirmFreemiusOneProductKeys`).
+   */
+  | {
+      outcome: 'unverifiable';
+      productId: string;
+      reason:
+        | 'product_key_read_failed'
+        | 'product_keys_unavailable'
+        | 'developer_pair_unreachable'
+        | 'developer_pair_refused'
+        | 'one_product_keys_unconfirmed';
+      /** The developer key pair's state (`getFreemiusDeveloperStatus`), for the log line; never key material. */
+      developerStatus: FreemiusDeveloperStatus['state'] | 'unknown';
+    };
+
+type FreemiusWebhookUnverifiableReason = Extract<FreemiusWebhookVerification, { outcome: 'unverifiable' }>['reason'];
+
+/** A product's failed key read is logged at most once per window. */
+const KEY_READ_FAILURE_LOG_WINDOW_MS = 60_000;
+/**
+ * At most this many products are remembered, and so logged, per window. plugin_id is whatever the
+ * sender wrote, and an id missing from the account's list reaches the failure path while Freemius
+ * does not answer, so both the memory and the lines that forged webhooks can cause stay bounded.
+ */
+const KEY_READ_FAILURE_LOG_MAX_PRODUCTS = 50;
+
+/**
+ * Whether a failed key read of a product is logged now. While Freemius throttles the developer
+ * key, every forged webhook ends here without a request being sent (the failure is remembered), so
+ * an unthrottled line per webhook let anyone fill the logs.
+ */
+const shouldLogKeyReadFailure = createFreemiusLogThrottle({
+  windowMs: KEY_READ_FAILURE_LOG_WINDOW_MS,
+  maxKeys: KEY_READ_FAILURE_LOG_MAX_PRODUCTS,
+});
+
+function describeKeyReadError(error: unknown): string {
+  return isFreemiusApiError(error) ? `${error.kind}: ${error.message}` : 'unexpected error';
+}
+
+/** Logs a product's failed key read (digits, an error kind and Freemius' message: never key material), throttled. */
+function logFreemiusProductKeyReadFailure(productId: string, detail: string) {
+  if (!shouldLogKeyReadFailure(productId)) {
+    return;
+  }
+
+  console.error(`[Freemius Webhook] Could not read product ${productId}'s keys with the developer key pair:`, detail);
+}
+
+/**
+ * Checks a Freemius webhook over its raw body, before the event is parsed for use: the
+ * `x-signature` header is the hex HMAC-SHA256 of the body with the secret key of the product the
+ * event names (`plugin_id`), compared in constant time. An event that names no product is refused.
+ *
+ * 1. When the developer key pair owns the product, its secret is the one read from Freemius (read
+ *    once more after a minute, for a rotated secret), and no other secret is tried. Keys served
+ *    from memory through an outage verify for FREEMIUS_WEBHOOK_SECRET_MAX_AGE_MS at most: past
+ *    that, they count as a failed read.
+ * 2. The product's bound secrets (`resolveFreemiusBoundWebhookSecrets`): its
+ *    FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, or the one-product secret when FREEMIUS_PRODUCT_ID
+ *    names it, unless the one-product keys are, or may be, a developer pair (the checkout's rule
+ *    for its bound keys). After a failed read in step 1, nothing else.
+ * 3. The one-product secret for a product without bound keys, only where the key policy lets the
+ *    one-product keys stand in (`decideFreemiusOneProductStandIn`, the rule the checkout follows):
+ *    no developer pair, the public sandbox, a product outside a working developer account (never
+ *    when the one-product names hold the developer pair), or a refused "pair" that is only the
+ *    one-product names, once Freemius confirms they are this product's keys. That confirmation is
+ *    asked for only after the signature matches the one-product secret (a forger without it sends
+ *    nothing to Freemius): refused gives `invalid`, no answer gives `unverifiable`. Never while a
+ *    dedicated pair is refused or Freemius is unreachable.
+ * 4. When the pair owns (or may own) the product and its secret could not be read, the outcome is
+ *    `unverifiable`: the route answers 503, so Freemius redelivers the event, never 401.
+ *
+ * `valid` carries the product id the handlers must keep to (`productId` on the order syncs); the
+ * outcome is an object, so test `outcome === 'valid'`, never its truthiness. Always `await` it.
+ * Call `hydrateFreemiusEnvFromDb()` first.
+ */
+export async function getFreemiusWebhookVerification(
+  rawBody: string,
+  signature: string | null
+): Promise<FreemiusWebhookVerification> {
+  const presented = normalizeFreemiusSignature(signature);
+
+  if (!presented) {
+    return { outcome: 'invalid', productId: null, reason: 'malformed_signature' };
+  }
+
+  const productId = readFreemiusWebhookProductId(rawBody);
+
+  if (!productId) {
+    return { outcome: 'invalid', productId: null, reason: 'missing_product_id' };
+  }
+
+  const matches = (secretKey: string) => freemiusSignatureMatches(secretKey, rawBody, presented);
+  const valid: FreemiusWebhookVerification = { outcome: 'valid', productId };
+  const mismatch: FreemiusWebhookVerification = { outcome: 'invalid', productId, reason: 'signature_mismatch' };
+  const unverifiable = (
+    reason: FreemiusWebhookUnverifiableReason,
+    developerStatus: FreemiusDeveloperStatus['state'] | 'unknown'
+  ): FreemiusWebhookVerification => ({ outcome: 'unverifiable', productId, reason, developerStatus });
+
+  // 1. The product's own secret, read with the developer key pair when the account owns the product.
+  let keys: FreemiusProductKeys | null = null;
+  let keyReadFailed = false;
+
+  try {
+    keys = await getFreemiusProductKeys(productId);
+  } catch (error) {
+    keyReadFailed = true;
+    logFreemiusProductKeyReadFailure(productId, describeKeyReadError(error));
+  }
+
+  if (keys && Date.now() - keys.fetchedAt > FREEMIUS_WEBHOOK_SECRET_MAX_AGE_MS) {
+    // Served from memory through a long outage (reads failing, or the shared developer key pushed
+    // into 429s): a secret rotated because it leaked must not keep verifying forged payments and
+    // refunds. Only this product's configured secrets count until Freemius answers again.
+    keys = null;
+    keyReadFailed = true;
+    logFreemiusProductKeyReadFailure(productId, 'Freemius has not answered since its last keys outlived the webhook limit.');
+  }
+
+  if (keys) {
+    if (matches(keys.secretKey)) {
+      return valid;
+    }
+
+    if (Date.now() - keys.fetchedAt < FREEMIUS_WEBHOOK_KEY_REFRESH_AFTER_MS) {
+      return mismatch;
+    }
+
+    try {
+      const fresh = await getFreemiusProductKeys(productId, { maxAgeMs: 0 });
+
+      if (fresh && fresh.fetchedAt > keys.fetchedAt) {
+        // Freemius answered again: its current secret decides.
+        return fresh.secretKey !== keys.secretKey && matches(fresh.secretKey) ? valid : mismatch;
+      }
+
+      // The same keys back: Freemius gave no new answer (unreachable, or a read in the last minute
+      // went unanswered), so the current secret is unknown. No keys any more: decided below too.
+      keyReadFailed = fresh !== null;
+    } catch (error) {
+      keyReadFailed = true;
+      logFreemiusProductKeyReadFailure(productId, describeKeyReadError(error));
+    }
+  }
+
+  // 2. The bound secrets of this product, and of no other.
+  if ((await resolveFreemiusBoundWebhookSecrets(productId)).some(matches)) {
+    return valid;
+  }
+
+  // 3. The one-product secret standing in for a product without bound keys, where the key policy
+  // (the checkout's rule too) allows it. It also reads the developer key pair's state for step 4.
+  // Where the policy needs Freemius to confirm those keys are this product's, it may ask only for
+  // an event that the one-product secret signed.
+  const oneProductSecret = readFreemiusEnvValue('FREEMIUS_SECRET_KEY');
+  const signedWithOneProductSecret = Boolean(oneProductSecret && matches(oneProductSecret));
+  const standIn = await decideFreemiusOneProductStandIn(productId, { keyReadFailed, confirm: signedWithOneProductSecret });
+
+  if (signedWithOneProductSecret) {
+    if (standIn.allowed) {
+      return valid;
+    }
+
+    if (standIn.reason === 'one_product_keys_not_this_product') {
+      // Freemius says the one-product keys are another product's, or a developer pair's: a secret
+      // that signs any product id once it leaked.
+      return mismatch;
+    }
+
+    if (standIn.reason === 'one_product_keys_unconfirmed') {
+      return unverifiable('one_product_keys_unconfirmed', standIn.developer.state);
+    }
+  }
+
+  // 4. Could the developer key pair vouch for a secret the app could not read?
+  const developer = standIn.developer;
+
+  if (keyReadFailed) {
+    return unverifiable('product_key_read_failed', developer.state);
+  }
+
+  switch (developer.state) {
+    case 'working':
+      // The account lists the product but gave no keys for it; another account's product has only
+      // its bound secrets, and the one-product secret where the policy lets it stand in.
+      return developer.owned ? unverifiable('product_keys_unavailable', 'working') : mismatch;
+    case 'missing':
+    case 'sandbox':
+      return mismatch;
+    case 'refused':
+      // A rotated or revoked pair: redelivered once it is fixed, never verified meanwhile.
+      return unverifiable('developer_pair_refused', 'refused');
+    default:
+      return unverifiable('developer_pair_unreachable', developer.state);
+  }
+}
+
+/**
+ * `getFreemiusWebhookVerification` as a boolean, kept for route files written before it: true only
+ * for a `valid` event. Such a route answers 401 to an event the app could not check (the current
+ * route answers 503 so Freemius redelivers it) and must still keep its handlers to the event's own
+ * product, which the order syncs do from the event's `plugin_id`. Async: always `await` it.
+ */
+export async function verifyFreemiusWebhookRequest(rawBody: string, signature: string | null): Promise<boolean> {
+  return (await getFreemiusWebhookVerification(rawBody, signature)).outcome === 'valid';
+}
+
+/**
+ * The synchronous check of route files from 0.23.3 and older (`if (!verifyFreemiusWebhookSignature(
+ * rawBody, signature))`), which scaffolds keep when they upgrade the libs. It stays synchronous (an
+ * async version under this name returns a Promise, which is truthy, and that `if` would pass every
+ * forged webhook) and accepts what it always did: the event must name its product (`plugin_id`)
+ * and match that product's bound secret (`getFreemiusWebhookSecretCandidates({ productId })`) or,
+ * for a product without bound keys (no FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, FREEMIUS_PRODUCT_ID
+ * empty), the one-product secret. That last rule is how those routes verify a one-product install
+ * that left its Product ID empty; dropping it would answer that install's genuine webhooks 401.
+ *
+ * It never reads developer keys and never asks Freemius (it cannot wait), so it cannot apply the
+ * key policy of `getFreemiusWebhookVerification`: where the one-product names hold the developer
+ * pair (nextblock.dev), such a route also accepts that secret for every product without bound keys.
+ * A route on this check should move to `getFreemiusWebhookVerification` (answering 503 on
+ * `unverifiable` and passing the verified `productId` to the handlers).
+ */
 export function verifyFreemiusWebhookSignature(rawBody: string, signature: string | null) {
-  if (!signature) {
+  const presented = normalizeFreemiusSignature(signature);
+  const productId = presented ? readFreemiusWebhookProductId(rawBody) : null;
+
+  if (!presented || !productId) {
     return false;
   }
 
-  return getFreemiusWebhookSecretCandidates().some((secretKey) => {
-    const hash = crypto.createHmac('sha256', secretKey).update(rawBody).digest('hex');
+  const unscoped = getUnscopedSingleProductSecret(productId);
 
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(hash, 'hex'),
-        Buffer.from(signature, 'hex')
-      );
-    } catch {
-      return false;
-    }
-  });
+  return [...getFreemiusWebhookSecretCandidates({ productId }), ...(unscoped ? [unscoped] : [])].some((secretKey) =>
+    freemiusSignatureMatches(secretKey, rawBody, presented)
+  );
 }

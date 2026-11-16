@@ -2,12 +2,10 @@
 
 import 'server-only';
 
-import { createClient } from '@supabase/supabase-js';
 import { getPackageById } from '@nextblock-cms/utils';
 import { createClient as createCookieClient } from '@nextblock-cms/db/server';
 import { headers } from 'next/headers';
-import { resolveSupabaseAnonKey, resolveSupabaseUrl } from '../../lib/setup/env-status';
-import { resolveSupabaseServiceKey } from '../../lib/setup/service-key';
+import { requireCmsAdmin, type ServiceRoleClient } from '../../lib/auth/cms-actor';
 import {
   activateLicenseKeyWithFreemius,
   buildPackageActivationInstance,
@@ -32,53 +30,54 @@ const LICENSE_CLAIM_TIMEOUT_MS = 20_000;
 const isSandbox = () => process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
 
 const ADMIN_ONLY_MESSAGE = 'Only an administrator can activate or deactivate packages.';
+const SIGN_IN_MESSAGE = 'You must be signed in to manage packages.';
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
+const PERMISSION_CHECK_FAILED_MESSAGE = 'Could not verify your permissions.';
+const SANDBOX_ACTIVATION_MESSAGE = 'License activation is disabled in Sandbox mode. To purchase a real license, visit nextblock.dev';
 
 /**
- * Server actions are callable by any signed-in user who can reach the app, and the
- * activation row is written with the service role, so the caller's CMS role is checked
- * here rather than relied upon from the (admin-only) packages page.
+ * The verified administrator for a package action: the service-role client every activation
+ * write uses, or the message to show instead.
+ *
+ * Server actions are public POST endpoints (proxy.ts only gates /cms URLs) and never pass the CMS
+ * layout's 2FA redirect, and these write `package_activations` with the service role and ask
+ * Freemius to activate, deactivate or re-send licenses. So the caller must be an ADMIN whose
+ * session has passed its enrolled second factor: requireCmsAdmin(), which also hands out the only
+ * service-role client this module uses. Until 2026-11-13 a role read through the cookie client let
+ * an ADMIN password alone (the first factor) do all of that.
  */
-async function requireAdminActor(): Promise<{ error: string } | null> {
+async function authorizePackageAdmin(): Promise<{ supabase: ServiceRoleClient } | { error: string }> {
   try {
-    const supabase = createCookieClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    const { supabase } = await requireCmsAdmin();
+    return { supabase };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : '';
 
-    if (!user) {
-      return { error: 'You must be signed in to manage packages.' };
+    if (reason === 'Forbidden') {
+      return { error: ADMIN_ONLY_MESSAGE };
     }
 
-    const { data: profile } = await supabase.from('profiles').select('role').eq('id', user.id).maybeSingle();
+    if (reason === 'Unauthorized') {
+      // requireCmsAdmin() refuses with Unauthorized both without a session and while the session's
+      // enrolled second factor is pending. The refusal stands either way; this only picks the message.
+      return { error: (await hasSignedInUser()) ? SECOND_FACTOR_MESSAGE : SIGN_IN_MESSAGE };
+    }
 
-    return profile?.role === 'ADMIN' ? null : { error: ADMIN_ONLY_MESSAGE };
-  } catch {
-    return { error: 'Could not verify your permissions.' };
+    return { error: PERMISSION_CHECK_FAILED_MESSAGE };
   }
 }
 
-// Helper to get service role client
-const getServiceRoleClient = () => {
-    const supabaseUrl = resolveSupabaseUrl();
-    const supabaseServiceKey = resolveSupabaseServiceKey();
-
-    if (!supabaseUrl || !supabaseServiceKey) {
-        console.error('Missing Supabase credentials');
-        throw new Error('Missing Supabase credentials (Service Key required for activation).');
-    }
-
-    if (supabaseServiceKey === resolveSupabaseAnonKey()) {
-        console.warn('CRITICAL WARNING: SUPABASE_SERVICE_ROLE_KEY matches NEXT_PUBLIC_SUPABASE_ANON_KEY. This will likely cause Permission Denied errors as RLS cannot be bypassed.');
-    }
-
-    return createClient(supabaseUrl, supabaseServiceKey, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false,
-      },
-    });
-};
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createCookieClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The install identity Freemius sees, derived from the request host (a server action
@@ -114,18 +113,27 @@ export type ActivatePackageResult =
  * tried, since a key alone does not say which package it unlocks.
  */
 export async function activatePackage(key: string, options?: ActivatePackageOptions): Promise<ActivatePackageResult> {
-  const denied = await requireAdminActor();
-
-  if (denied) {
-    return denied;
+  if (isSandbox()) {
+    return { error: SANDBOX_ACTIVATION_MESSAGE };
   }
 
-  return activateLicenseKey(key, options);
+  const admin = await authorizePackageAdmin();
+
+  if ('error' in admin) {
+    return { error: admin.error };
+  }
+
+  return activateLicenseKey(key, admin.supabase, options);
 }
 
-async function activateLicenseKey(key: string, options?: ActivatePackageOptions): Promise<ActivatePackageResult> {
+/** `supabase` is the service-role client of the verified administrator (authorizePackageAdmin). */
+async function activateLicenseKey(
+  key: string,
+  supabase: ServiceRoleClient,
+  options?: ActivatePackageOptions
+): Promise<ActivatePackageResult> {
   if (isSandbox()) {
-    return { error: 'License activation is disabled in Sandbox mode. To purchase a real license, visit nextblock.dev' };
+    return { error: SANDBOX_ACTIVATION_MESSAGE };
   }
 
   // The Freemius call, the activation row and the cache purge live in
@@ -135,7 +143,7 @@ async function activateLicenseKey(key: string, options?: ActivatePackageOptions)
     licenseKey: key,
     packageId: options?.packageId,
     provenance: options?.provenance,
-    supabase: getServiceRoleClient(),
+    supabase,
   });
 
   if ('success' in result) {
@@ -244,10 +252,10 @@ export async function activatePurchasedPackage(input: {
     return failure('sandbox', 'License activation is disabled in Sandbox mode.');
   }
 
-  const denied = await requireAdminActor();
+  const admin = await authorizePackageAdmin();
 
-  if (denied) {
-    return failure('claim_failed', denied.error);
+  if ('error' in admin) {
+    return failure('claim_failed', admin.error);
   }
 
   const pkg = getPackageById(input.packageId);
@@ -300,7 +308,7 @@ export async function activatePurchasedPackage(input: {
     );
   }
 
-  const activation = await activateLicenseKey(licenseKey, {
+  const activation = await activateLicenseKey(licenseKey, admin.supabase, {
     packageId: pkg.id,
     provenance: {
       expiration: typeof claimBody?.['expiration'] === 'string' ? (claimBody['expiration'] as string) : null,
@@ -336,10 +344,10 @@ export async function resendPurchasedLicenseEmail(endpoint: string): Promise<{ o
     return { error: 'License emails are disabled in Sandbox mode.', ok: false };
   }
 
-  const denied = await requireAdminActor();
+  const admin = await authorizePackageAdmin();
 
-  if (denied) {
-    return { error: denied.error, ok: false };
+  if ('error' in admin) {
+    return { error: admin.error, ok: false };
   }
 
   let url: URL;
@@ -372,13 +380,13 @@ export async function deactivatePackage(packageId: string) {
         return { error: 'License deactivation is disabled in Sandbox mode.' };
     }
 
-    const denied = await requireAdminActor();
+    const admin = await authorizePackageAdmin();
 
-    if (denied) {
-        return denied;
+    if ('error' in admin) {
+        return { error: admin.error };
     }
 
-    const supabase = getServiceRoleClient();
+    const supabase = admin.supabase;
 
     // 1. Get current activation (newest first: a stale second row must not block this)
     const { data: activations, error: fetchError } = await supabase

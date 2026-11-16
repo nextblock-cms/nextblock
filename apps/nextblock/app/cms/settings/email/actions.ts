@@ -1,8 +1,11 @@
 // app/cms/settings/email/actions.ts
 'use server';
 
+import 'server-only';
+
 import { createClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
+import { getCmsActor } from '../../../../lib/auth/cms-actor';
 import { saveEmailSettings } from '../../../../lib/config/email-settings';
 import { sendEmail } from '../../../actions/email';
 
@@ -15,24 +18,37 @@ export type EmailActionResult =
   | { ok: true; message: string }
   | { ok: false; error: string };
 
-/** Null when the caller is an ADMIN, otherwise the failure to return. */
+/**
+ * Null when the caller is an ADMIN whose session passed its enrolled second factor, otherwise the
+ * failure to return. A test send reads the SMTP settings and credentials with the service role and
+ * mails the address typed in the form, and a server action never passes the CMS layout's 2FA
+ * redirect, so the role comes from getCmsActor(), which refuses a pending factor. Until 2026-11-13
+ * it was read through the cookie client, and an ADMIN password alone sent mail through the site's
+ * SMTP account to any address.
+ */
 async function adminCheck(): Promise<EmailActionResult | null> {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return { ok: false, error: 'You must be logged in to update settings.' };
-  }
-  const { data: profile, error } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-  if (error || !profile || profile.role !== 'ADMIN') {
+  const actor = await getCmsActor();
+  if (actor?.role === 'ADMIN') return null;
+  if (actor) {
     return { ok: false, error: 'You do not have permission to perform this action.' };
   }
-  return null;
+  // getCmsActor() is null without a session and while a second factor is pending. The refusal
+  // stands either way; this only picks the message.
+  return (await hasSignedInUser())
+    ? { ok: false, error: 'Complete two-factor verification, then try again.' }
+    : { ok: false, error: 'You must be logged in to update settings.' };
+}
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
 }
 
 export async function updateEmailSettings(formData: FormData): Promise<EmailActionResult> {

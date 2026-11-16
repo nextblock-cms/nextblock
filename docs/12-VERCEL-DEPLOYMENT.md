@@ -170,6 +170,11 @@ the question entirely by resolving everything in-app, so the button prompts for 
    > function (`/api/upload/proxy`), which is subject to Vercel's ~4.5 MB request-body
    > limit — larger single images fail on the Hobby/Pro serverless runtime regardless of
    > storage backend. This is a platform constraint, not a NextBlock one.
+   >
+   > **Bucket limits:** Supabase's signed upload URLs (the custom-block image uploader and
+   > `/api/upload/presigned-url`) cannot bind a file's size or type the way the R2 URLs do,
+   > so set the `media` bucket's file size limit (25 MB) and, optionally, its allowed MIME
+   > types. See [docs/04 → "Upload URLs"](./04-DATABASE-AND-AUTH.md#upload-urls).
 4. **Email / Bot protection / Sign-ups** — optional steps; bot-protection and the
    sign-up policy persist to the database and work immediately. SMTP, if used, is set
    as Vercel environment variables.

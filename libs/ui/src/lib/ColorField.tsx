@@ -7,8 +7,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "./popover";
 import { Label } from "./label";
 import { Input } from "./input";
 import { Button } from "./button";
+import { cn } from "@nextblock-cms/utils/utils";
 import {
-  cn,
   contrastRatio,
   formatHsla,
   formatRgba,
@@ -18,7 +18,7 @@ import {
   rgbaToHex,
   rgbaToHsla,
   type Rgba,
-} from "@nextblock-cms/utils";
+} from "@nextblock-cms/utils/color";
 
 /** A design-token swatch — stored by keyword so it keeps following the theme. */
 export interface ColorTokenOption {

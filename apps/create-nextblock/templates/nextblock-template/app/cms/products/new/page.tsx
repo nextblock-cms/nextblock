@@ -11,6 +11,7 @@ import {
   getStoreConfigStatus,
   normalizeCurrencyRecord,
   getCategoriesWithCount,
+  getProductCategories,
 } from '@nextblock-cms/ecommerce/server';
 import { ArrowLeft } from 'lucide-react';
 import { Badge, Button } from '@nextblock-cms/ui';
@@ -67,13 +68,18 @@ export default async function NewProductPage({
         .limit(1);
       
       if (groupProducts && groupProducts[0]) {
-        const { data: sourceProduct, error: fetchError } = await getProduct(supabase, groupProducts[0].id);
+        const [{ data: sourceProduct, error: fetchError }, sourceCategories] = await Promise.all([
+          getProduct(supabase, groupProducts[0].id),
+          // Categories belong to the translation group: createProduct() syncs the form's
+          // category_ids to every product in it, so a translation form that started with none
+          // removed the categories of the whole group (review 2026-11-15).
+          getProductCategories(groupProducts[0].id),
+        ]);
         if (sourceProduct && !fetchError) {
-          initialData = buildTranslationSourceInitialData(
-            sourceProduct,
-            from_group,
-            target_lang_id
-          );
+          initialData = {
+            ...buildTranslationSourceInitialData(sourceProduct, from_group, target_lang_id),
+            category_ids: (sourceCategories ?? []).map((category: { id: string }) => category.id),
+          };
         }
       }
     } catch (e) {

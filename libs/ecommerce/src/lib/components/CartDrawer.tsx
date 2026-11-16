@@ -14,7 +14,7 @@ import { useRef } from 'react';
 import { Minus, Plus, Trash2 } from 'lucide-react';
 import { getCartItemActivePrice, useCartSubtotal } from '../cart-store';
 import { useCart } from '../use-cart';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { usePriceFormatter } from '../use-price-formatter';
 import { isDigitalItem } from '../types';
 import { useCurrency } from '../CurrencyProvider';

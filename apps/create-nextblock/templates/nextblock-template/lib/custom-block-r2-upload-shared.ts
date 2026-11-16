@@ -128,6 +128,12 @@ function formatUploadTimestamp(date: Date) {
   return parts.join('');
 }
 
+/**
+ * The shape checks only: filename, content type, declared size, folder cleanup. A route must use
+ * the server entry's validateR2PresignedUploadPayload (lib/custom-block-r2-upload.ts), which also
+ * refuses the partner upload namespaces; that policy is server-only, and this module is not, so
+ * scripts can import it under plain Node.
+ */
 export function validateR2PresignedUploadPayload(
   payload: R2PresignedUploadPayload
 ): ValidR2PresignedUploadPayload {

@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { Check, Copy, KeyRound } from 'lucide-react';
 
 import { Button } from '@nextblock-cms/ui/button';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 import { getInvoiceLocale, translateOrFallback } from '../invoice-ui';
 import { formatInvoiceDate } from '../invoice';

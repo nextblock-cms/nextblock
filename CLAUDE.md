@@ -49,6 +49,21 @@ mirrors all but `db/types`).
 - Live Draft Mode stages edits in `content_drafts` / `product_drafts` (`meta`, `blocks` jsonb).
   `site_settings` is a `key → value jsonb` bag. Pages, posts, products, and nav rows carry
   `language_id` + `translation_group_id`.
+- `product_drafts.meta` is the in-page overlay (`{}`, then `title` / `short_description` /
+  `description_json`) or product form values in MAJOR units (a `variants` array, never an `id`),
+  stamped `form_version: 2` since 0.23.4: a new writer of product values stamps it too
+  (`withProductDraftFormMarker`; `product-draft-marker.test.ts` pins the libs' copies). A
+  pre-0.23.4 draft may hold the raw products row (an `id`, cents, no `variants`). Never seed `meta`
+  from a products row: publishing one wrote every price x100 and deleted the variants (master from
+  2026-05-22, releases 0.8.11 to 0.23.3). Classify with `classifyProductDraftMeta`
+  (`apps/nextblock/lib/visual-editing/product-draft-meta.ts`); docs/09 → "Product Drafts".
+- No trigger maintains `products.updated_at` (the sitemap reads it), so code that changes a
+  product's title, short description or description sets it: a draft holding the raw products row
+  (above) publishes its copies of those fields only while `updated_at` is not later than
+  `product_drafts.created_at`.
+- Product draft publish runs `requireCmsAdmin()` first, and only an ADMIN may update a `products`
+  row (visibility included); the UI's `currentUserCanPublishProductDrafts()` is publish's check,
+  and the server decides. Publish's block swap and its known limits: docs/09 → "Product Drafts".
 
 ## Auth and data access
 
@@ -77,7 +92,8 @@ mirrors all but `db/types`).
   (public readiness), `POST /api/setup/bootstrap` (first admin, bearer = `MCP_BEARER_TOKEN`),
   `NEXTBLOCK_LICENSE_KEY` activated on first use by `lib/packages/env-license.ts`, and the
   env-token auth path in `app/api/mcp/route.ts`. The vendor mints the trial key in
-  `app/api/packages/provision-trial`. Docs/08 → "Headless bootstrap".
+  `app/api/packages/provision-trial` (Cortex AI only, 404 on the sandbox; both vendor routes are
+  rate-limited by `app/api/packages/vendor-route-limits.ts`). Docs/08 → "Headless bootstrap".
 
 ## Commands
 
@@ -183,6 +199,13 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   and declare them in the lib's `dependencies` (editor: `use-sync-external-store`; ui:
   `react-color`); `esmExternalRequirePlugin` bundles React in library mode, don't use it.
   `verify-lib-dist.js` check 6 fails on the shim.
+- `import()` / `require()` take one string literal (`tools/scripts/dynamic-import-specifiers.test.ts`):
+  a computed specifier makes Turbopack bundle the whole folder, tests included, and only a
+  scaffold notices (the monorepo installs vitest): 0.23.0–0.23.3 standalone builds failed on
+  `vitest` that way. Pick a module at runtime through a loader map (`blockEditorLoaders.ts`).
+  `require.context` / `import.meta.glob` (called, stored or destructured), `import.meta` used whole
+  and Node's `require` used as a value are refused too, a `createRequire()` function and
+  `require.resolveWeak()` take a literal like `require()`, and a cast hides none of them.
 - No Nx executors: `nx build <lib>` is the inferred `vite build` after `typecheck`, and the app
   targets are `nx:run-commands` (`next build`/`dev`/`start`, port 4200). So a lib config sets
   `build.outDir` itself (relative, `/`), `emptyOutDir: true`, and copies extra files with
@@ -194,7 +217,12 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   Check 10 keeps a lib's `sideEffects` list (affiliates) in the dist manifest and refuses an
   entry the tarball lacks. Check 11 refuses a `@nextblock-cms/*` import in shipped JS that the
   dist manifest leaves out of dependencies/peerDependencies; editor, ui and db write sibling peers
-  in afterBuild.
+  in afterBuild. Check 12 refuses any packed dot path. db's `build` is explicit: `vite build`, then
+  `tools/scripts/copy-db-supabase.cjs`, which empties `dist/libs/db/supabase` and copies only
+  `config.toml`, `migrations/` and `templates/`, no dot entry; check 13 holds the db tarball's
+  `supabase/` to those three, and check 14 its migrations to valid names equal to those the
+  `/setup` bundle embeds (`npm run generate:migrations-bundle`). Never link `dist/` or a folder
+  below it into the checkout: vite's `emptyOutDir` empties through the link (libs/db/CLAUDE.md).
 - A scaffold override (`postcss`, `qs`, `uuid`, `glob`) lives in three places: root `overrides`,
   `apps/create-nextblock/bin/lib/fallback-overrides.js`, and `MANAGED_OVERRIDES` in
   `apps/nextblock/tools/lib/managed-overrides.mjs` (old value into `previous`, so `npm run

@@ -17,9 +17,16 @@ pnpm-debug.log*
 .env.development.local
 .env.production.local
 .env.test.local
+# The env templates hold names, never values: keep them in git and in the npm tarball. The
+# template sync copies this file into create-nextblock, where npm packs by it
+# (apps/create-nextblock/scripts/lib/pack-check.js).
+!.env.example
+!.env.docker.example
 .vscode
 .idea
 .swp
 *.sw?
 supabase/.temp
 supabase/.branches
+supabase/signing_keys.json
+supabase/snippets/

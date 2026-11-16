@@ -9,12 +9,17 @@ import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/se
  * which route the request hit, so `apps/nextblock/proxy.ts` (which only gates `/cms` *URLs*)
  * is NOT a backstop for an action bundled into a public page. An action that reaches for the
  * service-role client (which bypasses RLS) therefore has no guard at all unless it checks the
- * caller itself — which is exactly what these helpers do, mirroring the long-standing
- * `getAdminClient()` in `coupons/actions.ts` and `requireAdminActor()` in the app's
- * `package-actions.ts`.
+ * caller itself — which is exactly what these helpers do. They are the lib's twin of the app's
+ * `requireCmsAdmin()` / `requireCmsStaff()` (`apps/nextblock/lib/auth/cms-actor.ts`, which also
+ * registers the second-factor gate read below; the lib cannot import the app). The coupon, order,
+ * product, inventory and shipping actions and `savePaymentCredentials` call them first. The
+ * coupon actions used a local role-only `getAdminClient()` until 2026-11-13, so an ADMIN password
+ * alone could push a coupon to every Freemius product; `tools/scripts/server-action-actors.test.ts`
+ * now fails on an action that reaches a coupon push without `requireEcomAdmin()` /
+ * `requireCmsAdmin()` first.
  *
- * Each helper verifies the cookie-scoped session's CMS role, then returns the service-role
- * client for the privileged write. `service_role`/`postgres` callers (background jobs, the
+ * Each helper verifies the cookie-scoped session's CMS role and second factor, then returns the
+ * service-role client for the privileged write. `service_role`/`postgres` callers (background jobs, the
  * setup wizard, the sandbox reset) never carry a user session and must not reach these
  * actions; they call the underlying service-role paths directly.
  */

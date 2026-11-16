@@ -8,7 +8,7 @@
 import type { Editor } from '@tiptap/core';
 import { ReactRenderer } from '@tiptap/react';
 import type { SuggestionProps } from '@tiptap/suggestion';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import {
   Heading2,
   Heading3,

@@ -103,7 +103,7 @@ export async function updateBotProtectionSettings(
   //   with '' would silently break every captcha-protected form.
   // - A pre-encryption plaintext row is re-encrypted on this save even when the field is
   //   empty, which is how existing installs migrate without a data migration.
-  // - Likewise an envelope from before 0.23.1 (not bound to its field) is re-sealed for it.
+  // - Likewise an envelope from before 0.23.0 (not bound to its field) is re-sealed for it.
   const { data: existingSecret } = await supabase
     .from('site_settings')
     .select('value')

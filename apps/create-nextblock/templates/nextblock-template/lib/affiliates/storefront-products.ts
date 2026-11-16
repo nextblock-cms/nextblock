@@ -3,7 +3,7 @@ import 'server-only';
 import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
-import { getProducts } from '@nextblock-cms/ecommerce/server';
+import { getProducts } from '@nextblock-cms/ecommerce/product-actions';
 import type { Product } from '@nextblock-cms/ecommerce/types';
 import { mapProductRowToUiProduct } from '../blocks/product-grid-data';
 import { AFFILIATE_PUBLIC_READ_REVALIDATE_SECONDS } from './storefront-data';

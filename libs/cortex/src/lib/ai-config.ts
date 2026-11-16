@@ -237,7 +237,7 @@ export function decryptStoredOpenRouterApiKey(encryptedKey: unknown) {
 type SettingsClient = { from: (table: string) => any };
 
 /**
- * Re-seal, each for its own row, the Cortex AI keys stored before 0.23.1: a version 1 envelope
+ * Re-seal, each for its own row, the Cortex AI keys stored before 0.23.0: a version 1 envelope
  * opens in any slot. Every save on the Cortex AI settings screen and the setup wizard's key steps
  * call it with the service-role client, after their own role check, so saving anything there
  * once binds every stored key. Each row is swapped only while it still holds the envelope that

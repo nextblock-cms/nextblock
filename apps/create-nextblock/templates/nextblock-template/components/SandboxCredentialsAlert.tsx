@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { Info } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { useLabel } from '../lib/i18n/use-label';
 
 /**

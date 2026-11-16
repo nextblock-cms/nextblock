@@ -2,8 +2,8 @@
 
 import 'server-only';
 
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
-import { requireEcomStaff } from '../../../server-actions/require-ecom-role';
+import { createClient } from '@nextblock-cms/db/server';
+import { requireEcomAdmin, requireEcomStaff } from '../../../server-actions/require-ecom-role';
 import { ProductFormValues } from '../../../product-schema';
 import {
   createProduct as createProductLib,
@@ -27,6 +27,11 @@ function slugify(value: string) {
 }
 
 export async function createProductAction(data: ProductFormValues) {
+  // An ADMIN who has passed the enrolled second factor, before anything is read or written. The
+  // product RPC checks is_admin(), the role only, which a password alone (aal1) satisfies, and a
+  // Freemius product's sale coupon is then pushed with the service role through the developer key
+  // pair, which reaches every product of the account. Until 2026-11-13 nothing else checked.
+  const serviceClient = await requireEcomAdmin();
   const supabase = createClient();
   const { data: currencies } = await supabase
     .from('currencies')
@@ -46,7 +51,7 @@ export async function createProductAction(data: ProductFormValues) {
     try {
       await syncProductSaleCouponToFreemius({
         productId: createdProduct.id,
-        client: getServiceRoleSupabaseClient(),
+        client: serviceClient,
       });
     } catch (couponError) {
       console.error('Failed to sync Freemius sale coupon on create:', couponError);
@@ -56,6 +61,17 @@ export async function createProductAction(data: ProductFormValues) {
   revalidatePath('/cms/products');
   redirect('/cms/products');
 }
+
+/**
+ * Stamped on every product-values draft this action writes (0.23.4 and later). The app checks a
+ * draft without it, which an earlier version wrote, for the fields the pre-0.23.4 edit page could
+ * poison (prices x100, no variants, gallery or description), and never checks one with it. A
+ * 'use server' module exports only async functions, so the app keeps its own copy of the literal
+ * (PRODUCT_DRAFT_FORM_MARKER_KEY / _VALUE in apps/nextblock/lib/visual-editing/product-draft-meta.ts);
+ * product-draft-marker.test.ts there runs this action and fails when the two drift. It never
+ * reaches updateProduct() or the products row.
+ */
+const PRODUCT_DRAFT_FORM_MARKER = { form_version: 2 } as const;
 
 /**
  * Persist the product form's debounced autosave into `product_drafts` without
@@ -77,7 +93,7 @@ async function saveProductDraftMeta(
 ) {
   const metaUpdate = {
     author_id: authorId,
-    meta: meta as any,
+    meta: { ...meta, ...PRODUCT_DRAFT_FORM_MARKER } as any,
     updated_at: new Date().toISOString(),
   };
   const updateExistingDraft = async () => {
@@ -158,10 +174,11 @@ export async function updateProductAction(id: string, data: ProductFormValues) {
   await saveProductDraftMeta(supabase, id, user.id, sanitizedData);
 
   // NOTE: do NOT revalidate the edit route here. This is a debounced autosave
-  // that only writes a draft; revalidating refetches the page and re-initializes
-  // the form (the variations editor re-emits onChange and re-dirties the form),
-  // which re-triggers autosave in an infinite loop. The draft is read fresh on
-  // the next real navigation/load, so no revalidation is needed for autosave.
+  // that only writes a draft; revalidating refetches the page, which resets the
+  // form to the saved values and drops an edit typed during the round trip
+  // (before 0.23.4 the variations editor also re-dirtied the form after that
+  // reset, so the autosave looped). The draft is read fresh on the next real
+  // navigation/load, so no revalidation is needed for autosave.
   return { success: true };
 }
 

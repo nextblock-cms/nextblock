@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /**
  * Media UPDATE/DELETE is row-scoped to the uploader (or ADMIN) by RLS (migration 02022 §9).
@@ -17,6 +17,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * Partner uploads (Affiliates avatars and storefront images, `affiliates/...`) are no media row's,
  * so the in-use check cannot protect them: no delete or move ever touches such a key, and nothing
  * is moved into that prefix (lib/storage/media-object-keys.ts, isPartnerUploadKey).
+ *
+ * Since 2026-11-13 the delete and move actions check the caller with getCmsActor(), which also
+ * refuses a session whose enrolled second factor is pending (a server action never passes the CMS
+ * layout's 2FA redirect). The real getCmsActor() and evaluateTwoFactor() run here, against the
+ * faked cookie session below: its own profile role, its `user_security_settings` row and the
+ * session's assurance level, with no trusted-device or email-code cookie.
  */
 
 const PARTNER = '0f8a1c2e-3b4d-4e5f-8a9b-1c2d3e4f5a6b';
@@ -29,6 +35,10 @@ const mocks = vi.hoisted(() => ({
   mediaWrite: { data: [] as any[] | null, error: null as any },
   role: 'WRITER' as string | null,
   user: { id: 'user-1' } as { id: string } | null,
+  /** The caller's `user_security_settings` row: the second factor they enrolled, if any. */
+  mfa: null as { mfa_enabled: boolean; mfa_type: 'totp' | 'email' } | null,
+  /** The assurance level of this session (a TOTP factor is verified at aal2). */
+  aal: 'aal1' as 'aal1' | 'aal2',
   backend: 's3' as 's3' | 'supabase',
   bucket: 'test-bucket' as string,
   // What media_storage_keys_in_use returns (keys another row references), and its error.
@@ -60,6 +70,9 @@ function makeSupabaseClient() {
   function resolve(state: any) {
     if (state.table === 'profiles') {
       return { data: mocks.role ? { role: mocks.role } : null, error: null };
+    }
+    if (state.table === 'user_security_settings') {
+      return { data: mocks.mfa, error: null };
     }
     if (state.table === 'media') {
       if (state.op === 'delete') {
@@ -94,11 +107,21 @@ function makeSupabaseClient() {
   }
 
   return {
-    auth: { getUser: async () => ({ data: { user: mocks.user }, error: null }) },
+    auth: {
+      getUser: async () => ({ data: { user: mocks.user }, error: null }),
+      mfa: {
+        getAuthenticatorAssuranceLevel: async () => ({ data: { currentLevel: mocks.aal, nextLevel: 'aal2' }, error: null }),
+      },
+    },
     from: (t: string) => builder(t),
     rpc: vi.fn(),
   };
 }
+
+// No trusted-device or email-code cookie: a second factor counts only through the session itself.
+vi.mock('next/headers', () => ({
+  cookies: async () => ({ get: () => undefined, set: () => undefined }),
+}));
 
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => makeSupabaseClient(),
@@ -150,18 +173,23 @@ vi.mock('@aws-sdk/client-s3', () => {
   };
 });
 
+import { revalidatePath } from 'next/cache';
 import {
   deleteMediaItem,
   deleteMultipleMediaItems,
   moveMultipleMediaItems,
+  moveSingleMediaItem,
 } from './actions';
 
 beforeEach(() => {
   vi.clearAllMocks();
   callLog.length = 0;
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
   mocks.role = 'WRITER';
   mocks.user = { id: 'user-1' };
+  mocks.mfa = null;
+  mocks.aal = 'aal1';
   mocks.backend = 's3';
   mocks.bucket = 'test-bucket';
   mocks.mediaWrite = { data: [], error: null };
@@ -170,7 +198,23 @@ beforeEach(() => {
   mocks.rpcCalls = [];
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('deleteMediaItem', () => {
+  // Review 2026-11-15: the success redirect was neither returned nor awaited, so the async
+  // encodedRedirect rejected unhandled (NEXT_REDIRECT); returned, it navigated to the unfiltered
+  // library, which renders no ?success= banner. Success now only revalidates, in place.
+  it('neither redirects nor leaves a redirect pending on success: it revalidates the library in place', async () => {
+    mocks.mediaWrite = { data: [{ object_key: 'uploads/a.avif', variants: [] }], error: null };
+
+    await expect(deleteMediaItem('media-1', 'uploads/a.avif')).resolves.toBeUndefined();
+    expect(encodedRedirect).not.toHaveBeenCalled();
+    // The revalidation is what takes the deleted item out of the grid now.
+    expect(revalidatePath).toHaveBeenCalledWith('/cms/media');
+  });
+
   it('deletes the DB row before storage, and only for keys the row returned', async () => {
     mocks.mediaWrite = {
       data: [{ object_key: 'uploads/a.avif', variants: [{ objectKey: 'uploads/a_thumbnail.avif' }] }],
@@ -187,7 +231,7 @@ describe('deleteMediaItem', () => {
       { Key: 'uploads/a.avif' },
       { Key: 'uploads/a_thumbnail.avif' },
     ]);
-    expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
+    expect(encodedRedirect).not.toHaveBeenCalled(); // success revalidates in place, no redirect
   });
 
   it("a decoy row never deletes another upload's objects (the 2026-10-21 audit)", async () => {
@@ -239,7 +283,7 @@ describe('deleteMediaItem', () => {
     expect(s3Send).not.toHaveBeenCalled();
     expect(supabaseRemoveObjects).not.toHaveBeenCalled();
     // The row is gone, so the action still reports the delete; the object is an orphan.
-    expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
+    expect(encodedRedirect).not.toHaveBeenCalled(); // success revalidates in place, no redirect
   });
 
   it("a decoy row naming a partner's uploads (affiliates/) deletes no object on either backend", async () => {
@@ -266,7 +310,7 @@ describe('deleteMediaItem', () => {
       expect(mocks.rpcCalls).toEqual([]);
       expect(s3Send).not.toHaveBeenCalled();
       expect(supabaseRemoveObjects).not.toHaveBeenCalled();
-      expect(encodedRedirect).toHaveBeenLastCalledWith('success', '/cms/media', expect.any(String));
+      expect(encodedRedirect).not.toHaveBeenCalled(); // success revalidates in place, no redirect
     }
   });
 
@@ -473,5 +517,103 @@ describe('moveMultipleMediaItems', () => {
     }
     expect(callLog).toEqual([]);
     expect(s3Send).not.toHaveBeenCalled();
+  });
+});
+
+describe('the delete and move actions authorize through getCmsActor(), second factor included (2026-11-13)', () => {
+  const SECOND_FACTOR = 'Complete two-factor verification, then try again.';
+  // A row the caller may write, so a missing check would go on to delete or move its objects.
+  const ownedRow = { id: 'a', object_key: 'uploads/a.avif', file_type: 'image/avif', variants: [{ objectKey: 'uploads/a_small.avif' }] };
+  const items = [{ id: 'a', objectKey: 'uploads/a.avif' }];
+
+  /** Every storage-touching action, each answering its refusal message (deleteMediaItem redirects). */
+  async function runEveryAction(): Promise<string[]> {
+    const messages: string[] = [];
+    await deleteMediaItem('a', 'uploads/a.avif');
+    messages.push(encodedRedirect.mock.lastCall?.[2] ?? '');
+    messages.push(String((await deleteMultipleMediaItems(items)).error));
+    messages.push(String((await moveMultipleMediaItems(items, 'photos')).error));
+    messages.push(String((await moveSingleMediaItem(items[0], 'photos')).error));
+    return messages;
+  }
+
+  it.each<readonly [string, () => void]>([
+    ['an ADMIN whose enrolled authenticator app this session has not passed (aal1)', () => {
+      mocks.role = 'ADMIN';
+      mocks.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+    }],
+    ['an ADMIN whose enrolled email code this session has not passed', () => {
+      mocks.role = 'ADMIN';
+      mocks.mfa = { mfa_enabled: true, mfa_type: 'email' };
+    }],
+    ['a WRITER whose enrolled authenticator app this session has not passed (aal1)', () => {
+      mocks.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+    }],
+    ['a WRITER whose enrolled email code this session has not passed', () => {
+      mocks.mfa = { mfa_enabled: true, mfa_type: 'email' };
+    }],
+  ])('refuses %s, deleting, moving and reading nothing', async (_label, arrange) => {
+    arrange();
+    mocks.backend = 's3';
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    expect(await runEveryAction()).toEqual([SECOND_FACTOR, SECOND_FACTOR, SECOND_FACTOR, SECOND_FACTOR]);
+    // No media row deleted or claimed, no service-role in-use read, no storage delete or copy.
+    expect(callLog).toEqual([]);
+    expect(mocks.rpcCalls).toEqual([]);
+    expect(s3Send).not.toHaveBeenCalled();
+    expect(supabaseRemoveObjects).not.toHaveBeenCalled();
+  });
+
+  it('refuses a signed-in customer (USER) with the permissions message, touching nothing', async () => {
+    mocks.role = 'USER';
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    expect(await runEveryAction()).toEqual(Array(4).fill('Forbidden: Insufficient permissions.'));
+    expect(callLog).toEqual([]);
+    expect(s3Send).not.toHaveBeenCalled();
+  });
+
+  it('refuses a caller with no session before anything else', async () => {
+    mocks.user = null;
+    mocks.role = null;
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    expect(await runEveryAction()).toEqual(Array(4).fill('User not authenticated.'));
+    expect(callLog).toEqual([]);
+  });
+
+  it('lets an ADMIN whose session passed the enrolled authenticator app (aal2) delete', async () => {
+    mocks.role = 'ADMIN';
+    mocks.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+    mocks.aal = 'aal2';
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    await deleteMediaItem('a', 'uploads/a.avif');
+
+    expect(callLog).toEqual(['media.delete', 'rpc:media_storage_keys_in_use', 's3.send:DeleteObjects']);
+    expect(encodedRedirect).not.toHaveBeenCalled(); // success revalidates in place, no redirect
+  });
+
+  it('lets a WRITER whose session passed the enrolled authenticator app (aal2) delete a batch, on Supabase Storage too', async () => {
+    mocks.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+    mocks.aal = 'aal2';
+    mocks.backend = 'supabase';
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    const res = await deleteMultipleMediaItems(items);
+
+    expect(res).toEqual({ success: expect.stringContaining('deleted successfully') });
+    expect(supabaseRemoveObjects).toHaveBeenCalledWith(['uploads/a.avif', 'uploads/a_small.avif']);
+  });
+
+  it('lets an ADMIN who enrolled no second factor move', async () => {
+    mocks.role = 'ADMIN';
+    mocks.mediaWrite = { data: [ownedRow], error: null };
+
+    const res = await moveSingleMediaItem(items[0], 'photos');
+
+    expect(callLog[0]).toBe('media.update');
+    expect(res).toEqual({ success: expect.stringContaining('Moved 1 item') });
   });
 });

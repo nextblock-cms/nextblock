@@ -1,3 +1,7 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 import {
   executeDatabaseActionPlan,
@@ -967,5 +971,228 @@ describe('Cortex AI generic database tools: JSONB payload validation', () => {
       )
     );
     expect(preview.requiresConfirmation).toBe(true);
+  });
+});
+
+describe('Cortex AI generic database tools: updated_at', () => {
+  const STALE = '2026-01-01T00:00:00.000Z';
+  // A later timestamp than the write would make a pre-0.23.4 draft skip its copies: still not kept.
+  const FUTURE = '2099-01-01T00:00:00.000Z';
+
+  /** The tool's own stamp: written during the call, so neither older nor later than it. */
+  function expectFreshStamp(value: unknown, startedAt: number) {
+    expect(value).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/));
+    expect(Date.parse(String(value))).toBeGreaterThanOrEqual(startedAt);
+    expect(Date.parse(String(value))).toBeLessThanOrEqual(Date.now());
+  }
+
+  // products.updated_at has no trigger behind it and a raw update writes only the columns it
+  // names, so a title changed here left the row looking untouched: the sitemap kept its old
+  // lastModified, and the app publishes a pre-0.23.4 product draft's copy of the title, short
+  // description and description only while products.updated_at is not later than the draft's
+  // created_at, so such a draft could publish its stale title over this change.
+  it('stamps a confirmed products update that leaves updated_at out, after the confirmation', async () => {
+    const { database, supabase } = createMockSupabase({
+      products: [{ id: 'prod-1', title: 'Old title', updated_at: STALE }],
+    });
+    const input = {
+      filters: [{ column: 'id', operator: 'eq' as const, value: 'prod-1' }],
+      operation: 'update' as const,
+      table: 'products',
+      values: { title: 'New title' },
+    };
+
+    const preview = asDbConfirmation(await executeDatabaseMutation(input, { actorUserId: 'user_1', supabase }));
+    expect(database.products[0]).toEqual({ id: 'prod-1', title: 'Old title', updated_at: STALE });
+
+    const startedAt = Date.now();
+    const result = await executeDatabaseMutation(input, {
+      actorUserId: 'user_1',
+      latestUserMessage: preview.confirmationPhrase,
+      supabase,
+    });
+
+    expect(result).toMatchObject({ mutationExecuted: true, success: true });
+    expect(database.products[0].title).toBe('New title');
+    expectFreshStamp(database.products[0].updated_at, startedAt);
+    // The phrase matched and the audit holds the input as the user confirmed it, unstamped.
+    expect(database.cortex_ai_db_mutation_audit[0].payload.input.values).toEqual({ title: 'New title' });
+  });
+
+  // On products the stamp wins over whatever the call carries: read_database_records returns
+  // updated_at by default, so a row read, edited and upserted back carries its old timestamp.
+  it('stamps every products update and upserted row, whatever updated_at the call carries', async () => {
+    const { database, supabase } = createMockSupabase({
+      products: [
+        { id: 'prod-1', title: 'One', updated_at: STALE },
+        { id: 'prod-2', title: 'Two', updated_at: STALE },
+        { id: 'prod-3', title: 'Three', updated_at: STALE },
+      ],
+    });
+    const context = { actorUserId: 'user_1', skipConfirmation: true, supabase };
+    const startedAt = Date.now();
+
+    const result = await executeDatabaseMutation(
+      {
+        operation: 'upsert',
+        rows: [
+          { id: 'prod-1', title: 'One, renamed' },
+          { id: 'prod-2', title: 'Two, renamed', updated_at: FUTURE },
+        ],
+        table: 'products',
+      },
+      context
+    );
+    await executeDatabaseMutation(
+      {
+        filters: [{ column: 'id', operator: 'eq', value: 'prod-3' }],
+        operation: 'update',
+        table: 'products',
+        values: { title: 'Three, renamed', updated_at: null },
+      },
+      context
+    );
+
+    expect(result).toMatchObject({ mutationExecuted: true, success: true });
+    expect(database.products.map((row) => row.title)).toEqual(['One, renamed', 'Two, renamed', 'Three, renamed']);
+    for (const row of database.products) expectFreshStamp(row.updated_at, startedAt);
+  });
+
+  // An insert is written as the call sends it: the column default applies where it leaves updated_at
+  // out, and a new product has no pre-0.23.4 draft whose rule the value could steer.
+  it('writes a products insert as the call sends it, updated_at included', async () => {
+    const { database, supabase } = createMockSupabase({ products: [] });
+
+    const result = await executeDatabaseMutation(
+      { operation: 'insert', rows: [{ id: 'prod-9', title: 'Nine', updated_at: STALE }], table: 'products' },
+      { actorUserId: 'user_1', skipConfirmation: true, supabase }
+    );
+
+    expect(result).toMatchObject({ mutationExecuted: true, success: true });
+    expect(database.products).toEqual([{ id: 'prod-9', title: 'Nine', updated_at: STALE }]);
+  });
+
+  it('stamps a products row read with read_database_records, edited and upserted back', async () => {
+    const { database, supabase } = createMockSupabase({
+      products: [
+        {
+          created_at: STALE,
+          id: 'prod-1',
+          language_id: 1,
+          payment_provider: 'stripe',
+          price: 4900,
+          product_type: 'physical',
+          sku: 'CHANCAPIEDRA',
+          slug: 'chanca-piedra',
+          status: 'active',
+          title: 'Old title',
+          updated_at: STALE,
+        },
+      ],
+    });
+    const read = await executeReadDatabaseRecords({ table: 'products' }, { supabase });
+    expect(read.columns).toContain('updated_at');
+    expect(read.rows[0]).toMatchObject({ id: 'prod-1', updated_at: STALE });
+    const startedAt = Date.now();
+
+    const result = await executeDatabaseMutation(
+      { operation: 'upsert', rows: [{ ...(read.rows[0] as Record<string, unknown>), title: 'New title' }], table: 'products' },
+      { actorUserId: 'user_1', skipConfirmation: true, supabase }
+    );
+
+    expect(result).toMatchObject({ mutationExecuted: true, success: true });
+    expect(database.products[0]).toMatchObject({ created_at: STALE, title: 'New title' });
+    expectFreshStamp(database.products[0].updated_at, startedAt);
+  });
+
+  it('stamps other tables whose config lists updated_at where the call leaves it out, never one without the column', async () => {
+    const { database, supabase } = createMockSupabase({
+      product_variants: [
+        { id: 'var-1', stock_quantity: 1, updated_at: STALE },
+        { id: 'var-2', stock_quantity: 1, updated_at: STALE },
+        { id: 'var-3', stock_quantity: 1, updated_at: STALE },
+      ],
+    });
+    const context = { actorUserId: 'user_1', skipConfirmation: true, supabase };
+    const startedAt = Date.now();
+
+    await executeDatabaseMutation(
+      {
+        filters: [{ column: 'id', operator: 'eq', value: 'var-1' }],
+        operation: 'update',
+        table: 'product_variants',
+        values: { stock_quantity: 5 },
+      },
+      context
+    );
+    // site_settings has no updated_at column: PostgREST would refuse the whole write.
+    await executeDatabaseMutation(
+      {
+        filters: [{ column: 'key', operator: 'eq', value: 'site_name' }],
+        operation: 'update',
+        table: 'site_settings',
+        values: { value: { en: 'Renamed' } },
+      },
+      context
+    );
+    // Outside products, a value the call sets itself, null included, is what it writes.
+    await executeDatabaseMutation(
+      {
+        filters: [{ column: 'id', operator: 'eq', value: 'var-2' }],
+        operation: 'update',
+        table: 'product_variants',
+        values: { stock_quantity: 6, updated_at: null },
+      },
+      context
+    );
+    await executeDatabaseMutation(
+      {
+        operation: 'upsert',
+        rows: [{ id: 'var-3', stock_quantity: 7, updated_at: '2026-02-02T00:00:00.000Z' }],
+        table: 'product_variants',
+      },
+      context
+    );
+
+    expect(database.product_variants[0].stock_quantity).toBe(5);
+    expectFreshStamp(database.product_variants[0].updated_at, startedAt);
+    expect(database.site_settings.find((row) => row.key === 'site_name')).toEqual({
+      key: 'site_name',
+      value: { en: 'Renamed' },
+    });
+    expect(database.product_variants.slice(1)).toEqual([
+      { id: 'var-2', stock_quantity: 6, updated_at: null },
+      { id: 'var-3', stock_quantity: 7, updated_at: '2026-02-02T00:00:00.000Z' },
+    ]);
+  });
+
+  // The stamp names updated_at in every update and upsert of a table whose config lists it, so
+  // a config entry for a table without the column would make PostgREST refuse all of them.
+  it('lists updated_at only for tables whose migrations create the column', async () => {
+    const migrationsDir = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../db/src/supabase/migrations'
+    );
+    const migrations = readdirSync(migrationsDir)
+      .filter((file) => /^\d{5}_[a-z0-9_]+\.sql$/.test(file))
+      .map((file) => readFileSync(path.join(migrationsDir, file), 'utf8').replace(/\r\n/g, '\n'));
+    const { tables } = await executeDescribeDatabaseSchema({ includeReadOnly: false });
+    const stamped = tables.filter((table) => table.columns.includes('updated_at')).map((table) => table.table);
+
+    expect(migrations.length).toBeGreaterThan(0);
+    expect(stamped).toContain('products');
+
+    for (const table of stamped) {
+      const alter = `ALTER TABLE (?:ONLY )?(?:IF EXISTS )?public\\.${table}\\b[^;]*\\b`;
+      const create = new RegExp(`CREATE TABLE (?:IF NOT EXISTS )?public\\.${table} \\(([\\s\\S]*?)\\n\\);`, 'i');
+      const addColumn = new RegExp(`${alter}ADD COLUMN (?:IF NOT EXISTS )?updated_at\\b`, 'i');
+      const dropColumn = new RegExp(`${alter}DROP COLUMN (?:IF EXISTS )?updated_at\\b`, 'i');
+      const created = migrations.some(
+        (sql) => /^\s*updated_at\s/m.test(sql.match(create)?.[1] ?? '') || addColumn.test(sql)
+      );
+
+      expect(created, `a migration creates ${table}.updated_at`).toBe(true);
+      expect(migrations.some((sql) => dropColumn.test(sql)), `a migration drops ${table}.updated_at`).toBe(false);
+    }
   });
 });

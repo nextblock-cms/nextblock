@@ -115,6 +115,13 @@ function isSetupAllowlisted(pathname: string): boolean {
     // and answers 503 while unconfigured. Letting it through means a coding agent gets a
     // JSON error it can act on instead of a 307 to the HTML wizard.
     pathname === '/api/mcp' ||
+    // The public sandbox's reset cron is what repairs a sandbox whose first-admin flag reads
+    // false: it restores the demo admin and sets the flag again. Gated, its call got the 307 like
+    // any anonymous request, so a false flag locked the sandbox (every page, sign-in and the reset
+    // itself) on /setup until someone fixed it by hand (2026-11-13). The route authenticates itself
+    // and fails closed: 404 unless NEXT_PUBLIC_IS_SANDBOX, 401 without the CRON_SECRET bearer.
+    // Exact path only.
+    pathname === '/api/cron/reset-sandbox' ||
     pathname.startsWith('/auth/') ||
     pathname.startsWith('/_next/') ||
     pathname.startsWith('/favicon') ||
@@ -718,6 +725,16 @@ function createContentSecurityPolicy(nonceValue: string, supabaseUrl: string | u
       ]
     : [];
 
+  // script-src trusts the request's nonce and, through 'strict-dynamic', the scripts a nonce'd
+  // script inserts at runtime: Next's chunk loader, next/script (the captcha loaders, GTM, GA),
+  // the scripts GTM loads, the consented custom scripts. A CSP3 browser then ignores every host and
+  // scheme source in the list, 'self' included, so a <script src> written into the markup runs only
+  // with the nonce. Before 2026-11-04 the host sources alone let such a tag run from an allowed host:
+  // gtm.js serves any container, and www.google.com has JSONP endpoints. The host list stays as the
+  // fallback for browsers without 'strict-dynamic' (CSP2, e.g. Safari before 15.4). Inline scripts
+  // always needed the nonce. Development keeps the same trust model, so a script without the nonce
+  // fails locally first; it adds 'unsafe-eval' for React's dev tooling ('unsafe-inline' is ignored
+  // wherever a nonce is). proxy.test.ts pins both lists.
   const directives = [
     createDirective('default-src', ["'self'"]),
     createDirective(
@@ -726,6 +743,7 @@ function createContentSecurityPolicy(nonceValue: string, supabaseUrl: string | u
         ? [
             "'self'",
             `'nonce-${nonceValue}'`,
+            "'strict-dynamic'",
             "'unsafe-inline'",
             "'unsafe-eval'",
             'blob:',
@@ -738,6 +756,7 @@ function createContentSecurityPolicy(nonceValue: string, supabaseUrl: string | u
         : [
             "'self'",
             `'nonce-${nonceValue}'`,
+            "'strict-dynamic'",
             'blob:',
             ...googleSources,
             ...vercelSources,

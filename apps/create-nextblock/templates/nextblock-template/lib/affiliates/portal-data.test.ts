@@ -46,8 +46,6 @@ function ssgClient() {
 vi.mock('next/cache', () => ({ unstable_cache: (fn: (...args: unknown[]) => unknown) => fn }));
 vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
 vi.mock('@nextblock-cms/db/server', () => ({ getSsgSupabaseClient: () => ssgClient() }));
-// Only the currency helpers (the full commerce barrel pulls in its client components).
-vi.mock('@nextblock-cms/ecommerce', () => vi.importActual('../../../../libs/ecommerce/src/lib/currency'));
 // The repository helpers and payout rules portal-data uses, without the rest of the server entry
 // (copilot, the payout cycle…).
 vi.mock('@nextblock-cms/affiliates/server', async () => ({

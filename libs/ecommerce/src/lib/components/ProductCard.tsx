@@ -3,7 +3,8 @@
 import { Product } from '../types';
 import { rememberStorefrontAffiliateRef } from '../cart-store';
 import { AddToCartButton, withReferralParam } from './AddToCartButton';
-import { cn, majorUnitAmountToMinor, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { cn, majorUnitAmountToMinor } from '@nextblock-cms/utils/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import Link from 'next/link';
 import { useCurrency } from '../CurrencyProvider';

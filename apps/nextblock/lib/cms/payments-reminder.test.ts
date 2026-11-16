@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('server-only', () => ({}));
 
-vi.mock('@nextblock-cms/ecommerce/server', () => ({
+vi.mock('@nextblock-cms/ecommerce/pages/cms/payments/queries', () => ({
   getStoreReadiness: mocks.getStoreReadiness,
 }));
 

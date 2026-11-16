@@ -48,7 +48,7 @@ vi.mock('@nextblock-cms/db/server', () => ({
   verifyPackageOnline: async (id: string) =>
     id === 'ecommerce' ? mocks.ecommerceActive : id === 'affiliates' ? mocks.affiliatesActive : true,
 }));
-vi.mock('@nextblock-cms/ecommerce', () => ({
+vi.mock('@nextblock-cms/ecommerce/components/ProductGrid', () => ({
   ProductGrid: (props: Record<string, unknown>) => {
     mocks.grids.push(props);
     const products = props['products'] as Array<{ title: string }>;

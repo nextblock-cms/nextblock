@@ -1,14 +1,17 @@
-import { getProductBySlug, getProducts, getProviderReadiness } from '@nextblock-cms/ecommerce/server';
+// Deep subpaths, not the '@nextblock-cms/ecommerce' or '/server' barrels: either barrel
+// makes every commerce client component (CMS forms included) a client reference of this
+// route, and the route then loads all of them (docs/05 "Public Page Performance Budget").
+import { getProductBySlug, getProducts } from '@nextblock-cms/ecommerce/product-actions';
+import { getProviderReadiness } from '@nextblock-cms/ecommerce/pages/cms/payments/queries';
 import { pickOriginalUploadObjectKey } from '../../../lib/media/original-upload';
 import { resolveMediaUrlWithSupabaseFallback } from '../../../lib/media/resolveMediaUrl';
+import { ProductProvider } from '@nextblock-cms/ecommerce/product-context';
 import {
-  ProductProvider,
   mapRawVariantRelations,
   getVariantEffectivePriceRange,
-  normalizePriceMap,
-  normalizeSalePriceMap,
   resolveTranslatedText,
-} from '@nextblock-cms/ecommerce';
+} from '@nextblock-cms/ecommerce/variation-utils';
+import { normalizePriceMap, normalizeSalePriceMap } from '@nextblock-cms/ecommerce/currency';
 import { getSsgSupabaseClient, verifyPackageOnline } from '@nextblock-cms/db/server';
 import { LIVE_STATUS, buildPublishedAtOrFilter, isPubliclyVisible } from '@nextblock-cms/utils';
 import { notFound } from 'next/navigation';

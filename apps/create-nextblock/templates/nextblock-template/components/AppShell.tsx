@@ -1,12 +1,13 @@
 'use client';
 
 import type { Database } from '@nextblock-cms/db';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import { usePathname } from 'next/navigation';
 import { createContext, useContext, useMemo, type ReactNode } from 'react';
 import Header from './Header';
 import FooterNavigation from './FooterNavigation';
 import { EnvVarWarning } from './env-var-warning';
+import { CookieSettingsButton } from './privacy/CookieSettingsButton';
 import { SandboxBanner } from './SandboxBanner';
 import { ThemeSwitcher } from './theme-switcher';
 import { useLabel } from '../lib/i18n/use-label';
@@ -186,6 +187,8 @@ export function AppShell({
                       </a>
                     </p>
                   )}
+                  {/* Reopens the consent banner (renders only while the layout mounts one). */}
+                  <CookieSettingsButton />
                   <ThemeSwitcher />
                 </div>
               </div>

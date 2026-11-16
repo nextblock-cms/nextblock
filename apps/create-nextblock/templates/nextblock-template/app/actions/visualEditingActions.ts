@@ -28,6 +28,7 @@ import {
   loadProductVisualEditingField,
   publishProductVisualEditingDraft,
 } from "../../lib/visual-editing/product-drafts";
+import { NO_CONTENT_DRAFT_ERROR } from "../../lib/visual-editing/product-draft-meta";
 import { revalidatePublicContent } from "../../lib/public-content-cache";
 import type {
   ContentDraftRow,
@@ -46,13 +47,13 @@ export async function loadVisualEditingBlockContent(request: VisualEditingBlockR
     let draftId: number | null = null;
 
     if (request.parentType === "product") {
-      const { getProductDraft, readProductSnapshot } = await import("../../lib/visual-editing/product-drafts");
+      const { getProductDraft, readProductLiveBlocks } = await import("../../lib/visual-editing/product-drafts");
       const draft = await getProductDraft(request.parentId as string);
       if (draft) {
         snapshot = draft;
         draftId = draft.id;
       } else {
-        snapshot = await readProductSnapshot(auth.supabase, request.parentId as string);
+        snapshot = { blocks: await readProductLiveBlocks(auth.supabase, request.parentId as string) };
       }
     } else {
       let draft: ContentDraftRow | null = null;
@@ -296,7 +297,7 @@ export async function publishVisualEditingDraft(parentType: NextblockDocumentTyp
     }
 
     if (!data) {
-      return { error: "No draft exists for this content." };
+      return { error: NO_CONTENT_DRAFT_ERROR };
     }
 
     const draft = normalizeContentDraftRow(data);
@@ -306,15 +307,10 @@ export async function publishVisualEditingDraft(parentType: NextblockDocumentTyp
         ? await publishPageDraft(draft, auth.user.id)
         : await publishPostDraft(draft, auth.user.id);
 
-    const { error: deleteError } = await (auth.supabase as any)
-      .from("content_drafts")
-      .delete()
-      .eq("id", draft.id);
-
-    if (deleteError) {
-      return { error: `Published, but failed to remove draft: ${deleteError.message}` };
-    }
-
+    // The content is live, whatever the draft delete below does: refresh the public path, the edit
+    // page and the cached published reads first. Until 0.23.4 a failed delete returned before this, and
+    // visitors kept the old version for up to five minutes (the public cache) while the CMS said it was
+    // published (review 2026-11-15).
     const slug = typeof draft.meta.slug === "string" ? draft.meta.slug : "";
     if (slug) {
       revalidateVisualEditingPath(getPublicPath(parentType, slug));
@@ -324,8 +320,22 @@ export async function publishVisualEditingDraft(parentType: NextblockDocumentTyp
     // variant is also "/"), so evict the whole kind. See lib/public-content-cache.ts.
     revalidatePublicContent(parentType === "page" ? "pages" : "posts");
 
-    if (revisionWarning) {
-      return { success: true, warning: `Published, but history was not recorded: ${revisionWarning}` };
+    const historyWarning = revisionWarning ? `Published, but history was not recorded: ${revisionWarning}` : null;
+
+    const { error: deleteError } = await (auth.supabase as any)
+      .from("content_drafts")
+      .delete()
+      .eq("id", draft.id);
+
+    if (deleteError) {
+      // A success the draft bar shows with this text (the draft row stayed), so it carries the history
+      // warning too.
+      const message = `Published, but failed to remove draft: ${deleteError.message}`.trim();
+      return { error: [/[.!?]$/.test(message) ? message : `${message}.`, historyWarning].filter(Boolean).join(" ") };
+    }
+
+    if (historyWarning) {
+      return { success: true, warning: historyWarning };
     }
 
     return { success: true };

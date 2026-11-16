@@ -31,7 +31,7 @@ vi.mock('@nextblock-cms/db/server', () => ({
     },
   }),
 }));
-vi.mock('@nextblock-cms/ecommerce/server', () => ({
+vi.mock('@nextblock-cms/ecommerce/product-actions', () => ({
   getProducts: async (_supabase: unknown, options: { productIds?: string[]; translationGroupIds?: string[]; languageId?: number }) => {
     mocks.getProductsCalls.push(options as Record<string, unknown>);
     if (mocks.productsError) return { data: null, error: mocks.productsError, count: 0 };

@@ -20,7 +20,7 @@ import { ThemeCatalogProvider } from '../context/ThemeCatalogContext';
 import { DeferredCartTranslator } from '../components/DeferredCartTranslator';
 import { ThemeColorSync } from '../components/ThemeColorSync';
 import { CurrencyProvider } from '@nextblock-cms/ecommerce/CurrencyProvider';
-import { TranslationsProvider } from '@nextblock-cms/utils';
+import { TranslationsProvider } from '@nextblock-cms/utils/translations-context';
 import {
   expandCompactTranslations,
   isCompactTranslations,

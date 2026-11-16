@@ -2316,7 +2316,8 @@ describe('seedSandboxAffiliateDemo', () => {
     expect(deletes).toEqual(['DELETE FROM public.orders WHERE id = ANY($1::uuid[])']);
     expect(state.orders.filter((row) => row['id'].startsWith('0d000000-'))).toHaveLength(5);
 
-    // Step A (the reset SQL generator) still preserves exactly the two demo admins.
+    // Step A (the reset SQL generator) still preserves exactly the two demo admin ids (and the demo
+    // admin's address), never a partner.
     const generator = readFileSync(path.join(REPO_ROOT, 'tools/scripts/generate-sandbox-reset.ts'), 'utf8');
     const stepA = /DELETE FROM auth\.users\s+WHERE id NOT IN \(([^)]*)\)/.exec(generator)?.[1] ?? '';
     expect(stepA.match(/'[0-9a-f-]{36}'/g)).toEqual([`'${DEMO_ADMIN_ID}'`, `'${OTHER_ADMIN_ID}'`]);

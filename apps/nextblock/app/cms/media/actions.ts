@@ -54,7 +54,23 @@ async function storageKeysStillInUse(keys: string[], excludeMediaId?: string): P
 
 
 import { recordMediaUpload as sharedRecordMediaUpload, type MediaUploadPayload } from "@nextblock-cms/db";
-import { requireCmsStaff } from "../../../lib/auth/cms-actor";
+import { getCmsActor, isCmsStaffRole, requireCmsStaff } from "../../../lib/auth/cms-actor";
+
+/**
+ * The staff check of the actions that remove or relocate storage objects (deleteMediaItem,
+ * deleteMultipleMediaItems, moveMultipleMediaItems). They delete and copy objects with the
+ * deployment's storage credentials after a service-role read (storageKeysStillInUse), which a
+ * first-factor session cannot do over PostgREST, and a server action never passes the CMS
+ * layout's 2FA redirect. So a role read is not enough: getCmsActor() also refuses a session whose
+ * enrolled second factor is pending. Until 2026-11-13 these read the role through the cookie
+ * client. Called after the session check, so a null actor here means a pending second factor.
+ * Returns the refusal message, or null for staff past their second factor.
+ */
+async function mediaStorageStaffRefusal(): Promise<string | null> {
+  const actor = await getCmsActor();
+  if (!actor) return "Complete two-factor verification, then try again.";
+  return isCmsStaffRole(actor.role) ? null : "Forbidden: Insufficient permissions.";
+}
 
 /**
  * Record an upload as the signed-in staff member. Takes no actor: this checks the session
@@ -121,7 +137,9 @@ export async function updateMediaItem(
     if (returnJustData) {
         return { success: true, media: updatedMedia } as { success: true; media: Media };
     }
-    encodedRedirect("success", mediaEditPath, "Media item updated successfully.");
+    // Returned, as every error path does: encodedRedirect is async, and an unreturned call left an
+    // unhandled NEXT_REDIRECT rejection while the action resolved without redirecting.
+    return encodedRedirect("success", mediaEditPath, "Media item updated successfully.");
 }
 
 
@@ -135,9 +153,9 @@ export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
       return encodedRedirect("error", "/cms/media", "User not authenticated.");
     }
 
-    const { data: profile } = await supabase.from("profiles").select("role").eq("id", user.id).single();
-    if (!profile || !["ADMIN", "WRITER"].includes(profile.role)) {
-        return encodedRedirect("error", "/cms/media", "Forbidden: Insufficient permissions.");
+    const refusal = await mediaStorageStaffRefusal();
+    if (refusal) {
+        return encodedRedirect("error", "/cms/media", refusal);
     }
 
     const backend = getStorageBackend();
@@ -198,8 +216,11 @@ export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
         console.error("Error deleting from storage:", r2Error);
     }
 
+    // No redirect on success: the revalidation re-renders the library in place, keeping its folder and
+    // search, and /cms/media renders no ?success= banner. 0.23.3 called encodedRedirect here without
+    // returning it, which left an unhandled NEXT_REDIRECT rejection; returning it navigated to the
+    // unfiltered library (review 2026-11-15).
     revalidatePath("/cms/media");
-    encodedRedirect("success", "/cms/media", "Media item deleted successfully.");
 }
 
 export async function deleteMultipleMediaItems(items: Array<{ id: string; objectKey: string }>) {
@@ -210,9 +231,9 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
     return { error: "User not authenticated." };
   }
 
-  const { data: profile } = await supabase.from("profiles").select("role").eq("id", user.id).single();
-  if (!profile || !["ADMIN", "WRITER"].includes(profile.role)) {
-    return { error: "Forbidden: Insufficient permissions." };
+  const refusal = await mediaStorageStaffRefusal();
+  if (refusal) {
+    return { error: refusal };
   }
 
   if (!items || items.length === 0) {
@@ -313,9 +334,9 @@ export async function moveMultipleMediaItems(
     return { error: "User not authenticated." };
   }
 
-  const { data: profile } = await supabase.from("profiles").select("role").eq("id", user.id).single();
-  if (!profile || !["ADMIN", "WRITER"].includes(profile.role)) {
-    return { error: "Forbidden: Insufficient permissions." };
+  const refusal = await mediaStorageStaffRefusal();
+  if (refusal) {
+    return { error: refusal };
   }
 
   const sanitizeFolder = (input?: string | null) => {

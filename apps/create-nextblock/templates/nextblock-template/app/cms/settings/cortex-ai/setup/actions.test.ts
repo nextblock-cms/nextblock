@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => ({
   remove: vi.fn(),
   read: vi.fn(),
   encrypt: vi.fn((value: string) => `enc:${value}`),
-  // Seals for a named key row (each Cortex key is bound to its own row since 0.23.1).
+  // Seals for a named key row (each Cortex key is bound to its own row since 0.23.0).
   encryptFor: vi.fn((_settingKey: string, value: string) => `enc:${value}`),
   reseal: vi.fn(async () => 0),
   verifyOpenRouter: vi.fn(),

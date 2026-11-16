@@ -7,6 +7,7 @@ import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/se
 import { revalidatePath, updateTag } from "next/cache";
 import { redirect } from "next/navigation";
 import type { Database, Json } from "@nextblock-cms/db";
+import { getCmsActor } from "../../../../lib/auth/cms-actor";
 import {
   LANGUAGE_DETECTION_SETTING_KEY,
   LANGUAGE_DETECTION_CACHE_TAG,
@@ -16,16 +17,33 @@ import {
 
 type Language = Database["public"]["Tables"]["languages"]["Row"];
 
-// Helper to check admin role
-async function verifyAdmin(supabase: ReturnType<typeof createClient>): Promise<boolean> {
-  const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return false;
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-  return profile?.role === "ADMIN";
+const ADMIN_REQUIRED_MESSAGE = "Unauthorized: Admin role required.";
+const SECOND_FACTOR_MESSAGE = "Complete two-factor verification, then try again.";
+
+/**
+ * Null when the caller is an ADMIN whose session passed its enrolled second factor, otherwise the
+ * error to return. getCmsActor() refuses a session whose factor is still pending: a server action
+ * never passes the CMS layout's 2FA redirect, and updateLanguageDetectionSettings writes with the
+ * service role. Until 2026-11-13 the role was read through the cookie client (verifyAdmin), so an
+ * ADMIN password alone wrote the language detection settings.
+ */
+async function adminRefusal(): Promise<string | null> {
+  const actor = await getCmsActor();
+  if (actor?.role === "ADMIN") return null;
+  // getCmsActor() is null without a session and while a second factor is pending. The refusal
+  // stands either way; this only picks the message.
+  if (!actor && (await hasSignedInUser())) return SECOND_FACTOR_MESSAGE;
+  return ADMIN_REQUIRED_MESSAGE;
+}
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const { data: { user } } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
 }
 
 export async function getLanguages(): Promise<{ data: Language[] | null; error: string | null; }> {
@@ -80,11 +98,11 @@ type UpsertLanguagePayload = {
 };
 
 export async function createLanguage(formData: FormData) {
-  const supabase = createClient();
-
-  if (!(await verifyAdmin(supabase))) {
-    return { error: "Unauthorized: Admin role required." };
+  const denied = await adminRefusal();
+  if (denied) {
+    return { error: denied };
   }
+  const supabase = createClient();
 
   const rawFormData = {
     code: formData.get("code") as string,
@@ -153,11 +171,11 @@ export async function createLanguage(formData: FormData) {
 }
 
 export async function updateLanguage(languageId: number, formData: FormData) {
-  const supabase = createClient();
-
-  if (!(await verifyAdmin(supabase))) {
-    return { error: "Unauthorized: Admin role required." };
+  const denied = await adminRefusal();
+  if (denied) {
+    return { error: denied };
   }
+  const supabase = createClient();
 
   const rawFormData = {
     code: formData.get("code") as string,
@@ -225,11 +243,11 @@ export async function updateLanguage(languageId: number, formData: FormData) {
 }
 
 export async function deleteLanguage(languageId: number) {
-  const supabase = createClient();
-
-  if (!(await verifyAdmin(supabase))) {
-    return { error: "Unauthorized: Admin role required." };
+  const denied = await adminRefusal();
+  if (denied) {
+    return { error: denied };
   }
+  const supabase = createClient();
 
   // Critical check: Prevent deleting the default language if it's the only one or default.
   const { data: langToDelete, error: langFetchError } = await supabase
@@ -289,18 +307,18 @@ export async function getLanguageDetectionSettings(): Promise<LanguageDetectionS
 export async function updateLanguageDetectionSettings(
   input: LanguageDetectionSettings,
 ): Promise<{ success?: string; error?: string }> {
-  const supabase = createClient();
-
-  if (!(await verifyAdmin(supabase))) {
-    return { error: "Unauthorized: Admin role required." };
+  const denied = await adminRefusal();
+  if (denied) {
+    return { error: denied };
   }
 
   // Never trust the client payload shape — coerce to a valid settings object.
   const settings = normalizeLanguageDetectionSettings(input);
 
-  // ADMIN verified above; written with the service role because the key is in the
-  // ADMIN-only write tier that migration 02023 gates behind is_admin_mfa(), which an admin
-  // on an aal1 "remember this device" session cannot satisfy through the cookie client.
+  // An ADMIN whose second factor passed, verified above; written with the service role because
+  // the key is in the ADMIN-only write tier that migration 02023 gates behind is_admin_mfa(),
+  // which an admin on an aal1 "remember this device" session cannot satisfy through the cookie
+  // client.
   const { error } = await getServiceRoleSupabaseClient()
     .from("site_settings")
     .upsert({ key: LANGUAGE_DETECTION_SETTING_KEY, value: settings as unknown as Json });

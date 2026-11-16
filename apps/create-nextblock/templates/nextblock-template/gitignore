@@ -26,6 +26,8 @@ pnpm-debug.log*
 
 supabase/.temp
 supabase/.branches
+supabase/signing_keys.json
+supabase/snippets/
 
 # Local safety copies written by `npm run update` when it replaces a framework file.
 .nextblock-backup/

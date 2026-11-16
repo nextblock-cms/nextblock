@@ -6,7 +6,8 @@ import { Badge } from '@nextblock-cms/ui/badge';
 import { Button } from '@nextblock-cms/ui/button';
 import { Label } from '@nextblock-cms/ui/label';
 import { Separator } from '@nextblock-cms/ui/separator';
-import { cn, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { cn } from '@nextblock-cms/utils/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 
 import { useProduct } from '../product-context';
@@ -261,8 +262,12 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
         })
       : null;
   const effectivePrice = resolvedVariantPrice?.price ?? resolvedBasePrice.price;
-  const effectiveSalePrice =
-    resolvedVariantPrice?.sale_price ?? resolvedBasePrice.sale_price;
+  // A selected variant's own sale only (null: none), which the cart and checkout charge; the
+  // product's with no variant selected. `?? resolvedBasePrice.sale_price` read a variant without an
+  // active sale of its own as unset and showed the product's sale price over the variant's price.
+  const effectiveSalePrice = resolvedVariantPrice
+    ? resolvedVariantPrice.sale_price
+    : resolvedBasePrice.sale_price;
   // `null` = not inventory-tracked (`products.stock` is nullable). It used to collapse to 0,
   // so an untracked product said "Out of stock" and lost its quantity stepper while the
   // add-to-cart button, which already treats null as unlimited, stayed enabled.

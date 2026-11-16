@@ -9,7 +9,7 @@ import {
 } from '@nextblock-cms/db/secrets';
 
 // Cortex AI's stored keys (OpenRouter BYOK, Pexels, Unsplash) use the same AES-256-GCM envelope
-// as every other stored secret (libs/db secret-crypto). Since 0.23.1 each is sealed for its own
+// as every other stored secret (libs/db secret-crypto). Since 0.23.0 each is sealed for its own
 // site_settings row (`slot`) and opens nowhere else; a version 1 envelope from before still opens.
 
 export const CORTEX_AI_KEY_ALGORITHM = SECRET_ENVELOPE_ALGORITHM;

@@ -20,6 +20,7 @@ import {
   CUSTOM_BLOCK_DEFINITIONS_CACHE_TAG,
   getCustomBlockDefinitionCacheTag,
 } from "../custom-block-definitions";
+import { withProductDraftFormMarker } from "../visual-editing/product-draft-meta";
 
 import {
   createPageRevision,
@@ -1373,7 +1374,10 @@ async function applyProductImport(params: {
         {
           product_id: productId,
           author_id: auth.userId,
-          meta: item.meta,
+          // Product values in major units, stamped as written by 0.23.4 or later: the edit page and
+          // publish check only unstamped drafts for the pre-0.23.4 editor's poisoned fields
+          // (lib/visual-editing/product-draft-meta.ts).
+          meta: withProductDraftFormMarker(item.meta),
           blocks: item.blocks,
           updated_at: new Date().toISOString(),
         },

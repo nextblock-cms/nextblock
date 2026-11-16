@@ -327,12 +327,14 @@ export async function saveCortexAiAgentSettingsAction(formData: FormData) {
     const rawMaxOutput = String(formData.get('max_output_tokens') || '').trim();
     const rawTimeoutSeconds = Number(formData.get('response_timeout_seconds'));
 
-    // normalizeCortexAiAgentSettings clamps everything to safe bounds.
+    // normalizeCortexAiAgentSettings clamps everything to safe bounds. The output-token cap is
+    // stored as a whole number: the AI SDK refuses a fractional maxOutputTokens, and the settings
+    // input (step 1) only accepts whole numbers, so a stored value always saves back unchanged.
     const settings = normalizeCortexAiAgentSettings({
       maxOutputTokens: unlimited
         ? null
         : rawMaxOutput
-          ? Number(rawMaxOutput)
+          ? Math.round(Number(rawMaxOutput))
           : CORTEX_AI_AGENT_SETTINGS_DEFAULTS.maxOutputTokens,
       maxSteps: Number(formData.get('max_steps')),
       responseTimeoutMs: Number.isFinite(rawTimeoutSeconds)

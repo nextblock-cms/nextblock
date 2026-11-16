@@ -3,7 +3,7 @@
 import React from 'react';
 import { ProductGrid } from '@nextblock-cms/ecommerce/components/ProductGrid';
 import type { Product } from '@nextblock-cms/ecommerce/types';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 
 import { fetchProductGridPage } from '../../app/actions/productGridActions';
 import { usePageParam } from '../../hooks/usePageParam';

@@ -1,12 +1,14 @@
 import React from 'react';
-import { ProductDetailsLayout } from '@nextblock-cms/ecommerce/components/ProductDetailsLayout';
 import type { VisualEditAttributes, VisualEditingDocumentContext } from '../../../lib/visual-editing/types';
 import { headers } from 'next/headers';
 import { createClient } from "@nextblock-cms/db/server";
-import { getProviderReadiness } from "@nextblock-cms/ecommerce/server";
+import { getProviderReadiness } from "@nextblock-cms/ecommerce/pages/cms/payments/queries";
 import BlockRenderer from "../../BlockRenderer";
-import ProductReviewsSection from "../../ProductReviewsSection";
-import ContactSellerSection from "../../ContactSellerSection";
+import {
+  LazyContactSellerSection,
+  LazyProductDetailsLayout,
+  LazyProductReviewsSection,
+} from "../../commerce/LazyCommerceClients";
 import PaymentReadinessBoundary from "../../commerce/PaymentReadinessBoundary";
 
 interface ProductDetailsBlockRendererProps {
@@ -54,22 +56,24 @@ export default async function ProductDetailsBlockRenderer({
       }
     }
 
+    let hasDraft = false;
     if (productVisualEditingEnabled) {
       const { data: draftData } = await supabase
         .from('product_drafts')
         .select('id, blocks')
         .eq('product_id', excludeProductId)
         .maybeSingle();
-        
+
+      // The draft's blocks are what Publish writes, an empty list included: publish deletes the
+      // live ones then, so the preview shows none rather than the live blocks it is about to remove.
       if (draftData) {
+        hasDraft = true;
         productDraftId = draftData.id;
-        if (draftData.blocks && Array.isArray(draftData.blocks)) {
-          descriptionBlocks = draftData.blocks;
-        }
+        descriptionBlocks = Array.isArray(draftData.blocks) ? draftData.blocks : [];
       }
     }
-    
-    if (descriptionBlocks.length === 0) {
+
+    if (!hasDraft) {
       const { data: liveBlocks } = await supabase
         .from('blocks')
         .select('*')
@@ -133,7 +137,7 @@ export default async function ProductDetailsBlockRenderer({
   // Only resolved when actually needed — a working store pays nothing for this.
   const purchaseFallbackNode =
     !canPurchase && excludeProductId ? (
-      <ContactSellerSection
+      <LazyContactSellerSection
         productId={excludeProductId}
         botProtectionProvider={botProtection.provider}
         botProtectionSiteKey={botProtection.siteKey}
@@ -144,10 +148,10 @@ export default async function ProductDetailsBlockRenderer({
   return (
     <div {...visualEditAttributes}>
       <PaymentReadinessBoundary>
-      <ProductDetailsLayout 
-        visualEditingEnabled={productVisualEditingEnabled} 
+      <LazyProductDetailsLayout
+        visualEditingEnabled={productVisualEditingEnabled}
         descriptionNode={descriptionNode}
-        reviewsNode={excludeProductId ? <ProductReviewsSection productId={excludeProductId} /> : undefined}
+        reviewsNode={excludeProductId ? <LazyProductReviewsSection productId={excludeProductId} /> : undefined}
         canPurchase={canPurchase}
         purchaseFallbackNode={purchaseFallbackNode}
       />

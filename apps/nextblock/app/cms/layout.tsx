@@ -6,7 +6,6 @@ import { verifyPackageOnline, createClient } from '@nextblock-cms/db/server';
 import { getCmsActor } from '../../lib/auth/cms-actor';
 import { evaluateTwoFactor, getStaffTwoFactorReminder } from '../../lib/auth/twoFactor';
 import { maybeRefreshUpstreamStatus } from '../../lib/updates/check-upstream';
-import { maybeRevalidatePackageActivations } from '../../lib/packages/revalidate-activations';
 import { getPaymentsReminder } from '../../lib/cms/payments-reminder';
 import { getUnreadMessageCount } from '../../lib/cms/unread-messages';
 import { getContactReminder } from '../../lib/cms/contact-reminder';
@@ -128,11 +127,8 @@ export default async function CmsLayout({
   // (throttled to ~6h, see maybeRefreshUpstreamStatus). This keeps the banner current
   // without a cron — so it works on Vercel Hobby (limited crons) and self-hosted alike.
   after(() => maybeRefreshUpstreamStatus());
-  // Same pattern for package licenses: once a day, ask Freemius whether each activated
-  // license (a free trial in particular) is still valid, and switch it off when not.
-  after(() => maybeRevalidatePackageActivations());
-  // And for store FX rates: once a day, when commerce is active and a currency asks for
-  // automatic rates. This replaced the daily /api/cron/sync-currencies Vercel cron.
+  // Same pattern for store FX rates: once a day, when commerce is active and a currency asks
+  // for automatic rates. This replaced the daily /api/cron/sync-currencies Vercel cron.
   after(() => maybeSyncCurrencyRates(isEcommerceActive));
   // And for affiliate payouts: the daily run (claimed per day in the database) when the package
   // is active, so payouts happen even where no cron calls /api/affiliates/cron/payouts.

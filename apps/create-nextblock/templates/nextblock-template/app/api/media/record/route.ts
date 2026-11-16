@@ -2,10 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { revalidatePath } from 'next/cache';
 import { createClient } from '@nextblock-cms/db/server';
 import type { Database } from '@nextblock-cms/db';
+import { getCmsActor, isCmsStaffRole } from '../../../../lib/auth/cms-actor';
 import {
-  hasAllowedObjectKeyExtension,
+  isAcceptableClientObjectKey,
   isPartnerUploadKey,
-  isSafeObjectKey,
 } from '../../../../lib/storage/upload-policy';
 
 type Media = Database['public']['Tables']['media']['Row'];
@@ -49,8 +49,42 @@ function buildFallbackVariant(payload: RecordMediaPayload): Required<ImageVarian
   };
 }
 
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
+    // Staff (ADMIN / WRITER) past their enrolled second factor, before the body is read, like the
+    // other staff upload routes: a route handler never passes the CMS layout's 2FA redirect, and
+    // until 2026-11-14 a cookie-client role read let a staff password alone (the first factor)
+    // record media rows. The row is still written with the cookie client below, so
+    // media_insert_policy applies as well.
+    const actor = await getCmsActor();
+    if (!actor) {
+      // getCmsActor() is null without a session and while an enrolled second factor is pending.
+      // The refusal stands either way; this only picks the answer.
+      return (await hasSignedInUser())
+        ? NextResponse.json({ error: SECOND_FACTOR_MESSAGE }, { status: 403 })
+        : NextResponse.json({ error: 'User not authenticated.' }, { status: 401 });
+    }
+    if (!isCmsStaffRole(actor.role)) {
+      return NextResponse.json(
+        { error: 'Forbidden: Insufficient permissions to record media.' },
+        { status: 403 }
+      );
+    }
+
     const payload = (await request.json()) as RecordMediaPayload;
 
     if (!payload.fileName || !payload.r2OriginalKey) {
@@ -60,28 +94,22 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // The uploaded original's key is client-supplied too, and meets the same policy as every key
+    // recorded below, whether or not it ends up on the row (it is the primary only when no variant
+    // names one); leading slashes go first, as they do for the primary. Until 2026-11-14 only the
+    // partner check further down saw it when a variant was the primary, so
+    // `uploads/<folder>/victim.png?.png` was accepted next to valid variants.
+    const originalKey: unknown = payload.r2OriginalKey;
+    if (
+      !isAcceptableClientObjectKey(
+        typeof originalKey === 'string' ? originalKey.replace(/^\/+/, '') : originalKey,
+        { requireAllowedExtension: true }
+      )
+    ) {
+      return NextResponse.json({ error: 'Invalid object key.' }, { status: 400 });
+    }
+
     const supabase = createClient();
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'User not authenticated.' }, { status: 401 });
-    }
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .single();
-
-    if (!profile || !['ADMIN', 'WRITER'].includes(profile.role)) {
-      return NextResponse.json(
-        { error: 'Forbidden: Insufficient permissions to record media.' },
-        { status: 403 }
-      );
-    }
 
     const variants = payload.r2Variants || [];
     let primaryVariant =
@@ -120,21 +148,23 @@ export async function POST(request: NextRequest) {
 
     // Harden: every object key recorded here is client-supplied. The upload routes mint safe
     // keys ending in an allowed media/document extension, but this endpoint trusts whatever the
-    // caller sends, so re-apply the shared upload policy (isSafeObjectKey + the extension
-    // allowlist): refuse a traversal/absolute/odd key, or one pointing at a non-media object
-    // (e.g. `.html` / `.js` / extension-less), before it reaches the media table.
+    // caller sends, so re-apply the shared policy for a key a client hands back
+    // (isAcceptableClientObjectKey): refuse a traversal/absolute/odd key, one with a character the
+    // upload routes never mint (any '%': storage may decode '%61ffiliates/pages/...' into a
+    // partner's prefix), a partner upload, or one pointing at a non-media object (e.g. `.html` /
+    // `.js` / extension-less), before it reaches the media table.
     const recordedKeys = [objectKey, ...allVariantsToStore.map((variant) => variant.objectKey)];
     for (const key of recordedKeys) {
-      if (!isSafeObjectKey(key) || !hasAllowedObjectKeyExtension(key)) {
+      if (!isAcceptableClientObjectKey(key, { requireAllowedExtension: true })) {
         return NextResponse.json({ error: 'Invalid object key.' }, { status: 400 });
       }
     }
 
     // Partner uploads (affiliates/avatars/… and affiliates/pages/…, PARTNER_UPLOAD_NAMESPACES in
     // lib/storage/upload-policy)
-    // never become media rows, whichever field names them: the /cms/media delete and move
-    // remove the objects their row lists, so a "decoy" row naming a partner's avatar would let
-    // a WRITER delete it (the 2026-10-21 decoy-row hole, for keys outside the media library).
+    // never become media rows, whichever field names them, recorded or not: the /cms/media delete
+    // and move remove the objects their row lists, so a "decoy" row naming a partner's avatar would
+    // let a WRITER delete it (the 2026-10-21 decoy-row hole, for keys outside the media library).
     const namedKeys = [
       payload.r2OriginalKey,
       payload.originalImageDetails?.objectKey,
@@ -148,7 +178,7 @@ export async function POST(request: NextRequest) {
     const mediaData: Omit<Media, 'id' | 'created_at' | 'updated_at'> & {
       uploader_id: string;
     } = {
-      uploader_id: user.id,
+      uploader_id: actor.userId,
       file_name: payload.fileName,
       object_key: objectKey,
       file_path: objectKey,

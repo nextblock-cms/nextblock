@@ -35,6 +35,20 @@ Modules: `ai-global-agent-tools.ts` (`createCortexGlobalAgentTools(context)`) pl
 - Any server-side fetch of a caller-supplied URL uses `guardedFetch` (`fetch-host-guard.ts`):
   pinned DNS, every redirect hop host-checked, streamed byte cap. Never `fetch()` with
   `redirect: 'follow'`, and never report a status for a refused hop.
+- Product writes are live: `patchOpenProductDraft` mirrors a block or gallery change into the open
+  `product_drafts` row (else publishing it undoes the change), and refuses to rewrite the `meta` of
+  unmarked product values (`isUnmarkedProductValuesDraftMeta`), where the gallery can be the only
+  sign of the damage publish refuses (`findPoisonedProductDraftFields`). A tool whose patch
+  rewrites `meta` first calls `assertOpenProductDraftMetaIsPatchable` with that patch's rule
+  (`patchesMeta`), before its live write, as `set_content_images` does. The marker
+  (`CORTEX_PRODUCT_DRAFT_FORM_MARKER_KEY` / `_VALUE`) and `isUnmarkedProductValuesDraftMeta` copy
+  the app's `product-draft-meta.ts` (`hasProductDraftFormMarker`, `classifyProductDraftMeta`);
+  `apps/nextblock/lib/visual-editing/product-draft-marker.test.ts` pins them.
+- `execute_database_mutation` / `execute_database_action_plan` stamp `updated_at` (now) on an
+  update or upsert that leaves it out, for each table whose `tableConfigs` entry lists it, and on
+  every `products` update or upsert whatever the call carries (`ALWAYS_STAMPED_TABLES`: no trigger
+  keeps it, and the app's pre-0.23.4 draft rule reads it). List `updated_at` only for a table whose
+  migrations create it (`ai-global-agent-db-tools.test.ts`; PostgREST would refuse the update).
 
 ## Gotchas
 - No call site reads `result.usage`; cached-token counts are not logged anywhere.

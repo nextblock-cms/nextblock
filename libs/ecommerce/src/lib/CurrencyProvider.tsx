@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 
-import { normalizeCurrencyCode } from '@nextblock-cms/utils';
+import { normalizeCurrencyCode } from '@nextblock-cms/utils/utils';
 
 import {
   type CurrencyRecord,

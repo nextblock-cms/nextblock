@@ -1,6 +1,6 @@
 'use client';
 
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 type LabelValues = Record<string, string | number>;
 

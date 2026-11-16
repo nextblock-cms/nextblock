@@ -1,7 +1,7 @@
 'use client';
 
 import { TriangleAlert } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 export function SandboxBanner() {
   const { t } = useTranslations();

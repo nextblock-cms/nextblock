@@ -394,14 +394,93 @@ only gates `/cms` *URLs*, so an action bundled into a public page runs for anyon
 (the id ships in the client bundle). An action that reaches for `getServiceRoleSupabaseClient()`
 (which bypasses RLS) therefore has **no** guard unless it checks the caller itself. Use
 `requireEcomAdmin()` / `requireEcomStaff()` (`libs/ecommerce/src/lib/server-actions/require-ecom-role.ts`,
-mirroring `requireAdminActor()` in `app/actions/package-actions.ts`) at the top of every such
-action, or write with the cookie client so RLS still applies. The 2026-10-19 pass found the
-inventory, product-taxonomy, Freemius-sync and shipping-zone/rate actions and the checkout-success
+the lib's twin of the app's `requireCmsAdmin()` / `requireCmsStaff()` in `lib/auth/cms-actor.ts`;
+both check the enrolled second factor, not just the role) at the top of every such action, or write
+with the cookie client so RLS still applies. The 2026-10-19 pass found the inventory,
+product-taxonomy, Freemius-sync and shipping-zone/rate actions and the checkout-success
 order lookup all missing this; they now gate (financial order transitions are ADMIN-only, content
 taxonomy is ADMIN/WRITER, checkout-success binds the order to its owner). Guest Freemius checkout
 still works because the provider mints a capability token (HMAC of the order id,
 `libs/ecommerce/src/lib/order-access-token.ts`) into the success redirect, which the action
-accepts as a third authorization path alongside owner / staff.
+accepts as a third authorization path alongside owner / staff. Since 2026-11-13 the staff path is
+an ADMIN whose session passed its enrolled second factor (`getCmsActor()`), any other signed-in
+account reads only its own orders, and a Stripe Checkout Session id reaches Stripe only when it is
+well formed (`cs_test_` / `cs_live_`) and an order stores it in `stripe_session_id`, so made-up ids
+never spend the operator's Stripe rate limit. Checkout hands out a session's URL only once its order
+stores that id: when the write fails (an error, or no row updated) it expires the session (best
+effort), marks the order `failed` and answers the keyed 503 `ecommerce.checkout_payments_unavailable`
+instead, so a buyer never pays a session the success page would answer with "Order not found"
+(`libs/ecommerce/src/lib/providers/stripe.ts`, `stripe/checkout.ts`).
+
+**A server action takes the service-role client from a verified helper.** The helpers above check
+the enrolled second factor and hand out the client; a role read through the cookie client followed
+by a client the module builds itself checks the first factor alone. The dashboard package actions
+(`app/actions/package-actions.ts`: `activatePackage`, `activatePurchasedPackage`,
+`resendPurchasedLicenseEmail`, `deactivatePackage`) had that shape until 2026-11-13, so an ADMIN
+password alone activated, deactivated and re-sent licenses. They now authorize with
+`requireCmsAdmin()` after their sandbox refusal and write `package_activations` only with the
+client it returns; a session whose enrolled factor is pending gets "Complete two-factor
+verification, then try again." The check "server actions take the service-role client only from a
+verified helper" in `tools/scripts/server-action-actors.test.ts` (in `security:check`) fails on any
+`'use server'` module of the app or the libraries that builds a supabase-js client or resolves the
+secret key itself, unless `OWN_SERVICE_CLIENT_ALLOWED` says why (`lib/setup/actions.ts`, the
+`/setup` probe of the keys the operator typed), and on a listed module that no longer does.
+
+**A role read is not a second factor.** A role read through the cookie client (or
+`getProfileWithRoleServerSide()`) followed by `getServiceRoleSupabaseClient()` checks the first
+factor alone just the same. Until 2026-11-13 six actions had that shape: `replyToInteraction` and
+`updateInteractionStatus` (`app/actions/interactions.ts`), `updateLanguageDetectionSettings`,
+`getFormEndpointForEditor`, `sendTestEmail` (`sendEmail` reads the SMTP credentials with the
+service role) and `pollGithubConnect` (`markSyncWorkflowInstalled` writes `system_configuration`),
+and the checkout success page's staff branch revealed any order the same way. The scan below then
+found `submitFeedback` (`sendEmail` again) and the media delete and move actions
+(`deleteMediaItem`, `deleteMultipleMediaItems`, `moveMultipleMediaItems` and `moveSingleMediaItem`:
+storage deletes and copies with the deployment's credentials after the service-role
+`media_storage_keys_in_use` read). They now resolve the actor with `getCmsActor()` /
+`requireCmsAdmin()` (who may act did not change; a session whose enrolled factor is pending is
+refused) and take the service-role client after it.
+`findRoleReadsBeforeServiceRole` in the same test follows calls out of every server action under
+`app/cms` and `app/actions` and fails one that can reach a role read (a `profiles` select naming
+`role` or `*`, or `getProfileWithRoleServerSide()`) and the service role
+(`getServiceRoleSupabaseClient()`, or a supabase-js client built from the secret key) but none of
+`requireCmsAdmin`, `requireCmsStaff`, `getCmsActor`, `requireEcomAdmin`, `requireEcomStaff`,
+`requireRetailer`, `requireRetailerPage` or `requireActorRole`. It is a presence check scoped to
+those two trees (the public flows elsewhere reach the service role by design): it does not prove
+the helper runs first or that its answer is honored, which the per-action tests do. Its reviewed
+exceptions sit in `ROLE_READ_BEFORE_SERVICE_ROLE_ALLOWED`, each with why (a stale entry fails): the
+one left is the security panel, whose `requireUser()` runs `evaluateTwoFactor()` itself.
+
+**Route handlers check the second factor themselves.** A route handler never passes the CMS
+layout's 2FA redirect either. Until 2026-11-14 the staff upload routes (`/api/media/r2-presigned`,
+`/api/upload/presigned-url`, `/api/upload/proxy`, `/api/process-image`, `/api/media/record`) read
+the role through the cookie client, so a staff password alone signed upload URLs, wrote and read
+bucket objects and recorded media rows. Each now opens with `getCmsActor()` and refuses before it
+reads the body or touches storage or the database: a signed-in user whose enrolled factor is
+pending gets 403 "Complete two-factor verification, then try again.", no session gets 401, and a
+role outside the route's rule gets 403 (who may upload did not change). `analyzeStaffRouteGates` in
+`tools/scripts/server-action-actors.test.ts` checks that order from the code's structure for every
+handler in `STAFF_UPLOAD_ROUTES`. It also fails a route module under `app/api/media/`,
+`app/api/upload/` or `app/api/process-image/` that is neither listed nor reviewed
+(`NOT_STAFF_UPLOAD_ROUTES`: the media picker's public read). `/api/media/record` still inserts with
+the cookie client, so `media_insert_policy` applies too, but that policy checks the role, not the
+factor (02028). Six more staff routes outside those folders read the role the same way until later
+that day: `/api/cms/ecommerce/product-picker` (the catalog, drafts included, through the service
+role), `/api/cms/check-updates` (`refreshUpstreamStatus()` writes `system_configuration` with the
+service role) and `/api/ai/generate-blocks`, `/api/ai/seo/metadata`, `/api/ai/seo/alt-text` and
+`/api/ai/cortex/build-widget` (the Cortex AI request quota, recorded with the service role, then the
+operator's model key). They open with `getCmsActor()` too, with the same answers (the update check
+stays ADMIN-only, the others ADMIN or WRITER), before the quota, the package check or the body.
+`STAFF_ROUTES` holds them to the same structural check, with the Cortex AI client
+(`createCortexAiOpenRouterClient`) as one more operation that must follow the refusals, and a route
+module under `app/api/ai/` or `app/api/cms/` that is neither listed nor reviewed fails
+(`NOT_STAFF_ROUTES`: the global agent and the full backup, which run `evaluateTwoFactor()`
+themselves). Wherever a route lives, `findRouteRoleReadsBeforeServiceRole` in the same test follows
+every HTTP handler of the app (through const aliases such as `export const PATCH = PUT` and
+re-exports) and fails one that can reach a role read and the service role with none of the
+second-factor helpers above; like the server-action check it is a presence check, and its reviewed
+exceptions sit in `ROUTE_ROLE_READ_BEFORE_SERVICE_ROLE_ALLOWED`, each with why (the full-backup
+restore, and the headless bootstrap, which authenticates with `MCP_BEARER_TOKEN` and reads the role
+of the account it just created).
 
 **A server action takes no principal from its arguments.** The actor is the cookie session's
 user; an argument naming one (`actorUserId`, `authorId`, `uploaderId`, `userId`) or handing in
@@ -418,17 +497,43 @@ admin acts on goes under a name that says so (`userIdToUpdate`).
 module and inline action, follows each parameter's type into the module that declares it, and
 fails on an identity or client name.
 
+**A Freemius coupon push needs a verified admin.** The pushes (the exports of
+`freemius-coupons.ts` that send a coupon, all listed in `FREEMIUS_COUPON_PUSHES`, or the test fails)
+are signed with the Freemius developer key pair, which reaches every product of the account. Until
+2026-11-13 four paths reached one with an ADMIN password alone: the coupon actions, the promotions
+import, `createProductAction` and the visual-editing product publish. The same test
+(`findUnauthorizedCouponPushes`) follows calls out of every server action through relative and
+aliased imports, barrels, `export *`, namespace and dynamic imports, and functions
+passed as arguments; method calls, `.call` / `.apply` / `.bind` and aliases are not followed, so
+call a push directly. Every call toward a push must run after an awaited `requireEcomAdmin()` /
+`requireCmsAdmin()`, judged by the code's structure, not by source position. The await is a whole
+statement, a variable initializer or a plain `=` assignment, never behind `.catch()` / `.then()`,
+`void`, `??=` or a ternary. It protects the later statements of its own block, so one inside an
+if-branch or a loop protects only what follows inside it. Inside a try it counts only when the
+catch ends in `return` or `throw` (it then also protects what follows the try), and never inside a
+catch or finally. To reword a refusal, write
+`let admin; try { admin = await requireCmsAdmin(); } catch { throw new Error('…'); }`, never
+`requireCmsAdmin().catch(…)`. A wrapper counts only when every way it returns passes the check or
+returns the helper's own promise, a name the function rebinds never counts, and a call inside a
+nested function declaration counts from the start of its scope (hoisting).
+
 **The public sandbox refuses what would outlive its reset.** Its admin login is published, and so
 is the demo partner's once the Affiliates demo is configured (the second factor always reads
 satisfied). Every reset:
 
 - empties the bucket;
-- deletes every auth user except the two preserved demo ids (Step A of
-  `tools/scripts/generate-sandbox-reset.ts`; their factors, sessions and identities go with them);
-- rebuilds `public`;
+- deletes every auth user except the two preserved demo ids and `demo@nextblock.dev`, whatever its
+  id (Step A of `tools/scripts/generate-sandbox-reset.ts`; their factors, sessions and identities
+  go with them);
+- rebuilds `public`, anchoring the kept users as `ADMIN` (Step E) and setting `is_admin_created`
+  (Step F) inside the same transaction;
 - restores the demo admin's password and deletes every second factor on it (`restoreDemoAdmin`),
   right after the SQL and before every later step (a failure in the bucket wipe, the seed upload or
   the SQL itself ends that run first);
+- sets `is_admin_created` and the demo admin's `ADMIN` role itself (`pinSandboxAdmin`), the flag
+  even when the restore failed, because a false flag sends every visitor to `/setup`. The proxy
+  lets `/api/cron/reset-sandbox` through that gate, so the next run repairs such a state, and
+  `provisionFirstAdmin` refuses on the sandbox, so `/setup` creates no account there (2026-11-13);
 - re-creates the demo partners when `FREEMIUS_AFFILIATES_SANDBOX_KEY` is set (the program itself
   runs only with `FREEMIUS_ECOMMERCE_SANDBOX_KEY` too: Affiliates needs Commerce Pro).
 
@@ -479,7 +584,12 @@ Each of those now stops before the step that would outlive the reset:
 - for mail, accounts and payment providers, a call site sits outside a `SANDBOX_GUARDS` function of
   its module, a private helper or class only those reach, or a function or class the list exempts
   by name with a reason. Code that runs at import (a top-level initializer, an IIFE, a callback or
-  timer it starts, a class's static field or block) is never accepted that way.
+  timer it starts, a class's static field or block) is never accepted that way;
+- a request signed with the Freemius developer key pair (`DEVELOPER_KEY_SIGNERS`) sits outside a
+  refusal or a listed sandbox reader (`SANDBOX_DEVELOPER_READERS`: the reset's catalog reader), or a
+  use of that reader, in any module, sits outside a refusal or a relay `DEVELOPER_KEY_CALLERS` names
+  with its reason (`findDeveloperKeyProblems`). The sandbox env keeps the pair production depends
+  on, for the reset alone: until 2026-11-13 the CMS Sync from Freemius spent it for any visitor.
 
 Uploads stay open on the sandbox because the reset empties the bucket. The same file checks that
 it still does. The reset logs an error (with a `warnings` entry in its JSON) whenever uploads
@@ -490,18 +600,103 @@ or an `R2_S3_ENDPOINT` / `R2_S3_PUBLIC_ENDPOINT` whose origin is not
 **Authored HTML renders through `sanitizeAuthoredBlockHtml`.** It lives in
 `@nextblock-cms/utils` (`libs/utils/src/lib/authored-html.ts`; `lib/blocks/inlineScriptNonce.ts`
 re-exports it). Text blocks, product short descriptions, string `description_json`, custom-block
-rich text, the CMS editors' previews and the editor's SVG node all pass through it. It strips
-script, meta, base, link, object and embed elements, every complete `on*` handler and `srcdoc`,
-and `javascript:` / `vbscript:` / `data:text/html` URLs in URL attributes (read the way the URL
-parser reads them: character references decoded, spaces, tabs and newlines dropped, so
-`&#x6A;avascript:` and `java&#9;script:` count), and it escapes a tag left open at the end. A handler or `srcdoc` name it
-cannot delete whole (right after a quoted value, or with a quoted value that never closes) is
-neutralised instead (`onerror` → `&#111;nerror`): the reference decodes in text and values, so
-look-alike text reads as authored, but never in an attribute name. A text block whose
-`html_content` is Tiptap JSON (`isTiptapJsonString`) skips the sanitizer in `BlockRenderer` and
-`TextBlockRenderer` and renders through React (`SimpleTiptapRenderer`, whose string fallback is
-sanitized). That exemption never goes inside the sanitizer: the raw sinks inject JSON-parseable
-strings as HTML.
+rich text and the CMS editors' previews pass through it. The editor's SVG node uses its sibling
+`sanitizeAuthoredSvgMarkup`, the same allowlist reading an `<svg>`'s inner markup as SVG content
+(inside an `<svg>` wrapper, so `<path/>` closes and `linearGradient` keeps its casing).
+
+Since 2026-11-04 it is an allowlist on [sanitize-html](https://github.com/apostrophecms/sanitize-html)
+(a dependency of `@nextblock-cms/utils`), not a strip. The regex strip it replaced was bypassed in
+every review: `<scr<script>ipt>`, `src=x/onerror=`, a handler right after a quoted value, a tag
+left open to run on into the page markup, entity-encoded and tab-split script URLs. Each time the
+browser read the markup differently from the regexes, and every one of those inputs stays in the
+tests. htmlparser2 reads the input the way the browser does: raw-text elements, SVG context and
+its casing, character references in values. Only the listed elements and attributes are written
+back out, with every text and attribute value escaped and every element closed, so the browser
+reads the output as written.
+
+- **Kept:** what the editor writes (widget `data-*` attributes, inline `style`, `class`, `id`);
+  links on http, https, mailto, tel, sms, ftp and relative URLs; images (`data:` too); tables,
+  lists, code, audio and video; inline SVG; `<style>` blocks (`StyleTagNode`); task-list
+  checkboxes; and YouTube / Vimeo players over https, the `frame-src` hosts, with their attributes.
+- **Dropped:** scripts, handlers, `srcdoc`, meta, base and link, plugins, and forms with every
+  control but the checkbox. Every other iframe goes too, same-origin ones included:
+  `frame-ancestors 'self'` would let a block frame the CMS. Also dropped: the `name`, `form` and
+  `for` attributes (DOM clobbering, joining or toggling a CMS form), a `data-` or `aria-` attribute
+  under a name the HTML spec forbids (a `:` as in `data-x:xlink:href`, a bare `data-`, or after
+  `data-` anything but lowercase letters, digits, `.`, `_` and `-`, after `aria-` anything but
+  lowercase letters), SVG `foreignObject`, `use` and animation, MathML, comments, and any other
+  element or attribute (an unknown element keeps its text). Elements nested more than 100 deep are
+  dropped and keep their text, because html-react-parser and React's server render recurse once
+  per level.
+- **A `<style>` whose text could open a tag** (`<` followed by a letter, `!`, `/` or `?`) is
+  dropped whole. Inside `<svg>` the browser parses style text as markup, and sanitize-html wrote it
+  through unescaped until 2.18.1; 2.18.2 writes a `<` in svg or math style text as the CSS escape
+  `\3c ` (GHSA-6wrv-5cp6-h3c5), so this rule is defense in depth and the tests pin its exact output.
+  A `<` that opens nothing (`@media (width < 600px)`) stays (inside svg or math the library writes
+  it as `\3c `). CSS is authored content (`style-src 'unsafe-inline'`): it can restyle the page or
+  overlay it, never run script.
+- **`<style>`, `<title>` and `<iframe>` keep text only.** An element inside one is dropped whole.
+  Inside `<svg>` they hold markup until a tag like `<p>` switches the browser back to HTML, where
+  they hold raw text. A browser that serializes the DOM keeps `<` in attribute values, so
+  `<svg><p></p><style><a id="</style><img onerror=…>">` would come back live on its next parse.
+  The tests replay that round trip: parse into the page, serialize, parse again.
+- **A tag left open at the end** is escaped first, so `if a<b` stays readable text.
+
+It needs no DOM and no `eval` (the production CSP forbids it), so server components, client
+components and the published lib run the same code and get the same output, with no hydration
+drift. `authored-html.node.test.ts` runs it with no `window` at all. The CSP blocks inline
+handlers and inline scripts but allows the script hosts it lists, and a meta refresh needs no
+script, so this function is the boundary, not the CSP.
+
+The cost is client bundle size. sanitize-html requires postcss as it loads but calls it only to
+parse style attributes, which the sanitizer turns off, so `next.config.js` resolves `postcss` to the
+empty `lib/browser-stubs/postcss.cjs` in browser bundles (`turbopack.resolveAlias`, the `browser`
+condition only; the server keeps the real package as an external). `lib/browser-stubs/postcss.test.ts`
+runs the sanitizer against the stub and fails the day sanitize-html needs postcss for anything else.
+What is left (sanitize-html, htmlparser2's full entry point, launder with dayjs) is about 104 KB
+minified, 41 KB gzipped, in any client bundle that imports the sanitizer. The client components that
+do are `FeaturedProduct` and `ProductDetailsLayout` (through `ShortDescription` and
+`SimpleTiptapRenderer`), the CMS block editors and custom-block previews, and the editor's Toolbar
+and SvgNode.
+
+Measured on `next build` (2026-11-04), the chunks the root layout loads grew by 39.4 KB gzipped on
+`/`, `/[slug]`, `/article/[slug]` and `/product/[slug]`, and by 40.1 KB on the CMS page editor
+(57.5 KB and 66.6 KB before the postcss alias). That was every public page, and the cause was the
+`@nextblock-cms/utils` main barrel, not the ecommerce one (the code split had already taken that off
+public routes, and the cost stayed): the barrel re-exports `./lib/authored-html`, the package
+declares no `sideEffects`, and sanitize-html is CommonJS, so one value import of the barrel from
+client code puts the sanitizer in that chunk, together with Zod and the custom-block schemas
+(`custom-blocks.ts` runs `z.config()` at the top level). The root layout's own client modules
+imported it (`TranslationsProvider`, `useTranslations`, `cn`), and so did every ui primitive (`cn`)
+and most public client components. Since 0.23.4 client code on public routes, and the libraries'
+ui, storefront and partner components, import utils through deep subpaths
+(`@nextblock-cms/utils/utils` for `cn` and the currency helpers, `/translations-context`, `/color`,
+…), which the package publishes through `./*`; the barrel keeps every export for published
+libraries and user code. The sanitizer now reaches the browser only where it runs there: the CMS
+and its block editors, the in-page visual editor, and the two lazy commerce chunks that render
+authored HTML, those of the featured_product and product_details blocks (the product page renders
+the latter; `ShortDescription` and `SimpleTiptapRenderer` import `sanitizeAuthoredBlockHtml` from
+`@nextblock-cms/utils/authored-html`). The other chunks behind `LazyCommerceClients` (the product
+grid, cart, checkout, reviews and contact form) carry neither the sanitizer nor Zod, and Zod
+reaches a public page only with the in-page visual editor. Re-measured on 2026-11-14 the same way
+(a production `next build`, then the
+union of `entryJSFiles` in `.next/server/app/<route>/page_client-reference-manifest.js`, gzipped:
+docs/05 → "Measure before and after"): no chunk the root layout loads on `/` holds sanitize-html or
+Zod any more, those chunks fell from 242.5 KB to 112.3 KB gzipped, and the entry chunks of `/`,
+`/[slug]`, `/cart`, `/checkout`, `/product/[slug]`, `/article/[slug]` and `/setup` each lost about
+130 KB (`/`: 255.1 KB to 125.0 KB). The CMS dashboard and page editor, which load the sanitizer for
+their editors anyway, gained 1.8 KB and 1.7 KB. `tools/scripts/root-layout-chunking.test.ts` fails
+when the root layout's client graph, any public route's client graph, or any lazy chunk those load
+for visitors (the in-page editors aside) reaches the barrel or Zod (`zod` or `zod/*`, a
+`zod-config` module, `custom-blocks.ts`); when one reaches `authored-html` or sanitize-html outside
+the lazy chunks its `SANITIZING_LAZY_CHUNKS` lists, each with why and each checked to be still
+loaded and still sanitizing; and when a deep import names a module or an export the published
+package does not ship.
+
+A text block whose `html_content` is Tiptap JSON (`isTiptapJsonString`) skips the sanitizer in
+`BlockRenderer` and `TextBlockRenderer` and renders through React (`SimpleTiptapRenderer`, whose
+string fallback is sanitized). That exemption never goes inside the sanitizer: the raw sinks inject
+JSON-parseable strings as HTML.
 `tools/scripts/html-sinks.test.ts` (in `security:check`) fails on a module that writes HTML into a
 page without an `HTML_SINKS` entry (`tools/scripts/lib/html-sinks.js`), and on a sanitized sink
 that stops calling the sanitizer. Covered sinks: `dangerouslySetInnerHTML`, `srcDoc` / `srcdoc`
@@ -516,11 +711,46 @@ component like them would be listed with `noCallers`: then any import or value u
 count; the match is by name), and a barrel in its `allowedImporters` may re-export it only under
 its own name.
 
+**The Content-Security-Policy backs the sanitizer up; it is not the boundary.** `proxy.ts`
+(`createContentSecurityPolicy`) draws a nonce per request and sends the policy on every response
+it handles, redirects and `/setup` included. It also puts the policy on the forwarded request,
+where Next reads the nonce and stamps it on its own scripts. `script-src` is
+`'self' 'nonce-…' 'strict-dynamic'`, then the fallback sources: `blob:`, Google Tag Manager and
+Analytics (production only), the Vercel toolbar and insights, Turnstile, reCAPTCHA. A browser that supports
+`'strict-dynamic'` (CSP3) ignores every host and scheme source. It runs a script only if the script
+carries the nonce, or if a nonce'd script inserted it at runtime: Next's chunk loader, `next/script`
+(the captcha loaders, GTM, GA), the tags GTM loads, the consented custom scripts. So a
+`<script src>` in the markup without the nonce runs from no host at all. Until 2026-11-04 it ran
+from any listed host: gtm.js serves any container, and www.google.com has JSONP endpoints.
+Browsers without `'strict-dynamic'` (CSP2, such as Safari before 15.4) fall back to the host
+list. Development uses the same model plus `'unsafe-eval'` for React's dev tooling, so a script
+without the nonce fails locally first.
+
+Two things it cannot stop are why the sanitizer stays. A script that a trusted script inserts runs
+from any host: React 19 itself inserts every `<script async src>` it renders on the client. And a
+meta refresh needs no script at all. For your own scripts:
+
+- A script written into the markup needs the layout's nonce, as `SiteScripts` and the
+  trusted-types bootstrap have.
+- `next/script` after hydration inserts its script at runtime, which is trusted either way. Pass
+  the nonce anyway: CSP2 browsers and inline bodies need it.
+- JSON-LD (`type="application/ld+json"`) never runs, so the policy ignores it.
+- Pages must stay dynamically rendered (the root layout reads `headers()`). A prerendered page has
+  no nonce, so none of its scripts would run.
+- Vercel injects its comments toolbar into preview deployments as a markup script without the
+  nonce, so CSP3 browsers block it there (Vercel does not support `'strict-dynamic'` for it). The
+  layout mounts the toolbar itself, with the nonce (`@vercel/toolbar`): in draft mode on Vercel, or
+  anywhere with `NEXTBLOCK_VERCEL_TOOLBAR_ENABLED=true`.
+
+`proxy.test.ts` ("Content-Security-Policy") pins both `script-src` lists, the forwarded nonce, and
+the directives the model relies on: `script-src-attr 'none'`, `object-src 'none'`,
+`base-uri 'self'`.
+
 `02022` also carries these DB-level hardenings (second red-team pass):
 
 - **`media` is owner-scoped for staff.** `media_update_policy` / `media_delete_policy` let a WRITER
   change or delete only rows where `uploader_id = (select auth.uid())`; ADMIN keeps every row. The
-  CMS media actions and the product orphan-media sweep now do the DB write **first** and only touch
+  CMS media actions (and, until 0.23.4 removed it, the product save's orphan-media sweep) do the DB write **first** and only touch
   storage for the rows RLS actually returned, so a non-owner's request can no longer destroy a
   storage object while orphaning its row.
 - **Atomic, limit-aware coupon redemption.** `public.redeem_coupon_atomically(uuid)` (service-role
@@ -838,10 +1068,55 @@ is [15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md)):
   Data API.
 - **Partner uploads are not media.** Avatars and storefront images live under
   `affiliates/avatars/…` and `affiliates/pages/…` (`PARTNER_UPLOAD_NAMESPACES`; server-built keys,
-  `lib/affiliates/upload-keys.ts`). `/api/media/record` refuses any such key and the `/cms/media`
-  delete and move actions skip them (`isPartnerUploadKey` in `lib/storage/upload-policy.ts`,
-  re-exported by `lib/storage/media-object-keys.ts`), so the decoy-row trick `02028` closed for
-  media cannot reach a partner's files either. The rest of `affiliates/` is ordinary media.
+  `lib/affiliates/upload-keys.ts`). The staff upload routes refuse a folder inside them
+  (`resolveUploadFolder`; `/api/media/r2-presigned` through `validateR2PresignedUploadPayload` and
+  its signer, which signed such keys until 2026-11-14), and every staff key builder strips `%`, `?`
+  and `#`, so an encoded folder becomes a literal one outside them. `/api/process-image` and
+  `/api/media/record` take keys from the client, so both judge every key in the request with
+  `isAcceptableClientObjectKey` (`lib/storage/upload-policy.ts`) and `requireAllowedExtension`:
+  `isSafeObjectKey`, only the characters the builders mint (`[A-Za-z0-9._/-]`: no `%`, `?`, `#` or
+  whitespace), an allowed media extension in the last segment, and no partner key, checked before
+  any storage call or insert. `/api/media/record` judges `r2OriginalKey` too (leading slashes
+  dropped, as for the primary), whether or not it ends up on the row. The character rule is what
+  the native Supabase backend needs: storage-js puts the key into the request URL (raw, or for
+  `upload()`, `update()` and `uploadToSignedUrl()` with repeated slashes collapsed), the URL
+  parser resolves `..` and `%2e%2e` (so the URL can name another prefix or bucket) and ends the
+  path at `?` or `#`, and the storage server decodes `%xx`. Until 2026-11-14
+  `%61ffiliates/pages/<id>/x.jpg` passed `/api/process-image`, which read that partner's object and
+  wrote six AVIF variants into their prefix, against their upload caps (R2/S3 were not affected:
+  the SDK encodes the key); until the same day `/api/media/record` judged `r2OriginalKey` only
+  against the partner namespaces unless it became the primary (`uploads/<folder>/victim.png?.png`
+  was accepted next to valid variants), and `/api/process-image` took a key without a media
+  extension and named its variants after the text before the last `.` (`uploads/photo` wrote
+  `_xlarge.avif`… at the bucket root). The `/cms/media` delete and move actions skip partner keys
+  and send stored keys literally (the S3 SDK encodes a key and the move its `CopySource`; on
+  Supabase the delete puts keys in the request body and the move refuses), so the decoy-row trick
+  `02028` closed for media cannot reach a partner's files either. A product save deletes no media
+  since 0.23.4: `updateProduct()` only unlinks an image dropped from the gallery. Until then it
+  deleted the row of every dropped image no product, post, logo or variant used and, on R2, every
+  key that row listed, and took more ids from the draft's `explicitly_removed_media_ids`, so a
+  WRITER's draft or decoy row could make an ADMIN's publish delete other uploaders' files and
+  partner uploads, and on R2 an honest drop deleted the files of an image a page block still showed:
+  no foreign key tracks a key copied into block content (2026-11-15). `isPartnerUploadKey`
+  (re-exported by `lib/storage/media-object-keys.ts`) counts a key wherever storage could put it:
+  a `?` or `#` in the key or after any decoding round counts outright (it does not model where the
+  URL path ends); escapes decoded until none is left (4 rounds at most); tabs and newlines dropped,
+  backslashes read as slashes, case ignored; the path counted as written and with its dot segments
+  resolved; and the raw key also read in the URL parser's order, which resolves dot segments
+  (`%2e` spellings included) before anything is decoded and keeps empty segments, then decoded,
+  and that reading again on the key as `upload()` sends it (repeated slashes collapsed first, so
+  `x%2fy//../affiliates/pages/<id>/…` counts); a malformed or still-encoded escape, or a `..` that
+  leaves the bucket, counts as a partner key.
+  Until 2026-11-14 the custom-block signer signed, for a payload nobody validated,
+  `./affiliates/pages/<id>/x.jpg?/../../../..`, `affiliates//../pages/<id>/…` and
+  `x%2fy/../affiliates/pages/<id>/…`, which all land in that prefix. No builder mints a `?` or
+  `#`, so the delete and move also skip a stored key holding either.
+  `lib/storage/partner-upload-namespaces.test.ts` holds every builder and the client-key predicate
+  to 20 spellings per namespace (6 percent-encoded, 3 that end the URL path early) and the signer
+  to every spelling storage itself reads into a namespace; `upload-policy.test.ts` checks the
+  predicate against an offline model of the Supabase URL, for the raw-key calls and for `upload()`,
+  over 9,520 generated spellings. The rest
+  of `affiliates/` is ordinary media.
 
 `02032` (2026-11-03) is data only: the Affiliates license product page on nextblock.dev, EN + FR.
 It runs only on a database that holds the NextBlock Commerce Pro store product (Freemius
@@ -1012,7 +1287,7 @@ reachable there. Two layers close it:
   and reader must pass one (TypeScript requires it, and sealing without one throws), so each reader
   opens only its own slot and an envelope copied elsewhere reads as missing. The tag must be 16
   bytes, and relabelling a version 2 envelope as version 1 does not drop the binding. Version 1
-  envelopes (before 0.23.1) still open in any slot; each screen re-seals the ones it holds on
+  envelopes (before 0.23.0) still open in any slot; each screen re-seals the ones it holds on
   every save (`resealWithEnvKey`: email and payments on their form's save, bot protection when
   its field is submitted empty, `resealStoredCortexAiSecrets` on every save of the Cortex AI
   screen and the wizard's key steps). So after upgrading, save each of those screens once: until
@@ -1025,6 +1300,23 @@ service role reads and writes all of them. With the pre-`02038` policies restore
 seven of its lines fail. Section 16's aal2 and no-factor probes moved to `store_contact`. Not
 covered by either layer: the Bot Protection screen shows the stored captcha secret in clear
 (`getBotProtectionSettings`), where the other screens show at most its last four characters.
+
+`02041` (2026-11-13) takes `is_admin_created` away from every API role. The flag tells the
+proxy's first-boot gate that an administrator exists. While it is not `true`, every anonymous
+request goes to `/setup`, and the wizard offers to create the first administrator. The
+`is_admin_mfa()` write branch admitted it like any key that is not a secret. On the public
+sandbox every visitor is the factor-less demo admin, so one PostgREST request could lock the demo
+on `/setup`. That included the reset cron, which the gate also redirected until the same release.
+On 2026-11-13 cms.nextblock.dev's flag read false; whether a visitor or a failed reset wrote it
+is not known. Three RESTRICTIVE policies (`site_settings_admin_created_no_api_insert_policy`,
+`…_update_policy`, `…_delete_policy`, `TO anon, authenticated`) are AND-ed with every permissive
+policy, so no API session inserts, updates, renames another row into or deletes the flag. A later
+change to the permissive tiers cannot reopen it. The app never wrote it with a user session:
+`handle_new_user()` (definer), the seed and the sandbox reset (postgres) write it, and `/setup`
+reads it with the service role. Reads are unchanged, and no grant changes.
+`security-verify.sql` section 43 (7 assertions, 263 in the file) checks all of this, with
+`anon` still reading the flag and the service role still writing it. Before `02041`, five of
+its lines fail. Section 3's no-factor ADMIN probe moved to `store_contact`.
 
 ## Migration Structure
 
@@ -1309,6 +1601,81 @@ and are what the next squash repeats with `G = 3`.
     production via `--reconcile-squash`, the sandbox via its reset.
 11. **The first new migration is `G005`.** Never reuse a retired number.
 
+## Upload URLs
+
+Two routes hand the browser a URL it PUTs a file to directly, so the bytes never pass through a
+serverless function: `POST /api/upload/presigned-url` (media library, 10 MB; no in-app caller
+since the media uploader moved to `/api/upload/proxy`) and `POST /api/media/r2-presigned`
+(custom-block images from `ImageR2Picker`, 10 MB). Both are ADMIN/WRITER only, past their enrolled
+second factor (`getCmsActor()` first, as in `/api/upload/proxy`, `/api/process-image` and
+`/api/media/record`: a signed-in user whose factor is pending gets 403 "Complete two-factor
+verification, then try again.", no session gets 401). `/api/media/r2-presigned` refuses a folder
+inside the partner upload namespaces (400 "Invalid upload folder.", as `resolveUploadFolder` does on
+the media library routes). Both require the file's declared `size` in the JSON body: a request
+without it, or over the limit, gets 400 before anything is signed. `/api/upload/proxy` (25 MB) and the partner route
+`/api/affiliates/upload` receive the bytes themselves and cap them while reading, so they sign
+nothing.
+
+**S3-compatible storage (R2, MinIO).** `presignBoundPut()` (`apps/nextblock/lib/storage/presigned-put.ts`)
+is the only signer. It sets `ContentLength` to the declared size and signs `content-length` and
+`content-type` along with the key, so `X-Amz-SignedHeaders` reads `content-length;content-type;host`.
+Storage recomputes the signature from the PUT's own headers. For the URL's 300 seconds it
+therefore accepts exactly the declared number of bytes of the declared type, and answers 403
+`SignatureDoesNotMatch` to any other length, another type or a missing header. It also refuses
+to hand out a URL that leaves either header unsigned. Before 2026-11-04 both routes signed only
+`host` (the AWS presigner leaves `content-type` unsigned unless asked), so whoever held a URL
+could PUT up to R2's 5 GB, as any `Content-Type` (a `.png` key served as `text/html`).
+
+Both routes sign with `getS3PresignClient()` (`@nextblock-cms/utils/server`), a client of its
+own built with `requestChecksumCalculation: 'WHEN_REQUIRED'`. With the AWS SDK's default
+(`WHEN_SUPPORTED`, since 3.729) every presigned PutObject URL also signed
+`x-amz-checksum-crc32=AAAAAA==`, the checksum of the empty body present at signing time. Storage
+that validates checksums held the uploaded file to it and refused the upload. `getS3Client()`
+keeps the default: server-side writes send the real body.
+
+The response states the contract as `headers: { "Content-Type", "Content-Length" }`. A browser
+sends `Content-Type` as given and lets the browser set `Content-Length` from the `File` body
+(scripts may not set it). `presignedPutFetchHeaders()` (`lib/storage/presigned-put-client.ts`)
+builds those fetch headers and refuses a file whose size is not the signed one.
+
+**Native Supabase Storage.** Its signed upload URLs (`createSignedUploadUrl`, in
+`lib/storage/supabase-storage.ts`) carry a token for one object key and bind neither the size
+nor the type, so the routes return the same headers but the URL does not enforce them. On that
+backend the bucket's own restrictions are the cap. NextBlock creates the `media` bucket with
+`public: true` only, because a bucket limit cannot exceed the project's global file size limit,
+which depends on the plan. So set them yourself, in the dashboard (Storage → the `media`
+bucket's settings) or with `supabase.storage.updateBucket('media', { public: true,
+fileSizeLimit, allowedMimeTypes })`:
+
+- **File size limit:** 25 MB covers every NextBlock upload path (`/api/upload/proxy` is the
+  largest; the presigned routes stop at 10 MB, but one bucket holds one limit).
+- **Allowed MIME types** (optional): start from the media library's list
+  (`ALLOWED_UPLOAD_CONTENT_TYPES` in `lib/storage/upload-policy.ts`) and also allow `image/*`.
+  The external image importer (`lib/media/external-image-import.ts`: Cortex stock photos, URL
+  imports) stores whatever image type the remote server sends.
+
+Without a bucket limit, the project's global limit applies: at most 50 MB on the Free plan, up
+to 500 GB on paid plans.
+
+Gates:
+
+- `lib/storage/presigned-put.test.ts` signs with the real SDK (offline) and checks each URL the
+  way storage does. An honest PUT verifies; a 5 GB body, another type or a missing length does
+  not; the old host-only signing would have accepted all three. It also checks that a URL
+  leaving either header unsigned is never handed out, and fails when any module other than
+  `presigned-put.ts` imports the presigner. With the routes' own client it also checks that no
+  checksum is signed.
+- `libs/utils/tests/s3-presign-client.test.ts` checks that the presign client signs no checksum,
+  on R2 and on a MinIO public endpoint, and that the shared client still adds one (the control).
+- The route tests (`app/api/upload/presigned-url/route.test.ts`, `lib/custom-block-r2-upload.test.ts`)
+  refuse a missing or over-limit size before signing, on both backends, and read the signed
+  headers off the URL each route returns.
+- `sandbox-guards.test.ts` counts `presignBoundPut` callers as storage writers.
+- `server-action-actors.test.ts` (`analyzeStaffRouteGates`, in `security:check`) fails a staff
+  upload route whose handler does not open with `const actor = await getCmsActor()` and its two
+  refusals before any body read, storage call, signer or database query. Each route test runs the
+  real second-factor chain.
+
 ## Full Site Backup and Restore
 
 The CMS "Full ZIP backup" (`apps/nextblock/lib/full-backup/`, routes under
@@ -1395,7 +1762,8 @@ key). The two policies on `site_settings` are the only place the tiers live, so 
   `site_social_image`, `footer_copyright`, `footer_show_attribution`, `global_css`,
   `language_detection_settings`, `seo_robots_settings`, `bot_protection_public`,
   `active_logo_id`, `is_admin_created` (the `/setup` redirect in `proxy.ts` reads it with the
-  anon key — an empty result sends every visitor to `/setup`), `privacy_settings`,
+  anon key — an empty result sends every visitor to `/setup`; no API role writes it since
+  `02041`), `privacy_settings`,
   `enabled_payment_providers` (an empty result disables every Buy button),
   `ecommerce_inventory_settings`, `migration_baseline_generation`
 - any signed-in user: `invoice_settings` (a customer's own invoice page renders the seller
@@ -1437,7 +1805,9 @@ live, and a key on neither list is in the last tier):
   the cookie client goes on the first list in a migration, never by widening the default.
 - the service role only: the secret rows of the read list above (`02038`). A new secret goes
   under a name that ends like one (`<feature>_secret`, `<feature>_api_key`), so it lands here
-  without a migration.
+  without a migration. Also `is_admin_created` (`02041`, three RESTRICTIVE policies), which stays
+  publicly readable: only `handle_new_user()`, the seed, the sandbox reset and the service role
+  write it.
 
 SMTP (`lib/config/email-settings.ts`) resolves `email_public` and `email_secret` DB-first with an
 env fallback. A stored username or password counts only when it opens from its own field

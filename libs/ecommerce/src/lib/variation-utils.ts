@@ -9,6 +9,7 @@ import {
 } from './types';
 import { isSaleWindowActive, normalizePriceMap, normalizeSalePriceMap } from './currency';
 import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
+import { normalizeCurrencyCode } from '@nextblock-cms/utils/utils';
 
 type AttributeAccumulator = ProductAttribute & {
   terms: ProductAttributeTerm[];
@@ -92,6 +93,45 @@ export function buildVariantLabel(options: ProductVariantOption[]) {
   return options.map((option) => option.term_value).join(' / ');
 }
 
+/** A new variant's SKU: the product's SKU plus each option's term slug (its value slugified when it has none). */
+export function buildVariantSku(baseSku: string, options: ProductVariantOption[]) {
+  const skuSuffix = options
+    .map((option) => (option.term_slug ? option.term_slug : slugifyToken(option.term_value)).toUpperCase())
+    .filter(Boolean)
+    .join('-');
+
+  return [baseSku.trim(), skuSuffix].filter(Boolean).join('-');
+}
+
+/**
+ * A product-form price map (major units: 49.99) as a new variant takes it: each currency with a
+ * finite, non-negative amount and, with `keepCleared`, each sale amount cleared to null.
+ * normalizePriceMap / normalizeSalePriceMap are for stored minor-unit amounts and round to a whole
+ * number, which priced a variant generated from a $49.99 product at $50.00.
+ */
+function normalizeFormAmountMap(value: unknown, keepCleared: false): PriceMap;
+function normalizeFormAmountMap(value: unknown, keepCleared: true): SalePriceMap;
+function normalizeFormAmountMap(value: unknown, keepCleared: boolean): SalePriceMap {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  return Object.entries(value as Record<string, unknown>).reduce<SalePriceMap>(
+    (accumulator, [code, amount]) => {
+      const normalizedAmount = typeof amount === 'string' ? Number.parseFloat(amount) : amount;
+
+      if (typeof normalizedAmount === 'number' && Number.isFinite(normalizedAmount) && normalizedAmount >= 0) {
+        accumulator[normalizeCurrencyCode(code)] = normalizedAmount;
+      } else if (normalizedAmount === null && keepCleared) {
+        accumulator[normalizeCurrencyCode(code)] = null;
+      }
+
+      return accumulator;
+    },
+    {}
+  );
+}
+
 function cartesianProduct<T>(groups: T[][]): T[][] {
   if (groups.length === 0) {
     return [];
@@ -104,12 +144,20 @@ function cartesianProduct<T>(groups: T[][]): T[][] {
   );
 }
 
+/**
+ * Every combination of the selected terms, as variant drafts. A combination the previous drafts
+ * hold keeps every value of its own; a new one starts from the product's: its SKU plus the term
+ * slugs, its price and per-currency prices, and its sale (price and per-currency amounts, with the
+ * window when it takes an amount). The base amounts are the product form's (major units).
+ */
 export function generateVariantDrafts(params: {
   baseSku: string;
   basePrice: number;
-  basePrices?: PriceMap | null;
+  basePrices?: Record<string, number | null | undefined> | null;
   baseSalePrice?: number | null;
-  baseSalePrices?: SalePriceMap | null;
+  baseSalePrices?: Record<string, number | null | undefined> | null;
+  baseSaleStartAt?: string | null;
+  baseSaleEndAt?: string | null;
   selectedAttributes: VariationSelectionGroup[];
   previousVariants?: ProductVariantDraft[];
 }) {
@@ -119,6 +167,8 @@ export function generateVariantDrafts(params: {
     basePrices = {},
     baseSalePrice = null,
     baseSalePrices = {},
+    baseSaleStartAt = null,
+    baseSaleEndAt = null,
     selectedAttributes,
     previousVariants = [],
   } = params;
@@ -133,6 +183,16 @@ export function generateVariantDrafts(params: {
   const previousByKey = new Map(
     previousVariants.map((variant) => [variant.combination_key, variant])
   );
+  // A new combination takes the product's sale window only with a product sale amount. A variant's
+  // sale follows the variant's own window and none means always on (isSaleWindowActive), so a sale
+  // price without the product's window was on sale at once and for good; and the window of a
+  // product without a sale price (last year's, say) kept a sale set later on the variant from ever
+  // applying.
+  const takesProductSale =
+    typeof baseSalePrice === 'number' ||
+    Object.values(normalizeFormAmountMap(baseSalePrices, true)).some((amount) => typeof amount === 'number');
+  const newSaleStartAt = takesProductSale ? baseSaleStartAt || null : null;
+  const newSaleEndAt = takesProductSale ? baseSaleEndAt || null : null;
 
   const groupedTerms = selectedAttributes.map((attribute) =>
     attribute.terms.map((term) => ({
@@ -154,28 +214,27 @@ export function generateVariantDrafts(params: {
     const attributeTermIds = selectedOptions.map((option) => option.term_id);
     const combinationKey = buildCombinationKey(attributeTermIds);
     const previous = previousByKey.get(combinationKey);
-    const skuSuffix = selectedOptions
-      .map((option) => (option.term_slug ? option.term_slug : slugifyToken(option.term_value)).toUpperCase())
-      .filter(Boolean)
-      .join('-');
 
+    // IMPORTANT (future agents): every per-variant field a user can edit MUST be carried over from
+    // `previous` here. The variations editor re-runs this function when a term is toggled (or the
+    // currencies change), replacing the draft list. If a field is omitted, it silently resets on
+    // the next regenerate and then gets autosaved away, which is exactly how the sale window
+    // (sale_start_at/sale_end_at) used to "revert after publish". An existing variant
+    // keeps its own values, an empty one included: `previous?.sale_price ?? baseSalePrice` read a
+    // stored null as "unset" and gave a variant with no sale price the product's sale price with no
+    // window, so publishing put that variant (and its SKU in every language) on sale at once and
+    // for good. Only a new combination takes the product's values.
     return {
       id: previous?.id,
       combination_key: combinationKey,
-      sku: previous?.sku || [baseSku.trim(), skuSuffix].filter(Boolean).join('-'),
+      sku: previous?.sku || buildVariantSku(baseSku, selectedOptions),
       upc: previous?.upc ?? null,
       price: previous?.price ?? basePrice,
-      prices: previous?.prices ?? normalizePriceMap(basePrices),
-      sale_price: previous?.sale_price ?? baseSalePrice,
-      sale_prices: previous?.sale_prices ?? normalizeSalePriceMap(baseSalePrices),
-      // IMPORTANT (future agents): every per-variant field a user can edit MUST
-      // be carried over from `previous` here. This function re-runs whenever the
-      // variations editor mounts or attributes/base prices change, replacing the
-      // draft list. If a field is omitted, it silently resets to null on the next
-      // regenerate and then gets autosaved away — which is exactly how the sale
-      // window (sale_start_at/sale_end_at) used to "revert after publish".
-      sale_start_at: previous?.sale_start_at ?? null,
-      sale_end_at: previous?.sale_end_at ?? null,
+      prices: previous ? previous.prices ?? {} : normalizeFormAmountMap(basePrices, false),
+      sale_price: previous ? previous.sale_price ?? null : baseSalePrice,
+      sale_prices: previous ? previous.sale_prices ?? {} : normalizeFormAmountMap(baseSalePrices, true),
+      sale_start_at: previous ? previous.sale_start_at ?? null : newSaleStartAt,
+      sale_end_at: previous ? previous.sale_end_at ?? null : newSaleEndAt,
       stock_quantity: previous?.stock_quantity ?? 0,
       main_media_id: previous?.main_media_id ?? null,
       main_image_url: previous?.main_image_url ?? null,

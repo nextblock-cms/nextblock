@@ -1,7 +1,9 @@
 import 'server-only';
 
 import { createClient, verifyPackageOnline } from '@nextblock-cms/db/server';
-import { getStoreReadiness } from '@nextblock-cms/ecommerce/server';
+// Deep subpath: app/cms/layout.tsx imports this module, and the '/server' barrel would add
+// every CMS commerce screen's client components to every /cms route.
+import { getStoreReadiness } from '@nextblock-cms/ecommerce/pages/cms/payments/queries';
 
 /**
  * A store that has commerce switched on but cannot actually take money. This is easy to

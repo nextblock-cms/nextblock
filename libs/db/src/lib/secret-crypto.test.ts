@@ -107,7 +107,7 @@ describe('secret-crypto', () => {
       expect(() => decryptSecret({ envelope: shortTag, encryptionSecret: SECRET, slot: STRIPE_SECRET })).toThrow();
     });
 
-    it('still opens a version 1 envelope (written before 0.23.1)', () => {
+    it('still opens a version 1 envelope (written before 0.23.0)', () => {
       const legacy = legacyEnvelope('smtp-password', SECRET);
       expect(isEncryptedSecretEnvelope(legacy)).toBe(true);
       expect(decryptSecret({ envelope: legacy, encryptionSecret: SECRET, slot: EMAIL_PASS })).toBe('smtp-password');
@@ -124,7 +124,7 @@ describe('secret-crypto', () => {
       expect(OPENROUTER).toBe('site_settings:cortex_ai_openrouter_api_key');
     });
 
-    it('a caller compiled before 0.23.1 (no slot) reads version 1 only', () => {
+    it('a caller compiled before 0.23.0 (no slot) reads version 1 only', () => {
       const legacy = legacyEnvelope('smtp-password', SECRET);
       const bound = encryptSecret({ value: 'smtp-password', encryptionSecret: SECRET, slot: EMAIL_PASS });
       const noSlot = undefined as unknown as SecretSlot;

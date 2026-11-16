@@ -2049,6 +2049,32 @@ async function restoreDemoAdmin(supabaseAdmin: any): Promise<string> {
   return existingId;
 }
 
+/**
+ * Marks the sandbox provisioned and the demo admin an ADMIN, directly. The SQL reset re-seeds
+ * site_settings.is_admin_created as false and turns it back on only when a preserved account
+ * survived Step A (Step F); a re-created demo admin got both from the handle_new_user trigger,
+ * after the SQL had committed. A run that failed or timed out in between left a false flag, and
+ * the proxy then sent every visitor to /setup, where anyone could create an account (2026-11-13).
+ * The flag is set even when the demo admin could not be restored: on the sandbox the open
+ * first-admin bootstrap is the worse state, and the next run retries the account.
+ */
+async function pinSandboxAdmin(sql: SqlClient, demoAdminId: string | null) {
+  await sql`
+    INSERT INTO public.site_settings (key, value)
+    VALUES ('is_admin_created', 'true'::jsonb)
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+  `;
+  if (!demoAdminId) {
+    console.warn('[Sandbox Reset] No demo admin to pin: the first-admin flag is set, the next run retries the account.');
+    return;
+  }
+  await sql`
+    INSERT INTO public.profiles (id, full_name, website, role, updated_at)
+    VALUES (${demoAdminId}, 'Nextblock CMS', 'https://nextblock.dev', 'ADMIN', now())
+    ON CONFLICT (id) DO UPDATE SET role = 'ADMIN', updated_at = now()
+  `;
+}
+
 async function seedFakeStoreData(sql: SqlClient, supabaseAdmin: any, demoAdminId: string | null) {
   console.log('[Sandbox Reset] Starting fake store data seeding...');
 
@@ -2433,6 +2459,10 @@ export async function GET(request: NextRequest) {
       } catch (restoreErr: any) {
         console.error('[Sandbox Reset] Failed to restore the demo admin:', restoreErr?.message || restoreErr);
       }
+
+      // Then the first-admin flag and the demo admin's role, before anything else can fail: a false
+      // flag sends every visitor to /setup.
+      await pinSandboxAdmin(db, demoAdminId);
 
       // The replayed migrations re-add the "Live Demo" home-page promo that points at this
       // sandbox — strip it here so the demo does not advertise itself to itself.

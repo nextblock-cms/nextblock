@@ -16,9 +16,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * its env only, and the payments screen shows no stored value (until 2026-11-03 its form still
  * showed what a visitor wrote) and drops its "saving here moves them" hint there.
  *
- * 2026-11-04: each key is sealed for its own field of `payment_secret` and opens nowhere else, so
- * an envelope copied between fields or rows (the Stripe key into the SMTP password) is useless;
- * every save re-seals what was stored before 0.23.1. Those cases use real envelopes.
+ * 2026-11-04 (shipped in v0.23.0): each key is sealed for its own field of `payment_secret` and
+ * opens nowhere else, so an envelope copied between fields or rows (the Stripe key into the SMTP
+ * password) is useless; every save re-seals what was stored before 0.23.0. Those cases use real
+ * envelopes.
  */
 
 type SettingsRow = { key: string; value: unknown };
@@ -26,12 +27,20 @@ type SettingsRow = { key: string; value: unknown };
 const mocks = vi.hoisted(() => ({
   rows: new Map<string, unknown>(),
   reads: [] as string[],
+  /** site_settings keys whose reads answer an error (a database blip). */
+  failReads: new Set<string>(),
   upserts: [] as Array<{ key: string; value: unknown }>,
   requireEcomAdmin: vi.fn(),
   getEcomActorRole: vi.fn(),
   encryptWithEnvKey: vi.fn((value: string) => `enc:${value}`),
   // Opens nothing unless a test says otherwise (getStripeKeyDiagnostics' tests open `enc:` stand-ins).
   decrypt: vi.fn<(value: unknown) => string | null>(() => null),
+  developerStatus: vi.fn<(options?: { wait?: boolean }) => Promise<{ state: string; source: string | null; productIds: string[] }>>(async () => ({
+    state: 'missing',
+    source: null,
+    productIds: [],
+  })),
+  forgetDeveloperCaches: vi.fn(),
 }));
 
 /** The service-role client requireEcomAdmin hands back; it records every read and upsert. */
@@ -44,6 +53,7 @@ function fakeServiceClient() {
           eq: (_column: string, key: string) => ({
             maybeSingle: async () => {
               mocks.reads.push(key);
+              if (mocks.failReads.has(key)) return { data: null, error: { message: `${key} read failed` } };
               return { data: mocks.rows.has(key) ? { value: mocks.rows.get(key) } : null, error: null };
             },
           }),
@@ -87,17 +97,25 @@ vi.mock('./server-actions/require-ecom-role', () => ({
   getEcomActorRole: mocks.getEcomActorRole,
   requireEcomAdmin: mocks.requireEcomAdmin,
 }));
+// The developer pair's check with Freemius has its own tests (freemius-developer-api.test.ts).
+vi.mock('./freemius-developer-api', () => ({
+  getFreemiusDeveloperStatus: mocks.developerStatus,
+  forgetFreemiusDeveloperCaches: mocks.forgetDeveloperCaches,
+}));
 
 import {
   PAYMENT_SETTINGS_SANDBOX_MESSAGE,
   clearPaymentConfigCache,
+  getPaymentConfigStatus,
   getPaymentCredentialsView,
   getStripeKeyDiagnostics,
   hydrateFreemiusEnvFromDb,
+  resolveFreemiusDeveloperCredentialCandidates,
   resolveStripePublishableKey,
   resolveStripeSecretKey,
   resolveStripeWebhookSecret,
   savePaymentCredentials,
+  type RemovablePaymentSecret,
   type SavePaymentCredentialsInput,
 } from './payment-config';
 import { stripeSecretKeyLivemode } from './stripe/client';
@@ -108,7 +126,7 @@ const secretCrypto = await vi.importActual<typeof import('../../../db/src/lib/se
 const TEST_KEY = 'payment-config-test-key';
 const slot = (field: string) => secretCrypto.siteSettingSecretSlot('payment_secret', field);
 
-/** An envelope exactly as 0.23.0 and earlier wrote it: version 1, no associated data. */
+/** An envelope exactly as 0.22.x and earlier wrote it: version 1, no associated data. */
 function legacyEnvelope(value: string, encryptionSecret: string) {
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', createHash('sha256').update(encryptionSecret).digest(), iv);
@@ -134,18 +152,30 @@ const VISITOR_PUBLIC = {
 
 function input(secrets: {
   stripe?: Partial<Pick<SavePaymentCredentialsInput['stripe'], 'secretKey' | 'webhookSecret'>>;
-  freemius?: Partial<Pick<SavePaymentCredentialsInput['freemius'], 'secretKey' | 'apiKey'>>;
+  freemius?: Partial<Pick<SavePaymentCredentialsInput['freemius'], 'secretKey' | 'apiKey' | 'developerSecretKey'>>;
 } = {}): SavePaymentCredentialsInput {
   return {
     stripe: { publishableKey: ' pk_test_visitor ', ...secrets.stripe },
-    freemius: { developerId: ' 101 ', publicKey: ' pk_fm_visitor ', productId: ' 202 ', ...secrets.freemius },
+    freemius: {
+      developerId: ' 101 ',
+      developerPublicKey: ' pk_dev_visitor ',
+      publicKey: ' pk_fm_visitor ',
+      productId: ' 202 ',
+      ...secrets.freemius,
+    },
   };
 }
 
 /** The trimmed `payment_public` value the function writes for `input()`. */
 const PUBLIC_VALUE = {
   stripe: { publishableKey: 'pk_test_visitor' },
-  freemius: { developerId: '101', publicKey: 'pk_fm_visitor', productId: '202', sandboxEnabled: false },
+  freemius: {
+    developerId: '101',
+    developerPublicKey: 'pk_dev_visitor',
+    publicKey: 'pk_fm_visitor',
+    productId: '202',
+    sandboxEnabled: false,
+  },
 };
 
 const NEW_SECRETS: Array<[string, Parameters<typeof input>[0]]> = [
@@ -153,6 +183,7 @@ const NEW_SECRETS: Array<[string, Parameters<typeof input>[0]]> = [
   ['a Stripe webhook secret', { stripe: { webhookSecret: 'whsec_visitor' } }],
   ['a Freemius secret key', { freemius: { secretKey: 'sk_fm_visitor' } }],
   ['a Freemius API key', { freemius: { apiKey: 'fm_api_visitor' } }],
+  ['a Freemius developer secret key', { freemius: { developerSecretKey: 'sk_dev_visitor' } }],
 ];
 
 beforeEach(() => {
@@ -160,10 +191,13 @@ beforeEach(() => {
   mocks.rows.clear();
   mocks.rows.set('payment_secret', { ...STORED_SECRET });
   mocks.reads = [];
+  mocks.failReads.clear();
   mocks.upserts = [];
   mocks.requireEcomAdmin.mockReset().mockImplementation(async () => fakeServiceClient());
   mocks.getEcomActorRole.mockReset().mockImplementation(async () => 'ADMIN');
   mocks.encryptWithEnvKey.mockClear();
+  mocks.forgetDeveloperCaches.mockClear();
+  mocks.developerStatus.mockReset().mockImplementation(async () => ({ state: 'missing', source: null, productIds: [] }));
   vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
 });
@@ -210,6 +244,23 @@ describe('savePaymentCredentials on the sandbox', () => {
     await expect(savePaymentCredentials(input({ stripe: { secretKey: 'sk_live_visitor' } }))).rejects.toThrow('Forbidden');
     expect(mocks.upserts).toEqual([]);
   });
+
+  // 0.23.4: the remove boxes go through the same save, so the sandbox refuses them the same way.
+  it('refuses a removal: no stored secret is read or deleted, and the admin refusal still comes first', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+    const everyBox: RemovablePaymentSecret[] = ['stripeSecretKey', 'stripeWebhookSecret', 'freemiusSecretKey', 'freemiusApiKey', 'freemiusDeveloperSecretKey'];
+
+    await expect(savePaymentCredentials({ ...input(), remove: everyBox })).rejects.toThrow(PAYMENT_SETTINGS_SANDBOX_MESSAGE);
+    expect(mocks.requireEcomAdmin).toHaveBeenCalledTimes(1);
+    expect(mocks.reads).toEqual([]);
+    expect(mocks.upserts).toEqual([]);
+    expect(mocks.rows.get('payment_secret')).toEqual(STORED_SECRET);
+
+    mocks.requireEcomAdmin.mockRejectedValueOnce(new Error('Forbidden'));
+    await expect(savePaymentCredentials({ ...input(), remove: everyBox })).rejects.toThrow('Forbidden');
+    expect(mocks.upserts).toEqual([]);
+    expect(mocks.rows.get('payment_secret')).toEqual(STORED_SECRET);
+  });
 });
 
 describe('savePaymentCredentials off the sandbox', () => {
@@ -240,7 +291,7 @@ describe('savePaymentCredentials off the sandbox', () => {
     await savePaymentCredentials(
       input({
         stripe: { secretKey: 'sk_live_owner', webhookSecret: 'whsec_owner' },
-        freemius: { secretKey: 'sk_fm_owner', apiKey: 'fm_api_owner' },
+        freemius: { secretKey: 'sk_fm_owner', apiKey: 'fm_api_owner', developerSecretKey: ' sk_dev_owner ' },
       })
     );
 
@@ -249,10 +300,19 @@ describe('savePaymentCredentials off the sandbox', () => {
       ['whsec_owner', 'site_settings:payment_secret:stripeWebhookSecret'],
       ['sk_fm_owner', 'site_settings:payment_secret:freemiusSecretKey'],
       ['fm_api_owner', 'site_settings:payment_secret:freemiusApiKey'],
+      ['sk_dev_owner', 'site_settings:payment_secret:freemiusDeveloperSecretKey'],
     ]);
+    expect(mocks.rows.get('payment_secret')).toMatchObject({ freemiusDeveloperSecretKey: 'enc:sk_dev_owner' });
   });
 
-  it('re-seals the keys stored before 0.23.1 on a save that changes no key, and leaves the rest', async () => {
+  it('keeps the developer secret out of the public row, and drops the developer verdicts after a save', async () => {
+    await savePaymentCredentials(input({ freemius: { developerSecretKey: 'sk_dev_owner' } }));
+
+    expect(JSON.stringify(mocks.rows.get('payment_public'))).not.toContain('sk_dev_owner');
+    expect(mocks.forgetDeveloperCaches).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-seals the keys stored before 0.23.0 on a save that changes no key, and leaves the rest', async () => {
     vi.stubEnv('NEXTBLOCK_ENCRYPTION_KEY', TEST_KEY);
     mocks.rows.set('payment_secret', {
       stripeSecretKey: legacyEnvelope('sk_live_existing', TEST_KEY),
@@ -293,7 +353,7 @@ describe('reading payment_secret: each key opens only from its own field', () =>
     clearPaymentConfigCache();
   });
 
-  it('uses a key sealed for its field, and one stored before 0.23.1', async () => {
+  it('uses a key sealed for its field, and one stored before 0.23.0', async () => {
     mocks.rows.set('payment_secret', { stripeSecretKey: secretCrypto.encryptWithEnvKey('sk_live_owner', slot('stripeSecretKey')) });
     await expect(resolveStripeSecretKey()).resolves.toBe('sk_live_owner');
 
@@ -394,10 +454,14 @@ describe('getPaymentCredentialsView on the sandbox', () => {
     stripeWebhookSecret: 'enc:whsec_existing',
     freemiusSecretKey: 'enc:sk_fm_existing',
     freemiusApiKey: 'enc:fm_api_existing',
+    freemiusDeveloperSecretKey: 'enc:sk_dev_existing',
   };
 
   beforeEach(() => {
-    mocks.rows.set('payment_public', VISITOR_PUBLIC);
+    mocks.rows.set('payment_public', {
+      ...VISITOR_PUBLIC,
+      freemius: { ...VISITOR_PUBLIC.freemius, developerPublicKey: 'pk_dev_visitor' },
+    });
     mocks.rows.set('payment_secret', { ...FULL_SECRET });
     vi.stubEnv('STRIPE_SECRET_KEY', 'sk_test_env');
   });
@@ -407,7 +471,15 @@ describe('getPaymentCredentialsView on the sandbox', () => {
 
     await expect(getPaymentCredentialsView()).resolves.toEqual({
       stripe: { publishableKey: '', hasSecretKey: false, hasWebhookSecret: false },
-      freemius: { developerId: '', publicKey: '', productId: '', hasSecretKey: false, hasApiKey: false },
+      freemius: {
+        developerId: '',
+        developerPublicKey: '',
+        hasDeveloperSecretKey: false,
+        publicKey: '',
+        productId: '',
+        hasSecretKey: false,
+        hasApiKey: false,
+      },
       envFallbackActive: false,
     });
     expect(mocks.reads).toEqual([]);
@@ -421,7 +493,15 @@ describe('getPaymentCredentialsView on the sandbox', () => {
 
       await expect(getPaymentCredentialsView()).resolves.toEqual({
         stripe: { publishableKey: 'pk_test_visitor', hasSecretKey: true, hasWebhookSecret: true },
-        freemius: { developerId: '666', publicKey: 'pk_fm_visitor', productId: '999999', hasSecretKey: true, hasApiKey: true },
+        freemius: {
+          developerId: '666',
+          developerPublicKey: 'pk_dev_visitor',
+          hasDeveloperSecretKey: true,
+          publicKey: 'pk_fm_visitor',
+          productId: '999999',
+          hasSecretKey: true,
+          hasApiKey: true,
+        },
         envFallbackActive: false,
       });
       expect(mocks.reads).toEqual(['payment_secret', 'payment_public']);
@@ -582,5 +662,594 @@ describe('getStripeKeyDiagnostics', () => {
       const expected = livemode === null ? null : livemode ? 'live' : 'test';
       await expect(getStripeKeyDiagnostics(), key).resolves.toMatchObject({ mode: expected });
     }
+  });
+});
+
+/**
+ * The Freemius developer key pair (one pair for every product of the account). The candidates come
+ * most authoritative first: the CMS developer fields, the developer env names, then the legacy
+ * single-product names, which hold the developer pair on installs that run Sync from Freemius and
+ * count only once Freemius accepts them (freemius-developer-api.ts). The deployment's own legacy
+ * values survive hydrateFreemiusEnvFromDb writing the CMS single-product keys over the same names.
+ */
+describe('resolveFreemiusDeveloperCredentialCandidates', () => {
+  const FREEMIUS_ENV = [
+    'FREEMIUS_DEVELOPER_ID',
+    'FREEMIUS_DEVELOPER_PUBLIC_KEY',
+    'FREEMIUS_DEVELOPER_SECRET_KEY',
+    'FREEMIUS_PUBLIC_KEY',
+    'FREEMIUS_SECRET_KEY',
+    'FREEMIUS_PRODUCT_ID',
+    'FREEMIUS_API_KEY',
+  ];
+
+  beforeEach(() => {
+    vi.stubEnv('NEXTBLOCK_ENCRYPTION_KEY', TEST_KEY);
+    for (const name of FREEMIUS_ENV) vi.stubEnv(name, '');
+    mocks.rows.clear();
+    clearPaymentConfigCache();
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    clearPaymentConfigCache();
+  });
+
+  const pairsOf = (candidates: Awaited<ReturnType<typeof resolveFreemiusDeveloperCredentialCandidates>>) =>
+    candidates.map(({ source, developerId, publicKey, secretKey }) => [source, developerId, publicKey, secretKey]);
+
+  it('orders the CMS developer fields, the developer env names, then the legacy names, without duplicates', async () => {
+    mocks.rows.set('payment_public', {
+      freemius: { developerId: '4242', developerPublicKey: 'pk_dev_cms', publicKey: 'pk_single_cms' },
+    });
+    mocks.rows.set('payment_secret', {
+      freemiusDeveloperSecretKey: secretCrypto.encryptWithEnvKey('sk_dev_cms', slot('freemiusDeveloperSecretKey')),
+      freemiusSecretKey: secretCrypto.encryptWithEnvKey('sk_single_cms', slot('freemiusSecretKey')),
+    });
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '9999');
+    vi.stubEnv('FREEMIUS_DEVELOPER_PUBLIC_KEY', 'pk_dev_env');
+    vi.stubEnv('FREEMIUS_DEVELOPER_SECRET_KEY', ' "sk_dev_env" ');
+    // The legacy env names repeat the CMS developer pair: listed once.
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_dev_cms');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_dev_cms');
+
+    expect(pairsOf(await resolveFreemiusDeveloperCredentialCandidates())).toEqual([
+      ['cms', '4242', 'pk_dev_cms', 'sk_dev_cms'],
+      ['env', '4242', 'pk_dev_env', 'sk_dev_env'],
+      ['cms-legacy', '4242', 'pk_single_cms', 'sk_single_cms'],
+    ]);
+  });
+
+  it('reads the legacy env pair as the deployment set it, even after hydration wrote the CMS product keys over it', async () => {
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '4242');
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_developer_env');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_developer_env');
+    mocks.rows.set('payment_public', { freemius: { publicKey: 'pk_cortex_product' } });
+    mocks.rows.set('payment_secret', {
+      freemiusSecretKey: secretCrypto.encryptWithEnvKey('sk_cortex_product', slot('freemiusSecretKey')),
+    });
+
+    await hydrateFreemiusEnvFromDb();
+
+    // The single-product helpers see the CMS keys (DB wins), the developer pair keeps the env's.
+    expect(process.env['FREEMIUS_PUBLIC_KEY']).toBe('pk_cortex_product');
+    expect(process.env['FREEMIUS_SECRET_KEY']).toBe('sk_cortex_product');
+    expect(pairsOf(await resolveFreemiusDeveloperCredentialCandidates())).toEqual([
+      ['cms-legacy', '4242', 'pk_cortex_product', 'sk_cortex_product'],
+      ['env-legacy', '4242', 'pk_developer_env', 'sk_developer_env'],
+    ]);
+
+    // A later deployment value is read as such.
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_developer_rotated');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_developer_rotated');
+    expect(pairsOf(await resolveFreemiusDeveloperCredentialCandidates()).at(-1)).toEqual([
+      'env-legacy',
+      '4242',
+      'pk_developer_rotated',
+      'sk_developer_rotated',
+    ]);
+  });
+
+  it('never opens a developer secret sealed for another field', async () => {
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '4242');
+    mocks.rows.set('payment_public', { freemius: { developerPublicKey: 'pk_dev_cms' } });
+    mocks.rows.set('payment_secret', {
+      freemiusDeveloperSecretKey: secretCrypto.encryptWithEnvKey('sk_moved', slot('freemiusSecretKey')),
+    });
+
+    await expect(resolveFreemiusDeveloperCredentialCandidates()).resolves.toEqual([]);
+  });
+
+  it('needs a numeric developer id, and skips a public key that is not header-safe', async () => {
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_developer_env');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_developer_env');
+    await expect(resolveFreemiusDeveloperCredentialCandidates()).resolves.toEqual([]);
+
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '42/../1');
+    await expect(resolveFreemiusDeveloperCredentialCandidates()).resolves.toEqual([]);
+
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '4242');
+    vi.stubEnv('FREEMIUS_DEVELOPER_PUBLIC_KEY', 'pk_dev\nInjected: header');
+    vi.stubEnv('FREEMIUS_DEVELOPER_SECRET_KEY', 'sk_dev_env');
+    expect(pairsOf(await resolveFreemiusDeveloperCredentialCandidates())).toEqual([
+      ['env-legacy', '4242', 'pk_developer_env', 'sk_developer_env'],
+    ]);
+  });
+
+  it('on the sandbox reads no payment row: the env pairs only', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '4242');
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_developer_env');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_developer_env');
+    mocks.rows.set('payment_public', { freemius: { developerId: '666', developerPublicKey: 'pk_visitor' } });
+    mocks.rows.set('payment_secret', {
+      freemiusDeveloperSecretKey: secretCrypto.encryptWithEnvKey('sk_visitor', slot('freemiusDeveloperSecretKey')),
+    });
+
+    expect(pairsOf(await resolveFreemiusDeveloperCredentialCandidates())).toEqual([
+      ['env-legacy', '4242', 'pk_developer_env', 'sk_developer_env'],
+    ]);
+    expect(mocks.reads).toEqual([]);
+  });
+});
+
+/**
+ * Store readiness runs during public renders (buy buttons, product pages, the checkout preflight),
+ * so it asks for the developer pair's status without waiting on Freemius ({ wait: false }): a
+ * configured pair counts unless a verdict says Freemius refused it. An unreachable Freemius keeps
+ * the store ready, because checkout reports the outage itself. payment-config-readiness.test.ts
+ * runs the same rule through the real check.
+ */
+describe('getPaymentConfigStatus counts a usable developer key pair as Freemius-ready', () => {
+  beforeEach(() => {
+    for (const name of ['FREEMIUS_PUBLIC_KEY', 'FREEMIUS_SECRET_KEY', 'STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY']) {
+      vi.stubEnv(name, '');
+    }
+    mocks.rows.clear();
+    clearPaymentConfigCache();
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    clearPaymentConfigCache();
+  });
+
+  it.each(['working', 'unchecked', 'unreachable'])('is ready when the pair is %s, without waiting on Freemius', async (state) => {
+    mocks.developerStatus.mockResolvedValue(
+      state === 'working'
+        ? { state, source: 'env', productIds: ['24851', '28609', '43273'] }
+        : { state, source: null, productIds: [] }
+    );
+
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: { hasKeys: true, missing: [] } });
+    expect(mocks.developerStatus).toHaveBeenCalledTimes(1);
+    expect(mocks.developerStatus).toHaveBeenCalledWith({ wait: false });
+  });
+
+  // `sandbox` can only arrive here if this module and the developer module disagree about the
+  // sandbox: on it this module counts a configured env pair without asking. An answer that says
+  // nothing about the pair must not make Freemius ready.
+  it.each(['refused', 'missing', 'sandbox'])('is not ready when the pair is %s', async (state) => {
+    mocks.developerStatus.mockResolvedValue({ state, source: null, productIds: [] });
+
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({
+      freemius: { hasKeys: false, missing: ['Public key', 'Secret key'] },
+    });
+    expect(mocks.developerStatus).toHaveBeenCalledWith({ wait: false });
+  });
+
+  it('survives a failing check, and never asks about the pair when the single-product keys are set', async () => {
+    mocks.developerStatus.mockRejectedValue(new Error('boom'));
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: { hasKeys: false } });
+
+    mocks.developerStatus.mockClear();
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_single');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_single');
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: { hasKeys: true, missing: [] } });
+    expect(mocks.developerStatus).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Review 2026-11-13, round 3: with the one-product keys set, readiness never looked at the
+ * developer pair, so wrong developer keys typed beside them showed buy buttons over checkouts and
+ * webhooks that all answered 503: with Freemius refusing a dedicated pair, the Product ID empty and
+ * no FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, the key policy lets the one-product keys stand in for no
+ * product. Readiness reads that refusal from memory (never waiting on Freemius).
+ */
+describe('getPaymentConfigStatus with the one-product keys set', () => {
+  const NOT_READY = { hasKeys: false, missing: ['Developer key pair Freemius accepts, or a Product ID'] };
+
+  beforeEach(() => {
+    for (const name of [
+      'FREEMIUS_PRODUCT_ID',
+      'FREEMIUS_CHECKOUT_PRODUCTS_JSON',
+      'STRIPE_SECRET_KEY',
+      'STRIPE_WEBHOOK_SECRET',
+      'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY',
+    ]) {
+      vi.stubEnv(name, '');
+    }
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_one_product');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_one_product');
+    // Wrong developer keys typed beside them: a dedicated pair.
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', '4242');
+    vi.stubEnv('FREEMIUS_DEVELOPER_PUBLIC_KEY', 'pk_dev_wrong');
+    vi.stubEnv('FREEMIUS_DEVELOPER_SECRET_KEY', 'sk_dev_wrong');
+    mocks.rows.clear();
+    clearPaymentConfigCache();
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    clearPaymentConfigCache();
+  });
+
+  it('is not ready when Freemius refuses the dedicated pair, the Product ID is empty and no JSON entry exists, without waiting on Freemius', async () => {
+    mocks.developerStatus.mockResolvedValue({ state: 'refused', source: null, productIds: [] });
+
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: NOT_READY });
+    expect(mocks.developerStatus).toHaveBeenCalledTimes(1);
+    expect(mocks.developerStatus).toHaveBeenCalledWith({ wait: false });
+  });
+
+  it.each(['working', 'unchecked', 'unreachable', 'missing'])('stays ready when the pair is %s', async (state) => {
+    mocks.developerStatus.mockResolvedValue({ state, source: state === 'working' ? 'env' : null, productIds: [] });
+
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: { hasKeys: true, missing: [] } });
+  });
+
+  it('stays ready, never asking about the pair, when some product has bound keys or no dedicated pair is configured', async () => {
+    mocks.developerStatus.mockResolvedValue({ state: 'refused', source: null, productIds: [] });
+    const ready = { freemius: { hasKeys: true, missing: [] } };
+
+    // A Product ID binds the one-product keys (env, or the CMS field).
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '28609');
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject(ready);
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '');
+    mocks.rows.set('payment_public', { freemius: { productId: '28609' } });
+    clearPaymentConfigCache();
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject(ready);
+    mocks.rows.clear();
+    clearPaymentConfigCache();
+
+    // A FREEMIUS_CHECKOUT_PRODUCTS_JSON entry.
+    vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', JSON.stringify({ '24851': { publicKey: 'pk_a', secretKey: 'sk_a' } }));
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject(ready);
+    vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', '');
+
+    // Only the one-product names tried as a pair (a one-product install with a developer id): the
+    // policy may still let them stand in, once Freemius confirms them per product.
+    vi.stubEnv('FREEMIUS_DEVELOPER_PUBLIC_KEY', '');
+    vi.stubEnv('FREEMIUS_DEVELOPER_SECRET_KEY', '');
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject(ready);
+
+    expect(mocks.developerStatus).not.toHaveBeenCalled();
+  });
+
+  it('counts the refusal only off the sandbox', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+    mocks.developerStatus.mockResolvedValue({ state: 'refused', source: null, productIds: [] });
+
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: { hasKeys: true, missing: [] } });
+    expect(mocks.developerStatus).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Review 2026-11-13, round 3 (K5): every FREEMIUS_CHECKOUT_PRODUCTS_JSON entry counted, so entries
+   * without a `publicKey` (they open no checkout of their own and keep the one-product keys from
+   * standing in for their products) kept the store ready while every checkout answered 503.
+   */
+  it('counts a FREEMIUS_CHECKOUT_PRODUCTS_JSON entry only when it can open a checkout: a publicKey, or a usable developer pair', async () => {
+    const ready = { freemius: { hasKeys: true, missing: [] } };
+    vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', JSON.stringify({ '24851': { secretKey: 'sk_json_a' }, '28609': {}, '43273': null }));
+
+    // A refused dedicated pair reads none of their keys: no checkout opens, not ready.
+    mocks.developerStatus.mockResolvedValue({ state: 'refused', source: null, productIds: [] });
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject({ freemius: NOT_READY });
+    expect(mocks.developerStatus).toHaveBeenCalledWith({ wait: false });
+
+    // A pair that may read them keeps the store ready, never waiting on Freemius.
+    for (const state of ['working', 'unchecked', 'unreachable']) {
+      mocks.developerStatus.mockResolvedValue({ state, source: state === 'working' ? 'env' : null, productIds: [] });
+      await expect(getPaymentConfigStatus(), state).resolves.toMatchObject(ready);
+    }
+
+    // One entry with a publicKey opens its product's checkout whatever the pair says.
+    mocks.developerStatus.mockClear().mockResolvedValue({ state: 'refused', source: null, productIds: [] });
+    vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', JSON.stringify({ '24851': { secretKey: 'sk_json_a' }, '28609': { publicKey: 'pk_json_b' } }));
+    await expect(getPaymentConfigStatus()).resolves.toMatchObject(ready);
+    expect(mocks.developerStatus).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 0.23.4 verification (F3): a stored secret could not be deleted (a blank field keeps it), so after
+ * a rotation the old developer pair kept in the one-product fields stayed sealed in `payment_secret`,
+ * was hydrated into process.env on every instance, and verified forged webhooks on routes still on
+ * the synchronous check. CMS → Payments now offers a remove box under each stored secret, through the
+ * same save and its actor check.
+ */
+describe('savePaymentCredentials removing stored secrets', () => {
+  /** Every secret the form shows, stored, beside the Freemius sandbox key the form never saves. */
+  const FULL_SECRET = {
+    stripeSecretKey: 'enc:sk_live_existing',
+    stripeWebhookSecret: 'enc:whsec_existing',
+    freemiusSecretKey: 'enc:sk_fm_existing',
+    freemiusApiKey: 'enc:fm_api_existing',
+    freemiusDeveloperSecretKey: 'enc:sk_dev_existing',
+    freemiusSandboxSecretKey: 'enc:sk_fm_sandbox_existing',
+  };
+  const REMOVABLE: RemovablePaymentSecret[] = [
+    'stripeSecretKey',
+    'stripeWebhookSecret',
+    'freemiusSecretKey',
+    'freemiusApiKey',
+    'freemiusDeveloperSecretKey',
+  ];
+
+  beforeEach(() => {
+    mocks.rows.set('payment_secret', { ...FULL_SECRET });
+  });
+
+  it.each(REMOVABLE)('deletes %s from payment_secret and keeps every other stored secret as it was', async (field) => {
+    const kept: Record<string, string> = { ...FULL_SECRET };
+    delete kept[field];
+
+    await savePaymentCredentials({ ...input(), remove: [field] });
+
+    expect(mocks.rows.get('payment_secret')).toEqual(kept);
+    expect(mocks.encryptWithEnvKey).not.toHaveBeenCalled();
+    expect(mocks.upserts).toEqual([
+      { key: 'payment_public', value: PUBLIC_VALUE },
+      { key: 'payment_secret', value: kept },
+    ]);
+  });
+
+  it('deletes an old developer pair from every field at once, the one-product secret and API key included', async () => {
+    await savePaymentCredentials({ ...input(), remove: ['freemiusDeveloperSecretKey', 'freemiusSecretKey', 'freemiusApiKey'] });
+
+    expect(mocks.rows.get('payment_secret')).toEqual({
+      stripeSecretKey: 'enc:sk_live_existing',
+      stripeWebhookSecret: 'enc:whsec_existing',
+      freemiusSandboxSecretKey: 'enc:sk_fm_sandbox_existing',
+    });
+  });
+
+  it('keeps a blank field’s stored secret without its remove box, as before', async () => {
+    await savePaymentCredentials(input({ stripe: { secretKey: '   ', webhookSecret: '' }, freemius: { secretKey: '', apiKey: ' ' } }));
+    await savePaymentCredentials({ ...input(), remove: [] });
+
+    expect(mocks.rows.get('payment_secret')).toEqual(FULL_SECRET);
+    expect(mocks.upserts.map((row) => row.key)).toEqual(['payment_public', 'payment_public']);
+  });
+
+  it('stores a key typed into the field, remove box or not: the typed key replaces the stored one', async () => {
+    await savePaymentCredentials({ ...input({ freemius: { secretKey: ' sk_fm_rotated ' } }), remove: ['freemiusSecretKey'] });
+
+    expect(mocks.rows.get('payment_secret')).toEqual({ ...FULL_SECRET, freemiusSecretKey: 'enc:sk_fm_rotated' });
+    expect(mocks.encryptWithEnvKey).toHaveBeenCalledWith('sk_fm_rotated', 'site_settings:payment_secret:freemiusSecretKey');
+  });
+
+  it('writes nothing for a remove box over a secret that is not stored', async () => {
+    mocks.rows.set('payment_secret', { stripeSecretKey: 'enc:sk_live_existing' });
+
+    await savePaymentCredentials({ ...input(), remove: ['freemiusApiKey', 'freemiusDeveloperSecretKey'] });
+
+    expect(mocks.upserts).toEqual([{ key: 'payment_public', value: PUBLIC_VALUE }]);
+    expect(mocks.rows.get('payment_secret')).toEqual({ stripeSecretKey: 'enc:sk_live_existing' });
+  });
+
+  it('never deletes a field the form has no box for', async () => {
+    await savePaymentCredentials({
+      ...input(),
+      remove: ['freemiusSandboxSecretKey', '__proto__', 'constructor'] as unknown as RemovablePaymentSecret[],
+    });
+
+    expect(mocks.rows.get('payment_secret')).toEqual(FULL_SECRET);
+    expect(mocks.upserts.map((row) => row.key)).toEqual(['payment_public']);
+  });
+
+  it('refuses a removal when payment_secret cannot be read, writing nothing over it', async () => {
+    mocks.failReads.add('payment_secret');
+
+    await expect(savePaymentCredentials({ ...input(), remove: ['freemiusSecretKey'] })).rejects.toThrow('Failed to save payment credentials.');
+    expect(mocks.rows.get('payment_secret')).toEqual(FULL_SECRET);
+    expect(mocks.upserts.map((row) => row.key)).toEqual(['payment_public']);
+  });
+
+  it.each(['Unauthorized', 'Forbidden'])('checks the actor first: refused (%s), it reads and removes nothing', async (refusal) => {
+    mocks.requireEcomAdmin.mockRejectedValueOnce(new Error(refusal));
+
+    await expect(savePaymentCredentials({ ...input(), remove: REMOVABLE })).rejects.toThrow(refusal);
+    expect(mocks.reads).toEqual([]);
+    expect(mocks.upserts).toEqual([]);
+    expect(mocks.rows.get('payment_secret')).toEqual(FULL_SECRET);
+  });
+});
+
+/**
+ * The other half of F3: hydrateFreemiusEnvFromDb returned early on an empty value, so a Product ID,
+ * public key or secret cleared or removed in the CMS stayed in process.env (and so in the key
+ * policy, checkout and the webhook binding) until the process restarted. A name hydration wrote now
+ * goes back to the deployment's value, or is deleted when the deployment set none; a value it did
+ * not write is never touched, and a failed read takes nothing back.
+ */
+describe('hydrateFreemiusEnvFromDb after a CMS field is removed or cleared', () => {
+  /** Names hydration never writes: every case must leave them as they were. */
+  const UNTOUCHED = {
+    FREEMIUS_DEVELOPER_PUBLIC_KEY: 'pk_dev_deployment',
+    FREEMIUS_DEVELOPER_SECRET_KEY: 'sk_dev_deployment',
+    FREEMIUS_CHECKOUT_PRODUCTS_JSON: '{"43273":{"publicKey":"pk_json_deployment"}}',
+    FREEMIUS_SANDBOX_ENABLED: 'false',
+  };
+  /** Every name hydration may write, stubbed so each test's writes are undone after it. */
+  const HYDRATED = [
+    'FREEMIUS_SECRET_KEY',
+    'FREEMIUS_API_KEY',
+    'FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY',
+    'FREEMIUS_PUBLIC_KEY',
+    'FREEMIUS_PRODUCT_ID',
+    'FREEMIUS_DEVELOPER_ID',
+  ];
+
+  const sealed = (field: string, value: string) => secretCrypto.encryptWithEnvKey(value, slot(field));
+  const env = (name: string) => process.env[name];
+  const untouched = () => Object.fromEntries(Object.keys(UNTOUCHED).map((name) => [name, process.env[name]]));
+
+  /** CMS → Payments saved with these public fields (empty when left out), these secrets removed. */
+  const saveForm = (fields: { publicKey?: string; productId?: string; developerId?: string }, remove: RemovablePaymentSecret[] = []) =>
+    savePaymentCredentials({
+      stripe: { publishableKey: '' },
+      freemius: {
+        developerId: fields.developerId ?? '',
+        developerPublicKey: '',
+        publicKey: fields.publicKey ?? '',
+        productId: fields.productId ?? '',
+      },
+      remove,
+    });
+
+  beforeEach(() => {
+    vi.stubEnv('NEXTBLOCK_ENCRYPTION_KEY', TEST_KEY);
+    for (const name of HYDRATED) vi.stubEnv(name, '');
+    for (const [name, value] of Object.entries(UNTOUCHED)) vi.stubEnv(name, value);
+    mocks.rows.clear();
+    clearPaymentConfigCache();
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    clearPaymentConfigCache();
+  });
+
+  it('gives a removed secret’s name back to the deployment’s value, or deletes it when the deployment set none', async () => {
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_deployment');
+    vi.stubEnv('FREEMIUS_API_KEY', undefined);
+    mocks.rows.set('payment_secret', {
+      freemiusSecretKey: sealed('freemiusSecretKey', 'sk_cms_leaked'),
+      freemiusApiKey: sealed('freemiusApiKey', 'fm_api_cms'),
+    });
+
+    await hydrateFreemiusEnvFromDb();
+    expect(env('FREEMIUS_SECRET_KEY')).toBe('sk_cms_leaked');
+    expect(env('FREEMIUS_API_KEY')).toBe('fm_api_cms');
+
+    // The admin ticks both remove boxes; this instance's next request hydrates again.
+    await saveForm({}, ['freemiusSecretKey', 'freemiusApiKey']);
+    await hydrateFreemiusEnvFromDb();
+
+    expect(mocks.rows.get('payment_secret')).toEqual({});
+    expect(env('FREEMIUS_SECRET_KEY')).toBe('sk_deployment');
+    expect('FREEMIUS_API_KEY' in process.env).toBe(false);
+    expect(untouched()).toEqual(UNTOUCHED);
+  });
+
+  it('gives a cleared Product ID, public key and Developer ID back to the deployment’s values, or deletes them', async () => {
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '24851');
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_deployment');
+    vi.stubEnv('FREEMIUS_DEVELOPER_ID', undefined);
+
+    await saveForm({ publicKey: 'pk_cms_product', productId: '28609', developerId: '4242' });
+    await hydrateFreemiusEnvFromDb();
+    expect([env('FREEMIUS_PRODUCT_ID'), env('FREEMIUS_PUBLIC_KEY'), env('FREEMIUS_DEVELOPER_ID')]).toEqual(['28609', 'pk_cms_product', '4242']);
+
+    // The admin clears the three fields to unbind them: warm instances follow on their next hydration.
+    await saveForm({});
+    await hydrateFreemiusEnvFromDb();
+
+    expect(env('FREEMIUS_PRODUCT_ID')).toBe('24851');
+    expect(env('FREEMIUS_PUBLIC_KEY')).toBe('pk_deployment');
+    expect('FREEMIUS_DEVELOPER_ID' in process.env).toBe(false);
+    expect(untouched()).toEqual(UNTOUCHED);
+  });
+
+  it('never touches a value hydration did not write: the deployment’s own, or one the env changed to since', async () => {
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_deployment');
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '24851');
+
+    // Nothing stored: nothing written, nothing taken back.
+    await hydrateFreemiusEnvFromDb();
+    expect([env('FREEMIUS_SECRET_KEY'), env('FREEMIUS_PRODUCT_ID')]).toEqual(['sk_deployment', '24851']);
+
+    // Hydration writes the CMS key, then the deployment's env changes under it.
+    mocks.rows.set('payment_secret', { freemiusSecretKey: sealed('freemiusSecretKey', 'sk_cms') });
+    clearPaymentConfigCache();
+    await hydrateFreemiusEnvFromDb();
+    expect(env('FREEMIUS_SECRET_KEY')).toBe('sk_cms');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_set_since');
+
+    await saveForm({}, ['freemiusSecretKey']);
+    await hydrateFreemiusEnvFromDb();
+
+    expect(env('FREEMIUS_SECRET_KEY')).toBe('sk_set_since');
+    expect(env('FREEMIUS_PRODUCT_ID')).toBe('24851');
+    expect(untouched()).toEqual(UNTOUCHED);
+  });
+
+  it('takes nothing back after a failed read: a database blip never swaps the CMS keys for the deployment’s', async () => {
+    vi.stubEnv('FREEMIUS_SECRET_KEY', 'sk_deployment');
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '24851');
+    mocks.rows.set('payment_secret', { freemiusSecretKey: sealed('freemiusSecretKey', 'sk_cms') });
+    mocks.rows.set('payment_public', { freemius: { productId: '28609' } });
+
+    await hydrateFreemiusEnvFromDb();
+    expect([env('FREEMIUS_SECRET_KEY'), env('FREEMIUS_PRODUCT_ID')]).toEqual(['sk_cms', '28609']);
+
+    mocks.failReads.add('payment_secret');
+    mocks.failReads.add('payment_public');
+    clearPaymentConfigCache();
+    await hydrateFreemiusEnvFromDb();
+    expect([env('FREEMIUS_SECRET_KEY'), env('FREEMIUS_PRODUCT_ID')]).toEqual(['sk_cms', '28609']);
+
+    // The database answers again, without them (a missing row is an answer): now they are gone.
+    mocks.failReads.clear();
+    mocks.rows.delete('payment_secret');
+    mocks.rows.set('payment_public', { freemius: {} });
+    clearPaymentConfigCache();
+    await hydrateFreemiusEnvFromDb();
+    expect([env('FREEMIUS_SECRET_KEY'), env('FREEMIUS_PRODUCT_ID')]).toEqual(['sk_deployment', '24851']);
+  });
+
+  it('the upgrade notes’ case: an old developer pair kept in the CMS one-product fields leaves no candidate and no hydrated key once removed', async () => {
+    // The rotated pair lives in FREEMIUS_DEVELOPER_* (UNTOUCHED); the old one in the one-product fields.
+    vi.stubEnv('FREEMIUS_PUBLIC_KEY', undefined);
+    vi.stubEnv('FREEMIUS_SECRET_KEY', undefined);
+    mocks.rows.set('payment_public', { freemius: { developerId: '4242', publicKey: 'pk_dev_old', productId: '' } });
+    mocks.rows.set('payment_secret', { freemiusSecretKey: sealed('freemiusSecretKey', 'sk_dev_old') });
+    const pairs = async () => (await resolveFreemiusDeveloperCredentialCandidates()).map(({ source, secretKey }) => [source, secretKey]);
+
+    await hydrateFreemiusEnvFromDb();
+    expect(env('FREEMIUS_SECRET_KEY')).toBe('sk_dev_old');
+    expect(await pairs()).toEqual([
+      ['env', 'sk_dev_deployment'],
+      ['cms-legacy', 'sk_dev_old'],
+    ]);
+
+    // The operator clears the public key and ticks the secret's remove box.
+    await saveForm({ developerId: '4242' }, ['freemiusSecretKey']);
+    await hydrateFreemiusEnvFromDb();
+
+    expect('FREEMIUS_SECRET_KEY' in process.env).toBe(false);
+    expect('FREEMIUS_PUBLIC_KEY' in process.env).toBe(false);
+    expect(env('FREEMIUS_DEVELOPER_ID')).toBe('4242');
+    expect(await pairs()).toEqual([['env', 'sk_dev_deployment']]);
+    expect(untouched()).toEqual(UNTOUCHED);
+  });
+
+  it('on the sandbox neither writes nor takes back: it reads no payment row', async () => {
+    vi.stubEnv('FREEMIUS_PRODUCT_ID', '24851');
+    mocks.rows.set('payment_public', { freemius: { productId: '28609' } });
+    await hydrateFreemiusEnvFromDb();
+    expect(env('FREEMIUS_PRODUCT_ID')).toBe('28609');
+
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+    mocks.rows.set('payment_public', { freemius: {} });
+    mocks.reads = [];
+    clearPaymentConfigCache();
+    await hydrateFreemiusEnvFromDb();
+
+    expect(mocks.reads).toEqual([]);
+    expect(env('FREEMIUS_PRODUCT_ID')).toBe('28609');
   });
 });

@@ -28,7 +28,7 @@ const state = vi.hoisted(() => ({
 
 vi.mock('../context/AuthContext', () => ({ useAuth: () => state.auth }));
 vi.mock('../app/actions', () => ({ signOutAction: actions.signOutAction }));
-vi.mock('@nextblock-cms/utils', () => ({
+vi.mock('@nextblock-cms/utils/translations-context', () => ({
   useTranslations: () => ({ lang: state.lang, t: (key: string) => state.translations[key] ?? key }),
 }));
 

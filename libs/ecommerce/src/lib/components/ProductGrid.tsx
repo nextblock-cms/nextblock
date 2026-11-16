@@ -2,7 +2,8 @@
 
 import { Product } from '../types';
 import { ProductCard } from './ProductCard';
-import { cn, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { cn } from '@nextblock-cms/utils/utils';
 
 interface ProductGridProps {
   products: Product[];

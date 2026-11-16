@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 
-import { normalizeCurrencyCode } from '@nextblock-cms/utils';
+import { normalizeCurrencyCode } from '@nextblock-cms/utils/utils';
 
 interface CurrencyPreferenceState {
   activeCurrencyCode: string | null;

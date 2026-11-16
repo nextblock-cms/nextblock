@@ -3,7 +3,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Button, Input, Label } from '@nextblock-cms/ui';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import {
   AFFILIATE_PAYOUT_EMAIL_KINDS,
   AFFILIATE_PAYOUT_EMAIL_MAX_LENGTH,

@@ -16,8 +16,10 @@ type NavigationItem = Database['public']['Tables']['navigation_items']['Row'];
 
 const state = vi.hoisted(() => ({ lang: 'en', translations: {} as Record<string, string> }));
 
-vi.mock('@nextblock-cms/utils', async () => {
-  const actual = await vi.importActual<typeof import('@nextblock-cms/utils')>('@nextblock-cms/utils');
+vi.mock('@nextblock-cms/utils/translations-context', async () => {
+  const actual = await vi.importActual<typeof import('@nextblock-cms/utils/translations-context')>(
+    '@nextblock-cms/utils/translations-context'
+  );
   return {
     ...actual,
     // Unseeded keys answer with the key itself, exactly like the real provider.

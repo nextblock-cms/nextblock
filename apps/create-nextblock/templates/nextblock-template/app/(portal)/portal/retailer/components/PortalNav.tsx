@@ -2,7 +2,7 @@
 
 import Link, { useLinkStatus } from 'next/link';
 import { usePathname } from 'next/navigation';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import {
   AFFILIATE_PORTAL_PATH,
   AFFILIATE_PORTAL_PAYOUTS_PATH,

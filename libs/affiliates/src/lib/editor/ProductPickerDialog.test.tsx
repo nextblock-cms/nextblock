@@ -50,6 +50,16 @@ async function settle(ms = 20) {
   });
 }
 
+/**
+ * Moves the faked clock (only setTimeout and clearTimeout are faked) and lets React commit what
+ * the timers it ran scheduled. A real sleep raced the debounce under a full parallel run.
+ */
+async function advance(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
+}
+
 function typeInto(input: HTMLInputElement, value: string) {
   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(input, value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -78,37 +88,49 @@ function button(label: string): HTMLButtonElement {
 
 describe('StorefrontProductPickerDialog', () => {
   it('searches at once, then debounces typing, and shows safe thumbnails only', async () => {
-    const searchProducts = vi.fn(async (query: string) =>
-      CATALOG.filter((entry) => entry.title.toLowerCase().includes(query.toLowerCase()))
-    );
-    await render(<StorefrontProductPickerDialog open onOpenChange={() => undefined} searchProducts={searchProducts} onConfirm={() => undefined} />);
-    await settle();
+    // The debounce is asserted against a faked clock: a real 125 ms sleep against the 250 ms debounce
+    // failed once under 12 workers. Only the component's timers are faked; promises run as usual.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const searchProducts = vi.fn(async (query: string) =>
+        CATALOG.filter((entry) => entry.title.toLowerCase().includes(query.toLowerCase()))
+      );
+      await render(<StorefrontProductPickerDialog open onOpenChange={() => undefined} searchProducts={searchProducts} onConfirm={() => undefined} />);
+      // The first search waits for nothing (a 0 ms timer).
+      await advance(0);
 
-    expect(dialog().textContent).toContain('Choose products');
-    expect(searchProducts).toHaveBeenCalledTimes(1);
-    expect(searchProducts).toHaveBeenLastCalledWith('');
-    expect(dialog().textContent).toContain('3 products found');
+      expect(dialog().textContent).toContain('Choose products');
+      expect(searchProducts).toHaveBeenCalledTimes(1);
+      expect(searchProducts).toHaveBeenLastCalledWith('');
+      expect(dialog().textContent).toContain('3 products found');
 
-    const input = dialog().querySelector<HTMLInputElement>('input[type="search"]');
-    expect(input).not.toBeNull();
-    expect(document.querySelector(`label[for="${input?.id}"]`)?.textContent).toBe('Search the store');
-    await act(async () => {
-      typeInto(input as HTMLInputElement, 'c');
-      typeInto(input as HTMLInputElement, 'ca');
-      typeInto(input as HTMLInputElement, 'cand');
-    });
-    await settle(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS / 2);
-    expect(searchProducts).toHaveBeenCalledTimes(1);
-    await settle(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS + 50);
-    expect(searchProducts).toHaveBeenCalledTimes(2);
-    expect(searchProducts).toHaveBeenLastCalledWith('cand');
-    expect(dialog().textContent).toContain('1 product found');
+      const input = dialog().querySelector<HTMLInputElement>('input[type="search"]');
+      expect(input).not.toBeNull();
+      expect(document.querySelector(`label[for="${input?.id}"]`)?.textContent).toBe('Search the store');
+      await act(async () => {
+        typeInto(input as HTMLInputElement, 'c');
+        typeInto(input as HTMLInputElement, 'ca');
+        typeInto(input as HTMLInputElement, 'cand');
+      });
+      await advance(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS / 2);
+      expect(searchProducts).toHaveBeenCalledTimes(1);
+      // One millisecond short of the pause, still nothing; at the pause, one search for the last value.
+      await advance(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS / 2 - 1);
+      expect(searchProducts).toHaveBeenCalledTimes(1);
+      await advance(1);
+      expect(searchProducts).toHaveBeenCalledTimes(2);
+      expect(searchProducts).toHaveBeenLastCalledWith('cand');
+      expect(dialog().textContent).toContain('1 product found');
 
-    // A javascript: image address is never rendered; the https one is.
-    await act(async () => typeInto(input as HTMLInputElement, ''));
-    await settle(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS + 50);
-    const sources = Array.from(dialog().querySelectorAll('img')).map((img) => img.getAttribute('src'));
-    expect(sources).toEqual(['https://media.example.com/p2.jpg']);
+      // A javascript: image address is never rendered; the https one is.
+      await act(async () => typeInto(input as HTMLInputElement, ''));
+      await advance(STOREFRONT_PRODUCT_SEARCH_DEBOUNCE_MS);
+      expect(searchProducts).toHaveBeenCalledTimes(3);
+      const sources = Array.from(dialog().querySelectorAll('img')).map((img) => img.getAttribute('src'));
+      expect(sources).toEqual(['https://media.example.com/p2.jpg']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('caps the selection, keeps the pick order, reorders and confirms', async () => {

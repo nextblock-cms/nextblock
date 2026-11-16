@@ -9,10 +9,24 @@ import { createHash } from 'node:crypto';
 import { revalidatePath, updateTag } from 'next/cache';
 import { NEXTBLOCK_PACKAGES, getPackageById, type PackageDef } from '@nextblock-cms/utils';
 import { PACKAGE_ACTIVATION_CACHE_TAG } from '@nextblock-cms/db/server';
+import { FREEMIUS_API_URL, checkInstallLicense } from './freemius-license';
 
-// Freemius handles both Sandbox and Production keys on the same API domain.
-// The key itself determines the environment.
-export const FREEMIUS_API_URL = 'https://api.freemius.com/v1';
+/**
+ * What a row keeps of Freemius' activation answer. An allowlist: the rest is credentials
+ * (`FREEMIUS_CREDENTIAL_FIELDS`), and a field Freemius adds later stays out until it is needed.
+ */
+const STORED_ACTIVATION_FIELDS = [
+  'expiration',
+  'install_id',
+  'license_plan_id',
+  'license_plan_name',
+  'license_pricing_id',
+  'plugin_id',
+  'user_id',
+] as const;
+
+/** Freemius names the install in the error: "License is already activated on install 12345." */
+const ACTIVATED_INSTALL_PATTERN = /\binstall\b\D*(\d+)/i;
 
 export type PackageActivationSource = 'checkout' | 'env' | 'manual';
 
@@ -163,6 +177,61 @@ function buildActivationQuery(input: ActivateLicenseKeyInput): string {
   return params.toString();
 }
 
+function pickStoredActivationFields(data: Record<string, any>) {
+  return Object.fromEntries(
+    STORED_ACTIVATION_FIELDS.filter((field) => data[field] !== undefined).map((field) => [field, data[field]])
+  );
+}
+
+/**
+ * Freemius refuses a key already active on this install with `license_activated`, which
+ * means this CMS lost its record of the activation: a database reset or restore, a
+ * reinstall on the same host, a deactivation whose Freemius call failed. There is nothing
+ * left to activate, so the install the error names is read back and, when its license is
+ * good, stands in for the activation answer.
+ */
+async function recoverActivatedInstall(input: {
+  licenseKey: string;
+  message: string;
+  productId: string;
+  uid: string;
+}): Promise<{ data: Record<string, any> } | { error: string }> {
+  const installId = ACTIVATED_INSTALL_PATTERN.exec(input.message)?.[1];
+
+  if (!installId) {
+    return {
+      error:
+        'This key is already active on this site at Freemius, but this install lost track of it. Deactivate the license for this site in your Freemius customer portal, then activate it again.',
+    };
+  }
+
+  const { detail, license, verdict } = await checkInstallLicense(
+    { installId, productId: input.productId, uid: input.uid },
+    input.licenseKey,
+    { graceMs: 0 }
+  );
+
+  if (!verdict) {
+    console.warn(`[Packages] Could not read back install ${installId}: ${detail}`);
+    return { error: 'This key is already active on this site, but Freemius could not confirm it right now. Please try again in a few minutes.' };
+  }
+
+  if (!verdict.valid) {
+    return { error: `This license is no longer valid at Freemius (${verdict.reason}). Renew it, then activate it again.` };
+  }
+
+  return {
+    data: {
+      expiration: verdict.keepsFeatures ? null : verdict.expiration,
+      install_id: installId,
+      license_plan_id: license?.['plan_id'],
+      license_pricing_id: license?.['pricing_id'],
+      plugin_id: license?.['plugin_id'],
+      user_id: license?.['user_id'],
+    },
+  };
+}
+
 /**
  * Activate a license key against Freemius and record it locally.
  *
@@ -215,6 +284,24 @@ export async function activateLicenseKeyWithFreemius(
       }
 
       const errorCode = responseData?.error?.code;
+
+      if (errorCode === 'license_activated') {
+        const recovered = await recoverActivatedInstall({
+          licenseKey,
+          message: String(responseData.error.message ?? ''),
+          productId: p.fm_product_id,
+          uid: input.instance.uid,
+        });
+
+        if ('error' in recovered) {
+          return { code: 'freemius_error', error: recovered.error };
+        }
+
+        data = recovered.data;
+        pkg = p;
+        break;
+      }
+
       if (errorCode === 'not_found' || errorCode === 'invalid_license_key') {
         hasLicenseError = true;
       } else if (responseData?.error?.message) {
@@ -254,7 +341,7 @@ export async function activateLicenseKeyWithFreemius(
         last_validated_at: new Date().toISOString(),
         license_key: licenseKey,
         meta: {
-          ...data,
+          ...pickStoredActivationFields(data),
           fm_install_id: data.install_id,
           fm_product_id: pkg.fm_product_id,
           fm_uid: input.instance.uid,

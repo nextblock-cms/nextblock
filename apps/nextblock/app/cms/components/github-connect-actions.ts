@@ -1,8 +1,11 @@
 'use server';
 
+import 'server-only';
+
 import { cookies } from 'next/headers';
 import { revalidatePath } from 'next/cache';
 import { createClient } from '@nextblock-cms/db/server';
+import { getCmsActor } from '../../../lib/auth/cms-actor';
 import {
   startDeviceFlow,
   pollDeviceFlowOnce,
@@ -12,19 +15,38 @@ import { markSyncWorkflowInstalled } from '../../../lib/updates/check-upstream';
 
 const DEVICE_COOKIE = 'nb_gh_device';
 
-/** ADMIN gate, mirroring the rest of the CMS server entry points. */
-async function isAdmin(): Promise<boolean> {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) return false;
-  const { data: profile, error } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-  return !error && profile?.role === 'ADMIN';
+const ADMIN_REQUIRED_MESSAGE = 'Administrator role required.';
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
+
+/**
+ * ADMIN gate, mirroring the rest of the CMS server entry points: null for an ADMIN whose session
+ * passed its enrolled second factor (getCmsActor() refuses a pending one), otherwise the refusal to
+ * show. pollGithubConnect ends in a service-role write (markSyncWorkflowInstalled:
+ * system_configuration, ADMIN-only behind is_admin_mfa() since 02028), and a server action never
+ * passes the CMS layout's 2FA redirect, so until 2026-11-13 a role read through the cookie client
+ * let an ADMIN password alone reach it. A signed-in caller whose factor is pending is told to
+ * complete it, like the other actions fixed that day (until 2026-11-14 this answered
+ * "Administrator role required." to an ADMIN in that state).
+ */
+async function adminRefusal(): Promise<string | null> {
+  const actor = await getCmsActor();
+  if (actor?.role === 'ADMIN') return null;
+  if (actor) return ADMIN_REQUIRED_MESSAGE;
+  // getCmsActor() is null without a session and while an enrolled second factor is pending. The
+  // refusal stands either way; this only picks the message.
+  return (await hasSignedInUser()) ? SECOND_FACTOR_MESSAGE : ADMIN_REQUIRED_MESSAGE;
+}
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
 }
 
 export interface StartConnectResult {
@@ -38,7 +60,8 @@ export interface StartConnectResult {
 
 /** Begin the device flow; stash the device code in an httpOnly cookie for polling. */
 export async function startGithubConnect(): Promise<StartConnectResult> {
-  if (!(await isAdmin())) return { ok: false, error: 'Administrator role required.' };
+  const refusal = await adminRefusal();
+  if (refusal) return { ok: false, error: refusal };
 
   try {
     const flow = await startDeviceFlow();
@@ -69,7 +92,8 @@ export type PollConnectResult =
 
 /** Poll once; on authorization, install the workflow and clear the device cookie. */
 export async function pollGithubConnect(): Promise<PollConnectResult> {
-  if (!(await isAdmin())) return { status: 'error', error: 'Administrator role required.' };
+  const refusal = await adminRefusal();
+  if (refusal) return { status: 'error', error: refusal };
 
   const store = await cookies();
   const deviceCode = store.get(DEVICE_COOKIE)?.value;

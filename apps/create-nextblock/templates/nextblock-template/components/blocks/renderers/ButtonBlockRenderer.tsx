@@ -2,7 +2,7 @@
 import React from "react";
 import Link from "next/link";
 import { buttonVariants } from "@nextblock-cms/ui";
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 import type { VisualEditAttributes } from "../../../lib/visual-editing/types";
 
 export type ButtonBlockContent = {

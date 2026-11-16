@@ -1,5 +1,14 @@
 import { Freemius } from '@freemius/sdk';
 
+import {
+  FREEMIUS_USER_FIELDS,
+  freemiusDeveloperRequest,
+  isFreemiusApiError,
+  orNullWhenNotFound,
+  toFreemiusId,
+  withFreemiusDeveloperScope,
+} from './freemius-developer-api';
+import { createFreemiusLogThrottle } from './freemius-key-policy';
 import { hydrateFreemiusEnvFromDb } from './payment-config';
 import { resolveFreemiusCheckoutCredentials } from './providers/freemius';
 
@@ -168,18 +177,105 @@ export type FreemiusLicenseClaimResult =
   | {
       error: string;
       ok: false;
-      /** Detailed cause, for logs only; the route never sends it to the caller. */
-      reason: FreemiusLicenseClaimRejection | 'not_configured' | 'upstream_error';
+      /**
+       * Detailed cause, for logs only; the route never sends it to the caller. `credentials_refused`
+       * (Freemius answered 401/403 to the vendor's own keys) is answered like a refusal, the uniform
+       * 403, and logged as a configuration error (`logFreemiusCredentialsRefused`).
+       */
+      reason: FreemiusLicenseClaimRejection | 'credentials_refused' | 'not_configured' | 'upstream_error';
       status: number;
     };
 
 export type FreemiusLicenseRecords =
   | { license: FreemiusLicenseRecordLike | null; ok: true; user: FreemiusUserRecordLike | null }
-  | { ok: false; reason: 'not_configured' | 'upstream_error' };
+  | { ok: false; reason: 'credentials_refused' | 'not_configured' | 'upstream_error' };
+
+/** Which vendor credential Freemius refused: the developer key pair, or a product's bearer token. */
+export type FreemiusCredentialKind = 'bearer' | 'developer';
+
+/** One line a minute per credential and product, whatever drives the lookups (claims are unauthenticated). */
+const shouldLogCredentialsRefused = createFreemiusLogThrottle({ windowMs: 60_000, maxKeys: 20 });
+
+/**
+ * Logs a Freemius 401/403 on a license, subscription or user lookup as what it is: a configuration
+ * error (a wrong, revoked or out-of-scope key), never a missing license. Until 2026-11-13 the
+ * bearer path read it as "no license" (`@freemius/sdk` returns null for any failure) and the claim
+ * route logged a `console.warn` refusal, `license_not_found`, for every claim of the product.
+ * Throttled per credential kind and product; names the product and the status, never a key.
+ */
+export function logFreemiusCredentialsRefused(
+  kind: FreemiusCredentialKind,
+  productId: string,
+  status: number | null,
+  lookup: string
+): void {
+  if (!shouldLogCredentialsRefused(`${kind}:${productId}`)) {
+    return;
+  }
+
+  const answer = status === null ? 'refused' : `answered ${status}`;
+
+  console.error(
+    kind === 'bearer'
+      ? `[Freemius] Configuration error: Freemius ${answer} to product ${productId}'s API bearer token on the ${lookup}. ` +
+          "Fix that product's apiKey (its FREEMIUS_CHECKOUT_PRODUCTS_JSON entry, or FREEMIUS_API_KEY / CMS -> Payments for the one-product keys) or configure the developer key pair."
+      : `[Freemius] Configuration error: Freemius ${answer} to the developer key pair on the ${lookup} for product ${productId} ` +
+          "(a revoked pair, or one that cannot reach this product). The product's own keys are used instead, when it has any."
+  );
+}
+
+/**
+ * The status of every answer a product-scope (bearer) `@freemius/sdk` call receives, in order. The
+ * SDK's services read any failure (401, 429, 500) as null, so a wrong token or an outage looks like
+ * a missing record; the caller reads these statuses to tell them apart (`bearerMiss`).
+ */
+export function watchFreemiusAnswers(freemius: Freemius): number[] {
+  const statuses: number[] = [];
+
+  freemius.api.__unstable_ApiClient.use({
+    onResponse({ response }: { response: Response }) {
+      statuses.push(response.status);
+      return undefined;
+    },
+  });
+
+  return statuses;
+}
+
+/**
+ * What a null from an SDK lookup meant, by the status of its last answer: `null` when Freemius
+ * answered that there is no such record (404, or a 2xx without one), else the failure.
+ */
+function bearerMiss(
+  statuses: readonly number[],
+  productId: string,
+  lookup: string
+): Extract<FreemiusLicenseRecords, { ok: false }> | null {
+  const status = statuses[statuses.length - 1];
+
+  if (status === 404 || (status !== undefined && status >= 200 && status < 300)) {
+    return null;
+  }
+
+  if (status === 401 || status === 403) {
+    logFreemiusCredentialsRefused('bearer', productId, status, lookup);
+    return { ok: false, reason: 'credentials_refused' };
+  }
+
+  console.error(`[Freemius License] Freemius lookup failed: ${lookup} answered ${status ?? 'nothing'}`);
+  return { ok: false, reason: 'upstream_error' };
+}
 
 /**
  * The license and its owner as Freemius reports them, read with the vendor credentials for
- * `productId`. Credentials come from the CMS settings (hydrated here) or the environment.
+ * `productId`: the developer key pair when it works and the account owns the product (no
+ * per-product key needed), else the product's bearer from the CMS settings (hydrated here) or the
+ * environment. An id that is not a Freemius id reads as no license (the checkout callback that
+ * supplies it is untrusted, and it never reaches a request path).
+ *
+ * `license: null` means Freemius answered that there is no such license (404). A 401/403 to the
+ * vendor's keys is `credentials_refused` (bearer) or a fallback to the bearer (developer pair), each
+ * logged as a configuration error; any other failure is `upstream_error`.
  */
 export async function retrieveFreemiusLicenseRecords(
   productId: string,
@@ -187,7 +283,54 @@ export async function retrieveFreemiusLicenseRecords(
 ): Promise<FreemiusLicenseRecords> {
   await hydrateFreemiusEnvFromDb();
 
-  const credentials = resolveFreemiusCheckoutCredentials(productId);
+  const freemiusProductId = toFreemiusId(productId);
+  const freemiusLicenseId = toFreemiusId(licenseId);
+
+  if (!freemiusProductId || !freemiusLicenseId) {
+    return { license: null, ok: true, user: null };
+  }
+
+  try {
+    const viaDeveloper = await withFreemiusDeveloperScope(freemiusProductId, async () => {
+      try {
+        const license = await orNullWhenNotFound(
+          freemiusDeveloperRequest<FreemiusLicenseRecordLike>({
+            path: `/plugins/${freemiusProductId}/licenses/${freemiusLicenseId}.json`,
+          })
+        );
+        const userId = toFreemiusId(license?.user_id);
+        const user = userId
+          ? await orNullWhenNotFound(
+              freemiusDeveloperRequest<FreemiusUserRecordLike>({
+                path: `/plugins/${freemiusProductId}/users/${userId}.json`,
+                query: { fields: FREEMIUS_USER_FIELDS },
+              })
+            )
+          : null;
+
+        return { license: license && license.id ? license : null, ok: true as const, user };
+      } catch (error) {
+        // withFreemiusDeveloperScope falls back to the product's bearer on a 401/403; say why first.
+        if (isFreemiusApiError(error) && error.kind === 'auth') {
+          logFreemiusCredentialsRefused('developer', freemiusProductId, error.status, 'license lookup');
+        }
+
+        throw error;
+      }
+    });
+
+    if (viaDeveloper.handled) {
+      return viaDeveloper.value;
+    }
+  } catch (error) {
+    console.error(
+      '[Freemius License] Freemius lookup failed:',
+      isFreemiusApiError(error) ? `${error.kind} ${error.status ?? ''} ${error.message}`.trim() : 'unexpected error'
+    );
+    return { ok: false, reason: 'upstream_error' };
+  }
+
+  const credentials = resolveFreemiusCheckoutCredentials(freemiusProductId);
 
   if (!credentials.apiKey || !credentials.secretKey || !credentials.publicKey) {
     return { ok: false, reason: 'not_configured' };
@@ -195,22 +338,37 @@ export async function retrieveFreemiusLicenseRecords(
 
   const freemius = new Freemius({
     apiKey: credentials.apiKey,
-    productId: Number(productId),
+    productId: Number(freemiusProductId),
     publicKey: credentials.publicKey,
     secretKey: credentials.secretKey,
   });
+  const statuses = watchFreemiusAnswers(freemius);
 
   try {
-    const license = (await freemius.api.license.retrieve(licenseId)) as FreemiusLicenseRecordLike | null;
+    const license = (await freemius.api.license.retrieve(freemiusLicenseId)) as FreemiusLicenseRecordLike | null;
+
+    if (!license) {
+      return bearerMiss(statuses, freemiusProductId, 'license lookup') ?? { license: null, ok: true, user: null };
+    }
+
     let user: FreemiusUserRecordLike | null = null;
 
-    if (license?.user_id !== null && license?.user_id !== undefined) {
+    if (license.user_id !== null && license.user_id !== undefined) {
       user = (await freemius.api.user.retrieve(String(license.user_id))) as FreemiusUserRecordLike | null;
+
+      if (!user) {
+        const failure = bearerMiss(statuses, freemiusProductId, 'user lookup');
+
+        if (failure) return failure;
+      }
     }
 
     return { license, ok: true, user };
   } catch (error) {
-    console.error('[Freemius License] Freemius lookup failed:', error);
+    console.error(
+      '[Freemius License] Freemius lookup failed:',
+      error instanceof Error ? error.message.slice(0, 200) : 'unexpected error'
+    );
     return { ok: false, reason: 'upstream_error' };
   }
 }
@@ -224,6 +382,11 @@ export async function claimFreemiusLicenseKey(
   options?: { maxAgeMinutes?: number; now?: Date }
 ): Promise<FreemiusLicenseClaimResult> {
   const records = await retrieveFreemiusLicenseRecords(request.productId, request.licenseId);
+
+  if (!records.ok && records.reason === 'credentials_refused') {
+    // Already logged as a configuration error; the buyer sees the uniform refusal.
+    return { error: FREEMIUS_LICENSE_CLAIM_REFUSED_MESSAGE, ok: false, reason: 'credentials_refused', status: 403 };
+  }
 
   if (!records.ok) {
     return records.reason === 'not_configured'

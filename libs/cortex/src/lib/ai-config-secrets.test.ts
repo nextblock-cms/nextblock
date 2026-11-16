@@ -21,7 +21,7 @@ import { resolveCortexAiStockPhotoProviders } from './ai-global-agent-tools';
  * site_settings could move one key's envelope into another row, where a different consumer would
  * decrypt it (and the SMTP resolver would send it to a host of the writer's choosing). Each Cortex
  * AI key is now sealed for its own row and opens nowhere else; saves re-seal the keys stored
- * before 0.23.1, which still read.
+ * before 0.23.0, which still read.
  */
 
 const TEST_KEY = 'cortex-secret-slot-test-key';
@@ -108,7 +108,7 @@ describe('Cortex AI keys are bound to their rows', () => {
     expect(cortexAiSecretSlot(CORTEX_AI_OPENROUTER_SETTING_KEY)).toBe('site_settings:cortex_ai_openrouter_api_key');
   });
 
-  it('still opens a key stored before 0.23.1', () => {
+  it('still opens a key stored before 0.23.0', () => {
     expect(decryptStoredOpenRouterApiKey(legacyEnvelope(OPENROUTER_KEY, TEST_KEY))).toBe(OPENROUTER_KEY);
   });
 
@@ -129,7 +129,7 @@ describe('Cortex AI keys are bound to their rows', () => {
 });
 
 describe('resealStoredCortexAiSecrets', () => {
-  it('re-seals a key from before 0.23.1 for its row, only while the row still holds it', async () => {
+  it('re-seals a key from before 0.23.0 for its row, only while the row still holds it', async () => {
     const legacy = legacyEnvelope(OPENROUTER_KEY, TEST_KEY);
     const bound = encryptStoredCortexAiSecret(CORTEX_AI_PEXELS_SETTING_KEY, 'px-operator');
     const { client, updates } = settingsClient([

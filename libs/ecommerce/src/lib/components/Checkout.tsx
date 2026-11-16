@@ -27,7 +27,7 @@ import {
   Package,
   Download,
 } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { usePriceFormatter } from '../use-price-formatter';
 import { countries, normalizeCountryCode } from '../countries';
 import { usePaymentReadiness } from '../PaymentReadinessProvider';

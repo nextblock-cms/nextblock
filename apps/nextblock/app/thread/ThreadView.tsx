@@ -4,7 +4,7 @@ import { useActionState } from 'react';
 import { useFormStatus } from 'react-dom';
 import { Button } from '@nextblock-cms/ui/button';
 import { Textarea } from '@nextblock-cms/ui/textarea';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { CheckCircle2, Loader2, Send } from 'lucide-react';
 
 import { AuthBotProtection } from '../../components/auth/AuthBotProtection';

@@ -1,9 +1,8 @@
 // app/cms/blocks/components/EditableBlock.tsx
 "use client";
 
-import React, { useState, useEffect, useRef, Suspense, useMemo, lazy, LazyExoticComponent, ComponentType } from 'react';
+import React, { useState, useEffect, useRef, Suspense, useMemo, LazyExoticComponent, ComponentType } from 'react';
 import type { Database } from "@nextblock-cms/db";
-import PostsGridBlockEditor from '../editors/PostsGridBlockEditor';
 
 type Block = Database['public']['Tables']['blocks']['Row'];
 import { Button, Card, CardContent, Avatar, AvatarImage, AvatarFallback } from "@nextblock-cms/ui";
@@ -11,10 +10,11 @@ import { GripVertical, Edit2, Image as ImageIcon, MessageSquareQuote } from "luc
 import { blockHasEditableContent, getBlockDefinition, blockRegistry, BlockType } from '../../../../lib/blocks/blockRegistry';
 import { resolveTextAlign, resolveTextColor } from '../../../../lib/blocks/blockColors';
 import { BlockEditorModal } from './BlockEditorModal';
+import { describeMissingBlockEditor, getLazyBlockEditor, getLazyCustomBlockEditor } from './blockEditorLoaders';
 import { DeleteBlockButtonClient } from './DeleteBlockButtonClient';
 import { cn } from '@nextblock-cms/utils';
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
-import { SimpleTiptapRenderer } from '@nextblock-cms/ecommerce';
+import { SimpleTiptapRenderer } from '@nextblock-cms/ecommerce/components/SimpleTiptapRenderer';
 import { CustomBlockEditorPreview } from './CustomBlockEditorPreview';
 import { sanitizeAuthoredBlockHtml } from '../../../../lib/blocks/inlineScriptNonce';
 
@@ -52,7 +52,9 @@ export default function EditableBlock({
     if (block?.block_type === 'section') {
       const editorFilename = blockRegistry[block.block_type as BlockType]?.editorComponentFilename;
       if (editorFilename) {
-        return lazy(() => import(`../editors/${editorFilename}`));
+        const Editor = getLazyBlockEditor(editorFilename);
+        if (!Editor) console.error(describeMissingBlockEditor('section', editorFilename));
+        return Editor;
       }
     }
     return null;
@@ -68,25 +70,28 @@ export default function EditableBlock({
       setIsConfigPanelOpen(prev => !prev);
     } else {
       const blockDef = getBlockDefinition(block.block_type as BlockType);
-      
-      if (block.block_type === 'posts_grid') {
-        const LazifiedPostsGridEditor = lazy(() => Promise.resolve({ default: PostsGridBlockEditor }));
-        setLazyEditor(LazifiedPostsGridEditor);
-        setEditingBlock(block);
-      }
-      else if (blockDef?.EditorComponent) {
+
+      // Every editor file loads lazily through blockEditorLoaders (posts_grid included), so none
+      // ships in the CMS edit routes' entry chunk.
+      if (blockDef?.EditorComponent) {
         const Component = blockDef.EditorComponent;
         setLazyEditor(() => Component);
         setEditingBlock(block);
       }
       else if (blockDef?.editorComponentFilename) {
         const filename = blockDef.editorComponentFilename;
-        const Editor = lazy(() => import(`../editors/${filename.replace(/\.tsx$/, '')}`));
+        const Editor = getLazyBlockEditor(filename);
+        if (!Editor) {
+          // No mapped editor file: say which and how to map it, and open nothing (a lazy import
+          // of a missing module would throw inside Suspense).
+          console.error(describeMissingBlockEditor(block.block_type, filename));
+          return;
+        }
         setLazyEditor(Editor);
         setEditingBlock(block);
       }
       else {
-        const Editor = lazy(() => import(`../editors/DynamicCustomBlockEditor`));
+        const Editor = getLazyCustomBlockEditor();
         setLazyEditor(Editor);
         setEditingBlock(block);
       }

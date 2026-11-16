@@ -2,7 +2,7 @@
 
 import { createClient } from '@nextblock-cms/db/server';
 import type { CheckoutCustomerDefaults } from '@nextblock-cms/ecommerce';
-import { getDefaultUserAddresses } from '@nextblock-cms/ecommerce/server';
+import { getDefaultUserAddresses } from '@nextblock-cms/ecommerce/customer-addresses';
 
 /**
  * The signed-in customer's saved details for prefilling checkout, or a guest marker.

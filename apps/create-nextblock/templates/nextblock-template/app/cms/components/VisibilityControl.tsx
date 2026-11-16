@@ -57,6 +57,12 @@ import {
   type VisibilityIntent,
 } from "../../actions/visibilityActions";
 import { publishVisualEditingDraft, publishVisualEditingProductDraft } from "../../actions/visualEditingActions";
+import {
+  NO_CONTENT_DRAFT_ERROR,
+  NO_PRODUCT_DRAFT_ERROR,
+  PRODUCT_PUBLISH_ADMIN_ONLY_NOTE,
+} from "../../../lib/visual-editing/product-draft-meta";
+import { useSharedProductDraftFlag } from "../products/ProductDraftFlagProvider";
 
 interface LanguageOption {
   id: number;
@@ -64,8 +70,7 @@ interface LanguageOption {
   code: string;
 }
 
-export interface VisibilityControlProps {
-  type: PublishableType;
+interface VisibilityControlBaseProps {
   id: number | string;
   /** Live row status — never the draft overlay. */
   status: string;
@@ -77,7 +82,11 @@ export interface VisibilityControlProps {
   languageName?: string;
   translationGroupId?: string | null;
   languages?: LanguageOption[];
-  /** True when unpublished content edits exist in the Live Draft. */
+  /**
+   * True when unpublished content edits exist in the Live Draft, as the server rendered the page. On
+   * the product edit page the control also reads the flag the editor shell latches after an
+   * autosave (ProductDraftFlagProvider): that autosave creates a draft without revalidating the page.
+   */
   hasDraft?: boolean;
   /**
    * A caution to show before this content goes public — e.g. a product whose payment
@@ -87,6 +96,23 @@ export interface VisibilityControlProps {
    */
   publishWarning?: string | null;
 }
+
+export type VisibilityControlProps = VisibilityControlBaseProps &
+  (
+    | { type: Exclude<PublishableType, "product"> }
+    | {
+        type: "product";
+        /**
+         * Computed on the server (the product edit page: the caller is an ADMIN past the second
+         * factor, currentUserCanPublishProductDrafts()). Only an ADMIN can change a product's
+         * visibility (products_update_policy is is_admin(), so for anyone else
+         * setContentVisibility's UPDATE matches no row) or publish its draft (requireCmsAdmin()).
+         * Anyone else gets every visibility action disabled with a note; Copy public URL stays.
+         * The database refuses whatever this says. Required, so no product page forgets it.
+         */
+        canPublishProduct: boolean;
+      }
+  );
 
 const STATE_LABEL: Record<VisibilityState, string> = {
   draft: "Draft",
@@ -131,26 +157,55 @@ function defaultScheduleValue(): string {
   return toDateTimeLocal(soon.toISOString());
 }
 
-export default function VisibilityControl({
-  type,
-  id,
-  status,
-  publishedAt,
-  publicPath,
-  languageName,
-  translationGroupId,
-  languages = [],
-  hasDraft = false,
-  publishWarning = null,
-}: VisibilityControlProps) {
+/** A server message with its closing period, so the dialog's advice can follow it. */
+function asSentence(message: string): string {
+  const trimmed = message.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/** The draft publish found no draft: the page's flag outlived it, and there are no edits to publish. */
+function isNoDraftError(message: string): boolean {
+  return message === NO_PRODUCT_DRAFT_ERROR || message === NO_CONTENT_DRAFT_ERROR;
+}
+
+export default function VisibilityControl(props: VisibilityControlProps) {
+  const {
+    type,
+    id,
+    status,
+    publishedAt,
+    publicPath,
+    languageName,
+    translationGroupId,
+    languages = [],
+    hasDraft: serverHasDraft = false,
+    publishWarning = null,
+  } = props;
+  // A product draft the form autosaved after the page rendered counts too: the server's flag alone
+  // left the box below unoffered, and the older live version went public in place of those edits.
+  const latchedProductDraft = useSharedProductDraftFlag();
+  const hasDraft = serverHasDraft || (type === "product" && latchedProductDraft);
   const router = useRouter();
   const liveStatus = LIVE_STATUS[type];
   const state = resolveVisibilityState({ status, publishedAt, liveStatus });
+  // Publish, Schedule, Unpublish and Archive write the products row, which only an ADMIN may
+  // update: for anyone else each one failed with a database error. Pages and posts are unaffected.
+  const isProductLocked = props.type === "product" && !props.canPublishProduct;
+  const lockNoteId = React.useId();
 
   const [dialog, setDialog] = React.useState<null | "publish" | "schedule" | "unpublish" | "archive">(null);
   const [isBusy, setIsBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [alsoPublishDraft, setAlsoPublishDraft] = React.useState(true);
+  // The publish dialog published the draft, then the visibility change failed: a retry changes
+  // only the visibility (the draft is gone), and leaving the dialog shows the page as it now is.
+  const [draftPublishedHere, setDraftPublishedHere] = React.useState(false);
+  // What the draft publish warned about: fields a pre-0.23.4 draft could not publish, history not
+  // recorded, or a draft row it could not remove. It stays in the publish dialog, which stays open
+  // once the visibility changed (isPublishDone), until the editor closes it; only then does the page
+  // reload (a product) or refresh. As a toast, the reload 800 ms after the publish cut it short.
+  const [draftWarning, setDraftWarning] = React.useState<string | null>(null);
+  const [isPublishDone, setIsPublishDone] = React.useState(false);
   const [scheduleValue, setScheduleValue] = React.useState(() => toDateTimeLocal(publishedAt) || defaultScheduleValue());
   const [siblings, setSiblings] = React.useState<SiblingVisibility[] | null>(null);
 
@@ -183,6 +238,8 @@ export default function VisibilityControl({
     // A warning is not an error: seeding it into `error` renders it destructive-red and
     // `run()` clears it on the next attempt. It belongs in the dialog body instead.
     setError(null);
+    setDraftWarning(null);
+    setIsPublishDone(false);
     setAlsoPublishDraft(true);
     setSiblings(null);
     setDialog("publish");
@@ -192,36 +249,91 @@ export default function VisibilityControl({
     }
   }, [id, translationGroupId, type]);
 
+  /**
+   * The page's server data again after a write. After a product draft went live, a full reload 800 ms
+   * later, as the draft bar does (DraftStatusActions): the edit page's draft flag
+   * (ProductDraftFlagProvider) only ever latches on, so it would keep offering a draft that is gone.
+   * The draft publish's own revalidatePath has already re-rendered the page in its response, and
+   * ProductForm remounts its variations editor on that reset.
+   */
+  const showUpdatedPage = (afterProductDraftPublish: boolean) => {
+    if (afterProductDraftPublish) {
+      setTimeout(() => {
+        window.location.reload();
+      }, 800);
+      return;
+    }
+    router.refresh();
+  };
+
+  /**
+   * Cancel, Close, Escape or a click outside. After the edits went live here, the page catches up.
+   * Never while a write runs (the dialogs ignore a dismissal then): closed mid-publish, the dialog lost
+   * the draft publish's warning and the reload, and the control stayed stuck on 'This product is public'.
+   */
+  const closePublishDialog = () => {
+    setDialog(null);
+    setDraftWarning(null);
+    setIsPublishDone(false);
+    if (draftPublishedHere) {
+      setDraftPublishedHere(false);
+      showUpdatedPage(type === "product");
+    }
+  };
+
   const run = async (intent: VisibilityIntent, opts?: { publishDraft?: boolean }) => {
     setIsBusy(true);
     setError(null);
+    // Publishing the row and publishing pending edits are separate operations; the dialog offers
+    // to do both so a never-live page doesn't go public showing content the editor has already
+    // replaced. The edits go first: when they fail, nothing else is written, so the older live
+    // version never goes public in their place. A product publish also has to run before the
+    // visibility UPDATE, which sets products.updated_at: after it, publish took a pre-0.23.4
+    // draft's own title and descriptions for copies a later change had overtaken, and skipped
+    // them. Draft publish never changes status or published_at.
+    const publishesDraft = Boolean(opts?.publishDraft) && hasDraft && !draftPublishedHere;
+    let draftIsLive = draftPublishedHere;
+    // The page offered a draft that was already gone: a product reloads afterwards too, which resets
+    // the edit page's latched draft flag (the draft bar and the 'Unpublished edits' pill).
+    let draftFlagWasStale = false;
+    let warning = draftWarning;
+    const visibilityError = (message: string) =>
+      draftIsLive ? `The edits are published, but the visibility was not changed: ${message}` : message;
     try {
-      const result = await setContentVisibility(type, id, intent);
-      if (result.error) {
-        setError(result.error);
-        return;
-      }
-
-      // Publishing the row and publishing pending edits are separate operations;
-      // the dialog offers to do both so a never-live page doesn't go public
-      // showing content the editor has already replaced.
-      if (opts?.publishDraft && hasDraft) {
+      if (publishesDraft) {
         const draftResult =
           type === "product"
             ? await publishVisualEditingProductDraft(String(id))
             : await publishVisualEditingDraft(type, Number(id));
+        const draftError = draftResult && "error" in draftResult ? draftResult.error : undefined;
 
-        if (draftResult && "error" in draftResult && draftResult.error) {
-          toast.error(`Visibility updated, but the edits didn't publish: ${draftResult.error}`);
-          setDialog(null);
-          router.refresh();
+        if (draftError && isNoDraftError(draftError)) {
+          // The draft is already gone (a revision restore, a publish or discard elsewhere) while this
+          // page's flag still offered it: there are no edits to publish, so the visibility change
+          // goes on alone.
+          draftFlagWasStale = true;
+        } else if (draftError && !draftError.startsWith("Published, but")) {
+          // "Published, but failed to remove ... draft" is not a failure: the edits are live, and
+          // only the draft row stayed. It goes on below as a success with that warning.
+          setError(
+            `The visibility was not changed, because publishing the edits failed: ${asSentence(draftError)} Untick 'Publish your unpublished edits' to publish without them.`
+          );
           return;
+        } else {
+          draftIsLive = true;
+          setDraftPublishedHere(true);
+          // Published with a caveat: the revision didn't record, fields a pre-0.23.4 draft could not
+          // publish, or the draft row stayed.
+          const draftResultWarning = draftResult && "warning" in draftResult ? draftResult.warning : undefined;
+          warning = draftError || draftResultWarning || null;
+          setDraftWarning(warning);
         }
+      }
 
-        // Partial success: the edits went live but the revision didn't record.
-        if (draftResult && "success" in draftResult && draftResult.warning) {
-          toast.error(draftResult.warning, { duration: 8000 });
-        }
+      const result = await setContentVisibility(type, id, intent);
+      if (result.error) {
+        setError(visibilityError(result.error));
+        return;
       }
 
       toast.success(
@@ -233,10 +345,16 @@ export default function VisibilityControl({
               ? "Unpublished."
               : "Archived."
       );
+      if (warning) {
+        // The dialog stays open on the warning; closing it shows the updated page.
+        setIsPublishDone(true);
+        return;
+      }
       setDialog(null);
-      router.refresh();
+      setDraftPublishedHere(false);
+      showUpdatedPage((draftIsLive || draftFlagWasStale) && type === "product");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      setError(visibilityError(err instanceof Error ? err.message : "Something went wrong."));
     } finally {
       setIsBusy(false);
     }
@@ -294,7 +412,8 @@ export default function VisibilityControl({
             size="sm"
             className="rounded-r-none"
             onClick={openPublishDialog}
-            disabled={isBusy}
+            disabled={isBusy || isProductLocked}
+            aria-describedby={isProductLocked ? lockNoteId : undefined}
           >
             <Globe className="mr-2 h-4 w-4" />
             {state === "scheduled" ? "Publish now" : "Publish…"}
@@ -307,6 +426,7 @@ export default function VisibilityControl({
               variant={state === "published" ? "outline" : "default"}
               className={state === "published" ? "" : "-ml-px rounded-l-none px-2"}
               aria-label="Visibility options"
+              aria-describedby={isProductLocked ? lockNoteId : undefined}
               disabled={isBusy}
             >
               {state === "published" && <span className="mr-1">Visibility</span>}
@@ -317,6 +437,7 @@ export default function VisibilityControl({
             <DropdownMenuLabel>Visibility</DropdownMenuLabel>
             <DropdownMenuSeparator />
             <DropdownMenuItem
+              disabled={isProductLocked}
               onSelect={() => {
                 setError(null);
                 setScheduleValue(toDateTimeLocal(publishedAt) || defaultScheduleValue());
@@ -335,6 +456,7 @@ export default function VisibilityControl({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   className="text-destructive focus:text-destructive"
+                  disabled={isProductLocked}
                   onSelect={() => {
                     setError(null);
                     setDialog("unpublish");
@@ -348,6 +470,7 @@ export default function VisibilityControl({
             {state !== "archived" && (
               <DropdownMenuItem
                 className="text-destructive focus:text-destructive"
+                disabled={isProductLocked}
                 onSelect={() => {
                   setError(null);
                   setDialog("archive");
@@ -361,11 +484,17 @@ export default function VisibilityControl({
         </DropdownMenu>
       </div>
 
+      {isProductLocked ? (
+        <span id={lockNoteId} className="max-w-[16rem] text-[11px] leading-tight text-muted-foreground">
+          {PRODUCT_PUBLISH_ADMIN_ONLY_NOTE}
+        </span>
+      ) : null}
+
       {/* ---- Publish ---- */}
-      <Dialog open={dialog === "publish"} onOpenChange={(open) => !open && setDialog(null)}>
+      <Dialog open={dialog === "publish"} onOpenChange={(open) => !open && !isBusy && closePublishDialog()}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Make this {typeLabel} public?</DialogTitle>
+            <DialogTitle>{isPublishDone ? `This ${typeLabel} is public` : `Make this ${typeLabel} public?`}</DialogTitle>
             <DialogDescription>
               Anyone with the link will be able to see it, and search engines can index it.
             </DialogDescription>
@@ -384,7 +513,7 @@ export default function VisibilityControl({
             <dd>Immediately</dd>
           </dl>
 
-          {hasDraft && (
+          {hasDraft && !draftPublishedHere && (
             <label className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
               <Checkbox
                 checked={alsoPublishDraft}
@@ -414,25 +543,37 @@ export default function VisibilityControl({
 
           {publishWarning && publishWarningCallout}
 
+          {draftWarning && (
+            <div
+              role="status"
+              className="flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
+            >
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span>{draftWarning}</span>
+            </div>
+          )}
+
           {error && <p className="text-sm text-destructive">{error}</p>}
 
           <DialogFooter className="mt-2 gap-2">
-            <Button variant="outline" onClick={() => setDialog(null)} disabled={isBusy}>
-              Cancel
+            <Button variant="outline" onClick={closePublishDialog} disabled={isBusy}>
+              {isPublishDone ? "Close" : "Cancel"}
             </Button>
-            <Button
-              onClick={() => void run({ action: "publish" }, { publishDraft: alsoPublishDraft })}
-              disabled={isBusy}
-            >
-              {isBusy && busySpinner}
-              {publishWarning ? `Publish anyway` : `Publish ${typeLabel}`}
-            </Button>
+            {!isPublishDone && (
+              <Button
+                onClick={() => void run({ action: "publish" }, { publishDraft: alsoPublishDraft })}
+                disabled={isBusy}
+              >
+                {isBusy && busySpinner}
+                {publishWarning ? `Publish anyway` : `Publish ${typeLabel}`}
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       {/* ---- Schedule ---- */}
-      <Dialog open={dialog === "schedule"} onOpenChange={(open) => !open && setDialog(null)}>
+      <Dialog open={dialog === "schedule"} onOpenChange={(open) => !open && !isBusy && setDialog(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Schedule this {typeLabel}</DialogTitle>
@@ -479,7 +620,7 @@ export default function VisibilityControl({
       </Dialog>
 
       {/* ---- Unpublish ---- */}
-      <Dialog open={dialog === "unpublish"} onOpenChange={(open) => !open && setDialog(null)}>
+      <Dialog open={dialog === "unpublish"} onOpenChange={(open) => !open && !isBusy && setDialog(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Take this {typeLabel} off the live site?</DialogTitle>
@@ -510,7 +651,7 @@ export default function VisibilityControl({
       </Dialog>
 
       {/* ---- Archive ---- */}
-      <Dialog open={dialog === "archive"} onOpenChange={(open) => !open && setDialog(null)}>
+      <Dialog open={dialog === "archive"} onOpenChange={(open) => !open && !isBusy && setDialog(null)}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Archive this {typeLabel}?</DialogTitle>

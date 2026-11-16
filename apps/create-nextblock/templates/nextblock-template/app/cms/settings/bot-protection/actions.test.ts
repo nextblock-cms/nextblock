@@ -220,7 +220,7 @@ describe.each(OFF_SANDBOX)('bot protection settings actions (NEXT_PUBLIC_IS_SAND
     expect(mocks.upserts.map((row) => row.key)).toEqual(['bot_protection_public']);
   });
 
-  it('re-seals an envelope from before 0.23.1 for its field when the field is submitted empty', async () => {
+  it('re-seals an envelope from before 0.23.0 for its field when the field is submitted empty', async () => {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', createHash('sha256').update(TEST_KEY).digest(), iv);
     const ciphertext = Buffer.concat([cipher.update(SECRET, 'utf8'), cipher.final()]);

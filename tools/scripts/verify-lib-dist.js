@@ -65,10 +65,53 @@
 //      itself. Every `@nextblock-cms/<pkg>` a packed JS file imports must be in `dependencies`
 //      or `peerDependencies`; `@nextblock-cms/ecommerce` is the alias of the published
 //      `@nextblock-cms/ecom`, so it is declared under that name with an `npm:` spec.
+//  12. Dot paths in the tarball. The db build copied libs/db/src/supabase into dist whole, and
+//      through the 0.23.4 rehearsal builds that brought the Supabase CLI's local state along:
+//      .temp/ (the linked project ref, the pooler URL, the local start secrets) and .branches/.
+//      Only the copied supabase/.gitignore kept them out of the tarball (npm honours a nested
+//      ignore file inside a `files` whitelist), so renaming it, or adding an .npmignore beside it
+//      (even an empty one replaces it), would have published them. copy-db-supabase.cjs now copies
+//      no dot entry at any depth; this check refuses any packed path with a segment that starts
+//      with '.', a dot folder or a dotfile (.env files included). npm never packs .npmrc,
+//      .gitignore or .npmignore, and no lib ships a dot path on purpose, so the check has no
+//      exceptions.
+//  13. The db package's supabase/ folder. The Supabase CLI also keeps local state there that is
+//      not a dot path, which check 12 cannot see: local Studio saves SQL snippets to snippets/
+//      (read-write; a snippet can hold customer rows or a pasted key), and `gen signing-key`
+//      writes signing_keys.json. Both passed the old copy denylist and check 12. Consumers read
+//      only config.toml, migrations/ and templates/ from the package, so supabase/ must hold
+//      exactly SUPABASE_PACKAGE_ENTRIES (copy-db-supabase.cjs): no other top-level entry, and none
+//      of them missing, since a scaffold refuses a package without config.toml or migrations/.
+//      Each counts only in the shape consumers read: config.toml as exactly supabase/config.toml,
+//      migrations/ and templates/ as folders with a packed path below them (a file named
+//      supabase/migrations is refused, and holds no migration for check 14 to compare).
+//      The copy empties dist/libs/db/supabase before it copies: the db build's dts step declared
+//      the Deno edge function there (supabase/functions/nextblock-migration-ingest/index.d.ts,
+//      until libs/db/vite.config.ts excluded src/supabase), and a merge kept it, so this check
+//      refused every fresh db build.
+//  14. The files inside db's supabase/migrations and supabase/templates, which check 13 passes
+//      once the folder is allowed. Every install applies what ships in migrations/ (the build
+//      hook's migrate-core and `npm run update` take any `<digits>_*.sql`), and nothing in the
+//      release runs `npm run db:migrate:check`: a file the Supabase CLI writes with a timestamped
+//      name (`migration new`, `db diff -f`, `db pull`) would sort after every GGNNN version and run
+//      on every downstream database. So the packed migrations must pass validateMigrationNames
+//      (tools/scripts/lib/migration-naming.js: GGNNN_<snake_name>.sql, one generation, contiguous),
+//      flat, with no other file beside them (a .sql name without a <digits>_ prefix included: no
+//      applier runs it, and db:migrate:check never lists it), and templates/ may hold only the
+//      Auth email templates (*.html). A well-named migration can still be one that was never
+//      meant to ship (a work-in-progress 02043 left in the folder), so the packed names must also
+//      equal the names the /setup bundle embeds (apps/nextblock/lib/setup/migrations-bundle.ts,
+//      written by npm run generate:migrations-bundle): /setup on a serverless host applies the
+//      bundle, and the two lists drifting apart would also give /setup and npm run update
+//      different sets of migrations. A migrations/ folder that holds no top-level <digits>_*.sql
+//      file (only stray files, a subfolder or dot paths) is refused too. Only the names are compared, not the SQL: a migration edited after
+//      the bundle was generated still passes, and a file that was bundled as well still ships.
 
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { SUPABASE_PACKAGE_ENTRIES } = require('./copy-db-supabase.cjs');
+const { MIGRATION_FILE_RE, validateMigrationNames } = require('./lib/migration-naming');
 const { publishExportsFor } = require('./lib-publish-exports');
 
 const workspaceRoot = path.resolve(__dirname, '..', '..');
@@ -927,24 +970,269 @@ function findUndeclaredSiblingImports(library, distDir, packed = listPackedFiles
   return problems;
 }
 
+/* ------------------------------ 12. dot paths ------------------------------ */
+
+/**
+ * Packed paths with a segment that starts with '.'. A dot path that must ship one day gets its own
+ * commented exception here, never a looser rule. `packed` is a parameter so tests never run
+ * `npm pack`.
+ */
+function findPackedDotPaths(library, distDir, packed = listPackedFiles(distDir)) {
+  const problems = [];
+
+  for (const file of [...packed].sort()) {
+    if (!file.split('/').some((segment) => segment.startsWith('.'))) continue;
+
+    const fix =
+      library === 'db' && file.startsWith('supabase/')
+        ? 'tools/scripts/copy-db-supabase.cjs empties dist/libs/db/supabase and copies no dot entry into it, so a stale build or a step after the copy wrote it; rebuild with nx build db, and find that step if it comes back'
+        : 'stop the build from writing it to the dist folder; an ignore file only hides it until that file is renamed or shadowed';
+    problems.push(
+      `${file} would be published. Dot folders and dotfiles are local state, tool config or secrets (the Supabase CLI's .temp/, .env files), not package content: ${fix}`
+    );
+  }
+
+  return problems;
+}
+
+/* ------------------------- 13. the db package's supabase/ ------------------------- */
+
+/** The SUPABASE_PACKAGE_ENTRIES consumers read as a file; the others (migrations/, templates/) are folders. */
+const SUPABASE_FILE_ENTRIES = new Set(['config.toml']);
+
+const SUPABASE_ENTRY_READERS =
+  'new projects copy it from the package (create-nextblock refuses a package without config.toml or migrations/, and templates/ holds the Auth emails)';
+
+/**
+ * The db tarball's supabase/ folder by top-level entry (dot entries aside, check 12's): entry ->
+ * whether `supabase/<entry>` itself is a packed file (`file`) and the packed paths below it
+ * (`below`, sorted).
+ *
+ * @param {Iterable<string>} packed
+ * @returns {Map<string, { file: boolean, below: string[] }>}
+ */
+function readPackedSupabaseEntries(packed) {
+  const entries = new Map();
+
+  for (const file of [...packed].sort()) {
+    const [root, entry, ...rest] = file.split('/');
+    if (root !== 'supabase' || !entry || entry.startsWith('.')) continue;
+    if (!entries.has(entry)) entries.set(entry, { file: false, below: [] });
+    if (rest.length === 0) entries.get(entry).file = true;
+    else entries.get(entry).below.push(file);
+  }
+
+  return entries;
+}
+
+/**
+ * Whether one of SUPABASE_PACKAGE_ENTRIES ships in the shape consumers read: config.toml as exactly
+ * supabase/config.toml, migrations/ and templates/ as folders with a packed path below them.
+ */
+function hasPackedSupabaseEntry(entries, entry) {
+  const packedEntry = entries.get(entry);
+  if (!packedEntry) return false;
+  return SUPABASE_FILE_ENTRIES.has(entry) ? packedEntry.file : packedEntry.below.length > 0;
+}
+
+/**
+ * The db tarball's supabase/ folder must hold exactly SUPABASE_PACKAGE_ENTRIES (from
+ * copy-db-supabase.cjs), each in the shape consumers read (SUPABASE_FILE_ENTRIES are files, the
+ * rest folders): any other top-level entry is refused, and so is a missing one or one packed in
+ * the other shape (a file named supabase/migrations holds no migration). Dot entries are check
+ * 12's, and libs other than db ship no supabase/ folder. `packed` is a parameter so tests never
+ * run `npm pack`.
+ */
+function findSupabaseFolderProblems(library, distDir, packed = listPackedFiles(distDir)) {
+  if (library !== 'db') return [];
+
+  const entries = readPackedSupabaseEntries(packed);
+  const shipped = SUPABASE_PACKAGE_ENTRIES.join(', ');
+  const problems = [];
+
+  for (const [entry, { file, below }] of entries) {
+    if (SUPABASE_PACKAGE_ENTRIES.includes(entry)) continue;
+    // Named by its first packed path: the entry itself when it is a file.
+    problems.push(
+      `${file ? `supabase/${entry}` : below[0]} would be published. supabase/ ships only what consumers read from the package (${shipped}); the rest is the Supabase CLI's local state (local Studio's snippets/, signing_keys.json) or monorepo-only (functions/): rebuild with nx build db if dist/libs/db is stale, or add the entry to SUPABASE_PACKAGE_ENTRIES (tools/scripts/copy-db-supabase.cjs) once a consumer reads it`
+    );
+  }
+
+  for (const entry of SUPABASE_PACKAGE_ENTRIES) {
+    const packedEntry = entries.get(entry);
+    const shape = SUPABASE_FILE_ENTRIES.has(entry) ? 'file' : 'folder';
+    // A folder entry packed as a file, or a file entry with paths below it.
+    const misshapen = packedEntry && (shape === 'folder' ? packedEntry.file : packedEntry.below.length > 0);
+    if (misshapen) {
+      const inside = shape === 'file' ? ` (${packedEntry.below[0]})` : '';
+      problems.push(
+        `supabase/${entry} would be published as a ${shape === 'file' ? 'folder' : 'file'}${inside}, but consumers read it as a ${shape}: ${SUPABASE_ENTRY_READERS}; check that libs/db/src/supabase/${entry} is a ${shape} and that the db build ran tools/scripts/copy-db-supabase.cjs`
+      );
+    } else if (!hasPackedSupabaseEntry(entries, entry)) {
+      problems.push(
+        `the tarball has no supabase/${entry}: ${SUPABASE_ENTRY_READERS}; check that libs/db/src/supabase/${entry} exists and that the db build ran tools/scripts/copy-db-supabase.cjs`
+      );
+    }
+  }
+
+  return problems;
+}
+
+/* --------------------- 14. files inside db's supabase/migrations and templates --------------------- */
+
+const SHIPPED_MIGRATIONS_RULE =
+  'every install applies the migrations this package ships (migrate-core and npm run update take any <digits>_*.sql), so only the ' +
+  "current generation's GGNNN_<snake_name>.sql files may ship: rename or remove it in libs/db/src/supabase/migrations (the " +
+  "Supabase CLI's migration new, db diff -f and db pull write timestamped names), run npm run db:migrate:check and rebuild";
+
+/** The /setup wizard's embedded migrations, generated by tools/scripts/generate-migrations-bundle.ts. */
+const MIGRATIONS_BUNDLE_PATH = 'apps/nextblock/lib/setup/migrations-bundle.ts';
+const MIGRATIONS_BUNDLE_RULE =
+  `migrate-core and npm run update apply the migrations this package ships, while /setup on a serverless host applies the ones ` +
+  `${MIGRATIONS_BUNDLE_PATH} embeds, so the two lists must match`;
+
+/**
+ * The file names the /setup bundle embeds: the `name` of each MIGRATIONS_BUNDLE entry, read with the
+ * TypeScript parser, so an entry's SQL (one JSON-escaped string, which may well say "name") is never
+ * taken for one. Throws, naming npm run generate:migrations-bundle, when the file cannot be read or
+ * holds no such array of entries with string names.
+ */
+function readBundledMigrationNames(bundleFile = path.join(workspaceRoot, ...MIGRATIONS_BUNDLE_PATH.split('/'))) {
+  const ts = require('typescript');
+  const relative = path.relative(workspaceRoot, bundleFile);
+  const shown = relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative.split(path.sep).join('/') : bundleFile;
+  const fail = (reason) => new Error(`${shown} ${reason}; regenerate it with npm run generate:migrations-bundle`);
+
+  let text;
+  try {
+    text = fs.readFileSync(bundleFile, 'utf8');
+  } catch (error) {
+    throw fail(`cannot be read (${error.code || error.message})`);
+  }
+
+  const source = ts.createSourceFile(bundleFile, text, ts.ScriptTarget.Latest, false, ts.ScriptKind.TS);
+  const declaration = source.statements
+    .filter((statement) => ts.isVariableStatement(statement))
+    .flatMap((statement) => [...statement.declarationList.declarations])
+    .find((candidate) => ts.isIdentifier(candidate.name) && candidate.name.text === 'MIGRATIONS_BUNDLE');
+  let list = declaration && declaration.initializer;
+  while (list && (ts.isAsExpression(list) || ts.isSatisfiesExpression(list) || ts.isParenthesizedExpression(list))) {
+    list = list.expression;
+  }
+  if (!list || !ts.isArrayLiteralExpression(list)) throw fail('declares no MIGRATIONS_BUNDLE array');
+
+  return list.elements.map((element, index) => {
+    const property = ts.isObjectLiteralExpression(element)
+      ? element.properties.find(
+          (candidate) =>
+            ts.isPropertyAssignment(candidate) && !ts.isComputedPropertyName(candidate.name) && candidate.name.text === 'name'
+        )
+      : undefined;
+    if (!property || !ts.isStringLiteralLike(property.initializer)) {
+      throw fail(`has a MIGRATIONS_BUNDLE entry (index ${index}) without a string "name"`);
+    }
+    return property.initializer.text;
+  });
+}
+
+/**
+ * Problems with the files in the db tarball's supabase/migrations and supabase/templates:
+ * - in migrations/, anything but a top-level `<digits>_*.sql` file (what the appliers and
+ *   `npm run db:migrate:check` read; a seed.sql there is no migration, and no applier runs it), and the
+ *   names validateMigrationNames refuses (GGNNN_<snake_name>.sql, one generation, contiguous from
+ *   000), with db:migrate:check's hint;
+ * - a packed migration the /setup bundle does not embed, and a bundled one the tarball lacks
+ *   (`bundledMigrationNames`, default readBundledMigrationNames()), compared by name, not SQL; a
+ *   packed name that already fails validateMigrationNames on its own is reported for that alone,
+ *   since the generator refuses to bundle it until it is fixed; a migrations/ folder with no
+ *   migration at all gets one problem for the whole bundle;
+ * - in templates/, anything but *.html.
+ * Dot paths are check 12's, a missing folder (or one packed as a file) is check 13's, and libs
+ * other than db ship no supabase/ folder. `packed` is a parameter so tests never run `npm pack`.
+ *
+ * @param {string} library
+ * @param {string} distDir
+ * @param {Set<string>} [packed]
+ * @param {{ bundledMigrationNames?: Iterable<string> }} [options]
+ */
+function findSupabaseFileProblems(library, distDir, packed = listPackedFiles(distDir), { bundledMigrationNames } = {}) {
+  if (library !== 'db') return [];
+
+  const migrations = [];
+  const problems = [];
+
+  for (const file of [...packed].sort()) {
+    const segments = file.split('/');
+    if (segments[0] !== 'supabase' || segments.length < 3 || segments.some((segment) => segment.startsWith('.'))) continue;
+
+    if (segments[1] === 'migrations') {
+      if (segments.length === 3 && MIGRATION_FILE_RE.test(segments[2])) {
+        migrations.push(segments[2]);
+      } else {
+        problems.push(
+          `${file} would be published. supabase/migrations holds only migrations, as top-level GGNNN_<snake_name>.sql files: remove it from libs/db/src/supabase/migrations`
+        );
+      }
+    } else if (segments[1] === 'templates' && !file.endsWith('.html')) {
+      problems.push(
+        `${file} would be published. supabase/templates holds only the Auth email templates (*.html) that new projects upload: remove it from libs/db/src/supabase/templates`
+      );
+    }
+  }
+
+  if (migrations.length === 0) {
+    // A missing supabase/migrations, or one packed as a file, is check 13's. A folder that holds only
+    // stray files (reported above) or dot paths (check 12's) ships no migration either: one problem
+    // for the whole bundle, rather than one per bundled name.
+    if (hasPackedSupabaseEntry(readPackedSupabaseEntries(packed), 'migrations')) {
+      const bundled = new Set(bundledMigrationNames ?? readBundledMigrationNames());
+      if (bundled.size > 0) {
+        problems.push(
+          `the tarball ships none of the ${bundled.size} migration${bundled.size === 1 ? '' : 's'} the /setup bundle embeds (${MIGRATIONS_BUNDLE_RULE}): restore them in libs/db/src/supabase/migrations as top-level files (migrations are append-only) and rebuild`
+        );
+      }
+    }
+    return problems;
+  }
+
+  const misnamed = new Set();
+  for (const error of validateMigrationNames(migrations).errors) {
+    const named = migrations.find((name) => error.startsWith(`${name}: `));
+    if (named) misnamed.add(named);
+    problems.push(`${named ? `supabase/migrations/${error}` : `supabase/migrations: ${error}`}; ${SHIPPED_MIGRATIONS_RULE}`);
+  }
+
+  const bundled = new Set(bundledMigrationNames ?? readBundledMigrationNames());
+  for (const name of migrations) {
+    if (bundled.has(name) || misnamed.has(name)) continue;
+    problems.push(
+      `supabase/migrations/${name} would be published, but the /setup bundle does not embed it (${MIGRATIONS_BUNDLE_RULE}): if it is not meant for this release, take it out of libs/db/src/supabase/migrations and rebuild; if it is, run npm run generate:migrations-bundle`
+    );
+  }
+  for (const name of [...bundled].sort()) {
+    if (migrations.includes(name)) continue;
+    problems.push(
+      `supabase/migrations/${name} is embedded in the /setup bundle, but the tarball does not ship it (${MIGRATIONS_BUNDLE_RULE}): run npm run generate:migrations-bundle if the bundle is stale, or restore the file in libs/db/src/supabase/migrations (migrations are append-only) and rebuild`
+    );
+  }
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
 /**
+ * Every problem the checks find in a built lib, `packed` being the tarball's file list (from
+ * listPackedFiles). verifyLibDist runs `npm pack --dry-run` once and hands it here; tests hand in
+ * their own list, so each check's place in the release gate is tested without `npm pack`.
+ *
  * @param {string} library
- * @param {{ manifestFinalized?: boolean }} [options] `manifestFinalized`: the dist package.json
- *   is the one that will be published (release-lib.js has normalized it).
+ * @param {string} distDir
+ * @param {Set<string>} packed
+ * @param {{ manifestFinalized?: boolean, bundledMigrationNames?: Iterable<string> }} [options] as for verifyLibDist
  */
-function verifyLibDist(library, options = {}) {
-  const distDir = distDirFor(library);
-
-  if (!fs.existsSync(distDir)) {
-    throw new Error(`Build output not found at ${distDir}`);
-  }
-
-  // One `npm pack --dry-run` for every check that reads the tarball's file list.
-  const packed = listPackedFiles(distDir);
-
-  const problems = [
+function collectDistProblems(library, distDir, packed, options = {}) {
+  return [
     ...findDevelopmentArtifacts(distDir).map((entry) => `development build artifact: ${entry}`),
     ...findUnresolvableSubpaths(library, distDir).map((entry) => `unresolvable subpath: ${entry}`),
     ...findLostExports(library, distDir).map((entry) => `lost export: ${entry}`),
@@ -956,7 +1244,34 @@ function verifyLibDist(library, options = {}) {
     ...findWorkspaceProtocolDependencies(library, distDir, options).map((entry) => `workspace dependency: ${entry}`),
     ...findSideEffectsProblems(library, distDir, packed).map((entry) => `side effects: ${entry}`),
     ...findUndeclaredSiblingImports(library, distDir, packed).map((entry) => `undeclared sibling: ${entry}`),
+    ...findPackedDotPaths(library, distDir, packed).map((entry) => `dot path: ${entry}`),
+    ...findSupabaseFolderProblems(library, distDir, packed).map((entry) => `supabase folder: ${entry}`),
+    ...findSupabaseFileProblems(library, distDir, packed, options).map((entry) => `supabase file: ${entry}`),
   ];
+}
+
+/**
+ * @param {string} library
+ * @param {{
+ *   manifestFinalized?: boolean,
+ *   distDir?: string,
+ *   listPackedFiles?: (distDir: string) => Iterable<string>,
+ *   bundledMigrationNames?: Iterable<string>,
+ * }} [options] `manifestFinalized`: the dist package.json is the one that will be published
+ *   (release-lib.js has normalized it). `distDir` (default dist/libs/<lib>) and `listPackedFiles`
+ *   (default `npm pack --dry-run` there) let a test run the gate itself on a fixture and a file list,
+ *   and `bundledMigrationNames` (default: the names the /setup bundle embeds, readBundledMigrationNames)
+ *   stands in for the bundle check 14 compares db's packed migrations with.
+ */
+function verifyLibDist(library, options = {}) {
+  const { distDir = distDirFor(library), listPackedFiles: packFiles = listPackedFiles, ...checkOptions } = options;
+
+  if (!fs.existsSync(distDir)) {
+    throw new Error(`Build output not found at ${distDir}`);
+  }
+
+  // One `npm pack --dry-run` for every check that reads the tarball's file list.
+  const problems = collectDistProblems(library, distDir, new Set(packFiles(distDir)), checkOptions);
 
   if (problems.length > 0) {
     const shown = problems.slice(0, 25).map((entry) => `  - ${entry}`).join('\n');
@@ -972,6 +1287,7 @@ function verifyLibDist(library, options = {}) {
 
 module.exports = {
   verifyLibDist,
+  collectDistProblems,
   findUnpackedFiles,
   findRequireShims,
   findModuleFormatProblems,
@@ -979,6 +1295,10 @@ module.exports = {
   findWorkspaceProtocolDependencies,
   findSideEffectsProblems,
   findUndeclaredSiblingImports,
+  findPackedDotPaths,
+  findSupabaseFolderProblems,
+  findSupabaseFileProblems,
+  readBundledMigrationNames,
 };
 
 if (require.main === module) {

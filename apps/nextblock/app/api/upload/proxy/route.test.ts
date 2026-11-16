@@ -2,8 +2,18 @@ import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  getUser: vi.fn(),
-  profileSingle: vi.fn(),
+  /**
+   * The cookie session the route's getCmsActor() reads (the real one, with evaluateTwoFactor()
+   * behind it): the user, their own profile role, the second factor they enrolled, the session's
+   * assurance level.
+   */
+  session: {
+    user: { id: 'writer-1' } as { id: string } | null,
+    role: 'WRITER' as string | null,
+    mfa: null as { mfa_enabled: boolean; mfa_type: 'totp' | 'email' } | null,
+    aal: 'aal1' as 'aal1' | 'aal2',
+  },
+  getServiceRoleSupabaseClient: vi.fn(),
   getStorageBackend: vi.fn(),
   getStorageBucket: vi.fn(),
   getS3Client: vi.fn(),
@@ -13,13 +23,41 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@nextblock-cms/db/server', () => ({
   createClient: () => ({
-    auth: { getUser: mocks.getUser },
-    from: () => ({
+    auth: {
+      getUser: async () => ({ data: { user: mocks.session.user }, error: null }),
+      mfa: {
+        getAuthenticatorAssuranceLevel: async () => ({
+          data: { currentLevel: mocks.session.aal, nextLevel: 'aal2' },
+          error: null,
+        }),
+      },
+    },
+    from: (table: string) => ({
       select: () => ({
-        eq: () => ({ single: mocks.profileSingle }),
+        eq: () => {
+          const read = async () => {
+            if (table === 'profiles') {
+              return { data: mocks.session.role ? { role: mocks.session.role } : null, error: null };
+            }
+            if (table === 'user_security_settings') return { data: mocks.session.mfa, error: null };
+            throw new Error(`Unexpected cookie-client read of ${table}`);
+          };
+          // `single` too: the pre-2026-11-14 route read the role that way, so a return to it is
+          // judged by the refusals below rather than by a missing method.
+          return { maybeSingle: read, single: read };
+        },
       }),
     }),
   }),
+  getServiceRoleSupabaseClient: mocks.getServiceRoleSupabaseClient,
+}));
+// No trusted-device or email-code cookie: a second factor counts only through the session itself.
+vi.mock('next/headers', () => ({
+  cookies: async () => ({ get: () => undefined, set: () => undefined }),
+}));
+// Read only by the trusted-device and reminder paths, never on the way to these decisions.
+vi.mock('../../../../lib/privacy/settings', () => ({
+  getSecuritySettings: async () => ({ enforce_staff_2fa: false, trusted_device_days: 30 }),
 }));
 vi.mock('@nextblock-cms/utils/server', () => ({
   getS3Client: mocks.getS3Client,
@@ -59,8 +97,8 @@ function multipartRequest(parts: { file?: FilePart; folder?: string }) {
 }
 
 function signIn(role: string | null, user: { id: string } | null = WRITER) {
-  mocks.getUser.mockResolvedValue({ data: { user }, error: null });
-  mocks.profileSingle.mockResolvedValue({ data: role ? { role } : null, error: null });
+  mocks.session.user = user;
+  mocks.session.role = role;
 }
 
 async function json(response: Response) {
@@ -69,7 +107,10 @@ async function json(response: Response) {
 
 describe('POST /api/upload/proxy', () => {
   beforeEach(() => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
     signIn('WRITER');
+    mocks.session.mfa = null;
+    mocks.session.aal = 'aal1';
     mocks.getStorageBackend.mockReturnValue('s3');
     mocks.getStorageBucket.mockReturnValue('media');
     mocks.getS3Client.mockResolvedValue({ send: mocks.s3Send });
@@ -79,8 +120,61 @@ describe('POST /api/upload/proxy', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     vi.clearAllMocks();
+  });
+
+  // A route handler never passes the CMS layout's 2FA redirect. Until 2026-11-14 this route read
+  // the role through the cookie client, so a staff password alone (the first factor) uploaded.
+  describe('second factor', () => {
+    const SECOND_FACTOR = 'Complete two-factor verification, then try again.';
+
+    it.each([
+      ['a WRITER whose enrolled authenticator app this session has not passed (aal1)', 'WRITER', 'totp', 's3'],
+      ['an ADMIN whose enrolled email code this session has not passed', 'ADMIN', 'email', 's3'],
+      ['a WRITER with a pending authenticator app on the native Supabase backend', 'WRITER', 'totp', 'supabase'],
+    ] as const)('refuses %s before reading the body or touching storage', async (_label, role, factor, backend) => {
+      signIn(role);
+      mocks.session.mfa = { mfa_enabled: true, mfa_type: factor };
+      mocks.getStorageBackend.mockReturnValue(backend);
+      const pending = multipartRequest({ file: { name: 'a.png', type: 'image/png' } });
+
+      const response = await POST(pending);
+
+      expect(response.status).toBe(403);
+      expect(await json(response)).toEqual({ error: SECOND_FACTOR });
+      expect(pending.bodyUsed).toBe(false);
+      expect(mocks.getStorageBackend).not.toHaveBeenCalled();
+      expect(mocks.getS3Client).not.toHaveBeenCalled();
+      expect(mocks.s3Send).not.toHaveBeenCalled();
+      expect(mocks.supabaseUploadObject).not.toHaveBeenCalled();
+      expect(mocks.getServiceRoleSupabaseClient).not.toHaveBeenCalled();
+    });
+
+    it('403s a USER past an enrolled second factor (aal2): the factor is not a role', async () => {
+      signIn('USER');
+      mocks.session.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+      mocks.session.aal = 'aal2';
+
+      const response = await POST(multipartRequest({ file: { name: 'a.png', type: 'image/png' } }));
+
+      expect(response.status).toBe(403);
+      expect(await json(response)).toEqual({ error: 'Forbidden: Insufficient permissions' });
+      expect(mocks.s3Send).not.toHaveBeenCalled();
+    });
+
+    it.each(['WRITER', 'ADMIN'])('uploads for a %s whose session passed the enrolled authenticator app (aal2)', async (role) => {
+      signIn(role, { id: 'staff-1' });
+      mocks.session.mfa = { mfa_enabled: true, mfa_type: 'totp' };
+      mocks.session.aal = 'aal2';
+
+      const response = await POST(multipartRequest({ file: { name: 'a.png', type: 'image/png' } }));
+
+      expect(response.status).toBe(200);
+      const command = mocks.s3Send.mock.calls[0][0] as { input: Record<string, unknown> };
+      expect(command.input.Metadata).toEqual({ 'uploader-user-id': 'staff-1' });
+    });
   });
 
   describe('access control', () => {

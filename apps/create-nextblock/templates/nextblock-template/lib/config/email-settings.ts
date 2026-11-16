@@ -159,7 +159,7 @@ export type SaveEmailSettingsInput = {
 
 /**
  * Persist email settings. Public fields always overwrite; secret fields are encrypted
- * and only written when a new value is supplied, and a stored credential from before 0.23.1 is
+ * and only written when a new value is supplied, and a stored credential from before 0.23.0 is
  * re-sealed for its field on every save. Refuses everything on the sandbox: its
  * admin login is public, and a saved host would steer where mail goes (2026-11-03: with the
  * credentials left to SMTP_USER / SMTP_PASS, a visitor could point it at their own server and
@@ -196,7 +196,7 @@ export async function saveEmailSettings(input: SaveEmailSettingsInput): Promise<
   const newUser = input.user?.trim();
   const newPass = input.pass?.trim();
   // Read-merge so updating only one of user/pass keeps the other. What is kept is re-sealed for
-  // its own field: an envelope from before 0.23.1 opens in any slot, so every save, one that
+  // its own field: an envelope from before 0.23.0 opens in any slot, so every save, one that
   // changes neither credential included, leaves both bound to where they are stored.
   const { data: existing, error: readError } = await supabase
     .from('site_settings')

@@ -1,5 +1,5 @@
 import { formatAffiliateMoney } from '@nextblock-cms/affiliates';
-import { getCurrencyMinorUnitFactor, normalizeCurrencyCode } from '@nextblock-cms/utils';
+import { getCurrencyMinorUnitFactor, normalizeCurrencyCode } from '@nextblock-cms/utils/utils';
 
 /**
  * Money on the `/partners` page, shared by the server-rendered hero card and the calculator island

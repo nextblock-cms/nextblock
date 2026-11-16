@@ -3,14 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 type Row = Record<string, any>;
 type Tables = Record<string, Row[]>;
 
+/** How an update can fail: a PostgREST error, a filter that matched no row, or a request that rejects. */
+type UpdateFailure = Record<string, unknown> | 'no-rows' | Error;
+
 const mocks = vi.hoisted(() => {
   const state: {
     tables: Tables;
     /** Refuse an insert the way PostgREST would (no row is stored): return the error. */
     rejectInsert: ((table: string, rows: Row[]) => Record<string, unknown> | null) | null;
+    /** Fail an update (no row changes): return how, or null to let it through. */
+    failUpdate: ((table: string, values: Row) => UpdateFailure | null) | null;
     /** The configured Stripe secret key (its prefix is the payment mode an attributed order records). */
     secretKey: string | null;
-  } = { tables: {}, rejectInsert: null, secretKey: null };
+  } = { tables: {}, rejectInsert: null, failUpdate: null, secretKey: null };
   const stripe = {
     customers: {
       list: vi.fn(async () => ({ data: [] })),
@@ -20,6 +25,7 @@ const mocks = vi.hoisted(() => {
     checkout: {
       sessions: {
         create: vi.fn(async () => ({ id: 'cs_test', url: 'https://checkout.stripe.test/cs_test' })),
+        expire: vi.fn(async (id: string) => ({ id, status: 'expired' })),
       },
     },
   };
@@ -34,6 +40,7 @@ const mocks = vi.hoisted(() => {
     private filters: Array<(row: Row) => boolean> = [];
     private ordering: { path: string; ascending: boolean } | null = null;
     private pendingUpdate: Row | null = null;
+    private updateFailure: UpdateFailure | null = null;
     private inserted: Row[] | null = null;
     private insertError: Record<string, unknown> | null = null;
 
@@ -87,17 +94,18 @@ const mocks = vi.hoisted(() => {
 
     update(value: Row) {
       this.pendingUpdate = value;
+      this.updateFailure = state.failUpdate?.(this.table, value) ?? null;
       return this;
     }
 
     maybeSingle() {
-      return this.resolve().then((result) => ({ data: result.data[0] ?? null, error: null }));
+      return this.resolve().then((result) => ({ data: result.data?.[0] ?? null, error: null }));
     }
 
     single() {
       return this.resolve().then((result) => ({
-        data: result.error ? null : result.data[0] ?? null,
-        error: result.error ?? (result.data[0] ? null : { message: `${this.table}: no rows` }),
+        data: result.error ? null : result.data?.[0] ?? null,
+        error: result.error ?? (result.data?.[0] ? null : { message: `${this.table}: no rows` }),
       }));
     }
 
@@ -105,13 +113,23 @@ const mocks = vi.hoisted(() => {
       return this.resolve().then(onFulfilled, onRejected);
     }
 
-    private async resolve(): Promise<{ data: Row[]; error: Record<string, unknown> | null }> {
+    private async resolve(): Promise<{ data: Row[] | null; error: Record<string, unknown> | null }> {
       if (this.insertError) {
         return { data: [], error: this.insertError };
       }
 
       if (this.inserted) {
         return { data: this.inserted, error: null };
+      }
+
+      if (this.pendingUpdate && this.updateFailure) {
+        if (this.updateFailure instanceof Error) {
+          throw this.updateFailure;
+        }
+
+        return this.updateFailure === 'no-rows'
+          ? { data: [], error: null }
+          : { data: null, error: this.updateFailure };
       }
 
       const matched = this.rows().filter((row) => this.filters.every((filter) => filter(row)));
@@ -158,12 +176,10 @@ vi.mock('@nextblock-cms/db/server', () => ({
   getServiceRoleSupabaseClient: () => ({}),
   getSsgSupabaseClient: () => ({}),
 }));
+// What freemius-pricing-server.ts and shipping-rate-currency.ts take from the barrel (currency.ts
+// imports '@nextblock-cms/utils/utils', which this mock does not replace).
 vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number, currencyCode?: string | null) =>
-    `${currencyCode || 'USD'} ${amount}`,
-  getCurrencyMinorUnitFactor: () => 100,
   majorUnitAmountToMinor: (amount: number) => Math.round(amount * 100),
-  minorUnitAmountToMajor: (amount: number) => amount / 100,
   normalizeCurrencyCode: (code?: string | null) => (code || 'USD').trim().toUpperCase(),
 }));
 vi.mock('server-only', () => ({}));
@@ -311,8 +327,12 @@ describe('StripeProvider.createCheckoutSession', () => {
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'service-role-test-key');
     mocks.state.tables = seedTables();
     mocks.state.rejectInsert = null;
+    mocks.state.failUpdate = null;
     mocks.state.secretKey = 'sk_test_provider';
     mocks.stripe.checkout.sessions.create.mockClear();
+    mocks.stripe.checkout.sessions.expire
+      .mockReset()
+      .mockImplementation(async (id: string) => ({ id, status: 'expired' }));
     vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
   });
@@ -358,6 +378,78 @@ describe('StripeProvider.createCheckoutSession', () => {
       await checkout({ locale: 'fr' });
 
       expect(sessionLineItems()[1].name).toBe('Livraison standard');
+    });
+  });
+
+  /**
+   * The checkout success page asks Stripe about a session only once an order stores its id
+   * (`orders.stripe_session_id`, app/checkout/success/actions.ts), so a forged `cs_` id never
+   * spends the operator's Stripe rate limit. Until this check, a failed write of that id was only
+   * logged and the buyer still got the URL: they paid, and the success page answered "Order not
+   * found" (no invoice, and without a webhook the order was never marked paid).
+   */
+  describe('the session id the success page looks up', () => {
+    const PAYMENTS_UNAVAILABLE = {
+      url: null,
+      error: 'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
+      errorKey: 'ecommerce.checkout_payments_unavailable',
+      errorStatus: 503,
+    };
+
+    /** Fail only the write of the session id onto the order; every other write goes through. */
+    function failSessionIdWrite(failure: UpdateFailure) {
+      mocks.state.failUpdate = (table, values) =>
+        table === 'orders' && 'stripe_session_id' in values ? failure : null;
+    }
+
+    /** The success page's lookup: the order that stores this session id. */
+    function orderStoringSession(sessionId: string) {
+      return mocks.state.tables.orders.find((row) => row.stripe_session_id === sessionId) ?? null;
+    }
+
+    function sessionOrderId() {
+      const call = mocks.stripe.checkout.sessions.create.mock.calls[0] as unknown as [{ metadata: { orderId: string } }];
+      return call[0].metadata.orderId;
+    }
+
+    it('hands out the URL once the order the session names stores its id, the row the success page finds', async () => {
+      const result = await checkout();
+
+      expect(result).toEqual({ url: 'https://checkout.stripe.test/cs_test' });
+      expect(orderStoringSession('cs_test')).toMatchObject({ id: sessionOrderId(), status: 'pending' });
+      expect(mocks.stripe.checkout.sessions.expire).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, UpdateFailure]>([
+      ['the database refuses the write', { code: '57014', message: 'canceling statement due to statement timeout' }],
+      ['the write matches no order row', 'no-rows'],
+      ['the request itself fails', new TypeError('fetch failed')],
+    ])('expires the session and answers the keyed 503, never the URL, when %s', async (_label, failure) => {
+      failSessionIdWrite(failure);
+
+      const result = await checkout();
+
+      expect(result).toEqual(PAYMENTS_UNAVAILABLE);
+      expect(JSON.stringify(result)).not.toContain('checkout.stripe.test');
+      expect(mocks.stripe.checkout.sessions.create).toHaveBeenCalledTimes(1);
+      expect(mocks.stripe.checkout.sessions.expire).toHaveBeenCalledTimes(1);
+      expect(mocks.stripe.checkout.sessions.expire).toHaveBeenCalledWith('cs_test');
+      // Nothing is marked paid: the order fails, and no order names the session.
+      expect(mocks.state.tables.orders).toHaveLength(1);
+      expect(mocks.state.tables.orders[0]).toMatchObject({ id: sessionOrderId(), status: 'failed' });
+      expect(mocks.state.tables.orders[0]).not.toHaveProperty('paid_at');
+      expect(orderStoringSession('cs_test')).toBeNull();
+    });
+
+    it('still withholds the URL when Stripe refuses to expire the session too', async () => {
+      failSessionIdWrite({ code: '57014', message: 'canceling statement due to statement timeout' });
+      mocks.stripe.checkout.sessions.expire.mockRejectedValueOnce(new Error('Stripe is unreachable'));
+
+      const result = await checkout();
+
+      expect(result).toEqual(PAYMENTS_UNAVAILABLE);
+      expect(mocks.stripe.checkout.sessions.expire).toHaveBeenCalledWith('cs_test');
+      expect(mocks.state.tables.orders[0].status).toBe('failed');
     });
   });
 

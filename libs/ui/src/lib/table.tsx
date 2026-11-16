@@ -1,7 +1,7 @@
 "use client"
 import * as React from "react"
 
-import { cn } from "@nextblock-cms/utils"
+import { cn } from "@nextblock-cms/utils/utils"
 
 const Table = React.forwardRef<
   HTMLTableElement,

@@ -3,11 +3,11 @@
 import { Product } from '../types';
 import { AddToCartButton } from './AddToCartButton';
 import { ShortDescription } from './ShortDescription';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import Link from 'next/link';
 
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { useCurrency } from '../CurrencyProvider';
 import {
   resolveEffectivePriceForCurrency,

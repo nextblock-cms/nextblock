@@ -4,7 +4,7 @@ import {
   majorUnitAmountToMinor,
   minorUnitAmountToMajor,
   normalizeCurrencyCode,
-} from '@nextblock-cms/utils';
+} from '@nextblock-cms/utils/utils';
 
 export const CURRENCY_ROUNDING_MODES = [
   'none',

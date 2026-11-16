@@ -11,7 +11,7 @@ import { Input } from '@nextblock-cms/ui';
 import { Label } from '@nextblock-cms/ui';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@nextblock-cms/ui';
 import { Textarea } from '@nextblock-cms/ui';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { HONEYPOT_FIELD } from '../../../lib/botProtection/fields';
 import { useLabel } from '../../../lib/i18n/use-label';
 import type { VisualEditAttributes } from '../../../lib/visual-editing/types';

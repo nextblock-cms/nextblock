@@ -9,8 +9,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ params: new URLSearchParams() }));
 
-vi.mock('@nextblock-cms/utils', async () => {
-  const actual = await vi.importActual<typeof import('@nextblock-cms/utils')>('@nextblock-cms/utils');
+vi.mock('@nextblock-cms/utils/translations-context', async () => {
+  const actual = await vi.importActual<typeof import('@nextblock-cms/utils/translations-context')>(
+    '@nextblock-cms/utils/translations-context'
+  );
   return { ...actual, useTranslations: () => ({ lang: 'en', t: (key: string) => key }) };
 });
 vi.mock('next/navigation', async () => {

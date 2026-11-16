@@ -1,18 +1,17 @@
 'use client';
 
+import type { FreemiusOrderLicense, InvoicePresentationData } from '@nextblock-cms/ecommerce';
+import { FreemiusLicensePanel } from '@nextblock-cms/ecommerce/components/FreemiusLicensePanel';
+import { InvoiceViewerShell } from '@nextblock-cms/ecommerce/components/InvoiceViewerShell';
 import {
-  FreemiusLicensePanel,
-  type FreemiusOrderLicense,
-  InvoiceViewerShell,
-  type InvoicePresentationData,
   buildInvoiceDocumentLabels,
   getInvoiceLocale,
   localizeInvoicePresentationData,
   translateOrFallback,
-  useCartStore,
-  useIsCartHydrated,
-} from '@nextblock-cms/ecommerce';
-import { useTranslations } from '@nextblock-cms/utils';
+} from '@nextblock-cms/ecommerce/invoice-ui';
+import { useCartStore } from '@nextblock-cms/ecommerce/cart-store';
+import { useIsCartHydrated } from '@nextblock-cms/ecommerce/use-cart';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { CheckCircle2 } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';

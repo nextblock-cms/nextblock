@@ -8,7 +8,7 @@ import {
   SelectValue,
 } from '@nextblock-cms/ui/select';
 
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 import { useCurrency } from '../CurrencyProvider';
 

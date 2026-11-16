@@ -9,7 +9,12 @@ import 'server-only';
 // Stripe is resolved through getStripeClient() (a lazy client) and direct getters.
 // Freemius credentials are read synchronously throughout the package, so rather than an
 // invasive async refactor we hydrate the relevant FREEMIUS_* env vars from the DB at the
-// async entry points (webhook, checkout, coupon ops) — DB values win.
+// async entry points (webhook, checkout, coupon ops) — DB values win, and a field removed or
+// cleared there gives its name back to the deployment's own value.
+// The Freemius developer key pair (one pair for every product of the account) is the
+// exception: resolveFreemiusDeveloperCredentialCandidates() reads it (CMS developer fields,
+// then the developer env names, then the legacy names) for freemius-developer-api.ts, the only
+// module that signs with it, and it is never written into process.env.
 import {
   createClient,
   getServiceRoleSupabaseClient,
@@ -23,6 +28,8 @@ import {
   type SecretSlot,
 } from '@nextblock-cms/db/server';
 import type { Json } from '@nextblock-cms/db';
+import { forgetFreemiusDeveloperCaches, getFreemiusDeveloperStatus } from './freemius-developer-api';
+import { parseFreemiusCheckoutCredentialsMap } from './freemius-key-policy';
 import { getEcomActorRole, requireEcomAdmin } from './server-actions/require-ecom-role';
 
 const PAYMENT_SECRET_KEY = 'payment_secret';
@@ -35,8 +42,26 @@ const PAYMENT_SECRET_FIELDS = [
   'freemiusSecretKey',
   'freemiusApiKey',
   'freemiusSandboxSecretKey',
+  'freemiusDeveloperSecretKey',
 ] as const;
 type PaymentSecretField = (typeof PAYMENT_SECRET_FIELDS)[number];
+
+/**
+ * The stored secrets CMS → Payments shows, each with a remove box (`SavePaymentCredentialsInput.remove`):
+ * every field of `payment_secret` but the Freemius sandbox key, which the form never saves.
+ */
+const REMOVABLE_PAYMENT_SECRET_FIELDS = [
+  'stripeSecretKey',
+  'stripeWebhookSecret',
+  'freemiusSecretKey',
+  'freemiusApiKey',
+  'freemiusDeveloperSecretKey',
+] as const satisfies readonly PaymentSecretField[];
+export type RemovablePaymentSecret = (typeof REMOVABLE_PAYMENT_SECRET_FIELDS)[number];
+
+function isRemovablePaymentSecret(field: unknown): field is RemovablePaymentSecret {
+  return (REMOVABLE_PAYMENT_SECRET_FIELDS as readonly unknown[]).includes(field);
+}
 
 /**
  * Each key opens only from its own field (libs/db secret-crypto), so an envelope copied between
@@ -51,43 +76,58 @@ const CACHE_TTL_MS = 60_000;
 
 type Row = Record<string, unknown>;
 
-let cache: { at: number; secret: Row; public: Row } | null = null;
+/** The payment rows as last read. */
+type PaymentRows = {
+  secret: Row;
+  public: Row;
+  /**
+   * Whether the database answered each read (a missing row is an answer: nothing stored). A failed
+   * read leaves its row empty, so the resolvers fall back to the env as before, but only an answered
+   * row tells hydrateFreemiusEnvFromDb that a field it wrote is gone: a database blip must not swap
+   * the CMS keys for the deployment's.
+   */
+  answered: { secret: boolean; public: boolean };
+};
+
+let cache: ({ at: number } & PaymentRows) | null = null;
 
 function asRecord(value: unknown): Row {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Row) : {};
 }
 
-async function loadPaymentRows(force = false): Promise<{ secret: Row; public: Row }> {
+async function loadPaymentRows(force = false): Promise<PaymentRows> {
   // The sandbox neither saves nor reads the payment rows, so Stripe and Freemius resolve from its
   // env only. Its admin login is public: a visitor can write `payment_public` over PostgREST (the
   // factor-less demo admin passes is_admin_mfa()) or through Cortex's DB tool, and
   // hydrateFreemiusEnvFromDb would copy their Freemius ids into process.env for every later
   // request. No read and no cache entry (like resolveEmailServerConfig).
   if (isSandboxEnvironment()) {
-    return { secret: {}, public: {} };
+    return { secret: {}, public: {}, answered: { secret: false, public: false } };
   }
 
   const now = Date.now();
   if (!force && cache && now - cache.at < CACHE_TTL_MS) {
-    return { secret: cache.secret, public: cache.public };
+    return { secret: cache.secret, public: cache.public, answered: cache.answered };
   }
 
   let secret: Row = {};
   let pub: Row = {};
+  let answered = { secret: false, public: false };
   try {
     const supabase = getServiceRoleSupabaseClient();
-    const [{ data: secretData }, { data: publicData }] = await Promise.all([
+    const [secretRead, publicRead] = await Promise.all([
       supabase.from('site_settings').select('value').eq('key', PAYMENT_SECRET_KEY).maybeSingle(),
       supabase.from('site_settings').select('value').eq('key', PAYMENT_PUBLIC_KEY).maybeSingle(),
     ]);
-    secret = asRecord(secretData?.value);
-    pub = asRecord(publicData?.value);
+    secret = asRecord(secretRead.data?.value);
+    pub = asRecord(publicRead.data?.value);
+    answered = { secret: !secretRead.error, public: !publicRead.error };
   } catch {
     // No service-role key (unconfigured instance) — fall back to env-only resolution.
   }
 
-  cache = { at: now, secret, public: pub };
-  return { secret, public: pub };
+  cache = { at: now, secret, public: pub, answered };
+  return { secret, public: pub, answered };
 }
 
 /** Drop the in-memory cache after a save so the next read reflects new credentials. */
@@ -222,44 +262,174 @@ export async function getStripeKeyDiagnostics(): Promise<StripeKeyDiagnostics> {
 // --- Freemius (env hydration) --------------------------------------------------
 
 /**
+ * What hydrateFreemiusEnvFromDb wrote over each FREEMIUS_* name, and what the deployment had set
+ * there before. The legacy FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY names hold the developer pair
+ * on installs that run Sync from Freemius, while the CMS single-product fields hydrate into the
+ * same names: the developer pair is resolved from the deployment's own value. It is also what a
+ * field removed or cleared in the CMS gives the name back.
+ */
+const hydratedFreemiusEnv = new Map<string, { original: string | undefined; written: string }>();
+
+/**
+ * Writes a FREEMIUS_* name from the database (DB wins). When the database holds no value for it any
+ * more (`answered`: the row was read, and the field is empty, removed or cannot be opened), the value
+ * an earlier hydration wrote is taken back: the deployment's own value returns, or the name is
+ * deleted if the deployment set none. Until 0.23.4 a cleared Product ID, public key or secret stayed
+ * in process.env until the process restarted. A value hydration did not write (the deployment's, or
+ * one the env changed to since) is never touched.
+ */
+function hydrateFreemiusEnvValue(envName: string, value: string | null, answered: boolean): void {
+  const next = typeof value === 'string' ? value.trim() : '';
+  const current = process.env[envName];
+  const previous = hydratedFreemiusEnv.get(envName);
+
+  if (!next) {
+    if (!answered || !previous) {
+      return;
+    }
+
+    hydratedFreemiusEnv.delete(envName);
+
+    if (current !== previous.written) {
+      return;
+    }
+
+    if (previous.original === undefined) {
+      delete process.env[envName];
+    } else {
+      process.env[envName] = previous.original;
+    }
+    return;
+  }
+
+  // The deployment's value is what was there before the first overwrite, unless the env changed since.
+  const original = previous && current === previous.written ? previous.original : current;
+
+  hydratedFreemiusEnv.set(envName, { original, written: next });
+  process.env[envName] = next;
+}
+
+/** An env value without surrounding whitespace or matching quotes (as readFreemiusEnvValue reads them). */
+function normalizeEnvValue(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+
+  const trimmed = raw.trim();
+
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim() || null;
+  }
+
+  return trimmed || null;
+}
+
+/** The value the deployment set for a FREEMIUS_* name, even after hydrateFreemiusEnvFromDb wrote over it. */
+function readFreemiusDeploymentEnv(envName: string): string | null {
+  const current = process.env[envName];
+  const hydrated = hydratedFreemiusEnv.get(envName);
+
+  return normalizeEnvValue(hydrated && current === hydrated.written ? hydrated.original : current);
+}
+
+/**
  * Make the synchronous FREEMIUS_* env reads DB-aware by writing any configured DB
- * values into process.env (DB wins). Idempotent and cheap (cached); call at async
- * entry points before the package's sync credential helpers run. Writes nothing on
- * the sandbox, where loadPaymentRows reads no row.
+ * values into process.env (DB wins). A field removed or cleared in the database gives
+ * its name back to the deployment's value (hydrateFreemiusEnvValue); a failed read
+ * changes nothing. Idempotent and cheap (cached); call at async entry points before
+ * the package's sync credential helpers run. Writes nothing on the sandbox, where
+ * loadPaymentRows reads no row. The developer key pair is never written into
+ * process.env (resolveFreemiusDeveloperCredentialCandidates reads it).
  */
 export async function hydrateFreemiusEnvFromDb(): Promise<void> {
   // Best-effort overlay: a failure here must never break checkout/webhook/coupon flows,
   // which still resolve from env on their own.
   try {
-    const { secret, public: pub } = await loadPaymentRows();
+    const { secret, public: pub, answered } = await loadPaymentRows();
     const freemiusPublic = asRecord(pub['freemius']);
+    const fromSecret = (envName: string, field: PaymentSecretField) =>
+      hydrateFreemiusEnvValue(envName, decryptField(secret, field), answered.secret);
+    const fromPublic = (envName: string, key: string) =>
+      hydrateFreemiusEnvValue(
+        envName,
+        typeof freemiusPublic[key] === 'string' ? (freemiusPublic[key] as string) : null,
+        answered.public
+      );
 
-    const set = (envName: string, value: string | null) => {
-      if (value && value.trim()) {
-        process.env[envName] = value.trim();
-      }
-    };
-
-    set('FREEMIUS_SECRET_KEY', decryptField(secret, 'freemiusSecretKey'));
-    set('FREEMIUS_API_KEY', decryptField(secret, 'freemiusApiKey'));
-    set('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY', decryptField(secret, 'freemiusSandboxSecretKey'));
-    set(
-      'FREEMIUS_PUBLIC_KEY',
-      typeof freemiusPublic['publicKey'] === 'string' ? (freemiusPublic['publicKey'] as string) : null
-    );
-    set(
-      'FREEMIUS_PRODUCT_ID',
-      typeof freemiusPublic['productId'] === 'string' ? (freemiusPublic['productId'] as string) : null
-    );
-    set(
-      'FREEMIUS_DEVELOPER_ID',
-      typeof freemiusPublic['developerId'] === 'string'
-        ? (freemiusPublic['developerId'] as string)
-        : null
-    );
+    fromSecret('FREEMIUS_SECRET_KEY', 'freemiusSecretKey');
+    fromSecret('FREEMIUS_API_KEY', 'freemiusApiKey');
+    fromSecret('FREEMIUS_ECOMMERCE_SANDBOX_SECRET_KEY', 'freemiusSandboxSecretKey');
+    fromPublic('FREEMIUS_PUBLIC_KEY', 'publicKey');
+    fromPublic('FREEMIUS_PRODUCT_ID', 'productId');
+    fromPublic('FREEMIUS_DEVELOPER_ID', 'developerId');
   } catch (error) {
     console.warn('[payment-config] Could not hydrate Freemius credentials from the database:', error);
   }
+}
+
+// --- Freemius developer key pair ----------------------------------------------
+
+/**
+ * Where a developer key pair comes from: the CMS developer fields (`cms`), the
+ * FREEMIUS_DEVELOPER_PUBLIC_KEY / FREEMIUS_DEVELOPER_SECRET_KEY env names (`env`), or the
+ * single-product names, CMS (`cms-legacy`) or FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY as the
+ * deployment set them (`env-legacy`), which count only when Freemius accepts them at developer scope.
+ */
+export type FreemiusDeveloperCredentialSource = 'cms' | 'env' | 'cms-legacy' | 'env-legacy';
+
+export interface FreemiusDeveloperCredentials {
+  developerId: string;
+  publicKey: string;
+  secretKey: string;
+  source: FreemiusDeveloperCredentialSource;
+}
+
+/** A key sent in the Authorization header: printable ASCII, no spaces. */
+const HEADER_SAFE_KEY = /^[\x21-\x7e]{1,256}$/;
+
+/**
+ * Every configured Freemius developer key pair, most authoritative first and without duplicates:
+ * the CMS developer fields, the developer env names, then the CMS single-product fields and the
+ * deployment's legacy FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY (which hold the developer pair on
+ * installs that run Sync from Freemius). Nothing here asks Freemius: freemius-developer-api.ts
+ * uses a pair only once Freemius accepts it. Empty without a numeric developer id (CMS first,
+ * then FREEMIUS_DEVELOPER_ID). On the sandbox no row is read, so only the env pairs remain.
+ * Holds the master key of the Freemius account: server-only, never logged or returned to a client.
+ */
+export async function resolveFreemiusDeveloperCredentialCandidates(): Promise<FreemiusDeveloperCredentials[]> {
+  const { secret, public: pub } = await loadPaymentRows();
+  const freemiusPublic = asRecord(pub['freemius']);
+  const fromRow = (field: string) => normalizeEnvValue(typeof freemiusPublic[field] === 'string' ? (freemiusPublic[field] as string) : null);
+  const developerId = fromRow('developerId') ?? readFreemiusDeploymentEnv('FREEMIUS_DEVELOPER_ID');
+
+  if (!developerId || !/^[1-9]\d{0,19}$/.test(developerId)) {
+    return [];
+  }
+
+  const pairs: Array<[FreemiusDeveloperCredentialSource, string | null, string | null]> = [
+    ['cms', fromRow('developerPublicKey'), normalizeEnvValue(decryptField(secret, 'freemiusDeveloperSecretKey'))],
+    ['env', readFreemiusDeploymentEnv('FREEMIUS_DEVELOPER_PUBLIC_KEY'), readFreemiusDeploymentEnv('FREEMIUS_DEVELOPER_SECRET_KEY')],
+    ['cms-legacy', fromRow('publicKey'), normalizeEnvValue(decryptField(secret, 'freemiusSecretKey'))],
+    ['env-legacy', readFreemiusDeploymentEnv('FREEMIUS_PUBLIC_KEY'), readFreemiusDeploymentEnv('FREEMIUS_SECRET_KEY')],
+  ];
+  const seen = new Set<string>();
+  const candidates: FreemiusDeveloperCredentials[] = [];
+
+  for (const [source, publicKey, secretKey] of pairs) {
+    if (!publicKey || !secretKey || !HEADER_SAFE_KEY.test(publicKey) || secretKey.length > 256) continue;
+
+    const identity = `${publicKey}\n${secretKey}`;
+
+    if (seen.has(identity)) continue;
+
+    seen.add(identity);
+    candidates.push({ developerId, publicKey, secretKey, source });
+  }
+
+  return candidates;
 }
 
 // --- Config status (DB-or-env) -------------------------------------------------
@@ -310,10 +480,93 @@ export async function getPaymentConfigStatus(): Promise<PaymentConfigStatus> {
     freemiusMissing.push('Secret key');
   }
 
+  // A developer key pair covers every product of the account, so it is enough on its own. Asked
+  // when the single-product keys are missing, and when they alone can open no checkout.
+  let freemiusHasKeys = freemiusMissing.length === 0;
+
+  if (!freemiusHasKeys) {
+    freemiusHasKeys = await hasUsableFreemiusDeveloperPair().catch(() => false);
+  } else if (await freemiusOneProductKeysOpenNoCheckout(freemiusPublic).catch(() => false)) {
+    freemiusHasKeys = false;
+    freemiusMissing.push(FREEMIUS_REFUSED_DEVELOPER_PAIR_MISSING);
+  }
+
   return {
     stripe: { hasKeys: stripeMissing.length === 0, missing: stripeMissing },
-    freemius: { hasKeys: freemiusMissing.length === 0, missing: freemiusMissing },
+    freemius: { hasKeys: freemiusHasKeys, missing: freemiusHasKeys ? [] : freemiusMissing },
   };
+}
+
+/** What readiness says Freemius lacks when Freemius refuses a dedicated developer pair and nothing else can open a checkout. */
+const FREEMIUS_REFUSED_DEVELOPER_PAIR_MISSING = 'Developer key pair Freemius accepts, or a Product ID';
+
+/**
+ * The one-product keys are configured, yet, as far as memory knows, they open no checkout at all:
+ * no product has keys bound that can open one (FREEMIUS_PRODUCT_ID empty, no
+ * FREEMIUS_CHECKOUT_PRODUCTS_JSON entry with a `publicKey`), and Freemius refuses a dedicated
+ * developer pair, so the developer pair reads no product's keys and the key policy
+ * (`decideFreemiusOneProductStandIn`) lets the one-product keys stand in for none. Read as ready,
+ * that showed buy buttons whose checkouts and webhooks all answered 503. Never waits on Freemius
+ * (`getFreemiusDeveloperStatus({ wait: false })`: a pair not yet checked, or Freemius unreachable,
+ * keeps the store ready), and asks about the pair only when a dedicated one exists.
+ */
+async function freemiusOneProductKeysOpenNoCheckout(freemiusPublic: Row): Promise<boolean> {
+  if (isSandboxEnvironment()) {
+    return false;
+  }
+
+  const productId = resolveConfigValue(
+    typeof freemiusPublic['productId'] === 'string' ? (freemiusPublic['productId'] as string) : null,
+    'FREEMIUS_PRODUCT_ID',
+    { warnOnEnvFallback: false }
+  );
+
+  if (productId || freemiusCredentialsMapOpensCheckout(parseFreemiusCheckoutCredentialsMap())) {
+    return false;
+  }
+
+  const candidates = await resolveFreemiusDeveloperCredentialCandidates();
+
+  if (!candidates.some((credentials) => credentials.source === 'cms' || credentials.source === 'env')) {
+    return false;
+  }
+
+  return (await getFreemiusDeveloperStatus({ wait: false })).state === 'refused';
+}
+
+/**
+ * Some FREEMIUS_CHECKOUT_PRODUCTS_JSON entry opens its product's checkout whatever the developer
+ * pair says: it has a `publicKey`, the checkout's own test (`resolveFreemiusBoundCheckoutCredentials`).
+ * An entry without one opens a checkout only through the developer pair, and binds its product, so
+ * the one-product keys never stand in for it: such entries count only through the pair's state,
+ * which `freemiusOneProductKeysOpenNoCheckout` reads next (a usable pair, or no dedicated pair,
+ * keeps the store ready; a refused dedicated pair does not). Review 2026-11-13, round 3: counting
+ * every entry kept the store ready while each checkout answered 503.
+ */
+function freemiusCredentialsMapOpensCheckout(credentialsMap: Record<string, { publicKey?: unknown } | null | undefined> | null): boolean {
+  return Object.values(credentialsMap ?? {}).some((entry) => Boolean(entry?.publicKey));
+}
+
+/** The developer pair states that leave Freemius ready (`refused` and `missing` do not). */
+const USABLE_FREEMIUS_DEVELOPER_STATES: ReadonlySet<string> = new Set(['working', 'unchecked', 'unreachable']);
+
+/**
+ * Whether a configured Freemius developer key pair makes the store Freemius-ready. Store readiness
+ * runs during public renders (buy buttons, product pages, the checkout preflight), so this never
+ * waits on Freemius: a configured pair counts unless a verdict already says Freemius refused it,
+ * and the verdict is checked in the background (`getFreemiusDeveloperStatus({ wait: false })`).
+ * Checkout itself still uses the pair only once Freemius accepts it. On the sandbox, whose checkout
+ * is simulated and which never uses the pair, a configured env pair is enough. With the one-product
+ * keys set, `freemiusOneProductKeysOpenNoCheckout` reads the same verdict.
+ */
+async function hasUsableFreemiusDeveloperPair(): Promise<boolean> {
+  if (isSandboxEnvironment()) {
+    return (await resolveFreemiusDeveloperCredentialCandidates()).length > 0;
+  }
+
+  const developer = await getFreemiusDeveloperStatus({ wait: false });
+
+  return USABLE_FREEMIUS_DEVELOPER_STATES.has(developer.state);
 }
 
 // --- CMS form view + save ------------------------------------------------------
@@ -326,6 +579,9 @@ export interface PaymentCredentialsView {
   };
   freemius: {
     developerId: string;
+    /** The developer key pair's public key (Freemius → My Profile → Keys). */
+    developerPublicKey: string;
+    hasDeveloperSecretKey: boolean;
     publicKey: string;
     productId: string;
     hasSecretKey: boolean;
@@ -339,7 +595,15 @@ export async function getPaymentCredentialsView(): Promise<PaymentCredentialsVie
   if (isSandboxEnvironment()) {
     return {
       stripe: { publishableKey: '', hasSecretKey: false, hasWebhookSecret: false },
-      freemius: { developerId: '', publicKey: '', productId: '', hasSecretKey: false, hasApiKey: false },
+      freemius: {
+        developerId: '',
+        developerPublicKey: '',
+        hasDeveloperSecretKey: false,
+        publicKey: '',
+        productId: '',
+        hasSecretKey: false,
+        hasApiKey: false,
+      },
       envFallbackActive: false,
     };
   }
@@ -369,6 +633,8 @@ export async function getPaymentCredentialsView(): Promise<PaymentCredentialsVie
     },
     freemius: {
       developerId: asStr(freemiusPublic['developerId']),
+      developerPublicKey: asStr(freemiusPublic['developerPublicKey']),
+      hasDeveloperSecretKey: getSecretEnvelopeStatus(secret['freemiusDeveloperSecretKey']).hasStoredValue,
       publicKey: asStr(freemiusPublic['publicKey']),
       productId: asStr(freemiusPublic['productId']),
       hasSecretKey: getSecretEnvelopeStatus(secret['freemiusSecretKey']).hasStoredValue,
@@ -388,20 +654,31 @@ export interface SavePaymentCredentialsInput {
   };
   freemius: {
     developerId: string;
+    /** The developer key pair (all products); its secret is `developerSecretKey`. */
+    developerPublicKey: string;
+    developerSecretKey?: string;
     publicKey: string;
     productId: string;
     secretKey?: string;
     apiKey?: string;
   };
+  /**
+   * Stored secrets to delete from `payment_secret` (the form's remove boxes). A blank field keeps
+   * its stored secret unless it is named here; a key typed into the field replaces the stored one
+   * either way. Names outside `RemovablePaymentSecret` are ignored.
+   */
+  remove?: readonly RemovablePaymentSecret[];
 }
 
 /**
  * Persist payment credentials. Public fields always overwrite; secret fields are
  * encrypted and only written when a new value is supplied (blank keeps the stored
- * secret), and every stored key from before 0.23.1 is re-sealed for its field on each save.
- * Saves nothing on the sandbox (throws). Enforces ADMIN itself (throws otherwise) and writes
- * with the service role: `payment_secret` is a secret row of `site_settings`, which no API
- * session can write since migration 02038.
+ * secret, unless `remove` names it: then it is deleted from the row), and every stored
+ * key from before 0.23.0 is re-sealed for its field on each save. Until 0.23.4 a stored
+ * secret could not be deleted at all, so a leaked key kept verifying webhooks after a
+ * rotation. Saves nothing on the sandbox (throws). Enforces ADMIN itself (throws
+ * otherwise, before any read) and writes with the service role: `payment_secret` is a
+ * secret row of `site_settings`, which no API session can write since migration 02038.
  */
 export async function savePaymentCredentials(input: SavePaymentCredentialsInput): Promise<void> {
   const supabase = await requireEcomAdmin();
@@ -418,6 +695,7 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
     stripe: { publishableKey: input.stripe.publishableKey.trim() },
     freemius: {
       developerId: input.freemius.developerId.trim(),
+      developerPublicKey: input.freemius.developerPublicKey.trim(),
       publicKey: input.freemius.publicKey.trim(),
       productId: input.freemius.productId.trim(),
       sandboxEnabled: false,
@@ -438,12 +716,18 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
     ['stripeWebhookSecret', input.stripe.webhookSecret],
     ['freemiusSecretKey', input.freemius.secretKey],
     ['freemiusApiKey', input.freemius.apiKey],
+    ['freemiusDeveloperSecretKey', input.freemius.developerSecretKey],
   ] as const) {
     if (value && value.trim()) supplied.set(field, value.trim());
   }
 
+  // A remove box over a blank field deletes that stored secret; a typed key replaces it anyway.
+  const removed = new Set<PaymentSecretField>(
+    (input.remove ?? []).filter((field) => isRemovablePaymentSecret(field) && !supplied.has(field))
+  );
+
   // Read-merge: a blank field keeps its stored key. What is kept is re-sealed for its own field:
-  // an envelope from before 0.23.1 opens in any slot (libs/db secret-crypto), so every save, one
+  // an envelope from before 0.23.0 opens in any slot (libs/db secret-crypto), so every save, one
   // that changes no key included, leaves each key bound to where it is stored.
   const { data: existing, error: readError } = await supabase
     .from('site_settings')
@@ -452,13 +736,22 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
     .maybeSingle();
   if (readError) {
     console.error('Error reading payment_secret settings:', readError.message);
-    // Writing now could drop the keys that were not re-entered.
-    if (supplied.size > 0) throw new Error('Failed to save payment credentials.');
+    // Writing now could drop the keys that were not re-entered, and skipping a removal would
+    // leave the key the admin asked to delete.
+    if (supplied.size > 0 || removed.size > 0) throw new Error('Failed to save payment credentials.');
   } else {
     const current = asRecord(existing?.value);
     const nextValue: Row = { ...current };
     let changed = false;
     for (const field of PAYMENT_SECRET_FIELDS) {
+      if (removed.has(field)) {
+        if (Object.prototype.hasOwnProperty.call(nextValue, field)) {
+          delete nextValue[field];
+          changed = true;
+        }
+        continue;
+      }
+
       const value = supplied.get(field);
       const slot = paymentSecretSlot(field);
       const next = value ? encryptWithEnvKey(value, slot) : resealWithEnvKey(current[field], slot);
@@ -480,4 +773,6 @@ export async function savePaymentCredentials(input: SavePaymentCredentialsInput)
   }
 
   clearPaymentConfigCache();
+  // New keys are checked with Freemius again on their next use (and product keys re-read).
+  forgetFreemiusDeveloperCaches();
 }

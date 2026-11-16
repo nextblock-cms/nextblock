@@ -14,9 +14,10 @@ const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
 /** The same pattern sanitizeUiImports rewrites to the `@nextblock-cms/ui` barrel. */
 const UI_SUBPATH_IMPORT = /@nextblock-cms\/ui\/(?!styles\/)[A-Za-z0-9/_-]+/;
 
-const toPosix = (path) => path.split(sep).join('/');
+export const toPosix = (path) => path.split(sep).join('/');
 
-async function listFiles(dir, accept = () => true, out = []) {
+/** Every file under `dir` (absolute paths) whose name `accept` keeps. */
+export async function listFiles(dir, accept = () => true, out = []) {
   for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
     const full = resolve(dir, entry.name);
     if (entry.isDirectory()) await listFiles(full, accept, out);

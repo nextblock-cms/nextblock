@@ -144,6 +144,10 @@ const nextConfig = {
     // Work around Turbopack subpath resolution for the latest y-protocols package.
     resolveAlias: {
       'y-protocols/awareness': 'y-protocols/awareness.js',
+      // Browser bundles only: sanitize-html requires postcss but never calls it with style
+      // parsing off, so the client gets an empty module instead of ~18 KB gzipped of postcss.
+      // lib/browser-stubs/postcss.test.ts proves the sanitizer still works against the stub.
+      postcss: { browser: './lib/browser-stubs/postcss.cjs' },
     },
   },
   transpilePackages: [

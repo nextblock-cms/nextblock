@@ -27,6 +27,12 @@ declare namespace NodeJS {
     SMTP_FROM_NAME: string;
     FREEMIUS_STORE_ID: string;
     FREEMIUS_DEVELOPER_ID?: string;
+    /**
+     * The developer key pair (Freemius → My Profile → Keys): one pair for every product of the
+     * account, read only by libs/ecommerce freemius-developer-api.ts. A master key: server-only.
+     */
+    FREEMIUS_DEVELOPER_PUBLIC_KEY?: string;
+    FREEMIUS_DEVELOPER_SECRET_KEY?: string;
     FREEMIUS_PRODUCT_ID?: string;
     FREEMIUS_PUBLIC_KEY: string;
     FREEMIUS_SECRET_KEY: string;

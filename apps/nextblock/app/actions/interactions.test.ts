@@ -10,7 +10,6 @@ const cacheMocks = vi.hoisted(() => ({
 const dbServerMocks = vi.hoisted(() => ({
   createClient: vi.fn(),
   getServiceRoleSupabaseClient: vi.fn(),
-  getProfileWithRoleServerSide: vi.fn(),
 }));
 
 // Deliberately exports no `headers`: the notification link must not come from the
@@ -29,8 +28,11 @@ const emailMocks = vi.hoisted(() => ({
 
 // The notification-address actions authorize with requireCmsAdmin() and write with the
 // service-role client it returns (migration 02028: the key is in the second-factor tier).
+// replyToInteraction and updateInteractionStatus resolve getCmsActor(); their authorization runs
+// on the real second-factor chain in interactions.moderation.test.ts.
 const cmsActorMocks = vi.hoisted(() => ({
   requireCmsAdmin: vi.fn(),
+  getCmsActor: vi.fn(),
 }));
 
 vi.mock("next/cache", () => cacheMocks);
@@ -43,7 +45,6 @@ vi.mock("../../lib/auth/cms-actor", () => cmsActorMocks);
 import {
   submitInteraction,
   toggleReaction,
-  updateInteractionStatus,
   getNotificationEmails,
   saveNotificationEmails,
 } from "./interactions";
@@ -390,53 +391,8 @@ describe("Interactions Server Actions", () => {
     });
   });
 
-  describe("updateInteractionStatus", () => {
-    it("returns error if non-admin attempts moderation", async () => {
-      dbServerMocks.createClient.mockReturnValue(authedClient("user-1"));
-      dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
-        role: "WRITER",
-      } as any);
-
-      const res = await updateInteractionStatus("int-1", "approved");
-      expect(res.error).toContain("Unauthorized");
-    });
-
-    it("allows admins to approve and triggers path revalidation", async () => {
-      dbServerMocks.createClient.mockReturnValue(authedClient("admin-1"));
-      dbServerMocks.getProfileWithRoleServerSide.mockResolvedValue({
-        role: "ADMIN",
-      } as any);
-
-      const singleMock = vi.fn().mockResolvedValue({
-        data: {
-          product_id: "prod-1",
-          post_id: null,
-          products: { slug: "my-product" },
-        },
-        error: null,
-      });
-      const eqSelectMock = vi.fn().mockReturnValue({ single: singleMock });
-      const selectMock = vi.fn().mockReturnValue({ eq: eqSelectMock });
-      const eqUpdateMock = vi.fn().mockResolvedValue({ error: null });
-      const updateMock = vi.fn().mockReturnValue({ eq: eqUpdateMock });
-      const fromMock = vi.fn().mockReturnValue({
-        select: selectMock,
-        update: updateMock,
-      });
-
-      dbServerMocks.getServiceRoleSupabaseClient.mockReturnValue({
-        from: fromMock,
-      });
-
-      const res = await updateInteractionStatus("int-1", "approved");
-
-      expect(res.success).toBe(true);
-      expect(updateMock).toHaveBeenCalledWith({ status: "approved" });
-      expect(eqUpdateMock).toHaveBeenCalledWith("id", "int-1");
-      expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/product/my-product");
-      expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/cms/interactions");
-    });
-  });
+  // updateInteractionStatus and replyToInteraction: interactions.moderation.test.ts (the real
+  // getCmsActor() / evaluateTwoFactor() chain, refusals and the writes they allow).
 
   describe("Notification Emails Settings Actions", () => {
     it("returns error if non-admin attempts to get or save configuration", async () => {

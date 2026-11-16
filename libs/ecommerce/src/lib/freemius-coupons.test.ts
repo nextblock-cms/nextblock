@@ -14,6 +14,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   hydrateFreemiusEnvFromDb: vi.fn(async () => undefined),
+  // No developer key pair unless a test configures one (the bearer cases below predate it).
+  developerCandidates: vi.fn<() => Promise<Array<Record<string, string>>>>(async () => []),
 }));
 
 vi.mock('server-only', () => ({}));
@@ -28,14 +30,16 @@ vi.mock('@nextblock-cms/db/server', async () => {
     isSandboxEnvironment,
   };
 });
+// What freemius-coupons.ts and freemius-pricing-server.ts take from the barrel (currency.ts
+// imports '@nextblock-cms/utils/utils', which this mock does not replace).
 vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number, currencyCode?: string | null) => `${currencyCode || 'USD'} ${amount}`,
-  getCurrencyMinorUnitFactor: () => 100,
   majorUnitAmountToMinor: (amount: number) => Math.round(amount * 100),
   minorUnitAmountToMajor: (amount: number) => amount / 100,
-  normalizeCurrencyCode: (code?: string | null) => (code || 'USD').trim().toUpperCase(),
 }));
-vi.mock('./payment-config', () => ({ hydrateFreemiusEnvFromDb: mocks.hydrateFreemiusEnvFromDb }));
+vi.mock('./payment-config', () => ({
+  hydrateFreemiusEnvFromDb: mocks.hydrateFreemiusEnvFromDb,
+  resolveFreemiusDeveloperCredentialCandidates: mocks.developerCandidates,
+}));
 
 import {
   FREEMIUS_COUPON_SANDBOX_MESSAGE,
@@ -43,6 +47,7 @@ import {
   syncCouponToFreemius,
   syncProductSaleCouponToFreemius,
 } from './freemius-coupons';
+import { forgetFreemiusDeveloperCaches, signFreemiusRequest } from './freemius-developer-api';
 
 type Row = Record<string, any>;
 type Operation = { table: string; op: 'select' | 'update' | 'upsert'; values?: Row };
@@ -87,7 +92,7 @@ const MAPPING = {
   coupon_id: 'coupon-1',
   product_id: 'product-1',
   freemius_product_id: OPERATOR_PRODUCT_ID,
-  freemius_coupon_id: 'operator-coupon-7',
+  freemius_coupon_id: '7007',
   freemius_coupon_code: 'FREE100',
   sync_status: 'synced',
   sync_error: null,
@@ -214,6 +219,8 @@ beforeEach(() => {
   vi.stubEnv('FREEMIUS_API_KEY', BEARER);
   vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', '');
   mocks.hydrateFreemiusEnvFromDb.mockClear();
+  mocks.developerCandidates.mockReset().mockImplementation(async () => []);
+  forgetFreemiusDeveloperCaches();
 });
 
 afterEach(() => {
@@ -444,7 +451,7 @@ describe('Freemius coupons off the sandbox (only the exact value "true" is the s
       expect(mocks.hydrateFreemiusEnvFromDb).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledTimes(1);
       expect(fetchMock).toHaveBeenCalledWith(
-        `${COUPONS_URL}/operator-coupon-7.json`,
+        `${COUPONS_URL}/7007.json`,
         expect.objectContaining({
           method: 'DELETE',
           headers: expect.objectContaining({ Authorization: `Bearer ${BEARER}` }),
@@ -455,4 +462,183 @@ describe('Freemius coupons off the sandbox (only the exact value "true" is the s
       ]);
     }
   );
+});
+
+/**
+ * nextblock.dev has no per-product bearer: with the developer key pair, coupon pushes go to
+ * /v1/developers/{dev}/plugins/{product}/coupons, signed like the PHP SDK. A 401/403 refuses
+ * before anything is written, so the product's bearer may take over; any other refusal is
+ * Freemius' answer and is recorded, never retried with other keys.
+ */
+describe('Freemius coupons with the developer key pair', () => {
+  const DEV = '4242';
+  const PAIR = { developerId: DEV, publicKey: 'pk_dev_coupons', secretKey: 'sk_dev_coupons', source: 'env' };
+  const DEV_COUPONS_PATH = `/v1/developers/${DEV}/plugins/${OPERATOR_PRODUCT_ID}/coupons`;
+
+  type Call = { url: string; init: RequestInit };
+
+  /** Freemius: the pair lists the operator's products; `onCoupon` answers the coupon requests. */
+  function stubDeveloperFreemius(onCoupon: (call: Call) => { status: number; body?: unknown }, listed = [OPERATOR_PRODUCT_ID]) {
+    const calls: Call[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const call = { url: String(url), init };
+        calls.push(call);
+        const path = call.url.replace('https://api.freemius.com', '');
+        if (path.startsWith(`/v1/developers/${DEV}/plugins.json`)) {
+          return new Response(JSON.stringify({ plugins: listed.map((id) => ({ id: Number(id) })) }), { status: 200 });
+        }
+        const { status, body } = onCoupon(call);
+        return new Response(body === undefined ? '' : JSON.stringify(body), { status });
+      })
+    );
+    return calls;
+  }
+
+  function couponCalls(calls: Call[]) {
+    return calls.filter((call) => call.url.includes('/coupons'));
+  }
+
+  function expectDeveloperSigned(call: Call) {
+    const headers = call.init.headers as Record<string, string>;
+    expect(headers['Authorization']).toBe(
+      signFreemiusRequest({
+        body: typeof call.init.body === 'string' ? call.init.body : '',
+        date: headers['Date'],
+        method: call.init.method as 'POST',
+        path: call.url.replace('https://api.freemius.com', ''),
+        publicKey: PAIR.publicKey,
+        scopeId: DEV,
+        secretKey: PAIR.secretKey,
+      }).authorization
+    );
+  }
+
+  beforeEach(() => {
+    mocks.developerCandidates.mockImplementation(async () => [PAIR]);
+    vi.stubEnv('FREEMIUS_API_KEY', '');
+  });
+
+  it('POSTs a new coupon at developer scope, signed, and records the mapping', async () => {
+    const calls = stubDeveloperFreemius(() => ({ status: 201, body: { id: 9001, code: 'FREE100' } }));
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT] });
+
+    const result = await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(result).toEqual({ success: true, targetCount: 1 });
+    const [post] = couponCalls(calls);
+    expect(post.url).toBe(`https://api.freemius.com${DEV_COUPONS_PATH}.json`);
+    expect(post.init.method).toBe('POST');
+    expect(JSON.parse(String(post.init.body))).toMatchObject({ code: 'FREE100', discount: 100, discount_type: 'percentage' });
+    expect(post.init.headers).toMatchObject({ 'Content-Type': 'application/json', 'Content-MD5': expect.stringMatching(/^[0-9a-f]{32}$/) });
+    expectDeveloperSigned(post);
+    expect(calls.some((call) => String((call.init.headers as Record<string, string>)['Authorization']).startsWith('Bearer'))).toBe(false);
+    expect(store.tables.coupon_freemius_mappings).toEqual([
+      expect.objectContaining({ freemius_coupon_id: '9001', sync_status: 'synced', sync_error: null }),
+    ]);
+  });
+
+  it('PUTs a coupon that already has a remote id, and DELETEs it on delete', async () => {
+    const calls = stubDeveloperFreemius((call) => ({ status: 200, body: call.init.method === 'PUT' ? { id: 7007 } : undefined }));
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT], coupon_freemius_mappings: [MAPPING] });
+
+    await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+    await deleteCouponFromFreemius({ couponId: 'coupon-1', client: store.client });
+
+    const [put, del] = couponCalls(calls);
+    expect([put.init.method, put.url]).toEqual(['PUT', `https://api.freemius.com${DEV_COUPONS_PATH}/7007.json`]);
+    expect([del.init.method, del.url]).toEqual(['DELETE', `https://api.freemius.com${DEV_COUPONS_PATH}/7007.json`]);
+    expect(del.init.body).toBeUndefined();
+    expectDeveloperSigned(put);
+    expectDeveloperSigned(del);
+    expect(store.tables.coupon_freemius_mappings).toEqual([expect.objectContaining({ id: 'mapping-1', sync_status: 'deleted' })]);
+  });
+
+  it('pushes the sale coupon of a product at developer scope', async () => {
+    const calls = stubDeveloperFreemius(() => ({ status: 201, body: { id: 9002 } }));
+    const store = createStore({ products: [PRODUCT] });
+
+    await expect(syncProductSaleCouponToFreemius({ productId: 'product-1', client: store.client })).resolves.toEqual({
+      success: true,
+      active: true,
+      code: 'SALEFM248511',
+    });
+    expect(couponCalls(calls).map((call) => [call.init.method, call.url])).toEqual([
+      ['POST', `https://api.freemius.com${DEV_COUPONS_PATH}.json`],
+    ]);
+  });
+
+  it('records a refusal from Freemius as the sync error and never retries it with the bearer', async () => {
+    vi.stubEnv('FREEMIUS_API_KEY', BEARER);
+    const calls = stubDeveloperFreemius(() => ({ status: 400, body: { error: { code: 'invalid_coupon', message: 'Coupon code already exists.' } } }));
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT] });
+
+    await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(couponCalls(calls)).toHaveLength(1);
+    expect(store.tables.coupon_freemius_mappings).toEqual([
+      expect.objectContaining({ sync_status: 'failed', sync_error: 'Coupon code already exists.' }),
+    ]);
+  });
+
+  it('hands over to the product bearer when Freemius refuses the developer pair (401), which wrote nothing', async () => {
+    vi.stubEnv('FREEMIUS_API_KEY', BEARER);
+    const calls = stubDeveloperFreemius((call) =>
+      call.url.includes('/v1/developers/') ? { status: 401, body: {} } : { status: 200, body: { id: 'remote-coupon-1' } }
+    );
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT] });
+
+    await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(couponCalls(calls).map((call) => call.url)).toEqual([
+      `https://api.freemius.com${DEV_COUPONS_PATH}.json`,
+      `${COUPONS_URL}.json`,
+    ]);
+    expect(couponCalls(calls)[1].init.headers).toMatchObject({ Authorization: `Bearer ${BEARER}` });
+    expect(store.tables.coupon_freemius_mappings).toEqual([expect.objectContaining({ sync_status: 'synced' })]);
+  });
+
+  it('uses the bearer for a product the developer account does not list, and says what is missing without one', async () => {
+    const calls = stubDeveloperFreemius(() => ({ status: 200, body: { id: 'remote-coupon-1' } }), ['28609']);
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT] });
+
+    await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(couponCalls(calls)).toEqual([]);
+    expect(store.tables.coupon_freemius_mappings).toEqual([
+      expect.objectContaining({
+        sync_status: 'failed',
+        sync_error: expect.stringContaining('add the developer key pair under CMS → Payments'),
+      }),
+    ]);
+  });
+
+  it('on the sandbox sends nothing, with a working developer key pair configured', async () => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', 'true');
+    const calls = stubDeveloperFreemius(() => ({ status: 201, body: { id: 9001 } }));
+    const store = createStore({ coupons: [COUPON], products: [PRODUCT], coupon_freemius_mappings: [MAPPING] });
+
+    await syncCouponToFreemius({ couponId: 'coupon-1', client: store.client });
+    await syncProductSaleCouponToFreemius({ productId: 'product-1', client: store.client });
+    await deleteCouponFromFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(calls).toEqual([]);
+    expect(mocks.developerCandidates).not.toHaveBeenCalled();
+  });
+
+  it('refuses a mapping whose remote id is not a Freemius id, sending nothing', async () => {
+    const calls = stubDeveloperFreemius(() => ({ status: 200 }));
+    const store = createStore({
+      coupons: [COUPON],
+      coupon_freemius_mappings: [{ ...MAPPING, freemius_coupon_id: '7007/../../plugins/1' }],
+    });
+
+    await deleteCouponFromFreemius({ couponId: 'coupon-1', client: store.client });
+
+    expect(couponCalls(calls)).toEqual([]);
+    expect(store.tables.coupon_freemius_mappings).toEqual([
+      expect.objectContaining({ sync_status: 'failed', sync_error: expect.stringContaining('not a Freemius id') }),
+    ]);
+  });
 });

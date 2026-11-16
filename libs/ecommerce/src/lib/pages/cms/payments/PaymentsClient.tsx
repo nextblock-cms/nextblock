@@ -15,7 +15,8 @@ import {
 } from '@nextblock-cms/ui';
 import { AlertCircle, CheckCircle2 } from 'lucide-react';
 import { useFormStatus } from 'react-dom';
-import type { PaymentCredentialsView } from '../../../payment-config';
+import type { FreemiusDeveloperStatus } from '../../../freemius-developer-api';
+import type { FreemiusDeveloperCredentialSource, PaymentCredentialsView } from '../../../payment-config';
 // Events the Stripe endpoint must send (one list, also checked by the Affiliates connection test).
 import { STRIPE_REQUIRED_WEBHOOK_EVENTS, stripeCliListenCommand } from '../../../stripe/webhook-events';
 
@@ -30,13 +31,28 @@ interface ConfigStatus {
   };
 }
 
+/** What readiness lists while one product's keys are incomplete and no developer pair is usable (payment-config.ts). */
+const FREEMIUS_KEY_LABELS: ReadonlySet<string> = new Set(['Public key', 'Secret key']);
+
+/**
+ * Freemius lacks nothing but keys, so either way of configuring it works and the guide names both.
+ * Any other label (one product's keys that open no checkout: "Developer key pair Freemius accepts,
+ * or a Product ID") is what the operator actually has to add, so the guide shows the labels.
+ */
+function isFreemiusKeyList(missing: readonly string[]): boolean {
+  return missing.every((label) => FREEMIUS_KEY_LABELS.has(label));
+}
+
 export function PaymentsClient({
   initialEnabledProviders,
   configStatus,
   credentials,
+  freemiusDeveloper = null,
+  freemiusDeveloperSources = [],
   saveAction,
   saveCredentialsAction,
   partnerPayouts = false,
+  digitalPartnerPayouts,
 }: {
   initialEnabledProviders: {
     stripe: boolean;
@@ -44,14 +60,30 @@ export function PaymentsClient({
   };
   configStatus: ConfigStatus;
   credentials: PaymentCredentialsView;
+  /** Whether Freemius accepts the developer key pair (and how many products it reaches). */
+  freemiusDeveloper?: FreemiusDeveloperStatus | null;
+  /**
+   * Where each configured developer pair comes from, in the order they are tried: sources only,
+   * never key material. Words a refusal: with a Developer ID, the one-product keys are tried as a
+   * developer pair too (`cms-legacy` / `env-legacy`).
+   */
+  freemiusDeveloperSources?: readonly FreemiusDeveloperCredentialSource[];
   saveAction: (formData: FormData) => Promise<void>;
   saveCredentialsAction: (formData: FormData) => Promise<void>;
   /**
-   * The Affiliates program is active (the app passes `isAffiliatesProgramActive()`): Stripe also
-   * pays the partners, and the Stripe section says so. Off by default, so a store without the
-   * add-on is never told about partners it doesn't have.
+   * Stripe pays affiliate partners: the app passes it while the Affiliates program is active and
+   * at least one sale type's commissions go through Stripe Connect (`affiliateGatewaysPaidByStripe`).
+   * A store paying every commission outside Stripe (by hand or with PayPal) never calls Stripe for
+   * partners, so the Stripe section then says nothing about them. Off by default, so a store
+   * without the add-on is never told about partners it doesn't have.
    */
   partnerPayouts?: boolean;
+  /**
+   * Stripe Connect also pays the commissions on digital (Freemius) sales, so a store that sells
+   * only digital products still needs a Stripe secret key for its partners. Defaults to
+   * `partnerPayouts`: the program's default routing pays every sale type through Stripe Connect.
+   */
+  digitalPartnerPayouts?: boolean;
 }) {
   const router = useRouter();
   const [isSaving, startSaving] = useTransition();
@@ -95,8 +127,11 @@ export function PaymentsClient({
       <div className="grid gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(20rem,2fr)]">
         <ProviderCredentialsCard
           credentials={credentials}
+          freemiusDeveloper={freemiusDeveloper}
+          freemiusDeveloperSources={freemiusDeveloperSources}
           saveAction={saveCredentialsAction}
-          partnerPayouts={partnerPayouts}
+          partnerPayouts={partnerPayouts || digitalPartnerPayouts === true}
+          digitalPartnerPayouts={digitalPartnerPayouts ?? partnerPayouts}
         />
 
         <Card className="flex h-full flex-col">
@@ -156,6 +191,14 @@ export function PaymentsClient({
                   <MissingKeysGuide
                     provider="Freemius"
                     missingKeys={configStatus.freemius.missing}
+                    requirement={
+                      isFreemiusKeyList(configStatus.freemius.missing) ? (
+                        <>
+                          Freemius needs <strong>a developer key pair</strong> (Developer ID, developer
+                          public and secret key) or <strong>one product&rsquo;s public and secret key</strong>.
+                        </>
+                      ) : undefined
+                    }
                     docsUrl="https://dashboard.freemius.com/"
                     docsLabel="Freemius credentials"
                   />
@@ -209,6 +252,7 @@ function CredentialField({
   defaultValue,
   placeholder,
   hint,
+  removeLabel,
 }: {
   id: string;
   label: ReactNode;
@@ -216,7 +260,15 @@ function CredentialField({
   defaultValue?: string;
   placeholder?: string;
   hint?: string;
+  /**
+   * Set for a stored secret: a box (`remove_<id>`, value `true`) that deletes it on save while the
+   * field stays blank (savePaymentProviderCredentials). Without it a stored key could not be
+   * removed, a leaked one included.
+   */
+  removeLabel?: string;
 }) {
+  const removeId = `remove_${id}`;
+
   return (
     <div className="space-y-1">
       <Label htmlFor={id} className="text-xs">
@@ -236,18 +288,145 @@ function CredentialField({
           {hint}
         </p>
       )}
+      {removeLabel ? (
+        <label htmlFor={removeId} className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+          <input
+            id={removeId}
+            name={removeId}
+            type="checkbox"
+            value="true"
+            className="h-3.5 w-3.5 rounded border-slate-300 text-primary focus:ring-primary"
+          />
+          <span>{removeLabel}</span>
+        </label>
+      ) : null}
     </div>
+  );
+}
+
+/** Where a working developer pair was found, when it is not the developer fields of this screen. */
+const DEVELOPER_SOURCE_NOTES: Partial<Record<NonNullable<FreemiusDeveloperStatus['source']>, ReactNode>> = {
+  env: (
+    <>
+      They come from the <code>FREEMIUS_DEVELOPER_PUBLIC_KEY</code> and <code>FREEMIUS_DEVELOPER_SECRET_KEY</code>{' '}
+      environment variables.
+    </>
+  ),
+  'env-legacy': (
+    <>
+      They come from the <code>FREEMIUS_PUBLIC_KEY</code> and <code>FREEMIUS_SECRET_KEY</code> environment variables:
+      rename those <code>FREEMIUS_DEVELOPER_PUBLIC_KEY</code> and <code>FREEMIUS_DEVELOPER_SECRET_KEY</code>, or enter the
+      keys here.
+    </>
+  ),
+  'cms-legacy': <>They were entered in the one-product fields below: move them to the developer fields.</>,
+};
+
+/** A pair configured under the one-product names (the CMS fields or FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY). */
+function isOneProductKeysSource(source: FreemiusDeveloperCredentialSource): boolean {
+  return source === 'cms-legacy' || source === 'env-legacy';
+}
+
+/**
+ * Every pair Freemius refused came from the one-product names: a Developer ID turns those keys
+ * into a developer pair candidate, and Freemius refuses one product's keys at developer scope.
+ * They are not developer keys, so say what was tried and how to bind them to their product.
+ */
+function RefusedOneProductKeys({
+  sources,
+  productId,
+}: {
+  sources: readonly FreemiusDeveloperCredentialSource[];
+  productId: string;
+}) {
+  const inFields = sources.includes('cms-legacy');
+  const bound = productId.trim() !== '';
+
+  return (
+    <p className="text-xs text-amber-700">
+      {inFields ? (
+        <>
+          Freemius refused the one-product keys below as a developer key pair: with a Developer ID
+          filled in, they are tried as one too.
+        </>
+      ) : (
+        <>
+          Freemius refused the one-product keys in <code>FREEMIUS_PUBLIC_KEY</code> and{' '}
+          <code>FREEMIUS_SECRET_KEY</code> as a developer key pair: with a Developer ID set, they are
+          tried as one too.
+        </>
+      )}{' '}
+      {bound ? (
+        'Their Product ID binds them to that product.'
+      ) : inFields ? (
+        <>If they are one product&rsquo;s keys, fill in its Product ID: that binds them to that product.</>
+      ) : (
+        <>
+          If they are one product&rsquo;s keys, fill in its Product ID below (or set{' '}
+          <code>FREEMIUS_PRODUCT_ID</code>): that binds them to that product.
+        </>
+      )}
+    </p>
+  );
+}
+
+function DeveloperKeysStatus({
+  status,
+  sources,
+  productId,
+}: {
+  status: FreemiusDeveloperStatus | null;
+  sources: readonly FreemiusDeveloperCredentialSource[];
+  productId: string;
+}) {
+  if (!status || status.state === 'missing' || status.state === 'sandbox') {
+    return null;
+  }
+
+  if (status.state === 'refused' && sources.length > 0 && sources.every(isOneProductKeysSource)) {
+    return <RefusedOneProductKeys sources={sources} productId={productId} />;
+  }
+
+  if (status.state === 'working') {
+    const count = status.productIds.length;
+    const note = status.source ? DEVELOPER_SOURCE_NOTES[status.source] : null;
+
+    return (
+      <div className="space-y-1 text-xs">
+        <p className="flex items-center gap-2 text-green-600">
+          <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+          <span>
+            Freemius accepts the developer keys: they reach {count} {count === 1 ? 'product' : 'products'}.
+          </span>
+        </p>
+        {note ? <p className="text-muted-foreground">{note}</p> : null}
+      </div>
+    );
+  }
+
+  return (
+    <p className="text-xs text-amber-700">
+      {status.state === 'refused'
+        ? 'Freemius refused the developer keys. Check the Developer ID and the key pair (Freemius → My Profile → Keys).'
+        : "Freemius couldn't be reached to check the developer keys. They are checked again on the next visit."}
+    </p>
   );
 }
 
 function ProviderCredentialsCard({
   credentials,
+  freemiusDeveloper,
+  freemiusDeveloperSources,
   saveAction,
   partnerPayouts,
+  digitalPartnerPayouts,
 }: {
   credentials: PaymentCredentialsView;
+  freemiusDeveloper: FreemiusDeveloperStatus | null;
+  freemiusDeveloperSources: readonly FreemiusDeveloperCredentialSource[];
   saveAction: (formData: FormData) => Promise<void>;
   partnerPayouts: boolean;
+  digitalPartnerPayouts: boolean;
 }) {
   const storedPlaceholder = '•••••••• (stored — leave blank to keep)';
   const sandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
@@ -259,7 +438,8 @@ function ProviderCredentialsCard({
         <CardDescription>
           Keys are encrypted at rest and used DB-first (these override any{' '}
           <code>.env</code> values). Leave a secret blank to keep the stored
-          value.
+          value, or tick the remove box under it to delete it when you save:
+          its environment variable, if one is set, then applies again.
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-1 flex-col">
@@ -272,9 +452,19 @@ function ProviderCredentialsCard({
             </h3>
             {partnerPayouts ? (
               <p className="text-xs text-muted-foreground">
-                Stripe also pays your affiliate partners. Freemius doesn&rsquo;t,
-                so a store that sells only digital products still needs a Stripe
-                secret key to run the partner program.
+                {digitalPartnerPayouts ? (
+                  <>
+                    Stripe also pays your affiliate partners. Freemius doesn&rsquo;t,
+                    so a store that sells only digital products still needs a Stripe
+                    secret key to run the partner program.
+                  </>
+                ) : (
+                  <>
+                    Stripe also pays your affiliate partners their commissions on
+                    physical product sales. Commissions on digital product sales are
+                    paid outside Stripe.
+                  </>
+                )}
               </p>
             ) : null}
             <details className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground">
@@ -327,6 +517,7 @@ function ProviderCredentialsCard({
                     ? storedPlaceholder
                     : 'sk_live_…'
                 }
+                removeLabel={credentials.stripe.hasSecretKey ? 'Remove the stored secret key' : undefined}
               />
               <CredentialField
                 id="stripe_webhookSecret"
@@ -337,6 +528,7 @@ function ProviderCredentialsCard({
                     ? storedPlaceholder
                     : 'whsec_…'
                 }
+                removeLabel={credentials.stripe.hasWebhookSecret ? 'Remove the stored signing secret' : undefined}
               />
             </div>
           </div>
@@ -346,26 +538,63 @@ function ProviderCredentialsCard({
               Freemius (digital products)
             </h3>
             <p className="text-xs text-muted-foreground">
-              These fields hold the keys of one Freemius product (in Freemius:
-              the product &rarr; Settings &rarr; API &amp; Keys). Each product
-              in CMS &rarr; Products keeps its own Freemius Product ID and Plan
-              ID for checkout. Selling more than one Freemius product? Each one
-              signs its webhooks with its own secret key, so also list every
-              product&rsquo;s keys in the{' '}
-              <code>FREEMIUS_CHECKOUT_PRODUCTS_JSON</code> environment variable.
+              Enter your Freemius developer keys (in Freemius: My Profile
+              &rarr; Keys) and every product of your Freemius account works with
+              them: checkout, webhooks, license keys on orders, trials and
+              coupons each read that product&rsquo;s own keys from Freemius when
+              they need them. A product you add in Freemius works after Sync
+              from Freemius (CMS &rarr; Products), with nothing to paste.
             </p>
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               <CredentialField
                 id="freemius_developerId"
-                label="Developer ID (optional)"
+                label="Developer ID"
                 defaultValue={credentials.freemius.developerId}
-                hint="Only used by Sync from Freemius (CMS → Products), which imports your products, plans and prices."
+                hint="Shown in Freemius under My Profile. Sync from Freemius (CMS → Products) and the developer keys need it."
               />
+              <CredentialField
+                id="freemius_developerPublicKey"
+                label="Developer public key"
+                defaultValue={credentials.freemius.developerPublicKey}
+                placeholder="pk_…"
+              />
+              <CredentialField
+                id="freemius_developerSecretKey"
+                label="Developer secret key"
+                type="password"
+                placeholder={
+                  credentials.freemius.hasDeveloperSecretKey ? storedPlaceholder : 'sk_…'
+                }
+                hint="Reaches every product of your Freemius account: it stays on the server, encrypted."
+                removeLabel={
+                  credentials.freemius.hasDeveloperSecretKey ? 'Remove the stored developer secret key' : undefined
+                }
+              />
+            </div>
+            <DeveloperKeysStatus
+              status={freemiusDeveloper}
+              sources={freemiusDeveloperSources}
+              productId={credentials.freemius.productId}
+            />
+
+            <h4 className="pt-1 text-xs font-semibold">
+              One product&rsquo;s keys (optional)
+            </h4>
+            <p className="text-xs text-muted-foreground">
+              Only needed without developer keys, or for a product they
+              can&rsquo;t reach (one from another Freemius account): these fields
+              hold the keys of one Freemius product (in Freemius: the product
+              &rarr; Settings &rarr; API &amp; Keys). Each product in CMS &rarr;
+              Products keeps its own Freemius Product ID and Plan ID for
+              checkout. More such products go in the{' '}
+              <code>FREEMIUS_CHECKOUT_PRODUCTS_JSON</code> environment variable.
+            </p>
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
               <CredentialField
                 id="freemius_productId"
                 label="Product ID (optional)"
                 defaultValue={credentials.freemius.productId}
-                hint="Can stay empty: checkout, licenses, coupons and webhooks use the Freemius Product ID saved on each product."
+                hint="The product these keys belong to. Fill it in, also for a product outside your developer account: the keys then serve that product only and keep working while Freemius is slow or busy. Leave it empty only on a one-product store with no Developer ID. Developer keys never go here."
               />
               <CredentialField
                 id="freemius_publicKey"
@@ -382,6 +611,7 @@ function ProviderCredentialsCard({
                   credentials.freemius.hasSecretKey ? storedPlaceholder : 'sk_…'
                 }
                 hint="Proves that webhooks really come from Freemius."
+                removeLabel={credentials.freemius.hasSecretKey ? 'Remove the stored secret key' : undefined}
               />
               <CredentialField
                 id="freemius_apiKey"
@@ -391,6 +621,7 @@ function ProviderCredentialsCard({
                   credentials.freemius.hasApiKey ? storedPlaceholder : 'API key'
                 }
                 hint="The API bearer token from the same Freemius page. Shows license keys on orders and sends coupons to Freemius."
+                removeLabel={credentials.freemius.hasApiKey ? 'Remove the stored API key' : undefined}
               />
             </div>
           </div>
@@ -478,11 +709,14 @@ function ProviderToggleCard({
 function MissingKeysGuide({
   provider,
   missingKeys,
+  requirement,
   docsUrl,
   docsLabel,
 }: {
   provider: string;
   missingKeys: string[];
+  /** Replaces the "{provider} needs …" sentence when there is more than one way to configure it. */
+  requirement?: ReactNode;
   docsUrl: string;
   docsLabel: string;
 }) {
@@ -493,8 +727,12 @@ function MissingKeysGuide({
         <span>Configuration Required</span>
       </div>
       <p>
-        {provider} needs <strong>{missingKeys.join(', ')}</strong>. Add them in
-        Provider API Keys, save, then enable the provider.{' '}
+        {requirement ?? (
+          <>
+            {provider} needs <strong>{missingKeys.join(', ')}</strong>.
+          </>
+        )}{' '}
+        Add them in Provider API Keys, save, then enable the provider.{' '}
         <a
           href={docsUrl}
           target="_blank"

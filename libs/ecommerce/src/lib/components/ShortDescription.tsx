@@ -1,5 +1,6 @@
 import React from 'react';
-import { cn, sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
+import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils/authored-html';
+import { cn } from '@nextblock-cms/utils/utils';
 
 import { toNoCookieEmbedSrc } from './SimpleTiptapRenderer';
 

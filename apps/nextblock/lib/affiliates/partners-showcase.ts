@@ -3,7 +3,7 @@ import 'server-only';
 import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
-import { normalizeCurrencyRecord, resolveEffectivePriceForCurrency, type CurrencyRecord } from '@nextblock-cms/ecommerce';
+import { normalizeCurrencyRecord, resolveEffectivePriceForCurrency, type CurrencyRecord } from '@nextblock-cms/ecommerce/currency';
 import type { AffiliateLocale } from '@nextblock-cms/affiliates';
 import { buildPublishedAtOrFilter, majorUnitAmountToMinor } from '@nextblock-cms/utils';
 import type { PartnersShowcaseProduct } from '../../app/(public)/partners/_components/partners-model';

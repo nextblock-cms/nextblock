@@ -1,13 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@nextblock-cms/db/server', () => ({
-  getServiceRoleSupabaseClient: () => ({}),
-}));
-vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number) => String(amount),
-  getCurrencyMinorUnitFactor: () => 100,
-}));
+vi.mock('@nextblock-cms/db/server', async () => {
+  // The real check, as the other Freemius tests use. Without it the sync's purchase-data step threw
+  // inside canUseFreemiusDeveloperScope and the sync swallowed the error, so that step never ran here.
+  const { isSandboxEnvironment } = await vi.importActual<{ isSandboxEnvironment: () => boolean }>(
+    '../../../db/src/lib/config-resolve'
+  );
+  return { getServiceRoleSupabaseClient: () => ({}), isSandboxEnvironment };
+});
 vi.mock('server-only', () => ({}));
+// No developer key pair and (env blanked below) no product keys: the purchase-data step runs and
+// finds no credentials. freemius-checkout-sync-developer.test.ts runs it with the developer pair.
+vi.mock('./payment-config', () => ({
+  hydrateFreemiusEnvFromDb: async () => undefined,
+  resolveFreemiusDeveloperCredentialCandidates: async () => [],
+}));
 
 import { evaluateFreemiusCheckoutLicense, syncFreemiusCheckoutOrder } from './freemius-order-sync';
 
@@ -112,6 +119,28 @@ function fakeOrdersClient(row: Record<string, unknown>, otherOrdersWithLicense: 
 const pendingOrder = { id: 'o1', status: 'pending', provider: 'freemius', ...order };
 
 describe('syncFreemiusCheckoutOrder', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
+    for (const name of ['FREEMIUS_CHECKOUT_PRODUCTS_JSON', 'FREEMIUS_PUBLIC_KEY', 'FREEMIUS_SECRET_KEY', 'FREEMIUS_API_KEY', 'FREEMIUS_PRODUCT_ID']) {
+      vi.stubEnv(name, '');
+    }
+    // Nothing here may reach Freemius: the license lookup is injected and no key is configured.
+    fetchMock = vi.fn(async () => {
+      throw new Error('no network in this test');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
   it('refuses a forged callback naming another customer license, writing nothing', async () => {
     const { client, updates } = fakeOrdersClient(pendingOrder);
     const retrieveLicense = vi.fn(async () => ({
@@ -147,6 +176,10 @@ describe('syncFreemiusCheckoutOrder', () => {
     expect(result.success).toBe(true);
     expect(updates).toHaveLength(1);
     expect(updates[0]).toMatchObject({ freemius_license_id: '5001', freemius_product_id: '111', status: 'trial' });
+    // The purchase-data step ran to its end (no credentials here, so no data) instead of failing
+    // on the way and being swallowed, which printed "Failed to retrieve purchase data" and passed.
+    expect(console.error).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('refuses when Freemius cannot be reached or the license is already on another order', async () => {

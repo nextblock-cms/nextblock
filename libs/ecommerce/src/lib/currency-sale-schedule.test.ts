@@ -1,13 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
-
-vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number, currencyCode?: string | null) =>
-    `${currencyCode || 'USD'} ${amount}`,
-  getCurrencyMinorUnitFactor: () => 100,
-  majorUnitAmountToMinor: (amount: number) => Math.round(amount * 100),
-  minorUnitAmountToMajor: (amount: number) => amount / 100,
-  normalizeCurrencyCode: (code?: string | null) => (code || 'USD').trim().toUpperCase(),
-}));
+import { describe, expect, it } from 'vitest';
 
 import {
   isSaleWindowActive,

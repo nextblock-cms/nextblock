@@ -56,6 +56,20 @@ type BlockEditorModalProps = {
   onFlushBeforeClose?: () => Promise<boolean>;
 };
 
+/**
+ * Whether a pointer or focus event outside the editor dialog started on a toast (react-hot-toast's
+ * or sonner's container). A publish warning's toast (react-hot-toast) never expires and sits top
+ * right, over the dialog's header buttons, so clicking its Dismiss or Reload page counted as a click
+ * outside the editor: it closed a clean editor, or asked whether to save a dirty one (review
+ * 2026-11-15). sonner's toasts set no pointer-events of their own, so while a modal is open (Radix
+ * sets pointer-events none on body) a click on one reaches the overlay instead and still counts as
+ * outside; only react-hot-toast's toasts, which set pointer-events auto, are clickable over a modal.
+ */
+export function isToastInteraction(target: EventTarget | null): boolean {
+  const element = target as { closest?: (selector: string) => unknown } | null;
+  return Boolean(element && typeof element.closest === "function" && element.closest("[data-rht-toaster], [data-sonner-toaster]"));
+}
+
 const autosaveStatusLabels: Record<BlockEditorSaveStatus, string> = {
   idle: "Saved",
   dirty: "Unsaved",
@@ -198,6 +212,9 @@ export function BlockEditorModal({
           className="max-w-6xl h-[90vh] flex flex-col p-0 gap-0 overflow-hidden"
           onInteractOutside={(e) => {
             e.preventDefault();
+            if (isToastInteraction(e.target)) {
+              return;
+            }
             handleCloseAttempt();
           }}
           onEscapeKeyDown={(e) => {

@@ -93,9 +93,32 @@ export function resolveHeadlessEnvOptions(env = process.env) {
 }
 
 /**
+ * The options of a parsed commander command as the user passed them. commander fills in
+ * some values itself: `--no-trial` alone gives `trial` a default of true, so the parsed
+ * options could not tell "not passed" from "passed", and `mergeHeadlessOptions` never
+ * applied NEXTBLOCK_TRIAL=false (fixed 2026-11-13). A value whose source is commander's
+ * default is dropped for every option the environment can fill (HEADLESS_ENV_VARS), so
+ * the variable fills it and an explicit flag still wins; other defaults are kept.
+ */
+export function readExplicitHeadlessOptions(command) {
+  const explicit = {};
+
+  for (const [key, value] of Object.entries(command.opts())) {
+    if (command.getOptionValueSource(key) === 'default' && Object.hasOwn(HEADLESS_ENV_VARS, key)) {
+      continue;
+    }
+
+    explicit[key] = value;
+  }
+
+  return explicit;
+}
+
+/**
  * Command-line flags win; the environment fills whatever they left out. Only applied
  * once headless mode is on (by flag or by variable), so the interactive flow never
- * picks up stray variables.
+ * picks up stray variables. Pass the options through `readExplicitHeadlessOptions`
+ * first: a commander default is not a flag (`defineCreateCommand` does).
  */
 export function mergeHeadlessOptions(cliOptions = {}, env = process.env) {
   const fromEnv = resolveHeadlessEnvOptions(env);
@@ -113,7 +136,7 @@ export function mergeHeadlessOptions(cliOptions = {}, env = process.env) {
     }
   }
 
-  // commander leaves `trial` undefined when `--no-trial` was not passed.
+  // `trial` is undefined unless `--no-trial` was passed (`readExplicitHeadlessOptions`).
   if (merged.trial === undefined && fromEnv.trial !== undefined) {
     merged.trial = fromEnv.trial;
   }

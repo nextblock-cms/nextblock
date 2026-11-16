@@ -3,7 +3,7 @@
 import { Badge } from '@nextblock-cms/ui/badge';
 import { Button } from '@nextblock-cms/ui/button';
 import { ShoppingBag } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { useCartStore, useCartTotalItems } from '../cart-store';
 import { useCart } from '../use-cart';
 

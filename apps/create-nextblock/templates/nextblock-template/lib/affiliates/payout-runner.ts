@@ -2,7 +2,7 @@ import 'server-only';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
-import { getStripeClient, StripeNotConfiguredError } from '@nextblock-cms/ecommerce/server';
+import { getStripeClient, StripeNotConfiguredError } from '@nextblock-cms/ecommerce/stripe/client';
 import {
   AFFILIATE_ALERT_TYPES,
   AFFILIATE_CMS_STRIPE_PATH,

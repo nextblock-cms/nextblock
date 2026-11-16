@@ -21,7 +21,6 @@ import {
   emitJsonResult,
   generateAdminPassword,
   generateMcpBearerToken,
-  mergeHeadlessOptions,
   readEnvFile,
   requestTrialLicense,
   resolveAppUrlFromEnv,
@@ -38,6 +37,7 @@ import {
   findMissingPremiumDependencies,
   resolvePremiumPackages,
 } from './lib/activate.js';
+import { defineCreateCommand } from './lib/create-command.js';
 import { patchNextConfigForStandalone } from './lib/next-config.js';
 import { STANDALONE_ESLINT_CONFIG } from './lib/eslint-config.js';
 import { FALLBACK_OVERRIDES } from './lib/fallback-overrides.js';
@@ -90,22 +90,10 @@ program
   .description('NextBlock™ CMS CLI')
   .version(CLI_VERSION, '-v, --version');
 
-program
-  .command('create [project-directory]', { isDefault: true })
-  .description('Bootstrap a NextBlock™ CMS project')
-  .option('--skip-install', 'Skip installing dependencies')
-  .option('-y, --yes', 'Skip all interactive prompts and use defaults')
-  .option(
-    '--non-interactive',
-    'Headless run for coding agents: no prompts, JSON result on stdout, JSON errors on stderr. Requires --name and --email.',
-  )
-  .option('--name <name>', 'Your full name (headless: first administrator and trial owner)')
-  .option('--email <email>', 'Your email address (headless: first administrator and trial owner)')
-  .option('--mode <mode>', 'Headless hosting profile: docker (default) or cloud')
-  .option('--project-name <name>', 'Project directory name (same as the positional argument)')
-  .option('--license-key <key>', 'Headless: activate this NextBlock package key instead of provisioning a trial')
-  .option('--no-trial', 'Headless: do not request a Cortex AI trial key')
-  .action(handleCommand);
+// The flags live in bin/lib/create-command.js, which also merges in the NEXTBLOCK_* variables (the
+// shell-proof form of the headless flags: PowerShell strips the `--` that
+// `npm create nextblock -- --flag` depends on), so handleCommand receives the merged options.
+defineCreateCommand(program, handleCommand);
 
 // Hidden signpost (bin/lib/activate.js). Without it commander would hand `activate` to the
 // default `create` command and scaffold a project named "activate".
@@ -121,11 +109,8 @@ await program.parseAsync(process.argv).catch((error) => {
   process.exit(1);
 });
 
-async function handleCommand(projectDirectory, rawOptions) {
-  // NEXTBLOCK_* variables are the shell-proof form of the headless flags (PowerShell
-  // strips the `--` that `npm create nextblock -- --flag` depends on).
-  const options = mergeHeadlessOptions(rawOptions, process.env);
-
+async function handleCommand(projectDirectory, options) {
+  // `options` already carries the NEXTBLOCK_* variables in headless mode (defineCreateCommand).
   if (options.nonInteractive) {
     return handleHeadlessCommand(projectDirectory, options);
   }
@@ -1334,6 +1319,11 @@ async function ensureGitignore(projectDir) {
 
 async function ensureEnvExample(projectDir) {
   const destination = resolve(projectDir, '.env.example');
+  // copyTemplateTo normally put the template's .env.example here already. Through 0.23.3 the
+  // published tarball lacked it (npm packed the template by apps/nextblock's .gitignore, whose
+  // `.env.*` dropped it), so every `npm create nextblock` project got the placeholder below. The
+  // sync's pack check (scripts/lib/pack-check.js) now fails a publish without it; the candidates
+  // and the placeholder stay as the fallback for a template that lacks it anyway.
   if (await fs.pathExists(destination)) {
     return;
   }
@@ -1568,9 +1558,9 @@ async function ensureClientProviders(projectDir) {
 
   let content = await fs.readFile(providersPath, 'utf8');
   const wrapperImportStatement =
-    "import { TranslationsProvider } from '@nextblock-cms/utils';";
+    "import { TranslationsProvider } from '@nextblock-cms/utils/translations-context';";
   const existingImportRegex =
-    /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@nextblock-cms\/utils['"];?/;
+    /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@nextblock-cms\/utils(?:\/translations-context)?['"];?/;
   const legacyImportRegex =
     /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@\/lib\/client-translations['"];?/;
 

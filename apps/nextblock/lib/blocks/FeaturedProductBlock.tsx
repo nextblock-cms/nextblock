@@ -1,5 +1,5 @@
-import { FeaturedProduct } from '@nextblock-cms/ecommerce/components/FeaturedProduct';
-import { getProduct } from '@nextblock-cms/ecommerce/server';
+import { LazyFeaturedProduct } from '../../components/commerce/LazyCommerceClients';
+import { getProduct } from '@nextblock-cms/ecommerce/product-actions';
 import { normalizePriceMap, normalizeSalePriceMap } from '@nextblock-cms/ecommerce/currency';
 import { getVariantEffectivePriceRange } from '@nextblock-cms/ecommerce/variation-utils';
 
@@ -79,7 +79,7 @@ export const FeaturedProductBlock = async ({ content }: { content: FeaturedProdu
   return (
     <section className={`py-12 ${content.showBackground ? 'bg-secondary/30' : ''}`}>
        <div className="container">
-          <FeaturedProduct product={uiProduct} imagePosition={content.imagePosition} />
+          <LazyFeaturedProduct product={uiProduct} imagePosition={content.imagePosition} />
        </div>
     </section>
   );

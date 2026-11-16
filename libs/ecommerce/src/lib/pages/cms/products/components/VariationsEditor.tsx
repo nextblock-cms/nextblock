@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Badge, Button, Input, Label } from '@nextblock-cms/ui';
 
 import { ProductFormValues } from '../../../../product-schema';
@@ -18,8 +18,7 @@ import { CurrencyPriceFields } from './CurrencyPriceFields';
 import { SaleScheduleFields, type SaleScheduleField } from './SaleScheduleFields';
 import {
   convertMinorUnitAmount,
-  normalizePriceMap,
-  normalizeSalePriceMap,
+  normalizeCurrencyRecord,
   type CurrencyRecord,
 } from '../../../../currency';
 import {
@@ -41,6 +40,9 @@ interface VariationsEditorProps {
   basePrices?: Record<string, number | null | undefined>;
   baseSalePrice?: number | null;
   baseSalePrices?: Record<string, number | null | undefined>;
+  /** The product's sale window, which a new combination takes with the product's sale amounts. */
+  baseSaleStartAt?: string | null;
+  baseSaleEndAt?: string | null;
   currencies: CurrencyRecord[];
   availableVariantImages?: Array<{
     media_id: string;
@@ -68,6 +70,29 @@ function buildVariationAttributes(selectedTermsByAttribute: Record<string, strin
     .map(([attribute_id, term_ids]) => ({ attribute_id, term_ids }));
 }
 
+function compareText(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * What the variant list is regenerated from, each as one string compared by value: the selected
+ * terms, and each currency's code with the flags that decide which amounts a variant keeps.
+ */
+function buildRegenerationInputs(selectedAttributes: VariationSelectionGroup[], currencies: CurrencyRecord[]) {
+  return {
+    terms: JSON.stringify(
+      selectedAttributes
+        .map((attribute) => [attribute.attribute_id, attribute.terms.map((term) => term.id).sort(compareText)] as const)
+        .sort(([left], [right]) => compareText(left, right))
+    ),
+    currencies: JSON.stringify(
+      currencies
+        .map((currency) => normalizeCurrencyRecord(currency))
+        .map((currency) => [currency.code, currency.is_default, currency.auto_sync_product_prices])
+    ),
+  };
+}
+
 export function VariationsEditor({
   globalAttributes,
   currentLanguageCode,
@@ -76,6 +101,8 @@ export function VariationsEditor({
   basePrices,
   baseSalePrice,
   baseSalePrices,
+  baseSaleStartAt,
+  baseSaleEndAt,
   currencies,
   availableVariantImages = [],
   initialVariationAttributes,
@@ -116,9 +143,33 @@ export function VariationsEditor({
     [currentLanguageCode, globalAttributes, selectedTermsByAttribute]
   );
 
+  // The editor opens on exactly the variants the form holds and regenerates them only when the
+  // selected terms change (a toggle) or the currencies do, compared by value, so a render with new
+  // objects for the same terms and currencies regenerates nothing. Regenerating on open rebuilt every
+  // combination of the selected terms, so a product whose variants are not all of them (Cortex's
+  // manage_product_variants, a CMS import) gained the missing ones at the product's price with
+  // stock 0, and the form autosaved that with no edit. A change to the product's SKU, prices or sale
+  // regenerates nothing: an existing variant keeps its own values, so that rebuild only added the
+  // missing combinations (a product SKU edit did), or emptied the list when the attribute list
+  // lacked the variants' terms. A toggle reads the product's current values for what it adds.
+  const { terms: selectedTermsKey, currencies: currenciesKey } = buildRegenerationInputs(
+    selectedAttributes,
+    currencies
+  );
+  const regeneratedForRef = useRef({ terms: selectedTermsKey, currencies: currenciesKey });
+
   useEffect(() => {
+    const previousInputs = regeneratedForRef.current;
+    if (selectedTermsKey === previousInputs.terms && currenciesKey === previousInputs.currencies) {
+      return;
+    }
+    regeneratedForRef.current = { terms: selectedTermsKey, currencies: currenciesKey };
+
     if (selectedAttributes.length === 0) {
-      setVariantDrafts([]);
+      // Only deselecting the last term empties the list.
+      if (selectedTermsKey !== previousInputs.terms) {
+        setVariantDrafts([]);
+      }
       return;
     }
 
@@ -127,16 +178,30 @@ export function VariationsEditor({
         generateVariantDrafts({
           baseSku,
           basePrice,
-          basePrices: normalizePriceMap(basePrices),
+          basePrices,
           baseSalePrice,
-          baseSalePrices: normalizeSalePriceMap(baseSalePrices),
+          baseSalePrices,
+          baseSaleStartAt,
+          baseSaleEndAt,
           selectedAttributes,
           previousVariants: currentDrafts,
         }) as ProductFormValues['variants'],
         currencies
       ) as ProductVariantDraft[]
     );
-  }, [basePrice, basePrices, baseSalePrice, baseSalePrices, baseSku, currencies, selectedAttributes]);
+  }, [
+    basePrice,
+    basePrices,
+    baseSaleEndAt,
+    baseSalePrice,
+    baseSalePrices,
+    baseSaleStartAt,
+    baseSku,
+    currencies,
+    currenciesKey,
+    selectedAttributes,
+    selectedTermsKey,
+  ]);
 
   useEffect(() => {
     onChange({
@@ -464,7 +529,8 @@ export function VariationsEditor({
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-bold">{variant.label}</span>
                     <span className="text-xs text-muted-foreground">
-                      {variant.selected_options
+                      {/* A CMS draft import's variants carry only their term ids. */}
+                      {(variant.selected_options ?? [])
                         .map((option) => `${option.attribute_name}: ${option.term_value}`)
                         .join(' · ')}
                     </span>

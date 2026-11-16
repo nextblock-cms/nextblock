@@ -25,6 +25,12 @@
 // in a SANDBOX_GUARDS function of its module, in a private helper or class only those reach, or in
 // a function or class the entry exempts by name; code that runs at import never does. Client
 // handles resolve by lexical scope, so a same-named local elsewhere cannot borrow one.
+//
+// A fifth scan covers the Freemius developer key pair, which stays in the sandbox env for the
+// reset's catalog sync (findDeveloperKeyProblems): every request the developer module signs sits in
+// a refusal or a listed sandbox reader (SANDBOX_DEVELOPER_READERS), and every use of such a reader,
+// or of a function that relays one, in any module, sits in a refusal or is relayed by name in
+// DEVELOPER_KEY_CALLERS. Until 2026-11-13 the CMS "Sync from Freemius" spent that key for any visitor.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -74,7 +80,13 @@ const SANDBOX_GUARDS = [
     file: 'apps/nextblock/app/cms/users/actions.ts',
     functions: ['createUser', 'updateUserProfile', 'deleteUserAndProfile'],
     test: 'apps/nextblock/app/cms/users/actions.test.ts',
-    why: 'Visitors share the demo accounts: creating, changing or deleting a user mints live accounts or locks everyone out. The reset deletes every account but two preserved ids, then restores (or re-creates) the demo admin and re-creates the demo partners; it never re-creates the other preserved account, so deleting that one is permanent.',
+    why: "Visitors share the demo accounts: creating, changing or deleting a user mints live accounts or locks everyone out. The reset deletes every account but two preserved ids and the demo admin's address, then restores (or re-creates) the demo admin and re-creates the demo partners; it never re-creates the other preserved account, so deleting that one is permanent.",
+  },
+  {
+    file: 'apps/nextblock/lib/setup/provision-admin.ts',
+    functions: ['provisionFirstAdmin'],
+    test: 'apps/nextblock/lib/setup/provision-admin.test.ts',
+    why: 'The sandbox never runs first-boot setup: its administrator is the published demo account every reset restores. While its first-admin flag reads false (a reset that could not restore the demo admin; 2026-11-13), /setup and /api/setup/bootstrap would create an account with any address a visitor typed.',
   },
   {
     file: 'apps/nextblock/app/profile/password/actions.ts',
@@ -261,16 +273,48 @@ const SANDBOX_GUARDS = [
     why: "It mints a real trial license on the operator's Freemius product: the sandbox answers 404 even with the vendor flag copied into its env.",
   },
   {
+    file: 'apps/nextblock/app/api/packages/claim-license/route.ts',
+    functions: ['POST'],
+    test: 'apps/nextblock/app/api/packages/claim-license/route.test.ts',
+    why: "It hands out the license keys it reads with the operator's Freemius keys (the developer pair, else the one-product fallback), and every lookup spends the pair production's checkouts, claims, trials, coupon pushes and webhook checks share: the sandbox answers 404 even with the vendor flag copied into its env, before it reads the request.",
+  },
+  {
     file: 'apps/nextblock/lib/packages/revalidate-activations.ts',
     functions: ['maybeRevalidatePackageActivations'],
     test: 'apps/nextblock/lib/packages/revalidate-activations.test.ts',
-    why: 'It re-issues Freemius licenses/activate.json for every activation; the sandbox seeds placeholder activations and asks Freemius nothing.',
+    why: 'It asks Freemius which license is active on each due install (GET installs/{id}/license.json) and writes the verdict to package_activations with the service role; the sandbox seeds placeholder activations, reads none of them and asks Freemius nothing.',
   },
   {
     file: 'libs/ecommerce/src/lib/freemius-coupons.ts',
     functions: ['freemiusCouponRequest', 'syncCouponToFreemius', 'syncProductSaleCouponToFreemius', 'deleteCouponFromFreemius'],
     test: 'libs/ecommerce/src/lib/freemius-coupons.test.ts',
-    why: "Coupon, sale-price and promotion saves would create, change or delete live coupons on the operator's real Freemius products (the reset syncs their ids) with the deployment's bearer, and a remote coupon outlives the reset.",
+    why: "Coupon, sale-price and promotion saves would create, change or delete live coupons on the operator's real Freemius products (the reset syncs their ids) with the deployment's developer key or bearer, and a remote coupon outlives the reset.",
+  },
+  {
+    file: 'libs/ecommerce/src/lib/freemius-developer-api.ts',
+    functions: [
+      'freemiusDeveloperRequest',
+      'getFreemiusProductKeys',
+      'canUseFreemiusDeveloperScope',
+      'withFreemiusDeveloperScope',
+      'getFreemiusDeveloperStatus',
+      'describeFreemiusDeveloperPairs',
+      'confirmFreemiusOneProductKeys',
+    ],
+    test: 'libs/ecommerce/src/lib/freemius-developer-api.test.ts',
+    why: "The Freemius developer key pair is a master key for the operator's whole Freemius account (every product's secret, licenses and their keys, owners' emails, coupons, trial licenses): on the sandbox only the catalog reader the reset uses runs (openFreemiusCatalogReader: GET, catalog paths; its callers are checked through SANDBOX_DEVELOPER_READERS), and every other entry, the product-scope check of the one-product keys included, refuses before it resolves or sends a key.",
+  },
+  {
+    file: 'libs/ecommerce/src/lib/pages/cms/products/actions.ts',
+    functions: ['triggerFreemiusSync', 'triggerSingleProductSync'],
+    test: 'libs/ecommerce/src/lib/pages/cms/products/actions.sandbox.test.ts',
+    why: "Sync from Freemius reads the catalog with the operator's developer key pair (about 22 signed requests a click), the key production's checkouts, license links, claims, coupon pushes and webhook checks depend on: clicked or scripted by sandbox visitors it could push that key into Freemius 429s (2026-11-13). Both actions refuse right after the admin check; the reset is the one sandbox sync.",
+  },
+  {
+    file: 'libs/ecommerce/src/lib/freemius-license.ts',
+    functions: ['getFreemiusOrderLicense'],
+    test: 'libs/ecommerce/src/lib/freemius-license.test.ts',
+    why: "The success and order pages read the order's license on every visit, with the developer key pair or the product's own keys. On the sandbox any visitor can open any order and, over PostgREST as the factor-less demo admin, point it at any license id and creation time: no license is read there, so no visit spends the operator's Freemius keys or shows a real customer's key.",
   },
   // Secrets later visitors would read or spend.
   {
@@ -475,11 +519,7 @@ const ACCOUNT_WRITERS = new Map([
   [
     'apps/nextblock/lib/setup/provision-admin.ts',
     {
-      why: 'first-admin provisioning (/setup, /api/setup/bootstrap).',
-      exempt: {
-        provisionFirstAdmin:
-          'refuses once an admin exists unless a local-dev reset was asked for (isLocalWritableEnv), and the sandbox always has its demo admin.',
-      },
+      why: 'first-admin provisioning (/setup, /api/setup/bootstrap): provisionFirstAdmin refuses on the sandbox (SANDBOX_GUARDS), and elsewhere once an admin exists unless a local-dev reset was asked for (isLocalWritableEnv).',
     },
   ],
 ]);
@@ -502,8 +542,11 @@ const STORAGE_WRITERS = new Map([
   ['apps/nextblock/lib/custom-block-r2-upload.ts', 'custom block assets; emptied by the next reset on the sandbox.'],
   ['apps/nextblock/lib/media/external-image-import.ts', 'imports an external image into media; emptied by the next reset on the sandbox.'],
   ['apps/nextblock/lib/full-backup/server.ts', 'full backup export and restore; both refuse on the sandbox (SANDBOX_GUARDS).'],
-  ['libs/ecommerce/src/lib/product-actions.ts', "updateProduct deletes the objects of the media rows it removed; the sandbox bucket is emptied by every reset."],
   ['apps/nextblock/lib/storage/supabase-storage.ts', 'the Supabase Storage adapter; callers of its write helpers (STORAGE_HELPERS) are listed here.'],
+  [
+    'apps/nextblock/lib/storage/presigned-put.ts',
+    'presignBoundPut signs browser upload URLs for exactly the declared size and type; its callers (STORAGE_HELPERS) are listed here.',
+  ],
   ['libs/utils/src/lib/r2-client.ts', 'a deleteMediaFiles copy no module imports; callers of deleteMediaFiles (STORAGE_HELPERS) are listed here.'],
   ['libs/utils/src/server.ts', 'deleteMediaFiles (@nextblock-cms/utils/server); its callers (STORAGE_HELPERS) are listed here.'],
 ]);
@@ -528,7 +571,6 @@ const VENDOR_WRITERS = new Map([
       },
     },
   ],
-  ['apps/nextblock/lib/packages/revalidate-activations.ts', { why: 'the daily re-validation skips the sandbox before reading an activation (SANDBOX_GUARDS).' }],
   [
     'libs/affiliates/src/lib/connect/accounts.ts',
     {
@@ -551,6 +593,12 @@ const VENDOR_WRITERS = new Map([
     },
   ],
   ['libs/ecommerce/src/lib/freemius-coupons.ts', { why: 'every request refuses on the sandbox (freemiusCouponRequest and its callers are in SANDBOX_GUARDS).' }],
+  [
+    'libs/ecommerce/src/lib/freemius-developer-api.ts',
+    {
+      why: 'every write at developer scope (coupons, trial licenses and their assignment) goes through freemiusDeveloperRequest, which refuses on the sandbox before it resolves the developer key (SANDBOX_GUARDS); the catalog reader the sync and the sandbox reset use sends GET only.',
+    },
+  ],
   [
     'apps/nextblock/lib/affiliates/paypal/client.ts',
     { why: 'every PayPal request goes through sendAffiliatePayPalRequest, which throws on the sandbox before any fetch (SANDBOX_GUARDS).' },
@@ -582,6 +630,56 @@ const VENDOR_WRITERS = new Map([
       exempt: {
         createCheckoutSession: 'exported for standalone use but unused by the app, which checks out through providers/stripe.ts behind /api/checkout (403 on the sandbox).',
       },
+    },
+  ],
+]);
+
+/**
+ * Freemius developer-scope reads that still run on the public sandbox. Its env holds the operator's
+ * developer key pair so that the reset can sync the demo catalog, and that pair is the one
+ * production's checkouts, license links, claims, coupon pushes and webhook checks depend on: a
+ * visitor who can drive a request signed with it can push it into Freemius 429s (2026-11-13: the
+ * CMS Sync from Freemius sent 22 signed GETs a click there). Every other developer-scope entry
+ * refuses on the sandbox itself (SANDBOX_GUARDS, freemius-developer-api.ts); these do not, so
+ * their callers answer for them (DEVELOPER_KEY_CALLERS).
+ */
+const SANDBOX_DEVELOPER_READERS = [{ file: 'libs/ecommerce/src/lib/freemius-developer-api.ts', name: 'openFreemiusCatalogReader' }];
+
+/**
+ * The modules that sign with the developer key pair. Each request they send (a `fetch` call) sits
+ * in a SANDBOX_GUARDS function of the module, a private helper only those reach, or a listed
+ * sandbox reader: a new entry point either refuses on the sandbox or is listed, so that its
+ * callers are checked.
+ */
+const DEVELOPER_KEY_SIGNERS = ['libs/ecommerce/src/lib/freemius-developer-api.ts'];
+
+/**
+ * Modules that use a sandbox developer reader, or a function that relays one, with how they behave
+ * on the sandbox. Each use (a call, or the function passed as a value) sits in a SANDBOX_GUARDS
+ * function of the module, a private helper only those reach, or a function the entry `relays` by
+ * name with the reason it may run there. A relayed function becomes a reader in turn, so its own
+ * callers, in every module, answer for it too.
+ */
+const DEVELOPER_KEY_CALLERS = new Map([
+  [
+    'libs/ecommerce/src/lib/providers/freemius.ts',
+    {
+      why: 'Sync from Freemius reads the catalog through openFreemiusCatalogReader, on the sandbox too: its reset syncs the demo catalog that way.',
+      relays: {
+        syncFreemiusProductsToSupabase:
+          'the full-store sync runs wherever it is called: the CMS Sync refuses on the sandbox (SANDBOX_GUARDS) and the reset is the one sandbox sync, which this check keeps true for every caller.',
+        syncSingleFreemiusProduct: 'the one-product sync, like syncFreemiusProductsToSupabase.',
+      },
+    },
+  ],
+  [
+    'libs/ecommerce/src/lib/pages/cms/products/actions.ts',
+    { why: 'the CMS Sync from Freemius actions (triggerFreemiusSync, triggerSingleProductSync) refuse on the sandbox right after the admin check (SANDBOX_GUARDS).' },
+  ],
+  [
+    'apps/nextblock/app/api/cron/reset-sandbox/route.ts',
+    {
+      why: 'the 15-minute reset syncs the demo catalog, the one sandbox sync: GET answers 404 off the sandbox and needs the cron secret (SANDBOX_GUARDS), and ensureSandboxCommerceProductSynced runs only from it.',
     },
   ],
 ]);
@@ -639,10 +737,17 @@ const STORAGE_METHODS = new Set(['upload', 'update', 'remove', 'move', 'copy', '
 
 /**
  * Write helpers whose callers write storage: the Supabase Storage adapter's
- * (`apps/nextblock/lib/storage/supabase-storage.ts`) and the R2 delete helper `deleteMediaFiles`
- * (`@nextblock-cms/utils/server`).
+ * (`apps/nextblock/lib/storage/supabase-storage.ts`), the presigned upload signer `presignBoundPut`
+ * (`apps/nextblock/lib/storage/presigned-put.ts`; the URL it signs lets the browser write) and the
+ * R2 delete helper `deleteMediaFiles` (`@nextblock-cms/utils/server`).
  */
-const STORAGE_HELPERS = new Set(['supabaseUploadObject', 'supabaseCreateSignedUpload', 'supabaseRemoveObjects', 'deleteMediaFiles']);
+const STORAGE_HELPERS = new Set([
+  'supabaseUploadObject',
+  'supabaseCreateSignedUpload',
+  'supabaseRemoveObjects',
+  'presignBoundPut',
+  'deleteMediaFiles',
+]);
 
 function parseSource(fileName, source) {
   const kind = /\.[jt]sx$/.test(fileName) ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
@@ -1501,7 +1606,7 @@ function sideEffectsInSource(fileName, source) {
 
 /** Cheap text filter: only modules that could match one of the call sites above are parsed. */
 const SIDE_EFFECT_HINT =
-  /createTransport|\bauth\b|GoTrue|AuthClient|AuthAdminApi|ObjectCommand|ObjectsCommand|MultipartUpload|UploadPartCommand|\.storage\b|supabase(?:UploadObject|CreateSignedUpload|RemoveObjects)|deleteMediaFiles|stripe|freemius\.com|FREEMIUS_API_URL|@freemius\/|paypal\.com|createPayoutBatch|cancelPayoutItem/i;
+  /createTransport|\bauth\b|GoTrue|AuthClient|AuthAdminApi|ObjectCommand|ObjectsCommand|MultipartUpload|UploadPartCommand|\.storage\b|supabase(?:UploadObject|CreateSignedUpload|RemoveObjects)|presignBoundPut|deleteMediaFiles|stripe|freemius\.com|FREEMIUS_API_URL|@freemius\/|paypal\.com|createPayoutBatch|cancelPayoutItem/i;
 
 const SIDE_EFFECT_LISTS = [
   ['mail', 'MAIL_SENDERS', 'creates a mail transport'],
@@ -1576,13 +1681,190 @@ function findUnlistedSideEffects(
   return problems;
 }
 
+/* --------------------------------------------- Freemius developer-scope reads on the sandbox --- */
+
+const lineOfNode = (sourceFile, node) => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
+
+/**
+ * Every use of the global `fetch` in a module (a call, or the function taken as a value), and
+ * `globalThis.fetch` / `window.fetch` / `self.fetch`, each with its top-level binding. A local
+ * binding named `fetch` (a parameter, a destructured option) is not the global one.
+ */
+function fetchSites(sourceFile) {
+  const sites = [];
+  const visit = (node) => {
+    const global =
+      ts.isIdentifier(node) && node.text === 'fetch' && isReference(node) && !isImportBinding(node) && resolveDeclaration(node) === null;
+    const member =
+      ts.isPropertyAccessExpression(node) && node.name.text === 'fetch' && /^(?:globalThis|window|self)$/.test(node.expression.getText(sourceFile));
+    if (global || member) sites.push({ label: `fetch (line ${lineOfNode(sourceFile, node)})`, key: declarationKeyOf(node) });
+    if (!member) ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return sites;
+}
+
+/**
+ * Where a module uses a function named in `names` (the sandbox readers and their relays): a call
+ * or a reference through its own name, an alias it imports or destructures it under, or a member
+ * (`ns.name`, `ns['name']`). Imports and re-exports run nothing; a re-export under another name is
+ * returned in `exportAliases`, which the caller adds to the names.
+ */
+function developerReaderUses(sourceFile, names) {
+  const local = new Set(names);
+  const aliases = (node) => {
+    if (ts.isImportSpecifier(node) && names.has((node.propertyName ?? node.name).text)) local.add(node.name.text);
+    if (ts.isBindingElement(node) && node.propertyName && ts.isIdentifier(node.name) && names.has(propertyKey(node.propertyName) ?? '')) {
+      local.add(node.name.text);
+    }
+    ts.forEachChild(node, aliases);
+  };
+  aliases(sourceFile);
+
+  const uses = [];
+  const exportAliases = new Set();
+  const add = (name, node) => uses.push({ name, label: `${name} (line ${lineOfNode(sourceFile, node)})`, key: declarationKeyOf(node) });
+  const visit = (node) => {
+    if (ts.isExportSpecifier(node)) {
+      const source = (node.propertyName ?? node.name).text;
+      if (local.has(source) && node.name.text !== source) exportAliases.add(node.name.text);
+      return;
+    }
+    if (ts.isIdentifier(node) && local.has(node.text) && !isImportBinding(node) && isReference(node)) {
+      add(node.text, node);
+    } else if (ts.isPropertyAccessExpression(node) && names.has(node.name.text)) {
+      add(node.name.text, node);
+    } else if (ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) && names.has(node.argumentExpression.text)) {
+      add(node.argumentExpression.text, node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return { uses, exportAliases };
+}
+
+/**
+ * The Freemius developer key pair on the public sandbox (SANDBOX_DEVELOPER_READERS):
+ * - each request a signer module sends sits in a SANDBOX_GUARDS function of that module, a private
+ *   helper only those reach, or a listed sandbox reader of that module;
+ * - each use of a sandbox reader, or of a function that relays one, in any module sits in a
+ *   SANDBOX_GUARDS function of that module, a private helper only those reach, or a function its
+ *   DEVELOPER_KEY_CALLERS entry relays (and then that function's uses are checked too). Code that
+ *   runs at import never qualifies.
+ * Also reports a listed reader that is gone, an unlisted module, and stale entries or relays.
+ */
+function findDeveloperKeyProblems({
+  modules = scanRepository(),
+  readFile = (absolute) => fs.readFileSync(absolute, 'utf8'),
+  readers = SANDBOX_DEVELOPER_READERS,
+  signers = DEVELOPER_KEY_SIGNERS,
+  callers = DEVELOPER_KEY_CALLERS,
+  guards = SANDBOX_GUARDS,
+} = {}) {
+  const problems = [];
+  const guardedNames = new Map();
+  for (const guard of guards) guardedNames.set(guard.file, [...(guardedNames.get(guard.file) ?? []), ...guard.functions]);
+  const byRepoPath = new Map([...modules.values()].map((mod) => [mod.repoPath, mod]));
+  const parsed = new Map();
+  const parse = (mod) => {
+    if (!parsed.has(mod.repoPath)) parsed.set(mod.repoPath, parseSource(mod.absolute, readFile(mod.absolute)));
+    return parsed.get(mod.repoPath);
+  };
+
+  // 1. The signers: every request outside a refusal is a listed sandbox reader.
+  for (const repoPath of signers) {
+    const mod = byRepoPath.get(repoPath);
+    if (!mod) {
+      problems.push(`${repoPath}: missing. Moved? Update DEVELOPER_KEY_SIGNERS (tools/scripts/lib/sandbox-guards.js).`);
+      continue;
+    }
+    const sourceFile = parse(mod);
+    const index = moduleIndex(sourceFile);
+    const readerNames = readers.filter((reader) => reader.file === repoPath).map((reader) => reader.name);
+    const accepted = acceptedBindings(sourceFile, index, [...(guardedNames.get(repoPath) ?? []), ...readerNames]);
+    for (const site of fetchSites(sourceFile)) {
+      if (!accepted.has(site.key)) {
+        problems.push(
+          `${repoPath}#${site.key} sends a request signed with the Freemius developer key pair (${site.label}) outside a SANDBOX_GUARDS function of the module, a private helper only those reach, or a listed sandbox reader: refuse it on the sandbox (SANDBOX_GUARDS), or list it in SANDBOX_DEVELOPER_READERS (tools/scripts/lib/sandbox-guards.js) so that its callers are checked.`
+        );
+      }
+    }
+  }
+  for (const reader of readers) {
+    const mod = byRepoPath.get(reader.file);
+    const index = mod ? moduleIndex(parse(mod)) : null;
+    if (!index || !index.exportKeys.has(reader.name)) {
+      problems.push(`${reader.file}#${reader.name}: not found. Renamed? Update SANDBOX_DEVELOPER_READERS (tools/scripts/lib/sandbox-guards.js).`);
+    }
+  }
+
+  // 2. Every use of a reader or a relay, in every module. A re-export under another name adds that name.
+  const names = new Set(readers.map((reader) => reader.name));
+  for (const entry of callers.values()) for (const relay of Object.keys(entry.relays ?? {})) names.add(relay);
+  let found = new Map();
+  for (let round = 0; round < 5; round += 1) {
+    const before = names.size;
+    found = new Map();
+    for (const mod of modules.values()) {
+      const source = readFile(mod.absolute);
+      if (![...names].some((name) => source.includes(name))) continue;
+      const { uses, exportAliases } = developerReaderUses(parse(mod), names);
+      for (const alias of exportAliases) names.add(alias);
+      if (uses.length > 0) found.set(mod.repoPath, uses);
+    }
+    if (names.size === before) break;
+  }
+
+  for (const [repoPath, uses] of found) {
+    const entry = callers.get(repoPath);
+    if (!entry) {
+      problems.push(
+        `${repoPath} uses a Freemius developer-scope read that runs on the sandbox (${uses.map((use) => use.label).join(', ')}): refuse it there (isSandboxEnvironment()) and list the module in DEVELOPER_KEY_CALLERS (tools/scripts/lib/sandbox-guards.js) with how it behaves on the sandbox.`
+      );
+      continue;
+    }
+    const sourceFile = parse(byRepoPath.get(repoPath));
+    const index = moduleIndex(sourceFile);
+    const guarded = guardedNames.get(repoPath) ?? [];
+    const relays = Object.keys(entry.relays ?? {});
+    const accepted = acceptedBindings(sourceFile, index, [...guarded, ...relays]);
+    for (const use of uses) {
+      if (!accepted.has(use.key)) {
+        problems.push(
+          `${repoPath}#${use.key} uses a Freemius developer-scope read that runs on the sandbox (${use.label}) outside a SANDBOX_GUARDS function of the module or a private helper only those reach: refuse it on the sandbox and list the function in SANDBOX_GUARDS, or relay it by name with the reason in DEVELOPER_KEY_CALLERS (tools/scripts/lib/sandbox-guards.js), which checks its own callers too.`
+        );
+      }
+    }
+    for (const relay of relays) {
+      if (!index.bindings.has(relay)) {
+        problems.push(`DEVELOPER_KEY_CALLERS relays ${repoPath}#${relay}, which the module does not define: renamed? Update the entry.`);
+        continue;
+      }
+      const without = acceptedBindings(sourceFile, index, [...guarded, ...relays.filter((other) => other !== relay)]);
+      if (uses.every((use) => without.has(use.key) || !accepted.has(use.key))) {
+        problems.push(`DEVELOPER_KEY_CALLERS relays ${repoPath}#${relay}, which no longer uses a sandbox developer reader: remove it.`);
+      }
+    }
+  }
+  for (const repoPath of callers.keys()) {
+    if (!found.has(repoPath)) {
+      problems.push(`DEVELOPER_KEY_CALLERS lists ${repoPath}, which no longer uses a sandbox developer reader: remove the entry.`);
+    }
+  }
+  return problems;
+}
+
 module.exports = {
   VENDOR_WRITERS,
   ACCOUNT_WRITERS,
+  DEVELOPER_KEY_CALLERS,
+  DEVELOPER_KEY_SIGNERS,
   FLAG_READERS,
   MAIL_SENDERS,
+  SANDBOX_DEVELOPER_READERS,
   SANDBOX_GUARDS,
   STORAGE_WRITERS,
+  findDeveloperKeyProblems,
   findFlagReaderProblems,
   findGuardProblems,
   findUnlistedSideEffects,

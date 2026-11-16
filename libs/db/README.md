@@ -34,8 +34,10 @@ Vercel Supabase integration injects.
 
 ## Migrations
 
-The package includes `supabase/` with the NextBlock migrations. `npm run update` in a NextBlock
-project copies them into the project's `supabase/migrations` and applies the pending ones.
+The package includes `supabase/` with the NextBlock migrations, the Supabase `config.toml` and the
+Auth email templates. `npm run update` in a NextBlock project copies the migrations into the
+project's `supabase/migrations` (and `config.toml` when the project has none) and applies the
+pending ones.
 
 ## Documentation
 

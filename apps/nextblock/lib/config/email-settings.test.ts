@@ -163,7 +163,7 @@ describe('saveEmailSettings', () => {
     ]);
   });
 
-  it('re-seals a credential stored before 0.23.1 on a save that changes neither, keeping the other', async () => {
+  it('re-seals a credential stored before 0.23.0 on a save that changes neither, keeping the other', async () => {
     vi.stubEnv('NEXTBLOCK_ENCRYPTION_KEY', TEST_KEY);
     mocks.rows.set('email_secret', { user: 'enc:cms-user', pass: legacyEnvelope('cms-pass', TEST_KEY) });
 
@@ -289,7 +289,7 @@ describe('resolveEmailServerConfig', () => {
       expect(config).toMatchObject({ host: 'mail.provider.example', auth: { user: 'deployment-user', pass: 'deployment-pass' } });
     });
 
-    it('still uses credentials sealed for their own fields, and a version 1 pair from before 0.23.1', async () => {
+    it('still uses credentials sealed for their own fields, and a version 1 pair from before 0.23.0', async () => {
       mocks.rows.set('email_public', { host: 'smtp.cms.example', port: '465', fromEmail: '', fromName: '', secure: true });
       mocks.rows.set('email_secret', {
         user: db.encryptWithEnvKey('cms-user', USER_SLOT),

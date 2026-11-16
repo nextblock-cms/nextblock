@@ -7,7 +7,7 @@ import Link from 'next/link';
 
 import { useCart } from '../use-cart';
 import { rememberStorefrontAffiliateRef } from '../cart-store';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 import { getProductPaymentProvider, isDigitalProduct, Product } from '../types';
 import { useCurrency } from '../CurrencyProvider';

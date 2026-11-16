@@ -7,7 +7,7 @@
  * order through `onConfirm`; nothing is saved until then.
  */
 import { Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Input, Label } from '@nextblock-cms/ui';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import { ArrowDown, ArrowUp, Loader2, Package, Search, X } from 'lucide-react';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 

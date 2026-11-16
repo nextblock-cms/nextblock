@@ -62,6 +62,8 @@ export function ConsentGatedAnalytics({
   }, [analyticsAllowed, blocked, customScripts, nonce]);
 
   if (blocked) return null;
+  // Unmounting stops only a tag that has not loaded yet. Once gtag.js, gtm.js or a custom script has
+  // run, a withdrawal needs the page reload ConsentBanner does (lib/privacy/consent-withdrawal.ts).
   if (!analyticsAllowed) return null;
   if (!gtmId && !gaMeasurementId) return null;
   return (

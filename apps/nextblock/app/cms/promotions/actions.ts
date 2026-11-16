@@ -1,8 +1,10 @@
 "use server";
 
-import { createClient } from "@nextblock-cms/db/server";
+import "server-only";
+
 import { revalidatePath } from "next/cache";
 
+import { requireCmsAdmin } from "../../../lib/auth/cms-actor";
 import {
   applyPromotionsImport,
   dryRunPromotionsImport,
@@ -13,26 +15,15 @@ import {
   type PromotionTransferResult,
 } from "../../../lib/promotions/server";
 
-async function assertAdmin() {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    throw new Error("Not authenticated.");
-  }
-
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-
-  if (profile?.role !== "ADMIN") {
-    throw new Error("Admin access required.");
-  }
-}
+/*
+ * lib/promotions/server.ts reads and writes products with the service role, and an applied sale
+ * import pushes each Freemius product's sale coupon (SALE<SKU>, up to 100% off) through the
+ * developer key pair. Every action therefore starts with requireCmsAdmin(): an ADMIN whose session
+ * has passed the enrolled second factor. Until 2026-11-13 a local assertAdmin() checked the role
+ * only, which an ADMIN password alone satisfies (a server action never meets the CMS layout's 2FA
+ * redirect). tools/scripts/server-action-actors.test.ts fails on an action that reaches a coupon
+ * push without requireEcomAdmin() / requireCmsAdmin() first.
+ */
 
 function dateStamp() {
   return new Date().toISOString().slice(0, 10);
@@ -46,7 +37,7 @@ export async function getPromotionsTemplateAction(
   kind: PromotionKind
 ): Promise<PromotionTransferResult> {
   try {
-    await assertAdmin();
+    await requireCmsAdmin();
     return {
       success: true,
       fileName: `nextblock-${kindLabel(kind)}-import-template.csv`,
@@ -65,7 +56,7 @@ export async function exportPromotionsAction(
   kind: PromotionKind
 ): Promise<PromotionTransferResult> {
   try {
-    await assertAdmin();
+    await requireCmsAdmin();
     return {
       success: true,
       fileName: `nextblock-${kindLabel(kind)}-${dateStamp()}.csv`,
@@ -85,7 +76,7 @@ export async function dryRunPromotionsImportAction(params: {
   content: string;
 }): Promise<{ success: boolean; summary?: PromotionImportSummary; error?: string }> {
   try {
-    await assertAdmin();
+    await requireCmsAdmin();
     const summary = await dryRunPromotionsImport(params.kind, params.content);
     return { success: true, summary };
   } catch (error) {
@@ -101,7 +92,7 @@ export async function applyPromotionsImportAction(params: {
   content: string;
 }): Promise<{ success: boolean; summary?: PromotionImportSummary; error?: string }> {
   try {
-    await assertAdmin();
+    await requireCmsAdmin();
     const summary = await applyPromotionsImport(params.kind, params.content);
     revalidatePath("/cms/promotions");
     revalidatePath("/cms/products");

@@ -1053,9 +1053,10 @@ async function resolveMediaReferences(
  * DIRECTLY. We must NOT route this through updateProduct /
  * upsert_product_with_variants: that is a full product rewrite that (because it
  * re-serializes the whole row) would wipe the product's variants, clear its
- * scheduled sale window and custom canonical, re-round-trip prices (corrupting
- * zero-decimal currencies), and hard-delete the previous images from storage.
- * Images live in a separate join table, so touch only that.
+ * scheduled sale window and custom canonical, and re-round-trip prices (corrupting
+ * zero-decimal currencies). (Through 0.23.3 it also deleted the previous images
+ * from storage; since 0.23.4 a save only unlinks them.) Images live in a separate
+ * join table, so touch only that.
  */
 async function replaceProductMediaRows(params: {
   mediaIds: readonly string[];
@@ -1095,14 +1096,91 @@ async function replaceProductMediaRows(params: {
 }
 
 /**
+ * The key and value every product-values draft meta NextBlock writes since 0.23.4 carries (the
+ * product form's autosave, a CMS import in draft mode). A lib cannot import the app, so this is a
+ * copy of PRODUCT_DRAFT_FORM_MARKER_KEY / _VALUE in
+ * apps/nextblock/lib/visual-editing/product-draft-meta.ts, and that folder's
+ * product-draft-marker.test.ts fails when the two drift.
+ */
+export const CORTEX_PRODUCT_DRAFT_FORM_MARKER_KEY = 'form_version';
+export const CORTEX_PRODUCT_DRAFT_FORM_MARKER_VALUE = 2;
+
+/**
+ * Whether a `product_drafts.meta` holds product values without that marker, i.e. written by a
+ * version before 0.23.4. Product values as the app's classifyProductDraftMeta defines them: not
+ * the pre-0.23.4 copy of the products row (an `id` and no `variants` array), and a string `sku` or
+ * a numeric `price`. Marked means a number at least the marker value (a later version may raise
+ * it). The old edit page autosaved some of these drafts over that row copy (prices 100 times too
+ * high, no variants, gallery or description), and the app refuses to publish one that shows it
+ * (findPoisonedProductDraftFields in apps/nextblock/app/cms/products/productFormData.ts).
+ */
+export function isUnmarkedProductValuesDraftMeta(meta: unknown): boolean {
+  if (!isPlainJsonRecord(meta)) {
+    return false;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(meta, 'id') && !Array.isArray(meta['variants'])) {
+    return false;
+  }
+
+  if (typeof meta['sku'] !== 'string' && typeof meta['price'] !== 'number') {
+    return false;
+  }
+
+  const marker = meta[CORTEX_PRODUCT_DRAFT_FORM_MARKER_KEY];
+  return !(typeof marker === 'number' && marker >= CORTEX_PRODUCT_DRAFT_FORM_MARKER_VALUE);
+}
+
+const UNMARKED_PRODUCT_DRAFT_RISK =
+  'may hold damaged values (prices 100 times too high, no variants, images or description), and changing it from here could hide that from the check that stops such a draft from being published';
+const UNMARKED_PRODUCT_DRAFT_ADVICE =
+  'Open the product in the CMS editor first (CMS → Products), review the draft there, then save a change or discard it';
+
+/**
+ * Refuses, before anything is written, a change whose draft patch would rewrite the `meta` of the
+ * product's open draft when that meta is unmarked product values (isUnmarkedProductValuesDraftMeta),
+ * the case patchOpenProductDraft refuses after the live write. `patchesMeta` is the caller's rule
+ * for when its patch returns a meta. set_content_images rewrites a meta that holds a gallery list
+ * (`product_media`), which can remove the only sign the app's check finds (an empty gallery where
+ * the live product has one); the draft's prices would then publish as they are. A meta without
+ * that list is left as it is, so such a draft is not refused. A read error counts as no draft, as
+ * in patchOpenProductDraft.
+ */
+async function assertOpenProductDraftMetaIsPatchable(params: {
+  label: string;
+  patchesMeta: (meta: Record<string, unknown>) => boolean;
+  productId: string | number;
+  supabase: SupabaseLike;
+}) {
+  const { data: draft, error } = await params.supabase
+    .from('product_drafts')
+    .select('meta')
+    .eq('product_id', params.productId)
+    .maybeSingle();
+
+  if (!error && draft && isUnmarkedProductValuesDraftMeta(draft.meta) && params.patchesMeta(draft.meta)) {
+    throw new Error(
+      `Product "${params.label}" has an open draft that a NextBlock version older than 0.23.4 saved. It ${UNMARKED_PRODUCT_DRAFT_RISK}. ${UNMARKED_PRODUCT_DRAFT_ADVICE}, and ask again. Nothing was changed.`
+    );
+  }
+}
+
+/**
  * Mirror a live product write into the product's open draft, if it has one.
  *
  * The product editor keeps its working copy in `product_drafts`: the edit page
  * renders `product_drafts.blocks` instead of the live rows whenever a draft
- * exists, and publishing deletes every live block for the product and reinserts
- * that snapshot. Cortex writes product content live, so a live-only write is
- * invisible in the editor and is destroyed by the next publish. Keeping both
- * stores in agreement is what stops an agent edit from silently disappearing.
+ * exists, and publishing replaces the live blocks with that list (it inserts the
+ * draft's rows, then deletes the live ids it read). Cortex writes product content
+ * live, so a live-only write is invisible in the editor and is destroyed by the
+ * next publish. Keeping both stores in agreement is what stops an agent edit from
+ * silently disappearing.
+ *
+ * A patch that rewrites `meta` is refused (an error, nothing written to the draft)
+ * when the draft holds unmarked product values; callers that patch `meta` check
+ * first with assertOpenProductDraftMetaIsPatchable, passing the rule for when their
+ * patch returns one, before their live write. A blocks-only patch leaves `meta` as
+ * it is, so it applies to any draft.
  *
  * Returns false when the product has no open draft (the common case).
  */
@@ -1133,6 +1211,13 @@ async function patchOpenProductDraft(params: {
     blocks: Array.isArray(draft.blocks) ? cloneJsonValue(draft.blocks) : [],
     meta: isPlainJsonRecord(draft.meta) ? cloneJsonValue(draft.meta) : {},
   });
+
+  if (next.meta && isUnmarkedProductValuesDraftMeta(draft.meta)) {
+    throw new Error(
+      `The product was updated, but its open draft was not: a NextBlock version older than 0.23.4 saved it, so it ${UNMARKED_PRODUCT_DRAFT_RISK}. ${UNMARKED_PRODUCT_DRAFT_ADVICE}, and make this change again.`
+    );
+  }
+
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
 
   if (next.blocks) {
@@ -7913,6 +7998,19 @@ export async function executeSetContentImages(
   const label = pageContext.title || pageContext.slug || 'current item';
   const isProduct = pageContext.contentType === 'product';
 
+  // The gallery patch below rewrites an open draft's meta when it holds a gallery list. Checked
+  // before the preview, with the patch's own rule, so a change that would be refused asks for no
+  // confirmation and writes nothing (no media import, no product_media rows).
+  const galleryPatchRewritesMeta = (meta: Record<string, unknown>) => Array.isArray(meta['product_media']);
+  if (isProduct) {
+    await assertOpenProductDraftMetaIsPatchable({
+      label,
+      patchesMeta: galleryPatchRewritesMeta,
+      productId: entityId,
+      supabase,
+    });
+  }
+
   const confirmation = getConfirmationPreview({
     action: 'SET IMAGES',
     context,
@@ -7971,7 +8069,7 @@ export async function executeSetContentImages(
     // straight back through updateProduct — which would restore the old gallery.
     await patchOpenProductDraft({
       patch: ({ meta }) =>
-        Array.isArray(meta['product_media'])
+        galleryPatchRewritesMeta(meta)
           ? {
               meta: {
                 ...meta,

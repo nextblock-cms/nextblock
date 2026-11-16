@@ -165,6 +165,12 @@ export default function RevisionHistoryButton({ parentType, parentId }: Revision
         toast.success('Version restored successfully');
         router.refresh();
         setTimeout(() => setOpen(false), 800);
+        if (parentType === 'product') {
+          // The restore deleted the product's draft, but the edit page's draft flag
+          // (ProductDraftFlagProvider) only ever latches on: without a reload the draft bar and the
+          // visibility dialog kept offering the deleted draft, and its Publish failed.
+          setTimeout(() => window.location.reload(), 800);
+        }
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : 'Failed to restore version');
         toast.error(e instanceof Error ? e.message : 'Failed to restore version');

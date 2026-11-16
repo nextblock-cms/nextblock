@@ -46,7 +46,10 @@ const HTML_SINKS = new Map([
       sanitizedInCallers: ['apps/nextblock/components/BlockRenderer.tsx', 'apps/nextblock/components/blocks/renderers/TextBlockRenderer.tsx'],
     },
   ],
-  ['libs/editor/src/lib/extensions/SvgNode.ts', { why: 'authored <svg> inner markup in the editor and its export (safeSvgInnerHtml).', sanitizedBy: [SANITIZED] }],
+  [
+    'libs/editor/src/lib/extensions/SvgNode.ts',
+    { why: 'authored <svg> inner markup in the editor and its export (safeSvgInnerHtml), read as SVG content.', sanitizedBy: ['sanitizeAuthoredSvgMarkup'] },
+  ],
   ['libs/editor/src/lib/components/menus/Toolbar.tsx', { why: 'the Preview document (a same-origin blob:) gets the sanitized editor HTML; Export only downloads files.', sanitizedBy: [SANITIZED] }],
   // Safe by construction.
   ['apps/nextblock/components/SiteScripts.tsx', { why: 'ADMIN site_scripts through escapeInlineScript, with the nonce; renders nothing on the sandbox (sandbox-guards).' }],
@@ -354,7 +357,7 @@ function findHtmlSinkProblems(
     const entry = sinks.get(mod.repoPath);
     if (!entry) {
       problems.push(
-        `${mod.repoPath} writes HTML into a page (${found.join(', ')}): render authored HTML through ${SANITIZED} (@nextblock-cms/utils) and list the module in HTML_SINKS (tools/scripts/lib/html-sinks.js) with why it is safe.`
+        `${mod.repoPath} writes HTML into a page (${found.join(', ')}): render authored HTML through ${SANITIZED} (@nextblock-cms/utils/authored-html in client code: the barrel also carries Zod) and list the module in HTML_SINKS (tools/scripts/lib/html-sinks.js) with why it is safe.`
       );
       continue;
     }

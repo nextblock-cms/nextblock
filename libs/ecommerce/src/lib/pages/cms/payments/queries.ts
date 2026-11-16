@@ -23,7 +23,11 @@ export interface StorePaymentConfigStatus {
 }
 
 // "Configured" now reads DB-first (CMS) with an env fallback, so providers can be enabled
-// once keys are entered in the CMS — without requiring environment variables.
+// once keys are entered in the CMS — without requiring environment variables. Freemius also
+// weighs what memory knows of the developer key pair, never waiting on Freemius (payment-config.ts):
+// a configured pair counts until Freemius refuses it, and one-product keys that can open no
+// checkout (Freemius refuses a dedicated pair, no Product ID, no FREEMIUS_CHECKOUT_PRODUCTS_JSON
+// entry with a publicKey: the key policy lets them stand in for no product) do not.
 export async function getStoreConfigStatus(): Promise<StorePaymentConfigStatus> {
   return getPaymentConfigStatus();
 }

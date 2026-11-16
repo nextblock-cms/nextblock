@@ -2,7 +2,7 @@
 
 import 'server-only';
 
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { createClient, getServiceRoleSupabaseClient, isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { requireEcomAdmin } from '../../../server-actions/require-ecom-role';
 import {
   getProduct as getProductLib,
@@ -31,9 +31,23 @@ import {
 } from '../../../providers/freemius';
 import { revalidatePath } from 'next/cache';
 
+/**
+ * Sync from Freemius reads the catalog with the operator's Freemius developer key pair (about 22
+ * signed requests a click for three products), the key production's checkouts, license links,
+ * claims, coupon pushes and webhook checks depend on. The public sandbox publishes its admin login
+ * and always passes its second factor, so a visitor clicking or scripting Sync there could push that
+ * shared key into Freemius 429s. Both actions refuse on the sandbox right after the admin check; the
+ * 15-minute reset syncs the demo catalog itself, the one sandbox sync.
+ */
+const FREEMIUS_SYNC_SANDBOX_MESSAGE =
+  'Sync from Freemius is turned off on the public demo; the demo resets every 15 minutes.';
+
 export async function triggerFreemiusSync() {
   try {
     await requireEcomAdmin();
+    if (isSandboxEnvironment()) {
+      return { error: FREEMIUS_SYNC_SANDBOX_MESSAGE };
+    }
     const result = await syncFreemiusProductsToSupabase();
     revalidatePath('/cms/products', 'page');
     return { success: true, data: result };
@@ -45,6 +59,9 @@ export async function triggerFreemiusSync() {
 export async function triggerSingleProductSync(productId: string) {
   try {
     await requireEcomAdmin();
+    if (isSandboxEnvironment()) {
+      return { error: FREEMIUS_SYNC_SANDBOX_MESSAGE };
+    }
     const result = await syncSingleFreemiusProduct(productId);
     revalidatePath('/cms/products', 'page');
     // The sync writes pricing directly onto the live product row(s). Also

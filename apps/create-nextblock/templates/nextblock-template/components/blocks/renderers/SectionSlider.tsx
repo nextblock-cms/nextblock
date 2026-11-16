@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play } from "lucide-react";
-import { useTranslations } from "@nextblock-cms/utils";
+import { useTranslations } from "@nextblock-cms/utils/translations-context";
 
 interface SectionSliderProps {
   autoplay?: boolean;

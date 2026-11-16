@@ -1,13 +1,17 @@
 # libs/utils — @nextblock-cms/utils
 
 Bottom of the stack (no `@nextblock-cms/*` deps): Zod contracts, the pure SEO engine, script
-safety, publishing state, color/currency helpers, the package registry, a server-only R2/SMTP entry.
+safety, the authored-HTML sanitizer, publishing state, color/currency helpers, the package registry,
+a server-only R2/SMTP entry.
 
 Entry points: `.` (curated barrel incl. all of `./seo`); `./server`; `./seo` (pure: `auditSeo`,
-`buildSeoDocument`, redirects, robots); `./custom-blocks`; `./utils`; `./media-variants`;
-`./media-url` (client-safe `resolveMediaUrl`, `BUNDLED_PUBLIC_MEDIA_KEYS`; ecommerce and the app's
-`lib/media/resolveMediaUrl.ts` re-export use it). `./script-safety` and `./editor-blocks` (Tiptap
-JSON schemas) resolve through the monorepo alias only, not in dist.
+`buildSeoDocument`, redirects, robots); `./script-safety`; and, through `./*` (`lib/*.es.js`),
+every module the barrel re-exports: `./utils` (`cn`, currency helpers), `./translations-context`,
+`./translation-workspace`, `./color`, `./client-utils`, `./custom-blocks`, `./nextblock-packages`,
+`./publishing`, `./media-variants`, `./media-url` (client-safe `resolveMediaUrl`,
+`BUNDLED_PUBLIC_MEDIA_KEYS`; ecommerce and the app's `lib/media/resolveMediaUrl.ts` re-export use
+it), `./authored-html`. `./editor-blocks` (Tiptap JSON schemas) resolves through the monorepo alias
+only: no build entry reaches it, so the package ships no JavaScript for it.
 
 ## Rules
 - Stay strict-clean: `libs/db` compiles these sources under `noPropertyAccessFromIndexSignature`;
@@ -24,6 +28,16 @@ JSON schemas) resolve through the monorepo alias only, not in dist.
   barrel passes every local check and breaks standalone installs: add `lib/<dir>/index` to
   `build.lib.entry` plus an exports key in `vite.config.mts` afterBuild (see `./seo`).
 - Published deps and the exports map are written in `vite.config.mts` afterBuild, not `package.json`.
+- Client code on public routes imports deep subpaths (`@nextblock-cms/utils/utils`,
+  `/translations-context`, `/color`, …), never `.`: the barrel re-exports `authored-html`, whose
+  sanitize-html (CommonJS, about 39 KB gzipped with htmlparser2) no bundler drops, plus Zod and the
+  custom-block schemas (`custom-blocks.ts` calls `z.config()` at load), and this package declares
+  no `sideEffects` (pure modules such as the SEO engine were tree-shaken even so). Keep the
+  barrel's exports: published libs and user code import from it. A deep import ships only for a
+  module a build entry reaches and a name an entry exports (preserveModules drops the rest).
+  `tools/scripts/root-layout-chunking.test.ts` checks the public routes' client graphs and the
+  lazy chunks they load (no barrel or Zod; the sanitizer only in its `SANITIZING_LAZY_CHUNKS`), and
+  every deep import's names.
 
 ## Gotchas
 - `server.{es,cjs}.js` + `server.d.ts` are compiled from `src/server.ts` like every other module.
@@ -33,6 +47,16 @@ JSON schemas) resolve through the monorepo alias only, not in dist.
 - The stale tracked twins (`src/lib/server-utils.js`, `src/server.js`) are ignored:
   `resolve.extensions` puts `.ts` first here and in the root `vitest.config.ts`, so the `.ts`
   sources are what ships and what the tests run.
+- `src/lib/authored-html.ts` is the boundary for authored HTML (an allowlist on `sanitize-html`; it
+  imports nothing else and touches no DOM). The library writes allowed `<style>` text unescaped
+  (since 2.18.2 a `<` inside svg or math becomes `\3c `), so never allow `script`, and keep the
+  TAG_OPENER and TEXT_ONLY_ELEMENTS rules in `exclusiveFilter`: without them `<svg><style>`
+  round-trips into a live element (the tests replay it and pin the exact output). The `'*'`
+  transform drops a `data-` / `aria-` name the HTML spec forbids (`data-x:xlink:href`) before the
+  globs see it. Raise the sanitize-html range in the root `package.json` and in the dist manifest
+  (`vite.config.mts`) together, so scaffolds never resolve an older version than the tests ran
+  (`tests/published-dependencies.test.ts` fails when they differ). Run
+  `npx vitest run libs/utils/src/lib/authored-html` after any change to the options.
 - `src/lib/server-utils.ts` is server-only but must never be a `"use server"` module: that would
   make `getEmailServerConfig()` (it returns the SMTP password) callable from the browser once a
   client component imports it. It throws in a browser instead; `server-utils.test.ts` guards it.

@@ -1,4 +1,4 @@
-import { getProducts } from '@nextblock-cms/ecommerce/server';
+import { getProducts } from '@nextblock-cms/ecommerce/product-actions';
 import { normalizePriceMap, normalizeSalePriceMap } from '@nextblock-cms/ecommerce/currency';
 import { getVariantEffectivePriceRange } from '@nextblock-cms/ecommerce/variation-utils';
 import type { Product } from '@nextblock-cms/ecommerce/types';

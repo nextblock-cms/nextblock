@@ -12,7 +12,7 @@ import {
   type StorefrontEditorUploadResult,
 } from '@nextblock-cms/affiliates';
 import { Button, Input, Label, Textarea } from '@nextblock-cms/ui';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 
 import { StorefrontCopilotPanel } from '../../../../../components/affiliates/StorefrontCopilotPanel';
 import {

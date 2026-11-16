@@ -55,6 +55,15 @@ try {
 } catch {
   /* tools/lib/managed-overrides.mjs is missing */
 }
+// Same for the next.config.js postcss browser alias: without the file the update only leaves
+// next.config.js alone.
+let applyPostcssBrowserAlias = () => null;
+let describePostcssBrowserAlias = () => [];
+try {
+  ({ applyPostcssBrowserAlias, describePostcssBrowserAlias } = await import('./lib/postcss-browser-alias.mjs'));
+} catch {
+  /* tools/lib/postcss-browser-alias.mjs is missing */
+}
 
 const UPSTREAM_URL = 'https://github.com/nextblock-cms/nextblock.git';
 const UPSTREAM_SLUG = 'nextblock-cms/nextblock';
@@ -67,7 +76,17 @@ const TEMPLATE_SUBPATH = path.join('templates', 'nextblock-template');
  * project is the user's: .env*, public/, supabase/ (refreshed separately from the
  * @nextblock-cms/db package), package.json (merged, never replaced), README.md, and the
  * four files the scaffolder generates per-project — next.config.js, tailwind.config.js,
- * tsconfig.json, .gitignore.
+ * tsconfig.json, .gitignore. Two of those get one change each and are never replaced:
+ * next.config.js one anchored edit, the postcss browser alias (./lib/postcss-browser-alias.mjs);
+ * tsconfig.json the TypeScript 6 option, written back as JSON (keepTsconfigCompilingOnTs6, which
+ * skips a tsconfig that is not plain JSON).
+ *
+ * proxy.test.ts stays off the list on purpose. No updater has refreshed it, so a project keeps the
+ * copy it was scaffolded with (0.22.1, 0.23.0 and 0.23.4 each shipped a different one), and a 3-way
+ * merge would read that copy as the developer's edit: the next release that changes the file could
+ * conflict there and hold the migrations, over a test nothing in a standalone project builds or
+ * runs. A root file added here later has the same problem when earlier releases shipped different
+ * copies of it.
  */
 const FRAMEWORK_PATHS = [
   'app',
@@ -270,6 +289,14 @@ function copyInto(from, to) {
   copyFileSync(from, to);
 }
 
+function isFile(file) {
+  try {
+    return statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Compare two semver-ish strings. >0 if a>b. Matches lib/updates/check-upstream.ts. */
 function compareSemver(a, b) {
   const parse = (v) =>
@@ -438,6 +465,9 @@ function updateCodeViaGit(install, flags) {
 
   const behind = commitsBehind(root, channel);
   if (behind === 0 && !flags.force) {
+    // As in the npm channel: the merge that brought 0.23.4's blockEditorLoaders.ts ran the updater
+    // from before it, which has no editor check, so a run with nothing to merge is the first to warn.
+    reportUnlistedBlockEditors(path.join(root, 'apps', 'nextblock'), 'apps/nextblock/');
     good('Code is already up to date.');
     return { ok: true, changed: false };
   }
@@ -477,6 +507,8 @@ function updateCodeViaGit(install, flags) {
   }
 
   good('Upstream merged.');
+  // Editors of the fork's own that the merged CMS cannot open.
+  reportUnlistedBlockEditors(path.join(root, 'apps', 'nextblock'), 'apps/nextblock/');
   return { ok: true, changed: true };
 }
 
@@ -881,6 +913,393 @@ function checkTranspilePackages(projectRoot, projectPkg) {
     .filter((name) => !text.includes(name));
 }
 
+/**
+ * Print what applyPostcssBrowserAlias() did to next.config.js, what a --check run would do, or
+ * the entry to add by hand when the file has no anchor the patch can trust.
+ */
+function reportPostcssBrowserAlias(result) {
+  for (const { level, text } of describePostcssBrowserAlias(result)) {
+    if (level === 'good') good(text);
+    else if (level === 'warn') warn(text);
+    else if (level === 'code') info(C.cyan(`    ${text}`));
+    else if (level === 'dim') info(C.dim(text));
+    else info(text);
+  }
+}
+
+/* -------------------------------------------------------- block editors --- */
+
+/** What the editor check reads, relative to the app (a standalone project, or apps/nextblock). */
+const BLOCK_EDITOR_PATHS = {
+  registry: 'lib/blocks/blockRegistry.ts',
+  editors: 'app/cms/blocks/editors',
+  loaders: 'app/cms/blocks/components/blockEditorLoaders.ts',
+};
+/** The files an extension-less import('../editors/<name>') resolves to. */
+const EDITOR_MODULE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js'];
+/** A registry name the check can look up and print: relative path segments, ASCII only. */
+const EDITOR_NAME_RE = /^(?:[\w$-]+(?:\.[\w$-]+)*\/)*[\w$-]+(?:\.[\w$-]+)*$/;
+/** A test, spec, story (.story or .stories) or declaration: mapping one would bundle it into the CMS (the 0.23.0 build failure). */
+const NOT_AN_EDITOR_RE = /\.(?:test|spec|story|stories|d)$/i;
+/**
+ * A line git merge-file writes to open or close a conflict hunk (`<<<<<<< your version`,
+ * `>>>>>>> NextBlock 0.23.5`).
+ */
+const CONFLICT_MARKER_RE = /^(?:<{7}|>{7})(?: |$)/m;
+/**
+ * The `=======` line between a hunk's two sides. Seven `=` alone on a line are also a markdown
+ * heading underline, which a registry template literal may hold, so hasMergeConflict counts such a
+ * line only where it is code.
+ */
+const CONFLICT_SEPARATOR_RE = /^={7}[ \t]*$/gm;
+
+const WORD_RE = /[A-Za-z_$][\w$]*/y;
+const NUMBER_RE = /\d[\w.]*/y;
+const PUNCT_RE = /\.\.\.|=>|[=!]==?|[<>]=|&&|\|\||\?\?|[^\s\w$'"`]/y;
+const OPENERS = new Set(['(', '[', '{']);
+const CLOSERS = new Set([')', ']', '}']);
+/** Words after which a `/` starts a regular expression rather than a division. */
+const REGEX_AFTER_WORDS = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
+
+/**
+ * Just enough of a JavaScript/TypeScript tokenizer to read object keys and string values. Comments
+ * are dropped, and a string, template literal or regular expression is one token, so nothing inside
+ * one reads as code. Tokens are { type, value, start } with type 'word', 'number', 'punct',
+ * 'string', 'template' (plus `substitution`) or 'regex', and `start` the index of the token's first
+ * character in the source. Returns null for what it cannot read with confidence: an unterminated
+ * string, template literal or comment.
+ */
+function tokenizeSource(source) {
+  const n = source.length;
+  // Each skip takes the index of the opening character and returns the index past the token, or -1.
+  const skipComment = (k) => {
+    if (source[k] !== '/') return k;
+    if (source[k + 1] === '/') {
+      const end = source.indexOf('\n', k);
+      return end < 0 ? n : end;
+    }
+    if (source[k + 1] !== '*') return k;
+    const end = source.indexOf('*/', k + 2);
+    return end < 0 ? -1 : end + 2;
+  };
+  const skipString = (start) => {
+    for (let k = start + 1; k < n; k += 1) {
+      if (source[k] === '\\') k += source[k + 1] === '\r' && source[k + 2] === '\n' ? 2 : 1; // `\` + CRLF continues the line
+      else if (source[k] === source[start]) return k + 1;
+      else if (source[k] === '\n' || source[k] === '\r') return -1;
+    }
+    return -1;
+  };
+  // A `${…}` part is read by scan() itself, regular expressions and nested templates included.
+  const skipTemplate = (start) => {
+    for (let k = start + 1; k < n; k += 1) {
+      if (source[k] === '\\') k += 1;
+      else if (source[k] === '`') return k + 1;
+      else if (source[k] === '$' && source[k + 1] === '{') {
+        k = scan(k + 2, [], true) - 1;
+        if (k < 0) return -1;
+      }
+    }
+    return -1;
+  };
+  const skipRegex = (start) => {
+    let inClass = false;
+    for (let k = start + 1; k < n; k += 1) {
+      if (source[k] === '\\') k += 1;
+      else if (source[k] === '\n' || source[k] === '\r') return -1;
+      else if (source[k] === '[') inClass = true;
+      else if (source[k] === ']') inClass = false;
+      else if (source[k] === '/' && !inClass) {
+        let end = k + 1;
+        while (end < n && /[A-Za-z]/.test(source[end])) end += 1;
+        return end;
+      }
+    }
+    return -1;
+  };
+  const sticky = (re, at) => {
+    re.lastIndex = at;
+    return re.exec(source)?.[0];
+  };
+  // Tokens from `start` into `tokens`, to the end of the source; or, for a template substitution
+  // (`inner`), to the brace that closes it. Returns the index past where it stopped, or -1.
+  const scan = (start, tokens, inner) => {
+    let depth = 0;
+    for (let i = start; i < n; ) {
+      if (/\s/.test(source[i])) {
+        i += 1;
+        continue;
+      }
+      const afterComment = skipComment(i);
+      if (afterComment !== i) {
+        if (afterComment < 0) return -1;
+        i = afterComment;
+        continue;
+      }
+      const previous = tokens.at(-1);
+      const regexMayStart =
+        !previous ||
+        (previous.type === 'punct' && !CLOSERS.has(previous.value)) ||
+        (previous.type === 'word' && REGEX_AFTER_WORDS.has(previous.value));
+      let end;
+      if (source[i] === '"' || source[i] === "'") {
+        end = skipString(i);
+        if (end < 0) return -1;
+        tokens.push({ type: 'string', value: source.slice(i + 1, end - 1), start: i });
+      } else if (source[i] === '`') {
+        end = skipTemplate(i);
+        if (end < 0) return -1;
+        const value = source.slice(i + 1, end - 1);
+        tokens.push({ type: 'template', value, substitution: value.includes('${'), start: i });
+      } else if (source[i] === '/' && regexMayStart && (end = skipRegex(i)) > 0) {
+        tokens.push({ type: 'regex', value: source.slice(i, end), start: i });
+      } else {
+        const word = sticky(WORD_RE, i);
+        const number = word ? undefined : sticky(NUMBER_RE, i);
+        const text = word ?? number ?? sticky(PUNCT_RE, i);
+        if (!text) return -1;
+        if (inner && text === '{') depth += 1;
+        else if (inner && text === '}' && depth-- === 0) return i + 1;
+        tokens.push({ type: word ? 'word' : number ? 'number' : 'punct', value: text, start: i });
+        end = i + text.length;
+      }
+      i = end;
+    }
+    return inner ? -1 : n;
+  };
+
+  const tokens = [];
+  return scan(0, tokens, false) < 0 ? null : tokens;
+}
+
+/**
+ * Whether a file still holds a merge conflict: a `<<<<<<<` or `>>>>>>>` line, or a `=======` line
+ * that is code, which a hunk resolved by deleting only the outer two lines leaves behind. A
+ * `=======` line inside a template literal, a string or a comment is text: the tokenizer starts no
+ * token there. A file it cannot read counts as clean here, and the readers below then say nothing.
+ */
+function hasMergeConflict(source) {
+  if (CONFLICT_MARKER_RE.test(source)) return true;
+  const separators = [...source.matchAll(CONFLICT_SEPARATOR_RE)].map((match) => match.index);
+  if (separators.length === 0) return false;
+  const codeStarts = new Set((tokenizeSource(source) ?? []).map((token) => token.start));
+  return separators.some((index) => codeStarts.has(index));
+}
+
+/**
+ * The members of the object literal whose `{` is tokens[open], each as its tokens, split at the
+ * commas outside brackets; or null when the object never closes.
+ */
+function readObjectMembers(tokens, open) {
+  const members = [];
+  let member = [];
+  let depth = 0;
+  for (let k = open + 1; k < tokens.length; k += 1) {
+    const token = tokens[k];
+    if (token.type === 'punct' && depth === 0 && (token.value === ',' || token.value === '}')) {
+      if (member.length > 0) members.push(member); // an empty one is a trailing comma
+      member = [];
+      if (token.value === '}') return members;
+      continue;
+    }
+    if (token.type === 'punct' && OPENERS.has(token.value)) depth += 1;
+    else if (token.type === 'punct' && CLOSERS.has(token.value) && (depth -= 1) < 0) return null;
+    member.push(token);
+  }
+  return null; // never closed
+}
+
+/**
+ * The keys of the object literal whose `{` is tokens[open], or null when one member is not
+ * `key: value` with an identifier or plain string key: a spread, a shorthand, a method, an
+ * accessor or a computed key adds entries this cannot name.
+ */
+function readObjectKeys(tokens, open) {
+  const members = readObjectMembers(tokens, open);
+  if (!members) return null;
+  const keys = new Set();
+  for (const [key, colon] of members) {
+    if (colon?.type !== 'punct' || colon.value !== ':') return null;
+    if (key.type !== 'word' && (key.type !== 'string' || key.value.includes('\\'))) return null;
+    keys.add(key.value);
+  }
+  return keys;
+}
+
+/**
+ * Whether the `<` at tokens[open] opens a method's type parameters: the `>` that closes it (a depth
+ * count over `<` and `>`) is followed by `(`. Otherwise it opens type arguments.
+ */
+function opensTypeParameters(tokens, open) {
+  let depth = 0;
+  for (let k = open; k < tokens.length; k += 1) {
+    const { type, value } = tokens[k];
+    if (type !== 'punct') continue;
+    if (value === '<') depth += 1;
+    else if (value === '>' && (depth -= 1) === 0) return tokens[k + 1]?.type === 'punct' && tokens[k + 1].value === '(';
+  }
+  return false;
+}
+
+/**
+ * Whether an object member (its tokens) sets EditorComponent, its key quoted or not: a property
+ * (`EditorComponent: …`), a method (`EditorComponent() {…}`, `EditorComponent<T>() {…}`) or the
+ * shorthand, so the token after the key is `:`, `(`, `<` or none, and after `<` the `>` that
+ * closes it is followed by `(`. Any other is no such member: readObjectMembers splits a type's
+ * `Map<string, EditorComponent>` at its comma into a member `EditorComponent >`, and
+ * `Map<string, EditorComponent<Props>>` into `EditorComponent < Props > >`. That scan runs over
+ * `tokens`, the whole file's, as a comma also splits a method's type parameters
+ * (`EditorComponent<T, U>() {…}`). `EditorComponent: undefined` or `: null` sets nothing, and the
+ * CMS opens the file.
+ */
+function setsEditorComponent([key, next, value, ...rest], tokens) {
+  if (key.value !== 'EditorComponent' || (key.type !== 'word' && key.type !== 'string')) return false;
+  if (next && !(next.type === 'punct' && [':', '(', '<'].includes(next.value))) return false;
+  if (next?.value === '<' && !opensTypeParameters(tokens, tokens.indexOf(next))) return false;
+  const unset = next?.value === ':' && value?.type === 'word' && (value.value === 'undefined' || value.value === 'null');
+  return !(unset && rest.length === 0);
+}
+
+/**
+ * The keys of the BLOCK_EDITOR_LOADERS object literal, or null when they cannot all be read: no
+ * such declaration, a value that is not a plain object literal, or a member readObjectKeys refuses.
+ */
+function readBlockEditorLoaderKeys(source) {
+  const tokens = tokenizeSource(source);
+  if (!tokens) return null;
+  for (let at = 0; at + 1 < tokens.length; at += 1) {
+    const [keyword, name] = [tokens[at], tokens[at + 1]];
+    if (keyword.type !== 'word' || !['const', 'let', 'var'].includes(keyword.value)) continue;
+    if (name.type !== 'word' || name.value !== 'BLOCK_EDITOR_LOADERS') continue;
+    // The value follows the first `=` outside brackets: a type annotation may hold braces and `=>`.
+    let depth = 0;
+    let open = -1;
+    for (let k = at + 2; k < tokens.length && open < 0 && depth >= 0; k += 1) {
+      const token = tokens[k];
+      if (token.type !== 'punct') continue;
+      if (OPENERS.has(token.value)) depth += 1;
+      else if (CLOSERS.has(token.value)) depth -= 1;
+      else if (depth === 0 && token.value === ';') break;
+      else if (depth === 0 && token.value === '=') open = k + 1;
+    }
+    if (open < 0) continue; // declared without a value: the declaration that has one comes later
+    return tokens[open]?.type === 'punct' && tokens[open].value === '{' ? readObjectKeys(tokens, open) : null;
+  }
+  return null;
+}
+
+/**
+ * Every editorComponentFilename the registry writes as a string literal, or null when it cannot be
+ * read. A definition that also sets EditorComponent is left out: EditableBlock and ColumnEditor open
+ * that component instead, so its file needs no loader. Only a member of the filename's own object
+ * literal counts; a spread is not followed.
+ */
+function readRegistryEditorFilenames(source) {
+  const tokens = tokenizeSource(source);
+  if (!tokens) return null;
+  const filenames = [];
+  const opens = []; // the brackets around tokens[k], innermost last
+  const opensEditorComponent = new Map(); // `{` index -> whether that object literal sets EditorComponent
+  for (let k = 0; k < tokens.length; k += 1) {
+    const [key, colon, value] = [tokens[k], tokens[k + 1], tokens[k + 2]];
+    if (key.type === 'punct' && OPENERS.has(key.value)) opens.push(k);
+    else if (key.type === 'punct' && CLOSERS.has(key.value)) opens.pop();
+    if (key.value !== 'editorComponentFilename' || (key.type !== 'word' && key.type !== 'string')) continue;
+    if (tokens[k - 1]?.type === 'punct' && tokens[k - 1].value === '.') continue; // `def.editorComponentFilename : '…'` reads one
+    if (colon?.type !== 'punct' || colon.value !== ':' || !value) continue;
+    if (value.type !== 'string' && (value.type !== 'template' || value.substitution)) continue;
+    const open = opens.at(-1);
+    if (open !== undefined && tokens[open].value === '{') {
+      if (!opensEditorComponent.has(open)) {
+        opensEditorComponent.set(open, readObjectMembers(tokens, open)?.some((member) => setsEditorComponent(member, tokens)) === true);
+      }
+      if (opensEditorComponent.get(open)) continue;
+    }
+    filenames.push(value.value);
+  }
+  return filenames;
+}
+
+/**
+ * Editors the CMS cannot open: each editorComponentFilename lib/blocks/blockRegistry.ts writes as a
+ * string in a definition that sets no EditorComponent of its own, whose module exists in
+ * app/cms/blocks/editors (nested paths included), and whose name without its extension, the key
+ * getLazyBlockEditor looks up, BLOCK_EDITOR_LOADERS lacks.
+ *
+ * Through 0.23.3 the CMS imported an editor by that name alone, so a project that added its own
+ * editor there (docs/07) needed nothing else. Since 0.23.4 it opens only the editors that
+ * app/cms/blocks/components/blockEditorLoaders.ts maps, and logs "No editor component found" for any
+ * other; the update brings the map without a conflict, and a standalone project has no vitest to run
+ * blockEditorLoaders.test.ts. Registry names with no file (cart, checkout, product_details, the
+ * testimonial placeholder) are skipped, so the shipped files report nothing; so are test, spec,
+ * story and declaration names, and any name that is not ASCII path segments (EDITOR_NAME_RE).
+ *
+ * Returns { conflicted: [file] } when either file holds a merge conflict (hasMergeConflict),
+ * { missing: [name] } otherwise, or null when there is nothing to compare: a file is missing (a
+ * project before 0.23.4 has no map and still opens editors by name), or the registry or the map
+ * cannot be read.
+ */
+function findUnlistedBlockEditors(appRoot) {
+  const fsPath = (relative) => path.join(appRoot, ...relative.split('/'));
+  const { registry, editors, loaders } = BLOCK_EDITOR_PATHS;
+  if (![registry, editors, loaders].every((relative) => existsSync(fsPath(relative)))) return null;
+  const sources = { [loaders]: readFileSync(fsPath(loaders), 'utf8'), [registry]: readFileSync(fsPath(registry), 'utf8') };
+  const conflicted = Object.keys(sources).filter((relative) => hasMergeConflict(sources[relative]));
+  if (conflicted.length > 0) return { conflicted };
+  const filenames = readRegistryEditorFilenames(sources[registry]);
+  if (!filenames) return null;
+  const names = new Set();
+  for (const filename of filenames) {
+    const name = filename.trim().replace(/\.[jt]sx?$/, '');
+    if (!EDITOR_NAME_RE.test(name) || NOT_AN_EDITOR_RE.test(name)) continue;
+    if (EDITOR_MODULE_EXTENSIONS.some((extension) => isFile(fsPath(`${editors}/${name}${extension}`)))) names.add(name);
+  }
+  if (names.size === 0) return { missing: [] };
+  const keys = readBlockEditorLoaderKeys(sources[loaders]);
+  return keys ? { missing: [...names].filter((name) => !keys.has(name)).sort() } : null;
+}
+
+/** The BLOCK_EDITOR_LOADERS key for an editor name, quoted when it is not an identifier ('faq/FaqBlockEditor'). */
+const loaderKeyOf = (name) => (/^[A-Za-z_$][\w$]*$/.test(name) ? name : `'${name}'`);
+
+/**
+ * Print what findUnlistedBlockEditors found: each editor the CMS cannot open with the line that
+ * opens it, or one line naming the file whose merge conflict stopped the check. `prefix` places the
+ * app in the repository ('apps/nextblock/' in the monorepo). A warning only: it never fails or
+ * prompts, and an error costs one dim line.
+ */
+function reportUnlistedBlockEditors(appRoot, prefix = '') {
+  let found;
+  try {
+    found = findUnlistedBlockEditors(appRoot);
+  } catch (err) {
+    info(C.dim(`Could not check the block editors against BLOCK_EDITOR_LOADERS: ${err?.message ?? err}`));
+    return;
+  }
+  const { registry, editors, loaders } = BLOCK_EDITOR_PATHS;
+  if (found?.conflicted) {
+    const files = found.conflicted.map((relative) => `${prefix}${relative}`);
+    const one = files.length === 1;
+    warn(
+      `${files.join(' and ')} ${one ? 'has a merge conflict' : 'have merge conflicts'}, so the block editors were not ` +
+        `checked: resolve the conflict${one ? ' in that file' : 's in those files'}, then run ${C.cyan('npm run update')} again.`,
+    );
+    return;
+  }
+  const missing = found?.missing ?? [];
+  if (missing.length === 0) return;
+  const one = missing.length === 1;
+  warn(
+    `${missing.length} block editor${one ? '' : 's'} in ${prefix}${editors} ${one ? 'is' : 'are'} named in ${prefix}${registry} ` +
+      `but missing from BLOCK_EDITOR_LOADERS, so the CMS opens nothing for ${one ? 'its block' : 'their blocks'}.`,
+  );
+  info(
+    `Since 0.23.4 the CMS opens only the editors listed there. Add ${one ? 'this line' : 'these lines'} to ` +
+      `BLOCK_EDITOR_LOADERS in ${prefix}${loaders}:`,
+  );
+  for (const name of missing) info(C.cyan(`    ${loaderKeyOf(name)}: () => import('../editors/${name}'),`));
+}
+
 async function updateCodeViaNpm(install, flags) {
   const { root } = install;
   const pkgPath = path.join(root, 'package.json');
@@ -905,6 +1324,9 @@ async function updateCodeViaNpm(install, flags) {
     // step, so check here too or it would never run for that project. Idempotent.
     const tsconfigNote = keepTsconfigCompilingOnTs6(root, projectPkg, { dryRun: flags.check });
     if (tsconfigNote) good(tsconfigNote);
+    // Same for the editor check: the update that brought 0.23.4's blockEditorLoaders.ts ran the
+    // 0.23.3 updater, which has none, so the run docs/13 asks for after it is the first to warn.
+    reportUnlistedBlockEditors(root);
     // Same for the overrides NextBlock wrote in earlier releases: the update that brought this
     // script ran the previous one, which kept them. Moving one needs an `npm install`, so the
     // run then counts as a change and main() installs.
@@ -918,6 +1340,7 @@ async function updateCodeViaNpm(install, flags) {
       good('Code is already up to date.');
       // Nothing else records this move, so a failed install has to undo it: otherwise the next
       // run finds the overrides already current, reports nothing to do, and never installs.
+      // main() adds the postcss alias below after that install, beside the transpilePackages check.
       return {
         ok: true,
         changed: true,
@@ -925,6 +1348,10 @@ async function updateCodeViaNpm(install, flags) {
         restoreOnInstallFailure: { path: pkgPath, text: original },
       };
     }
+    // Same for the postcss browser alias in next.config.js: the update that brought 0.23.4 and
+    // lib/browser-stubs/postcss.cjs ran the 0.23.3 updater, which never edits next.config.js, so
+    // this run is the first that can add it. Idempotent: a file that has it is never touched.
+    reportPostcssBrowserAlias(applyPostcssBrowserAlias(root, { dryRun: flags.check }));
     good('Code is already up to date.');
     return { ok: true, changed: false, version: current };
   }
@@ -953,6 +1380,8 @@ async function updateCodeViaNpm(install, flags) {
           ? C.dim('These would be applied as a git 3-way merge against your edits.')
           : C.dim(`Files would be replaced (${mergeable.reason}).`),
       );
+      // The stub may only arrive with this release, so the staged template counts as having it.
+      reportPostcssBrowserAlias(applyPostcssBrowserAlias(root, { dryRun: true, incomingDir: staged.templateDir }));
       return { ok: true, changed: false, version: current };
     }
 
@@ -1044,6 +1473,10 @@ async function updateCodeViaNpm(install, flags) {
         good(`Applied. ${backupDir ? `Backup: ${path.relative(root, backupDir)}` : 'No backup needed.'}`);
       }
     }
+
+    // Once, after the merge or the replacement: editors of the project's own that the new
+    // release's CMS cannot open.
+    reportUnlistedBlockEditors(root);
 
     step('Updating package.json');
     const merged = mergePackageJson(templatePkg, projectPkg, latest);
@@ -1352,6 +1785,8 @@ async function main() {
       for (const name of checkTranspilePackages(install.root, projectPkg)) {
         warn(`Add "${name}" to transpilePackages in next.config.js.`);
       }
+      // After the file sync, so lib/browser-stubs/postcss.cjs is on disk before anything points at it.
+      reportPostcssBrowserAlias(applyPostcssBrowserAlias(install.root));
     }
   }
 

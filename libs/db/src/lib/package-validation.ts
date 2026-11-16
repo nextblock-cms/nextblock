@@ -17,8 +17,17 @@ import { createClient as createSupabaseJsClient } from '@supabase/supabase-js';
  */
 export const PACKAGE_ACTIVATION_CACHE_TAG = 'package-activation';
 
+/**
+ * How long an `active` row keeps counting after its license `expiration` has passed.
+ * Freemius shows a license as expired until its renewal is processed, and retries a failed
+ * card for nine days before it cancels the license, so a paying customer's store must not
+ * switch off on the date itself. A cancelled license does not wait for this: the
+ * re-validation ends it on its next check. Trials get none, see `isTrialActivation`.
+ */
+export const PACKAGE_RENEWAL_GRACE_MS = 10 * 24 * 60 * 60_000;
+
 /** Freemius timestamps are "YYYY-MM-DD HH:mm:ss" UTC; ISO strings pass through. */
-function parseLicenseTimestamp(value: unknown): number | null {
+export function parseLicenseTimestamp(value: unknown): number | null {
   if (typeof value !== 'string' || !value.trim()) {
     return null;
   }
@@ -30,23 +39,26 @@ function parseLicenseTimestamp(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function readActivationRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
 /**
  * The moment a stored activation stops being valid, from what the row knows:
  * the license expiration (recorded from the vendor at checkout, from Freemius at
  * activation, and refreshed by the background re-validation) or the trial end. Null
  * when the row carries no date, which is the case for keys activated before these
- * fields existed and for lifetime licenses.
+ * fields existed, for lifetime licenses, and for licenses whose plan keeps features
+ * after expiry.
  */
 export function resolvePackageActivationExpiry(meta: unknown): number | null {
-  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+  const record = readActivationRecord(meta);
+
+  if (!record) {
     return null;
   }
 
-  const record = meta as Record<string, unknown>;
-  const nextblock =
-    record['nextblock'] && typeof record['nextblock'] === 'object' && !Array.isArray(record['nextblock'])
-      ? (record['nextblock'] as Record<string, unknown>)
-      : null;
+  const nextblock = readActivationRecord(record['nextblock']);
   const candidates = [nextblock?.['expiration'], nextblock?.['trial_ends_at'], record['expiration']]
     .map(parseLicenseTimestamp)
     .filter((value): value is number => value !== null);
@@ -54,7 +66,15 @@ export function resolvePackageActivationExpiry(meta: unknown): number | null {
   return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
-/** A row counts only while its status is active AND any known expiry is in the future. */
+/** A trial has no renewal behind it, so it ends on its date. */
+export function isTrialActivation(meta: unknown) {
+  return readActivationRecord(readActivationRecord(meta)?.['nextblock'])?.['is_trial'] === true;
+}
+
+/**
+ * A row counts only while its status is active AND any known expiry is still ahead, give or
+ * take the renewal grace of a paid license.
+ */
 export function isPackageActivationRowValid(row: { meta?: unknown; status?: unknown }, now = Date.now()) {
   if (row.status !== 'active') {
     return false;
@@ -62,7 +82,7 @@ export function isPackageActivationRowValid(row: { meta?: unknown; status?: unkn
 
   const expiry = resolvePackageActivationExpiry(row.meta);
 
-  return expiry === null || expiry > now;
+  return expiry === null || expiry + (isTrialActivation(row.meta) ? 0 : PACKAGE_RENEWAL_GRACE_MS) > now;
 }
 
 async function queryPackageActivation(packageId: string, supabase: any): Promise<boolean> {

@@ -7,7 +7,7 @@ import { SubmitButton } from "../../../components/submit-button";
 import { Input } from "@nextblock-cms/ui";
 import { Label } from "@nextblock-cms/ui";
 import Link from "next/link";
-import { useTranslations } from "@nextblock-cms/utils";
+import { useTranslations } from "@nextblock-cms/utils/translations-context";
 import { useSearchParams } from "next/navigation";
 
 function getMessage(searchParams: URLSearchParams): Message | undefined {

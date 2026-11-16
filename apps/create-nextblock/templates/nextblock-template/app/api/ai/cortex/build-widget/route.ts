@@ -15,6 +15,7 @@ import {
   CUSTOM_BLOCK_DEFINITIONS_CACHE_TAG,
   getCustomBlockDefinitionCacheTag,
 } from '../../../../../lib/custom-block-definitions';
+import { getCmsActor, isCmsStaffRole } from '../../../../../lib/auth/cms-actor';
 import { enforceCortexAiRequestQuota } from '../../../../../lib/cortex-ai/request-quota';
 import {
   safeParseCortexAiModelSelection,
@@ -25,30 +26,19 @@ export const dynamic = 'force-dynamic';
 
 const DYNAMIC_LAYOUT_ENGINE_CACHE_TAG = 'dynamic-layout-engine';
 
-type SupabaseServerClient = ReturnType<typeof createClient>;
+const PERMISSION_MESSAGE = 'You do not have permission to build Cortex widgets.';
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
 
-async function requireCmsWriterAccess(supabase: SupabaseServerClient) {
-  const {
-    data: { user },
-    error: userError,
-  } = await supabase.auth.getUser();
-
-  if (userError || !user) {
-    return null;
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
   }
-
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-
-  if (profileError || !profile || !['ADMIN', 'WRITER'].includes(profile.role)) {
-    return null;
-  }
-
-  // The role rides along because the request quota that follows is per role.
-  return { role: profile.role, userId: user.id };
 }
 
 function jsonError(message: string, status: number) {
@@ -72,19 +62,33 @@ function revalidateCortexWidgetDefinition(definition: { id: string; slug: string
 
 export async function POST(request: Request) {
   try {
-    const supabase = createClient();
-    const access = await requireCmsWriterAccess(supabase);
-
-    if (!access) {
-      return jsonError('You do not have permission to build Cortex widgets.', 403);
+    // ADMIN or WRITER past their enrolled second factor, before the quota, the package check or
+    // the body: a route handler never passes the CMS layout's 2FA redirect, and until 2026-11-14 a
+    // cookie-client role read let a staff password alone (the first factor) spend the request
+    // quota (recorded with the service role) and the operator's model key, and register a widget.
+    // The actor's role rides along because the quota is per role.
+    const actor = await getCmsActor();
+    if (!actor) {
+      // getCmsActor() is null without a session and while an enrolled second factor is pending.
+      // The refusal stands either way; this only picks the answer.
+      return (await hasSignedInUser())
+        ? jsonError(SECOND_FACTOR_MESSAGE, 403)
+        : jsonError(PERMISSION_MESSAGE, 401);
     }
+    if (!isCmsStaffRole(actor.role)) {
+      return jsonError(PERMISSION_MESSAGE, 403);
+    }
+
+    // The widget definition is written with the cookie client below, so the policies on
+    // custom_block_definitions apply as well.
+    const supabase = createClient();
 
     // Per-user hourly cap (writer-openrouter-cost-abuse): one request-log row per call,
     // 429 past the role's cap. Runs before anything that can reach a model.
     const quotaResponse = await enforceCortexAiRequestQuota({
-      role: access.role,
+      role: actor.role,
       route: 'ai/cortex/build-widget',
-      userId: access.userId,
+      userId: actor.userId,
     });
 
     if (quotaResponse) {

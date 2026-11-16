@@ -11,11 +11,13 @@ import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import {
   syncFreemiusOrderDisputeFromWebhookEvent,
   syncFreemiusOrderRefundFromWebhookEvent,
+  type FreemiusWebhookEvent,
+} from '@nextblock-cms/ecommerce/freemius-order-sync';
+import {
   syncStripeOrderDisputeFromEvent,
   syncStripeOrderRefundFromEvent,
-  type FreemiusWebhookEvent,
-  type StripeWebhookEvent,
-} from '@nextblock-cms/ecommerce/server';
+} from '@nextblock-cms/ecommerce/stripe/order-sync';
+import type { StripeWebhookEvent } from '@nextblock-cms/ecommerce/stripe/webhooks';
 
 import {
   scheduleAffiliateNotification,
@@ -140,13 +142,28 @@ export async function handleStripeDisputeWebhookEvent(event: StripeWebhookEvent)
   return { handled: true, orderId: dispute.orderId, open: dispute.open, affiliate };
 }
 
+/** What the Freemius webhook route verified about an event. */
+export interface FreemiusWebhookHandlerOptions {
+  /**
+   * The product whose secret verified the event (`getFreemiusWebhookVerification`): only an order
+   * of that product is touched. Passed on to the order sync explicitly, so the binding holds even
+   * when a caller hands over an event whose `plugin_id` was not overwritten with it. Without it,
+   * the sync keeps to the event's own `plugin_id`.
+   */
+  productId?: string;
+}
+
 /**
  * `payment.refund` / `payment.refunded` / `payment.dispute.lost` / `payment.dispute.closed`,
- * always a full refund. The refund of a renewal payment changes nothing (renewals never earned;
- * the order records the first purchase). Throws on any database failure.
+ * always a full refund, for an order of the verified product only (`options.productId`). The
+ * refund of a renewal payment changes nothing (renewals never earned; the order records the first
+ * purchase). Throws on any database failure.
  */
-export async function handleFreemiusRefundWebhookEvent(event: FreemiusWebhookEvent): Promise<AffiliateRefundWebhookResult> {
-  const refund = await syncFreemiusOrderRefundFromWebhookEvent({ event });
+export async function handleFreemiusRefundWebhookEvent(
+  event: FreemiusWebhookEvent,
+  options: FreemiusWebhookHandlerOptions = {}
+): Promise<AffiliateRefundWebhookResult> {
+  const refund = await syncFreemiusOrderRefundFromWebhookEvent({ event, productId: options.productId });
 
   if (!refund.isRefund || !refund.orderId || refund.isRenewal) {
     return { handled: false, orderId: refund.orderId, full: true, orderStatusUpdated: false, affiliate: 'skipped' };
@@ -172,11 +189,16 @@ export async function handleFreemiusRefundWebhookEvent(event: FreemiusWebhookEve
 /**
  * `payment.dispute.created` holds the order's commission until the dispute closes;
  * `payment.dispute.won` releases it (a lost or refunded dispute is a refund,
- * `handleFreemiusRefundWebhookEvent`). A dispute on a renewal payment concerns no commission.
- * The order itself never changes. Throws on any database failure, so Freemius redelivers.
+ * `handleFreemiusRefundWebhookEvent`), for an order of the verified product only
+ * (`options.productId`). A dispute on a renewal payment concerns no commission. The order's status
+ * never changes (an order that stored no product gets the one its items prove). Throws on any
+ * database failure, so Freemius redelivers.
  */
-export async function handleFreemiusDisputeWebhookEvent(event: FreemiusWebhookEvent): Promise<AffiliateDisputeWebhookResult> {
-  const dispute = await syncFreemiusOrderDisputeFromWebhookEvent({ event });
+export async function handleFreemiusDisputeWebhookEvent(
+  event: FreemiusWebhookEvent,
+  options: FreemiusWebhookHandlerOptions = {}
+): Promise<AffiliateDisputeWebhookResult> {
+  const dispute = await syncFreemiusOrderDisputeFromWebhookEvent({ event, productId: options.productId });
 
   if (!dispute.isDispute || !dispute.orderId || dispute.isRenewal) {
     return { handled: false, orderId: dispute.orderId, open: dispute.open, affiliate: 'skipped' };

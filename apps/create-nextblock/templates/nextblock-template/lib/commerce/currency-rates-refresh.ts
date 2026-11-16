@@ -1,7 +1,9 @@
 import 'server-only';
 
 import { getServiceRoleSupabaseClient, verifyPackageOnline } from '@nextblock-cms/db/server';
-import { syncStoreCurrencyRates } from '@nextblock-cms/ecommerce/server';
+// Deep subpath: app/cms/layout.tsx imports this module, and the '/server' barrel would add
+// every CMS commerce screen's client components to every /cms route.
+import { syncStoreCurrencyRates } from '@nextblock-cms/ecommerce/currency-sync';
 
 /**
  * Daily FX-rate refresh without a cron.

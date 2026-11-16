@@ -9,7 +9,7 @@ import {
 } from "./popover";
 import { Label } from "./label";
 import { Input } from "./input";
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 
 interface ColorPickerProps {
   label: string;

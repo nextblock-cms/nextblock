@@ -1,18 +1,54 @@
 import 'server-only';
 
 import { getStripeClient } from './client';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { type CartItem } from '../types';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
 import { resolveShippingOptions, type ShippingDestination } from '../shipping/resolver';
 import { getDefaultCurrency, resolveEffectivePriceForCurrency } from '../currency';
+
+/**
+ * Stores a new Checkout Session's id on its order. The NextBlock checkout success page finds a
+ * Stripe order only through this column (it asks Stripe about a session only once an order stores
+ * its id), so a session its order could not record must never reach the buyer. True only when the
+ * order row took the id: an error, a request that threw and an update that matched no row are all
+ * false.
+ */
+async function saveSessionIdOnOrder(
+  supabase: SupabaseClient<any>,
+  orderId: string,
+  sessionId: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ stripe_session_id: sessionId })
+      .eq('id', orderId)
+      .select('id');
+
+    if (error) {
+      console.error('Failed to save Stripe session ID on order:', error);
+      return false;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
+      console.error(`Failed to save Stripe session ID on order ${orderId}: no order row was updated.`);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Failed to save Stripe session ID on order:', error);
+    return false;
+  }
+}
 
 export const createCheckoutSession = async (
   cartItems: CartItem[],
   userId?: string,
   destination?: ShippingDestination,
   currencyCode?: string
-): Promise<{ url: string | null; error?: string }> => {
+): Promise<{ url: string | null; error?: string; errorKey?: string; errorStatus?: number }> => {
   // Use Service Role Key to bypass RLS
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
@@ -236,11 +272,29 @@ export const createCheckoutSession = async (
       },
     });
 
-    // 4.1 Immediately save the session ID so success page can find it before webhook
-    await supabase
-      .from('orders')
-      .update({ stripe_session_id: session.id })
-      .eq('id', order.id);
+    // 4.1 Save the session id on the order before the URL leaves: the success page finds the order
+    // only through it, so a session the order could not record would take the payment and then
+    // answer "Order not found". It is expired instead (best effort: its URL never left the server,
+    // and Stripe expires an open session after 24 hours), the order fails, and the caller gets the
+    // keyed 503 (seeded EN + FR) instead of the URL.
+    if (!(await saveSessionIdOnOrder(supabase, order.id, session.id))) {
+      try {
+        await stripe.checkout.sessions.expire(session.id);
+      } catch (expireError) {
+        console.error(
+          `Failed to expire the Stripe Checkout Session that order ${order.id} could not record:`,
+          expireError
+        );
+      }
+      await supabase.from('orders').update({ status: 'failed' }).eq('id', order.id);
+      return {
+        error:
+          'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
+        errorKey: 'ecommerce.checkout_payments_unavailable',
+        errorStatus: 503,
+        url: null,
+      };
+    }
 
     return { url: session.url };
   } catch (err: any) {

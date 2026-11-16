@@ -11,7 +11,7 @@ import {
 import { Laptop } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
-import { useTranslations } from "@nextblock-cms/utils";
+import { useTranslations } from "@nextblock-cms/utils/translations-context";
 import { useThemeCatalog } from "../context/ThemeCatalogContext";
 import { ThemeIcon } from "./theme-icon";
 

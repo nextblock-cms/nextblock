@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => ({
   remove: vi.fn(),
   read: vi.fn(),
   encrypt: vi.fn((value: string) => `enc:${value}`),
-  // Seals for a named key row (each Cortex key is bound to its own row since 0.23.1).
+  // Seals for a named key row (each Cortex key is bound to its own row since 0.23.0).
   encryptFor: vi.fn((_settingKey: string, value: string) => `enc:${value}`),
   reseal: vi.fn(async () => 0),
   getStoredKeyStatus: vi.fn(),
@@ -280,5 +280,53 @@ describe.each(GUARDED)('$name', ({ run, sandboxError, success, expectWrite }) =>
       expect(mocks.redirect, value).toHaveBeenCalledWith(`${SETTINGS_PATH}?success=${encodeURIComponent(success)}`);
       expect(mocks.revalidatePath, value).toHaveBeenCalledWith(SETTINGS_PATH);
     }
+  });
+});
+
+describe('saveCortexAiAgentSettingsAction output-token cap', () => {
+  /** What the action stores for these form fields, through the real normalizer and its bounds. */
+  async function storedSettings(fields: Record<string, string>) {
+    const actual = await vi.importActual<typeof import('../../../../../../libs/cortex/src/lib/ai-config')>(
+      '../../../../../../libs/cortex/src/lib/ai-config'
+    );
+    mocks.normalizeAgentSettings.mockImplementationOnce(actual.normalizeCortexAiAgentSettings);
+
+    await expect(
+      actions.saveCortexAiAgentSettingsAction(
+        form({ max_steps: '8', response_timeout_seconds: '120', temperature: '0.1', ...fields })
+      )
+    ).rejects.toThrow('NEXT_REDIRECT');
+
+    expect(mocks.redirect).toHaveBeenCalledWith(
+      `${SETTINGS_PATH}?success=${encodeURIComponent('Advanced agent settings saved.')}`
+    );
+    const [table, row] = mocks.upsert.mock.calls.at(-1) as [string, { key: string; value: { maxOutputTokens: number | null } }];
+    expect([table, row.key]).toEqual(['site_settings', 'cortex_ai_agent_settings']);
+    return row.value;
+  }
+
+  // The settings input has step 1, and the AI SDK refuses a fractional maxOutputTokens: the stored
+  // cap is a whole number, so the form always submits it back unchanged.
+  it.each([
+    ['16000', 16000],
+    ['16001', 16001],
+    [' 300 ', 300],
+    ['16000.4', 16000],
+    ['16000.5', 16001],
+    ['255.6', 256],
+    ['200000.4', 200000],
+    ['100', 256],
+    ['999999', 200000],
+  ])('stores %j as %d tokens', async (raw, expected) => {
+    const settings = await storedSettings({ max_output_tokens: raw });
+
+    expect(settings.maxOutputTokens).toBe(expected);
+    expect(Number.isInteger(settings.maxOutputTokens)).toBe(true);
+  });
+
+  it('stores no cap with Unlimited, and the default for an empty or unreadable field', async () => {
+    expect((await storedSettings({ max_output_tokens: '16000', max_output_unlimited: 'on' })).maxOutputTokens).toBeNull();
+    expect((await storedSettings({ max_output_tokens: '' })).maxOutputTokens).toBe(16000);
+    expect((await storedSettings({ max_output_tokens: 'lots' })).maxOutputTokens).toBe(16000);
   });
 });

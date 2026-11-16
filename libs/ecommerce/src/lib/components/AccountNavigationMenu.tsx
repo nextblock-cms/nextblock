@@ -4,7 +4,8 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { KeyRound, Package2 } from 'lucide-react';
 
-import { useTranslations, cn } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { cn } from '@nextblock-cms/utils/utils';
 
 export type AccountNavigationIcon = 'orders' | 'password';
 

@@ -2,7 +2,7 @@
  * Commission money math in integer minor units, mirroring the SQL in migration 02030
  * (`private.affiliate_record_commission`), plus display formatting. Pure and client-safe.
  */
-import { formatPrice, getCurrencyMinorUnitFactor } from '@nextblock-cms/utils';
+import { formatPrice, getCurrencyMinorUnitFactor } from '@nextblock-cms/utils/utils';
 
 import type { AffiliateCommissionRow } from './types';
 

@@ -6,7 +6,7 @@
  * presses keep the editor's selection (no blur). Active states come from `useEditorState` in the
  * parent, so the toolbar re-renders only when they change.
  */
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import type { Editor } from '@tiptap/core';
 import {
   Bold,

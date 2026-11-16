@@ -3,7 +3,7 @@
 import * as React from "react"
 import * as TooltipPrimitive from "@radix-ui/react-tooltip"
 
-import { cn } from "@nextblock-cms/utils"
+import { cn } from "@nextblock-cms/utils/utils"
 
 const TooltipProvider = ({ children, ...props }: TooltipPrimitive.TooltipProviderProps & { children?: React.ReactNode }) => (
   <TooltipPrimitive.Provider delayDuration={200} {...props as any}>

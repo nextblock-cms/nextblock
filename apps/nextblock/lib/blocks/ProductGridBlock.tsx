@@ -1,4 +1,4 @@
-import ProductGridClient from '../../components/blocks/ProductGridClient';
+import { LazyProductGridClient } from '../../components/commerce/LazyCommerceClients';
 
 import {
   PRODUCT_GRID_UNLIMITED,
@@ -75,7 +75,7 @@ export const ProductGridBlock = async ({
         </div>
       )}
       <div className="container">
-        <ProductGridClient
+        <LazyProductGridClient
           initialProducts={products}
           initialPage={initialPage}
           totalCount={totalCount}

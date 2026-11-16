@@ -2,10 +2,10 @@
 
 import "server-only";
 
-import { createClient, getServiceRoleSupabaseClient, getProfileWithRoleServerSide } from "@nextblock-cms/db/server";
+import { createClient, getServiceRoleSupabaseClient } from "@nextblock-cms/db/server";
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
-import { requireCmsAdmin } from "../../lib/auth/cms-actor";
+import { getCmsActor, requireCmsAdmin, type CmsActor } from "../../lib/auth/cms-actor";
 import { resolveSiteUrl } from "../../lib/site-url";
 import { sendEmail } from "./email";
 
@@ -326,6 +326,34 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const SECOND_FACTOR_MESSAGE = "Complete two-factor verification, then try again.";
+
+/**
+ * The CMS actor for the staff answer and moderation actions below, or the error to return.
+ * Both write cms_interactions with the service role (a reply is published as approved; a status
+ * change publishes or hides a review), and a server action never passes the CMS layout's 2FA
+ * redirect. So the actor comes from getCmsActor(), which also refuses a session whose enrolled
+ * second factor is still pending. Until 2026-11-13 both read the role through the cookie client
+ * (getProfileWithRoleServerSide), so an ADMIN password alone published replies and moderated.
+ */
+async function resolveModerationActor(): Promise<{ actor: CmsActor } | { error: string }> {
+  const actor = await getCmsActor();
+  if (actor) return { actor };
+  // getCmsActor() is null without a session and while a second factor is pending. The refusal
+  // stands either way; this only picks the message.
+  return { error: (await hasSignedInUser()) ? SECOND_FACTOR_MESSAGE : "Not authenticated" };
+}
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const { data: { user } } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Publish a staff answer under a review or a post comment.
  *
@@ -341,15 +369,13 @@ function escapeHtml(value: string): string {
  * `type='review' AND status='approved'`. A reply must never move a product's stars.
  */
 export async function replyToInteraction(parentId: string, content: string) {
-  const supabase = createClient();
-
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    return { error: "Not authenticated" };
+  const auth = await resolveModerationActor();
+  if ("error" in auth) {
+    return { error: auth.error };
   }
+  const { actor } = auth;
 
-  const profile = await getProfileWithRoleServerSide(user.id);
-  if (!profile || profile.role !== "ADMIN") {
+  if (actor.role !== "ADMIN") {
     return { error: "Unauthorized. Admin permissions required to reply." };
   }
 
@@ -381,7 +407,7 @@ export async function replyToInteraction(parentId: string, content: string) {
       status: "approved",
       content: body,
       rating: null,
-      user_id: user.id,
+      user_id: actor.userId,
       parent_id: parent.id,
       product_id: parent.product_id,
       post_id: parent.post_id,
@@ -407,22 +433,20 @@ export async function replyToInteraction(parentId: string, content: string) {
 }
 
 export async function updateInteractionStatus(interactionId: string, status: "approved" | "denied") {
-  const supabase = createClient();
-
-  // 1. Authenticate user
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-  if (authError || !user) {
-    return { error: "Not authenticated" };
+  // 1. Authenticate: a session whose enrolled second factor has passed (resolveModerationActor).
+  const auth = await resolveModerationActor();
+  if ("error" in auth) {
+    return { error: auth.error };
   }
+  const { role } = auth.actor;
 
   // 2. Authorize as Admin or Writer
-  const profile = await getProfileWithRoleServerSide(user.id);
-  if (!profile || (profile.role !== "ADMIN" && profile.role !== "WRITER")) {
+  if (role !== "ADMIN" && role !== "WRITER") {
     return { error: "Unauthorized. Admin or Writer permissions required." };
   }
 
   // 3. Admin-only rule for denying/approving if strict
-  if (profile.role !== "ADMIN") {
+  if (role !== "ADMIN") {
     // If writers are not allowed to moderate, block it. The spec says:
     // "Admin-only permission action to switch states between approved or denied."
     // So let's enforce STRICT Admin only for status updates.

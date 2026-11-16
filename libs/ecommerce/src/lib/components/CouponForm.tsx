@@ -14,7 +14,7 @@ import { Button } from '@nextblock-cms/ui/button';
 import { Input } from '@nextblock-cms/ui/input';
 import { Label } from '@nextblock-cms/ui/label';
 import { Tag, X } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { usePriceFormatter } from '../use-price-formatter';
 
 import type { CouponQuote } from '../coupons';

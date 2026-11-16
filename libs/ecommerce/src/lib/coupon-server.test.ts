@@ -12,13 +12,11 @@ vi.mock('@nextblock-cms/db/server', async () => {
   };
 });
 
+// What freemius-coupons.ts and freemius-pricing-server.ts take from the barrel (currency.ts
+// imports '@nextblock-cms/utils/utils', which this mock does not replace).
 vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number, currencyCode?: string | null) =>
-    `${currencyCode || 'USD'} ${amount}`,
-  getCurrencyMinorUnitFactor: () => 100,
   majorUnitAmountToMinor: (amount: number) => Math.round(amount * 100),
   minorUnitAmountToMajor: (amount: number) => amount / 100,
-  normalizeCurrencyCode: (code?: string | null) => (code || 'USD').trim().toUpperCase(),
 }));
 
 vi.mock('server-only', () => ({}));

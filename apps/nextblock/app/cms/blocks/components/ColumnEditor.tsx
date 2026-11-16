@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, lazy } from 'react';
+import React, { useState } from 'react';
 import { cn } from '@nextblock-cms/utils';
 import { Button } from '@nextblock-cms/ui';
 import { PlusCircle, Trash2, Edit2, GripVertical, Image as ImageIcon } from "lucide-react";
@@ -11,6 +11,7 @@ import { useDroppable } from "@dnd-kit/core";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { BlockEditorModal } from './BlockEditorModal';
+import { describeMissingBlockEditor, getLazyBlockEditor, getLazyCustomBlockEditor } from './blockEditorLoaders';
 import { ConfirmationDialog } from '@nextblock-cms/ui';
 import BlockTypeSelector from './BlockTypeSelector';
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
@@ -24,6 +25,8 @@ interface SortableColumnBlockProps {
   block: ColumnBlock;
   index: number;
   columnIndex: number;
+  /** False for a block with nothing to configure (cart, checkout, product_details): no Edit button, as in EditableBlock. */
+  isEditable: boolean;
   onEdit: () => void;
   onDelete: () => void;
   blockType: 'section';
@@ -31,7 +34,7 @@ interface SortableColumnBlockProps {
   sectionBackground?: SectionBlockContent['background'];
 }
 
-function SortableColumnBlock({ block, index, columnIndex, onEdit, onDelete, blockType, onClick, sectionBackground }: SortableColumnBlockProps) {
+function SortableColumnBlock({ block, index, columnIndex, isEditable, onEdit, onDelete, blockType, onClick, sectionBackground }: SortableColumnBlockProps) {
   const {
     attributes,
     listeners,
@@ -280,7 +283,9 @@ function SortableColumnBlock({ block, index, columnIndex, onEdit, onDelete, bloc
         const placeholder = (
           <div className={cn("text-xs flex flex-col gap-0.5", isDarkBackground ? "text-white/70" : "text-muted-foreground")}>
             <span className="font-medium">{formattedLabel}</span>
-            <span className="text-[10px] opacity-70">Click edit to configure</span>
+            <span className="text-[10px] opacity-70">
+              {isEditable ? 'Click edit to configure' : 'Renders from the current page context — nothing to configure'}
+            </span>
           </div>
         );
         // Custom blocks (block_type === definition slug) render their real layout.
@@ -304,7 +309,7 @@ function SortableColumnBlock({ block, index, columnIndex, onEdit, onDelete, bloc
      {...listeners}
      className={cn(
        "group relative p-3 border border-transparent hover:border-dashed hover:border-primary/50 rounded-lg bg-transparent transition-all",
-       "cursor-pointer",
+       isEditable && "cursor-pointer",
        isDarkBackground ? "text-white border-white/20 hover:border-white/50" : "text-foreground border-transparent"
      )}
    >
@@ -313,9 +318,11 @@ function SortableColumnBlock({ block, index, columnIndex, onEdit, onDelete, bloc
           <div className="cursor-grab active:cursor-grabbing p-1">
              <GripVertical className={cn("h-3 w-3", isDarkBackground ? "text-white drop-shadow-md" : "text-foreground/70")} />
           </div>
-          <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onEdit(); }} className="h-6 w-6 p-0 hover:bg-transparent" title="Edit block">
-            <Edit2 className={cn("h-3 w-3", isDarkBackground ? "text-white drop-shadow-md" : "text-foreground/70")} />
-          </Button>
+          {isEditable && (
+            <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onEdit(); }} className="h-6 w-6 p-0 hover:bg-transparent" title="Edit block" aria-label="Edit block">
+              <Edit2 className={cn("h-3 w-3", isDarkBackground ? "text-white drop-shadow-md" : "text-foreground/70")} />
+            </Button>
+          )}
           <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onDelete(); }} className="h-6 w-6 p-0 text-red-600 hover:text-red-700 hover:bg-transparent" title="Delete block">
             <Trash2 className="h-3 w-3" />
           </Button>
@@ -441,9 +448,12 @@ export default function ColumnEditor({ columnIndex, blocks, onBlocksChange, bloc
   };
 
   const handleStartEdit = (block: ColumnBlock, index: number) => {
+    // cart / checkout / product_details have nothing to configure and no editor file,
+    // as in EditableBlock.
+    if (!blockHasEditableContent(block.block_type)) return;
     const blockDef = getBlockDefinition(block.block_type);
     if (!blockDef) {
-      const Editor = lazy(() => import(`../editors/DynamicCustomBlockEditor`));
+      const Editor = getLazyCustomBlockEditor();
       setLazyEditor(Editor);
       setEditingBlock({ ...block, index });
       return;
@@ -453,13 +463,17 @@ export default function ColumnEditor({ columnIndex, blocks, onBlocksChange, bloc
       const Component = blockDef.EditorComponent;
       setLazyEditor(() => Component);
       setEditingBlock({ ...block, index });
-    } else if (blockDef.editorComponentFilename) {
-      const filename = blockDef.editorComponentFilename;
-      const Editor = lazy(() => import(`../editors/${filename.replace(/\.tsx$/, '')}`));
+      return;
+    }
+
+    // No filename, or one with no mapped editor: log and open nothing rather than let a
+    // lazy import of a missing module throw inside Suspense.
+    const Editor = blockDef.editorComponentFilename ? getLazyBlockEditor(blockDef.editorComponentFilename) : null;
+    if (Editor) {
       setLazyEditor(Editor);
       setEditingBlock({ ...block, index });
     } else {
-      console.error(`No editor component found for block type: ${block.block_type}`);
+      console.error(describeMissingBlockEditor(block.block_type, blockDef.editorComponentFilename));
     }
   };
 
@@ -532,6 +546,7 @@ export default function ColumnEditor({ columnIndex, blocks, onBlocksChange, bloc
                   index={index}
                   columnIndex={columnIndex}
                   blockType={blockType}
+                  isEditable={blockHasEditableContent(block.block_type)}
                   onEdit={() => handleStartEdit(block, index)}
                   onDelete={() => handleDeleteBlock(index)}
                   onClick={(e) => handleCardClick(e, block, index)}

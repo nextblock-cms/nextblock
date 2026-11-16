@@ -255,5 +255,34 @@ describe("visual editing server actions", () => {
       expect(chain.delete).toHaveBeenCalled();
       expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/about");
     });
+
+    // Review 2026-11-15: a failed draft delete returned before the revalidation, so visitors kept the
+    // old version for up to five minutes while the CMS said it was published.
+    it("refreshes the live page before the draft delete, and reports a failed delete as published with its warning", async () => {
+      const { chain } = mockPublishChain();
+      const draftsChain: any = {
+        select: vi.fn(() => draftsChain),
+        eq: vi.fn(() => draftsChain),
+        maybeSingle: vi.fn().mockResolvedValue({ data: baseDraft, error: null }),
+        delete: vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: { message: "connection reset" } }) })),
+      };
+      draftContentMocks.getCurrentUserCanEdit.mockResolvedValue({
+        canEdit: true,
+        supabase: { from: vi.fn((table: string) => (table === "content_drafts" ? draftsChain : chain)) },
+        user: { id: "user-1" },
+      });
+      revisionMocks.getFullPageContent.mockResolvedValueOnce(previousContent).mockResolvedValueOnce(nextContent);
+      revisionMocks.createPageRevision.mockResolvedValue({ error: "Failed to insert page revision: permission denied" });
+
+      const result = await publishVisualEditingDraft("page", 2);
+
+      expect(result).toEqual({
+        error:
+          "Published, but failed to remove draft: connection reset. Published, but history was not recorded: Failed to insert page revision: permission denied",
+      });
+      expect(draftsChain.delete).toHaveBeenCalled();
+      expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/about");
+      expect(cacheMocks.revalidatePath).toHaveBeenCalledWith("/cms/pages/2/edit");
+    });
   });
 });

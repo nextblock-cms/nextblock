@@ -37,6 +37,7 @@ import type {
   VisualEditingProductFieldTarget,
 } from "../../lib/visual-editing/types";
 import type { BlockType } from "../../lib/blocks/blockRegistry";
+import { PRODUCT_PUBLISH_ADMIN_ONLY_NOTE } from "../../lib/visual-editing/product-draft-meta";
 
 type EditorComponent = ComponentType<BlockEditorProps<unknown>>;
 type HoverTarget = {
@@ -489,7 +490,30 @@ function getProductFieldEditorComponent(target: VisualEditingProductFieldTarget)
   return ProductPlainTextFieldEditor;
 }
 
-export function NextblockVisualEditing() {
+export interface NextblockVisualEditingProps {
+  /**
+   * Server-derived (the root layout's currentUserCanPublishProductDrafts(), through
+   * DeferredVisualEditing): the caller is an ADMIN past the second factor, the only caller
+   * publishProductVisualEditingDraft lets through. For anyone else the toolbar disables Publish on a
+   * product with a note (Discard stays); publish checks again on the server, so this only spares a
+   * refused round trip. Pages and posts are unaffected.
+   */
+  canPublishProducts?: boolean;
+  /**
+   * Server-derived too (the root layout): the caller's profile says ADMIN but the check behind
+   * `canPublishProducts` said no, so their second factor is pending (or the check failed). Only the
+   * note beside the disabled Publish changes, to PRODUCT_PUBLISH_SECOND_FACTOR_NOTE.
+   */
+  secondFactorPending?: boolean;
+}
+
+/** The note beside a disabled product Publish for an ADMIN whose second factor is pending. */
+export const PRODUCT_PUBLISH_SECOND_FACTOR_NOTE = "Complete two-factor verification to publish product changes.";
+
+export function NextblockVisualEditing({
+  canPublishProducts = false,
+  secondFactorPending = false,
+}: NextblockVisualEditingProps = {}) {
   const pathname = usePathname();
 
   // Hide the frontend toolbar on CMS/admin routes. This MUST stay a thin wrapper
@@ -504,10 +528,18 @@ export function NextblockVisualEditing() {
     return null;
   }
 
-  return <VisualEditingToolbar />;
+  return <VisualEditingToolbar canPublishProducts={canPublishProducts} secondFactorPending={secondFactorPending} />;
 }
 
-function VisualEditingToolbar() {
+const PRODUCT_PUBLISH_NOTE_ID = "nextblock-visual-product-publish-note";
+
+function VisualEditingToolbar({
+  canPublishProducts,
+  secondFactorPending,
+}: {
+  canPublishProducts: boolean;
+  secondFactorPending: boolean;
+}) {
   const router = useRouter();
 
   const [hoverTarget, setHoverTarget] = useState<HoverTarget | null>(null);
@@ -996,6 +1028,11 @@ function VisualEditingToolbar() {
       return;
     }
 
+    // Only an ADMIN publishes a product draft (the button is disabled for anyone else).
+    if (document.parentType === "product" && !canPublishProducts) {
+      return;
+    }
+
     const didFlush = await flushPendingEditorChanges();
     if (!didFlush) {
       return;
@@ -1025,7 +1062,7 @@ function VisualEditingToolbar() {
     hasSavedSinceOpenRef.current = false;
     closeVisualEditor();
     router.refresh();
-  }, [activeDocument, closeVisualEditor, flushPendingEditorChanges, router]);
+  }, [activeDocument, canPublishProducts, closeVisualEditor, flushPendingEditorChanges, router]);
 
   const discardDraft = useCallback(async () => {
     const document = activeDocumentRef.current ?? activeDocument;
@@ -1065,6 +1102,8 @@ function VisualEditingToolbar() {
         ? getEditorComponent(activeBlock.type)
         : JsonBlockEditor;
 
+  const isProductPublishBlocked = activeDocument?.parentType === "product" && !canPublishProducts;
+
   const draftActions = (
     <>
       <Button
@@ -1091,7 +1130,8 @@ function VisualEditingToolbar() {
         size="sm"
         className="h-8 rounded-full bg-amber-600 hover:bg-amber-500 text-white border-0 shadow-md shadow-amber-600/10 px-4 text-xs font-medium"
         onClick={publishDraft}
-        disabled={!activeDocument || isPublishing || isDiscarding || isSavingBlock}
+        disabled={!activeDocument || isProductPublishBlocked || isPublishing || isDiscarding || isSavingBlock}
+        aria-describedby={isProductPublishBlocked ? PRODUCT_PUBLISH_NOTE_ID : undefined}
       >
         {isPublishing ? (
           <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
@@ -1100,6 +1140,14 @@ function VisualEditingToolbar() {
         )}
         Publish
       </Button>
+      {isProductPublishBlocked ? (
+        <span
+          id={PRODUCT_PUBLISH_NOTE_ID}
+          className="max-w-[16rem] text-[11px] leading-tight text-muted-foreground"
+        >
+          {secondFactorPending ? PRODUCT_PUBLISH_SECOND_FACTOR_NOTE : PRODUCT_PUBLISH_ADMIN_ONLY_NOTE}
+        </span>
+      ) : null}
     </>
   );
 

@@ -38,7 +38,12 @@ export default defineConfig({
       // of monorepo-relative source paths that do not exist in the published package.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDirs: '../../dist/libs/db',
-      exclude: ['vite.config.ts'],
+      // The plugin declares every file tsconfig.lib.json includes (src/**/*.ts), not only what the
+      // entries import. src/supabase holds the Deno migration-ingest edge function (deployed from
+      // here, never shipped): without this exclude its declaration landed in
+      // dist/libs/db/supabase/functions/, which verify-lib-dist.js check 13 refuses. The copy step
+      // (tools/scripts/copy-db-supabase.cjs) also empties dist/libs/db/supabase before it copies.
+      exclude: ['vite.config.ts', 'src/supabase/**'],
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/db',

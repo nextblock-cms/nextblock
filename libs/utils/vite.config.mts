@@ -92,6 +92,11 @@ export default defineConfig({
             'zod-to-json-schema': '^3.25.2',
             '@aws-sdk/client-s3': '^3.1136.0',
             '@aws-sdk/s3-request-presigner': '^3.1136.0',
+            // sanitizeAuthoredBlockHtml's allowlist (lib/authored-html). Pure JavaScript, no
+            // install scripts; @types/sanitize-html stays a dev dependency (no type leaks).
+            // Always the root package.json's range, as a literal:
+            // tests/published-dependencies.test.ts fails when the two differ.
+            'sanitize-html': '^2.18.2',
           },
         };
 

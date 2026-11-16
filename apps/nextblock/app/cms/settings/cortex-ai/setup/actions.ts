@@ -115,7 +115,7 @@ export async function connectOpenRouterKeyAction(input: {
       throw new Error(error.message);
     }
 
-    // Binds the other stored keys to their rows too (a key from before 0.23.1 opens anywhere).
+    // Binds the other stored keys to their rows too (a key from before 0.23.0 opens anywhere).
     await resealStoredCortexAiSecrets(supabase);
 
     return {
@@ -266,7 +266,7 @@ export async function saveStockPhotoKeysForSetupAction(input: {
         throw new Error(error.message);
       }
 
-      // Binds the keys this step kept to their rows too (a key from before 0.23.1 opens anywhere).
+      // Binds the keys this step kept to their rows too (a key from before 0.23.0 opens anywhere).
       await resealStoredCortexAiSecrets(supabase);
     }
 

@@ -546,3 +546,219 @@ describe('proxy() forwarded request headers', () => {
     expect(forwarded(bare, 'x-nextblock-search')).toBe('');
   });
 });
+
+/* ------------------------------------------------------------------------------------------
+ * First-boot setup gate: while site_settings.is_admin_created is not true, anonymous requests go
+ * to /setup, except the paths that answer for themselves. The public sandbox's reset cron is one:
+ * on 2026-11-13 the flag read false on cms.nextblock.dev and the gate also bounced the pg_cron
+ * call, so the reset that restores the demo admin and the flag never ran again.
+ * ---------------------------------------------------------------------------------------- */
+
+const SUPABASE_ENV_ALIASES = [
+  'NEXT_PUBLIC_SUPABASE_URL',
+  'SUPABASE_URL',
+  'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  'SUPABASE_ANON_KEY',
+  'NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY',
+  'SUPABASE_PUBLISHABLE_KEY',
+];
+
+/** The pg_cron job's request (npm run sandbox:schedule): a bearer token, no cookie, no browser headers. */
+function cronCall(path: string) {
+  return new NextRequest(new URL(path, 'https://shop.example'), { headers: { authorization: 'Bearer cron-secret' } });
+}
+
+describe('proxy() first-boot setup gate', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mocks.afterCallbacks.length = 0;
+    mocks.rpcCalls.length = 0;
+    mocks.redirects = [];
+    mocks.user = null;
+    mocks.profile = null;
+    mocks.adminCreated = false;
+    for (const name of SUPABASE_ENV_ALIASES) vi.stubEnv(name, '');
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'https://db.example.test');
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY', 'anon-key');
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('sends anonymous pages, sign-in and the CMS to /setup while no admin exists', async () => {
+    for (const path of ['/', '/sign-in', '/cms/dashboard']) {
+      const response = await runProxy(visit(path));
+      expect(response.status, path).toBe(307);
+      expect(response.headers.get('location'), path).toBe('https://shop.example/setup');
+    }
+  });
+
+  it('lets the sandbox reset cron through, so a false flag never locks out the run that repairs it', async () => {
+    const response = await runProxy(cronCall('/api/cron/reset-sandbox'));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('location')).toBeNull();
+  });
+
+  it('lets it through on an unconfigured deploy too, where the route answers 404 off the sandbox', async () => {
+    for (const name of SUPABASE_ENV_ALIASES) vi.stubEnv(name, '');
+    expect((await runProxy(cronCall('/api/cron/reset-sandbox'))).headers.get('location')).toBeNull();
+    expect((await runProxy(visit('/'))).headers.get('location')).toBe('https://shop.example/setup');
+  });
+
+  it('lets the exact reset path through only: other cron routes and look-alike paths stay gated', async () => {
+    for (const path of ['/api/cron/sync-currencies', '/api/cron/reset-sandbox/extra', '/api/cron/reset-sandboxes', '/api/cron']) {
+      const response = await runProxy(cronCall(path));
+      expect(response.headers.get('location'), path).toBe('https://shop.example/setup');
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------------------------
+ * Content-Security-Policy: the script-src every response carries. 'strict-dynamic' is what
+ * makes the nonce the only way in: without it, a <script src> in the markup ran from any host
+ * in the list (any Google Tag Manager container, JSONP on www.google.com). The hosts stay as the
+ * fallback for browsers without 'strict-dynamic'.
+ * ---------------------------------------------------------------------------------------- */
+
+function cspDirectives(policy: string | null): Map<string, string[]> {
+  const directives = new Map<string, string[]>();
+  for (const directive of (policy ?? '').split(';')) {
+    const [name, ...sources] = directive.trim().split(/\s+/);
+    if (name) directives.set(name, sources);
+  }
+  return directives;
+}
+
+const scriptSrcOf = (response: Response) =>
+  cspDirectives(response.headers.get('content-security-policy')).get('script-src');
+
+// The fallback list, in order: Google Analytics / Tag Manager (production only), the Vercel
+// toolbar and insights, Cloudflare Turnstile, Google reCAPTCHA.
+const GOOGLE_TAG_HOSTS = [
+  'https://www.googletagmanager.com',
+  'https://*.googletagmanager.com',
+  'https://www.google-analytics.com',
+  'https://*.google-analytics.com',
+  'https://analytics.google.com',
+  'https://stats.g.doubleclick.net',
+];
+const VERCEL_AND_CAPTCHA_HOSTS = [
+  'https://vercel.live',
+  'https://vercel.com',
+  'https://assets.vercel.com',
+  'https://vitals.vercel-insights.com',
+  'https://*.vercel-insights.com',
+  'https://challenges.cloudflare.com',
+  'https://www.google.com',
+  'https://www.gstatic.com',
+];
+
+describe('proxy() Content-Security-Policy', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mocks.afterCallbacks.length = 0;
+    mocks.rpcCalls.length = 0;
+    mocks.redirects = [];
+    mocks.user = null;
+    mocks.profile = null;
+    mocks.adminCreated = true;
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'https://db.example.test');
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY', 'anon-key');
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('pins the production script-src: the nonce, strict-dynamic, then the fallback hosts', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const response = await runProxy(visit('/about'));
+    const nonce = forwarded(response, 'x-nonce');
+
+    expect(nonce).toMatch(/^[A-Za-z0-9+/]{16,}={0,2}$/);
+    expect(scriptSrcOf(response)).toEqual([
+      "'self'",
+      `'nonce-${nonce}'`,
+      "'strict-dynamic'",
+      'blob:',
+      ...GOOGLE_TAG_HOSTS,
+      ...VERCEL_AND_CAPTCHA_HOSTS,
+    ]);
+  });
+
+  it('keeps the directives strict-dynamic relies on', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const directives = cspDirectives((await runProxy(visit('/about'))).headers.get('content-security-policy'));
+
+    // Inline handlers and plugins have no nonce to carry, and a <base> injection would re-point
+    // the relative src of a nonce'd script.
+    expect(directives.get('script-src-attr')).toEqual(["'none'"]);
+    expect(directives.get('object-src')).toEqual(["'none'"]);
+    expect(directives.get('base-uri')).toEqual(["'self'"]);
+    expect(directives.has('upgrade-insecure-requests')).toBe(true);
+  });
+
+  it('pins the development script-src: the same trust model plus eval for the dev tooling', async () => {
+    vi.stubEnv('NODE_ENV', 'development');
+    const response = await runProxy(visit('/about'));
+    const nonce = forwarded(response, 'x-nonce');
+
+    expect(scriptSrcOf(response)).toEqual([
+      "'self'",
+      `'nonce-${nonce}'`,
+      "'strict-dynamic'",
+      "'unsafe-inline'",
+      "'unsafe-eval'",
+      'blob:',
+      'data:',
+      ...VERCEL_AND_CAPTCHA_HOSTS,
+      'http://localhost:*',
+      'https://localhost:*',
+      'http://127.0.0.1:*',
+    ]);
+  });
+
+  it('hands Next the same policy on the request, so it nonces its own scripts with this nonce', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const response = await runProxy(visit('/about'));
+    const policy = response.headers.get('content-security-policy');
+
+    // Next reads the nonce from the forwarded Content-Security-Policy request header.
+    expect(forwarded(response, 'content-security-policy')).toBe(policy);
+    expect(policy).toContain(`'nonce-${forwarded(response, 'x-nonce')}'`);
+  });
+
+  it('draws a fresh nonce for every request', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const first = forwarded(await runProxy(visit('/about')), 'x-nonce');
+    const second = forwarded(await runProxy(visit('/about')), 'x-nonce');
+    expect(first).not.toBe(second);
+  });
+
+  it('sends the same script-src on redirects and before setup', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const expectStrict = (response: Response) =>
+      expect(scriptSrcOf(response)?.slice(2, 4)).toEqual(["'strict-dynamic'", 'blob:']);
+
+    mocks.redirects = [{ id: 'r1', sourcePath: '/old-picks', destinationPath: '/new-picks', statusCode: 301, isActive: true }];
+    const managed = await runProxy(visit('/old-picks'));
+    expect(managed.status).toBe(301);
+    expectStrict(managed);
+
+    const signedOut = await runProxy(visit('/cms/pages'));
+    expect(signedOut.status).toBe(307);
+    expectStrict(signedOut);
+
+    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', '');
+    const wizard = await runProxy(visit('/setup'));
+    expect(wizard.status).toBe(200);
+    expectStrict(wizard);
+  });
+});

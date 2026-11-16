@@ -1,0 +1,146 @@
+//@ts-check
+
+const path = require('path');
+const webpack = require('webpack');
+
+/**
+ * @type {import('next').NextConfig}
+ **/
+const isDockerStandalone = process.env.DOCKER_BUILD === 'true';
+const nextConfig = {
+  ...(isDockerStandalone ? { output: 'standalone' } : {}),
+  outputFileTracingRoot: path.join(__dirname),
+  env: {
+    NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+  },
+  images: {
+    formats: ['image/avif', 'image/webp'],
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384, 512],
+    deviceSizes: [320, 480, 640, 750, 828, 1080, 1200, 1440, 1920, 2048, 2560],
+    qualities: [60, 75],
+    minimumCacheTTL: 31536000,
+    dangerouslyAllowSVG: false,
+    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
+    remotePatterns: getRemotePatterns(),
+  },
+  experimental: {
+    cssChunking: 'strict',
+  },
+  transpilePackages: ['@nextblock-cms/utils', '@nextblock-cms/ui', '@nextblock-cms/editor', '@nextblock-cms/db', '@nextblock-cms/sdk', '@nextblock-cms/ecommerce', '@nextblock-cms/cortex'],
+  webpack: (config, { isServer }) => {
+    config.resolve = config.resolve || {};
+    config.resolve.alias = {
+      ...(config.resolve.alias ?? {}),
+      '@nextblock-cms/ui/avatar': path.join(process.cwd(), 'lib/ui/avatar'),
+      '@nextblock-cms/ui/badge': path.join(process.cwd(), 'lib/ui/badge'),
+      '@nextblock-cms/ui/button': path.join(process.cwd(), 'lib/ui/button'),
+      '@nextblock-cms/ui/card': path.join(process.cwd(), 'lib/ui/card'),
+      '@nextblock-cms/ui/checkbox': path.join(process.cwd(), 'lib/ui/checkbox'),
+      '@nextblock-cms/ui/ColorPicker': path.join(process.cwd(), 'lib/ui/ColorPicker'),
+      '@nextblock-cms/ui/ConfirmationDialog': path.join(process.cwd(), 'lib/ui/ConfirmationDialog'),
+      '@nextblock-cms/ui/CustomSelectWithInput': path.join(process.cwd(), 'lib/ui/CustomSelectWithInput'),
+      '@nextblock-cms/ui/dialog': path.join(process.cwd(), 'lib/ui/dialog'),
+      '@nextblock-cms/ui/dropdown-menu': path.join(process.cwd(), 'lib/ui/dropdown-menu'),
+      '@nextblock-cms/ui/input': path.join(process.cwd(), 'lib/ui/input'),
+      '@nextblock-cms/ui/label': path.join(process.cwd(), 'lib/ui/label'),
+      '@nextblock-cms/ui/popover': path.join(process.cwd(), 'lib/ui/popover'),
+      '@nextblock-cms/ui/progress': path.join(process.cwd(), 'lib/ui/progress'),
+      '@nextblock-cms/ui/select': path.join(process.cwd(), 'lib/ui/select'),
+      '@nextblock-cms/ui/separator': path.join(process.cwd(), 'lib/ui/separator'),
+      '@nextblock-cms/ui/Skeleton': path.join(process.cwd(), 'lib/ui/Skeleton'),
+      '@nextblock-cms/ui/table': path.join(process.cwd(), 'lib/ui/table'),
+      '@nextblock-cms/ui/textarea': path.join(process.cwd(), 'lib/ui/textarea'),
+      '@nextblock-cms/ui/tooltip': path.join(process.cwd(), 'lib/ui/tooltip'),
+      '@nextblock-cms/ui/ui': path.join(process.cwd(), 'lib/ui/ui'),
+    };
+
+    if (!isServer) {
+      config.module = config.module || {};
+      config.module.rules = config.module.rules || [];
+      config.module.rules.push({
+        test: /\.svg$/i,
+        issuer: /\.[jt]sx?$/,
+        use: ['@svgr/webpack'],
+      });
+
+      config.optimization = {
+        ...(config.optimization ?? {}),
+        splitChunks: {
+          ...((config.optimization ?? {}).splitChunks ?? {}),
+          cacheGroups: {
+            ...(((config.optimization ?? {}).splitChunks ?? {}).cacheGroups ?? {}),
+            tiptap: {
+              test: /[\\/]node_modules[\\/](@tiptap|prosemirror)[\\/]/,
+              name: 'tiptap',
+              chunks: 'async',
+              priority: 30,
+              reuseExistingChunk: true,
+            },
+            tiptapExtensions: {
+              test: /[\\/](tiptap-extensions|RichTextEditor|MenuBar|MediaLibraryModal)[\\/]/,
+              name: 'tiptap-extensions',
+              chunks: 'async',
+              priority: 25,
+              reuseExistingChunk: true,
+            },
+          },
+        },
+      };
+    }
+
+    return config;
+  },
+  turbopack: {
+    // Turbopack-specific options can be configured here if needed.
+  },
+  compiler: {
+    removeConsole: process.env.NODE_ENV === 'production',
+  },
+  // The published @nextblock-cms/* libs are pre-built and fully type-checked in the upstream
+  // monorepo, but their consumer-side type declarations can be incomplete — so making
+  // `next build` re-type-check them would fail on imports the app uses correctly at runtime.
+  // Skip build-time type-checking of the pre-built deps; your own code is still checked in
+  // your editor (and you can run `tsc` directly if you want a gate). NOTE: Next 16 removed the
+  // `eslint` next.config key (built-in lint-on-build is gone), so it's intentionally absent.
+  typescript: { ignoreBuildErrors: true },
+};
+
+module.exports = nextConfig;
+
+function getRemotePatterns() {
+  /** @type {Array<{ protocol: "http" | "https", hostname: string, pathname: string }>} */
+  const patterns = [];
+  // Storage providers allowlisted by wildcard so next/image works on a fresh install
+  // WITHOUT a dev-server restart: next.config.js is read once at startup, before the
+  // /setup wizard writes the R2 env, so the exact env-derived hosts below would be
+  // missing until a restart. Custom domains are still picked up from env below.
+  patterns.push(
+    { protocol: 'https', hostname: '**.r2.dev', pathname: '/**' },
+    { protocol: 'https', hostname: '**.r2.cloudflarestorage.com', pathname: '/**' },
+    { protocol: 'https', hostname: '**.supabase.co', pathname: '/**' },
+  );
+  // Whitelist this project R2 public/base URLs and the site URL for next/image.
+  const sources = [
+    process.env.NEXT_PUBLIC_R2_PUBLIC_URL,
+    process.env.NEXT_PUBLIC_R2_BASE_URL,
+    process.env.NEXT_PUBLIC_URL,
+  ];
+  for (const value of sources) {
+    if (!value) continue;
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+      const hostname = parsed.hostname;
+      if (patterns.some((pattern) => pattern.hostname === hostname)) continue;
+      patterns.push({
+        protocol: parsed.protocol === 'https:' ? 'https' : 'http',
+        hostname,
+        pathname: '/**',
+      });
+    } catch {
+      // ignore malformed value
+    }
+  }
+  return patterns;
+}

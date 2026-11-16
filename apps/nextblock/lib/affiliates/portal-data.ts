@@ -5,7 +5,7 @@ import { unstable_cache } from 'next/cache';
 import { headers } from 'next/headers';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getSsgSupabaseClient } from '@nextblock-cms/db/server';
-import { normalizeCurrencyRecord, resolveEffectivePriceForCurrency, type CurrencyRecord } from '@nextblock-cms/ecommerce';
+import { normalizeCurrencyRecord, resolveEffectivePriceForCurrency, type CurrencyRecord } from '@nextblock-cms/ecommerce/currency';
 import { buildPublishedAtOrFilter } from '@nextblock-cms/utils';
 import {
   AFFILIATE_GATEWAYS,

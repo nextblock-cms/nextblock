@@ -64,6 +64,29 @@ describe('isPartnerUploadKey', () => {
     expect(isPartnerUploadKey(42)).toBe(false);
   });
 
+  it('recognises the spellings storage decodes or resolves into a namespace (percent-escapes, dot segments)', () => {
+    for (const key of [
+      `%61ffiliates/avatars/${AFFILIATE}/a.jpg`,
+      `affiliates%2Fpages/${AFFILIATE}/a.jpg`,
+      `affiliates/pages%2F${AFFILIATE}/a.jpg`,
+      `%2561ffiliates/pages/${AFFILIATE}/a.jpg`,
+      `%41FFILIATES/AVATARS/${AFFILIATE}/A.JPG`,
+      `uploads/%2e%2e/affiliates/pages/${AFFILIATE}/a.jpg`,
+      `uploads/../affiliates/avatars/${AFFILIATE}/a.jpg`,
+    ]) {
+      expect(isPartnerUploadKey(key), key).toBe(true);
+    }
+  });
+
+  it('counts a malformed escape as a partner upload (it only refuses more) and leaves an ordinary escaped key alone', () => {
+    for (const key of ['uploads/100%.png', 'uploads/%zz.png', `affiliates%/pages/${AFFILIATE}/a.jpg`]) {
+      expect(isPartnerUploadKey(key), key).toBe(true);
+    }
+    for (const key of ['uploads/my%20photo.png', 'affiliates/banners/%62.png', 'uploads/affiliates%2Fpages/a.png']) {
+      expect(isPartnerUploadKey(key), key).toBe(false);
+    }
+  });
+
   it('matches the keys the partner upload route really builds (lib/affiliates/uploads.ts)', () => {
     const now = new Date('2026-10-27T10:15:00Z');
     for (const kind of ['avatar', 'image'] as const) {
@@ -114,6 +137,34 @@ describe('mediaKeyStem', () => {
     expect(mediaKeyStem(AVATAR)).toBeNull();
     expect(mediaKeyStem(PAGE_IMAGE)).toBeNull();
     expect(mediaKeyStem(`Affiliates/pages/${AFFILIATE}/photo_1_large.avif`)).toBeNull();
+    expect(mediaKeyStem(`%61ffiliates/pages/${AFFILIATE}/photo_1_large.avif`)).toBeNull();
+    expect(mediaKeyStem(`affiliates%2Favatars/${AFFILIATE}/photo_1.jpg`)).toBeNull();
+  });
+
+  it('refuses a key with a malformed escape, and keeps a stored key whose escapes decode outside the namespaces', () => {
+    expect(mediaKeyStem('uploads/50%_off_1.png')).toBeNull();
+    // The delete and move send stored keys literally (the S3 SDK encodes a Key, the move encodes its
+    // CopySource, Supabase's remove puts keys in the request body), so such a key is still the
+    // row's own object.
+    expect(mediaKeyStem('uploads/my%20photo_1.png')).toBe('uploads/my%20photo_1');
+    expect(mediaKeyStem('uploads/my%20photo_1_large.avif')).toBe('uploads/my%20photo_1');
+  });
+
+  it('refuses a stored key holding a `?` or `#`, which no builder mints, so delete and move never touch it', () => {
+    expect(mediaKeyStem('uploads/photo_1.png?x.png')).toBeNull();
+    expect(mediaKeyStem('uploads/photo_1.png#x.png')).toBeNull();
+    expect(
+      ownedMediaStorageKeys({
+        object_key: 'uploads/mine_20261021.png',
+        variants: [{ objectKey: 'uploads/mine_20261021_large.avif?x' }],
+      })
+    ).toEqual(['uploads/mine_20261021.png']);
+    expect(withoutKeysInUse(['uploads/a.png', 'uploads/b.png#c.png'], [])).toEqual(['uploads/a.png']);
+  });
+
+  it('refuses a stored key whose dot segments the URL parser resolves before decoding', () => {
+    expect(mediaKeyStem(`x%2fy/../affiliates/pages/${AFFILIATE}/photo_1.jpg`)).toBeNull();
+    expect(mediaKeyStem(`affiliates//../pages/${AFFILIATE}/photo_1.jpg`)).toBeNull();
   });
 });
 
@@ -171,6 +222,23 @@ describe('ownedMediaStorageKeys', () => {
     ).toEqual([`${own}.png`, `${own}_small.avif`]);
   });
 
+  it('a decoy row naming a percent-encoded partner key owns nothing', () => {
+    const encodedAvatar = `%61ffiliates/avatars/${AFFILIATE}/20261027101500-0a1b2c3d.jpg`;
+    expect(
+      ownedMediaStorageKeys({
+        object_key: encodedAvatar,
+        variants: [{ objectKey: encodedAvatar }, { objectKey: `affiliates%2Fpages/${AFFILIATE}/x.jpg` }],
+      }),
+    ).toEqual([]);
+    // A real media row that also lists an encoded partner key keeps only its own objects.
+    expect(
+      ownedMediaStorageKeys({
+        object_key: `${own}.png`,
+        variants: [{ objectKey: `affiliates/pages%2F${AFFILIATE}/x.jpg` }, { objectKey: `${own}_small.avif` }],
+      }),
+    ).toEqual([`${own}.png`, `${own}_small.avif`]);
+  });
+
   it('owns an ordinary media upload kept in an affiliates/ folder outside the partner namespaces', () => {
     expect(mediaKeyStem('affiliates/banner_1.png')).toBe('affiliates/banner_1');
     expect(
@@ -199,5 +267,14 @@ describe('withoutKeysInUse', () => {
     expect(withoutKeysInUse(['uploads/a.png', AVATAR, `/Affiliates/pages/${AFFILIATE}/b.jpg`, PAGE_IMAGE], [])).toEqual([
       'uploads/a.png',
     ]);
+  });
+
+  it('never returns a percent-encoded partner upload or a key with a malformed escape', () => {
+    expect(
+      withoutKeysInUse(
+        ['uploads/a.png', `%61ffiliates/pages/${AFFILIATE}/b.jpg`, `%2561ffiliates/avatars/${AFFILIATE}/c.jpg`, 'uploads/100%.png'],
+        [],
+      ),
+    ).toEqual(['uploads/a.png']);
   });
 });

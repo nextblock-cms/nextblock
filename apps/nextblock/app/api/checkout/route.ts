@@ -22,6 +22,42 @@ function jsonError(errorKey: string, error: string, status: number) {
   return NextResponse.json({ error, errorKey }, { status });
 }
 
+/**
+ * The readiness refusal below is logged at most once a minute per provider and missing set: this
+ * route is public, and a store that is not ready refuses every POST, so a line per request let
+ * anyone fill the logs. The sets come from the store's configuration, never from the request; the
+ * key cap only bounds the memory. Same rule as the lib's `createFreemiusLogThrottle`, which no
+ * server entry of `@nextblock-cms/ecommerce` exports.
+ */
+const READINESS_LOG_WINDOW_MS = 60_000;
+const READINESS_LOG_MAX_KEYS = 20;
+const readinessLoggedAt = new Map<string, number>();
+
+function shouldLogReadinessRefusal(key: string): boolean {
+  const now = Date.now();
+  // A clock that went back counts as a new window.
+  const fresh = (at: number) => now >= at && now - at < READINESS_LOG_WINDOW_MS;
+  const last = readinessLoggedAt.get(key);
+
+  if (last !== undefined && fresh(last)) {
+    return false;
+  }
+
+  if (last === undefined && readinessLoggedAt.size >= READINESS_LOG_MAX_KEYS) {
+    for (const [logged, at] of readinessLoggedAt) {
+      if (!fresh(at)) readinessLoggedAt.delete(logged);
+    }
+
+    // Still full of sets logged this window: say nothing more until they expire.
+    if (readinessLoggedAt.size >= READINESS_LOG_MAX_KEYS) {
+      return false;
+    }
+  }
+
+  readinessLoggedAt.set(key, now);
+  return true;
+}
+
 /** The English text of the seeded `ecommerce.sandbox_notice` translation (02004). */
 const SANDBOX_CHECKOUT_NOTICE =
   'This is a Sandbox environment. The Freemius checkout is skipped here for demo purposes.';
@@ -149,9 +185,10 @@ export async function POST(req: Request) {
     // every attempt — and the shopper got Stripe's raw "Invalid API Key" string back.
     const readiness = await getProviderReadiness(providerName);
     if (!readiness.ready) {
-      console.error(
-        `Checkout blocked: ${readiness.label} is not ready (missing: ${readiness.missing.join(', ') || 'unknown'})`
-      );
+      const missing = readiness.missing.join(', ') || 'unknown';
+      if (shouldLogReadinessRefusal(`${providerName}\n${[...readiness.missing].sort().join('\n')}`)) {
+        console.error(`Checkout blocked: ${readiness.label} is not ready (missing: ${missing})`);
+      }
       return jsonError(
         'ecommerce.checkout_payments_unavailable',
         'This store is not able to take payments right now. Please contact the seller to complete your purchase.',

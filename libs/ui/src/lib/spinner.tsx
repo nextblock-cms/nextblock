@@ -1,5 +1,5 @@
 import { Loader2 } from 'lucide-react';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 
 export interface SpinnerProps extends React.HTMLAttributes<HTMLDivElement> {
   size?: 'sm' | 'default' | 'lg' | 'xl';

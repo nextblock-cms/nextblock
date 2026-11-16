@@ -5,7 +5,7 @@ import { usePathname } from 'next/navigation';
 import React, { useState, useEffect, useMemo, useRef } from 'react'
 import type { Database } from '@nextblock-cms/db' // Relative path from components/
 import { useCurrentContent } from '../context/CurrentContentContext';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { useLabel } from '../lib/i18n/use-label';
 import { DeferredGlobalSearch } from './DeferredGlobalSearch';
 import { resolveMediaUrl } from '../lib/media/resolveMediaUrl';

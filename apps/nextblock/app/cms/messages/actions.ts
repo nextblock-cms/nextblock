@@ -3,9 +3,10 @@
 import 'server-only';
 
 import { revalidatePath } from 'next/cache';
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
+import { getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 
 import { requireAdminSupabaseClient } from './require-admin';
+import { getCmsActor, isCmsStaffRole } from '../../../lib/auth/cms-actor';
 import { ensureThreadToken, sendThreadNotice } from '../../../lib/messages/threads';
 import { invalidateEmailConfigCache } from '../../../lib/config/email-settings';
 import { resolveSiteUrl } from '../../../lib/site-url';
@@ -368,23 +369,17 @@ export async function saveFormEndpoint(
  * WRITERs can edit pages and therefore open this block, and showing them an empty field
  * would read as "no address configured" rather than "you may not change this". Writing
  * stays ADMIN-only; `canEdit` tells the UI which to render.
+ *
+ * The staff check is getCmsActor(), which also refuses a session whose enrolled second factor is
+ * pending: the read below uses the service role, and a server action never passes the CMS layout's
+ * 2FA redirect. Until 2026-11-13 the role was read through the cookie client instead.
  */
 export async function getFormEndpointForEditor(
   formKey: string
 ): Promise<{ label: string; recipientEmail: string; canEdit: boolean } | null> {
   try {
-    const supabase = createClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return null;
-
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .maybeSingle();
-    if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') return null;
+    const actor = await getCmsActor();
+    if (!actor || !isCmsStaffRole(actor.role)) return null;
 
     const service = getServiceRoleSupabaseClient();
     const { data } = await service
@@ -393,7 +388,7 @@ export async function getFormEndpointForEditor(
       .eq('form_key', formKey)
       .maybeSingle();
 
-    const canEdit = profile.role === 'ADMIN';
+    const canEdit = actor.role === 'ADMIN';
     if (!data) return { label: '', recipientEmail: '', canEdit };
     return {
       label: data.label ?? '',

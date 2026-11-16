@@ -165,6 +165,19 @@ export async function EditProductPage({
                   : null;
               return accumulator;
             }, {}),
+            // Every column the form saves back, as stored. ProductForm defaults a missing sale window
+            // to null and missing SEO fields and categories to empty, and its autosave sends them: the
+            // publish then cleared the live window across the SKU group, the SEO fields (stored as
+            // NULL) and the category assignments of the whole translation group.
+            sale_start_at: product.sale_start_at ?? null,
+            sale_end_at: product.sale_end_at ?? null,
+            meta_title: product.meta_title ?? null,
+            meta_description: product.meta_description ?? null,
+            custom_canonical: product.custom_canonical ?? null,
+            category_ids: (product.product_categories || [])
+              .flatMap((assignment: any) => assignment?.category ?? [])
+              .map((category: any) => category?.id)
+              .filter((categoryId: unknown): categoryId is string => typeof categoryId === 'string'),
             freemius_plan_id: product.freemius_plan_id ?? undefined,
             freemius_product_id: product.freemius_product_id ?? undefined,
             trial_period_days: product.trial_period_days ?? 0,

@@ -1,7 +1,8 @@
 'use client';
 
-import { formatInvoiceCurrency, formatInvoiceDate, translateOrderStatus, translateOrFallback, getInvoiceLocale } from '@nextblock-cms/ecommerce';
-import { useTranslations } from '@nextblock-cms/utils';
+import { formatInvoiceCurrency, formatInvoiceDate } from '@nextblock-cms/ecommerce/invoice';
+import { translateOrderStatus, translateOrFallback, getInvoiceLocale } from '@nextblock-cms/ecommerce/invoice-ui';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import {
   Badge,
   Button,

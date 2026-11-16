@@ -3,7 +3,7 @@
 import { Search } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Button } from "@nextblock-cms/ui";
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 import { useLabel } from "../lib/i18n/use-label";
 
 type TriggerVariant = "desktop" | "mobile";

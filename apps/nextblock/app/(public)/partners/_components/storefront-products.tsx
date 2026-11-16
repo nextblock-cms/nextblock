@@ -1,4 +1,4 @@
-import { ProductGrid } from '@nextblock-cms/ecommerce';
+import { ProductGrid } from '@nextblock-cms/ecommerce/components/ProductGrid';
 import type { Product } from '@nextblock-cms/ecommerce/types';
 import { hasStorefrontVisibleText, type StorefrontDoc, type StorefrontProductGridColumns } from '@nextblock-cms/affiliates';
 

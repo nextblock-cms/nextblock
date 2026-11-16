@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect } from 'react';
-import { useCartStore, type CartItem } from '@nextblock-cms/ecommerce';
+import { useCartStore } from '@nextblock-cms/ecommerce/cart-store';
+import type { CartItem } from '@nextblock-cms/ecommerce/types';
 
 interface UcpCartHydratorProps {
   items: CartItem[];

@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('server-only', () => ({}));
 
-vi.mock('@nextblock-cms/ecommerce/server', () => ({
+vi.mock('@nextblock-cms/ecommerce/currency-sync', () => ({
   syncStoreCurrencyRates: mocks.syncStoreCurrencyRates,
 }));
 

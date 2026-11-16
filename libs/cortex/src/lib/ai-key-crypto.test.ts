@@ -95,7 +95,7 @@ describe('Cortex AI OpenRouter key crypto', () => {
       maskedKey: '**** 7890',
       updatedAt: '2026-04-27T12:00:00.000Z',
     });
-    // A key stored before 0.23.1 (version 1) still counts as stored.
+    // A key stored before 0.23.0 (version 1) still counts as stored.
     expect(getOpenRouterKeyEnvelopeStatus({ ...encryptedKey, version: 1 }).hasStoredKey).toBe(true);
     expect(getOpenRouterKeyEnvelopeStatus({ ...encryptedKey, version: 3 }).hasStoredKey).toBe(false);
   });

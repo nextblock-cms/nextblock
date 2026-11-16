@@ -39,7 +39,6 @@ vi.mock('next/link', () => ({
 vi.mock('next/cache', () => ({ unstable_cache: (fn: (...args: unknown[]) => unknown) => fn }));
 vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
 vi.mock('@nextblock-cms/db/server', () => ({ getSsgSupabaseClient: () => ({}) }));
-vi.mock('@nextblock-cms/ecommerce', () => vi.importActual('../../../../../../../libs/ecommerce/src/lib/currency'));
 vi.mock('@nextblock-cms/affiliates/server', async () => ({
   ...(await vi.importActual<Record<string, unknown>>('../../../../../../../libs/affiliates/src/lib/repository')),
   ...(await vi.importActual<Record<string, unknown>>('../../../../../../../libs/affiliates/src/lib/payouts/payout-config')),

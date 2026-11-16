@@ -2,7 +2,6 @@
 
 import 'server-only';
 
-import { createClient, getServiceRoleSupabaseClient } from '@nextblock-cms/db/server';
 import { majorUnitAmountToMinor, normalizeCurrencyCode } from '@nextblock-cms/utils';
 import { revalidatePath } from 'next/cache';
 import { redirect } from 'next/navigation';
@@ -12,29 +11,19 @@ import {
   deleteCouponFromFreemius,
   syncCouponToFreemius,
 } from '../../../freemius-coupons';
+import { requireEcomAdmin } from '../../../server-actions/require-ecom-role';
 
-async function getAdminClient() {
-  const supabase = createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    throw new Error('Unauthorized');
-  }
-
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-
-  if (profile?.role !== 'ADMIN') {
-    throw new Error('Forbidden');
-  }
-
-  return getServiceRoleSupabaseClient();
-}
+/*
+ * Every action here writes coupons with the service role and pushes them to Freemius, where the
+ * developer key pair reaches every product of the account (a coupon with no product scope applies
+ * to all of them). So each one starts with requireEcomAdmin(): an ADMIN whose session has passed
+ * the enrolled second factor, checked before anything is read or written. Until 2026-11-13 a
+ * local getAdminClient() checked the role only, and a server action never meets the CMS layout's
+ * 2FA redirect, so an ADMIN password alone could create an unlimited 100% coupon on every product.
+ * tools/scripts/server-action-actors.test.ts fails on an action that reaches a coupon push
+ * without requireEcomAdmin() / requireCmsAdmin() first.
+ */
+type ServiceClient = Awaited<ReturnType<typeof requireEcomAdmin>>;
 
 function cleanString(value: FormDataEntryValue | null) {
   const text = typeof value === 'string' ? value.trim() : '';
@@ -124,7 +113,7 @@ function parseCouponPayload(formData: FormData) {
 }
 
 async function replaceCouponProducts(input: {
-  client: ReturnType<typeof getServiceRoleSupabaseClient>;
+  client: ServiceClient;
   couponId: string;
   productIds: string[];
 }) {
@@ -152,7 +141,7 @@ async function replaceCouponProducts(input: {
 }
 
 export async function createCouponAction(formData: FormData) {
-  const client = await getAdminClient();
+  const client = await requireEcomAdmin();
   const payload = parseCouponPayload(formData);
   const { data, error } = await (client as any)
     .from('coupons')
@@ -176,7 +165,7 @@ export async function createCouponAction(formData: FormData) {
 }
 
 export async function updateCouponAction(couponId: string, formData: FormData) {
-  const client = await getAdminClient();
+  const client = await requireEcomAdmin();
   const payload = parseCouponPayload(formData);
   const { error } = await (client as any)
     .from('coupons')
@@ -204,7 +193,7 @@ export async function updateCouponAction(couponId: string, formData: FormData) {
 }
 
 export async function toggleCouponActiveAction(couponId: string, isActive: boolean) {
-  const client = await getAdminClient();
+  const client = await requireEcomAdmin();
   const { error } = await (client as any)
     .from('coupons')
     .update({
@@ -223,14 +212,14 @@ export async function toggleCouponActiveAction(couponId: string, isActive: boole
 }
 
 export async function syncCouponAction(couponId: string) {
-  const client = await getAdminClient();
+  const client = await requireEcomAdmin();
   await syncCouponToFreemius({ couponId, client: client as any });
   revalidatePath('/cms/coupons');
   revalidatePath(`/cms/coupons/${couponId}/edit`);
 }
 
 export async function deleteCouponAction(couponId: string) {
-  const client = await getAdminClient();
+  const client = await requireEcomAdmin();
   await deleteCouponFromFreemius({ couponId, client: client as any });
   const { error } = await (client as any).from('coupons').delete().eq('id', couponId);
 

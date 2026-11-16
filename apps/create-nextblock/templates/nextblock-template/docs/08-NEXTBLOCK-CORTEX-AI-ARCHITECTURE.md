@@ -64,7 +64,7 @@ Known incomplete or future work:
 - Footer link updates currently replace footer links for the selected locale. Footer append mode is not yet implemented.
 - Documentation search is keyword/scored search over `posts` and `pages`, not a vector embedding RAG system yet.
 - The sandbox should eventually seed a visible product/package item for Cortex AI, similar to ecommerce. The preferred image asset is `apps/nextblock/public/images/cortex-ai-square.webp`.
-- Block insertion, creation (`create_cms_page/post/product`), deletion (`delete_cms_item`), multi-step plans (`execute_cms_action_plan`), direct typed DB CRUD, external URL ingestion (`fetch_url_content`), and whole-page rewrites staged into Live Draft Mode (`rewrite_page_draft`) are all implemented (this "future work" note is stale — see the tool inventory in `createCortexGlobalAgentTools` and the "External URL Ingestion and Live-Draft Page Rewrites" section below). Per-block mutations still write directly to live `blocks` via service role (no draft/snapshot); only `rewrite_page_draft` goes through `content_drafts`.
+- Block insertion, creation (`create_cms_page/post/product`), deletion (`delete_cms_item`), multi-step plans (`execute_cms_action_plan`), direct typed DB CRUD, external URL ingestion (`fetch_url_content`), and whole-page rewrites staged into Live Draft Mode (`rewrite_page_draft`) are all implemented (this "future work" note is stale — see the tool inventory in `createCortexGlobalAgentTools` and the "External URL Ingestion and Live-Draft Page Rewrites" section below). Per-block mutations still write directly to live `blocks` via service role (no draft/snapshot); only `rewrite_page_draft` goes through `content_drafts`. On a product with an open `product_drafts` row, the block tools also write the change into that draft, and so does `set_content_images` when the draft's meta holds a gallery list; it refuses that rewrite, before it writes anything, while the draft holds product values without the 0.23.4 marker (docs/09 → "Cortex AI Integration").
 
 ## Important Files
 
@@ -380,15 +380,32 @@ the vendor:
    `${NEXTBLOCK_LICENSE_SERVICE_URL ?? 'https://nextblock.dev'}/api/packages/claim-license`.
 2. That route exists in this codebase (`app/api/packages/claim-license/route.ts`) but
    answers 404 unless `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true`, which only the vendor
-   deployment sets. With the vendor Freemius credentials it loads the license and its
+   deployment sets, and on the public sandbox whatever its env says, before it reads the
+   request (`SANDBOX_GUARDS`). It looks up only the NextBlock packages of the registry
+   (`getPackageByFreemiusId`; anything else is 400). With the vendor Freemius credentials it loads the license and its
    user, and `evaluateFreemiusLicenseClaim` (`libs/ecommerce/src/lib/freemius-license-claim.ts`)
    accepts the claim only when the license was created within the last 20 minutes
    (checked first, so nothing about older licenses is revealed), belongs to the
    product and to the claimed user id, whose email matches, is not cancelled, and has
    **no activation yet** (the buyer activates right after the claim, so a second claim
    for the same license is refused). Every refusal is the same 403 with the same
-   message; the reason is only logged on the vendor. Rate-limited per address and
-   per license, best-effort (per process).
+   message; the reason is only logged on the vendor. A Freemius 401/403 to the vendor's own
+   keys is that same 403 for the buyer, but it is a configuration error, not a missing license:
+   `logFreemiusCredentialsRefused` writes one `console.error` line a minute per credential (the
+   developer pair, or the product's bearer) and product, naming no key; the developer pair then
+   falls back to the bearer. A 429 or 5xx is a 502 (`upstream_error`), never a refusal.
+
+   Every lookup spends the developer key pair that the store's checkouts, license links, trials,
+   coupon pushes and webhook checks share, so claims are limited the way the checkout sync is
+   (`app/api/packages/vendor-route-limits.ts`, best-effort per process): per client network
+   (the address read with `x-vercel-forwarded-for` only when `VERCEL=1`, then `x-real-ip`, then
+   the first `x-forwarded-for` hop, bucketed by `maskAffiliateVisitorIp`: an IPv4 /24, an IPv6
+   /48; 30 per 10 minutes, 60 for the shared bucket of unreadable addresses), per license id
+   (10 per 10 minutes, answered with the uniform 403) and per instance (30 Freemius lookups a
+   minute, one log line a minute while it refuses). A request is counted only when every limit
+   admits it. A license id Freemius just answered "no such license" for (`license_not_found`) is
+   refused from memory for 60 s, per product, so repeating a random id costs one lookup a minute;
+   failed lookups and refused keys are never remembered.
 3. The buyer's CMS activates the returned key with `activatePackage` (same Freemius
    `licenses/activate.json` call as a pasted key), recording `meta.nextblock`
    `{ source: 'checkout', is_trial, trial_ends_at, plan_id, expiration }`, which the
@@ -407,21 +424,80 @@ One row per package: `activatePackage` upserts the new row and then deletes the 
 rows for the same package, and `verifyPackageOnline` no longer uses `single()`, so a
 trial-to-paid conversion or a re-purchase never leaves the package reading as inactive.
 
+A key Freemius already holds on this install answers `licenses/activate.json` with
+`license_activated` ("License is already activated on install 12345."): the CMS lost its
+row to a database reset, a reinstall on the same host, or a deactivation that never reached
+Freemius. `activateLicenseKeyWithFreemius` then reads the named install back with the
+validation call below and records the row when the license is good, without the renewal
+grace (it keeps an activation alive, it does not start one). When the message names no
+install, the error sends the admin to the Freemius customer portal to release the license.
+
+The row keeps an allowlist of the activation answer (`STORED_ACTIVATION_FIELDS`). The rest of
+that answer is credentials nothing here uses (`FREEMIUS_CREDENTIAL_FIELDS`:
+`user_secret_key`, which signs Freemius API calls as the buyer, `install_secret_key`,
+`install_api_token` and the public keys). The re-validation removes them from rows activated
+before this rule.
+
 ### Trial expiry is enforced on the buyer's CMS
 
 `verifyPackageOnline` used to trust `status = 'active'` forever. Two things now end a
 trial (or a cancelled paid license) locally:
 
 - `isPackageActivationRowValid` (`libs/db/src/lib/package-validation.ts`) rejects a row
-  whose known expiry (`meta.nextblock.expiration`, `meta.nextblock.trial_ends_at`, or
-  the Freemius `expiration` spread into `meta`) is in the past.
+  whose known expiry (`meta.nextblock.expiration`, `meta.nextblock.trial_ends_at`, or a
+  Freemius `expiration` copied into `meta`) is behind it. It takes the earliest of the
+  three, so the re-validation below keeps all of them in step with Freemius. A paid license
+  gets `PACKAGE_RENEWAL_GRACE_MS` (10 days) past that date; a trial
+  (`meta.nextblock.is_trial`) gets none, because no renewal follows a no-card trial.
 - `maybeRevalidatePackageActivations` (`apps/nextblock/lib/packages/revalidate-activations.ts`)
-  runs from the CMS layout via `after()`, at most once a day per row, and re-issues the
-  same idempotent `licenses/activate.json` call with the stored uid and key. A valid
-  license gets its expiration refreshed; one Freemius reports as expired, cancelled,
-  revoked or invalid is set to `status = 'expired'` (the packages page then shows
-  "Trial ended" / "License expired" with the buy button). Network trouble leaves the
-  row alone.
+  runs from the root layout via `after()`, on any request except `/setup` (each process reads
+  the table at most every 10 minutes), because there is no cron and a store has to get
+  through its renewal date while nobody opens the CMS. On the public sandbox
+  (`NEXT_PUBLIC_IS_SANDBOX=true`) it returns before reading a row or calling Freemius
+  (`SANDBOX_GUARDS`). Each `active` or `expired` row with a
+  Freemius handle (`meta.fm_product_id`, `fm_install_id`, `fm_uid`; sandbox-seeded rows have
+  none and are skipped) is asked once a day, and again the moment it stops counting, which
+  license is active on its install:
+  `GET /v1/products/{product_id}/installs/{install_id}/license.json?uid=…&license_key=…`,
+  the validation call Freemius documents for license-key integrations (no Authorization
+  header; `lib/packages/freemius-license.ts`).
+  - A License with `is_cancelled: true`, or with an `expiration` past the grace, or a JSON
+    4xx whose error code says the key is invalid or the license or install is gone
+    (`not_found`, `invalid_license_key`, `license_expired`, …), sets `status = 'expired'`
+    and records `meta.nextblock.invalidated_at` / `invalidation_reason` (the packages page
+    then shows "Trial ended" / "License expired" with the buy button).
+  - A valid License sets `status = 'active'` and writes its `expiration` to
+    `meta.nextblock.expiration` (null for a lifetime license). Expired rows are rechecked
+    too, so a renewal of the same key flips the row back without the buyer pasting the
+    key again. A checkout trial's `trial_ends_at` / `is_trial` are dropped once the
+    license runs more than a day past the trial end (a paid period followed it); left in
+    place, the old trial end would lock a paying customer out.
+  - A License with `is_block_features: false` (only updates and support stop at expiry)
+    stays `active` past its `expiration`, so `meta.nextblock.expiration` is null: no date
+    ends it. `is_cancelled` still does, and so does a trial's own end. The recheck reads the
+    license's own `is_block_features`, never the plan's: Freemius stores the flag on each
+    license, sets it from the plan's "block features at expiry" setting and lets it be
+    overridden per license, and does not document whether changing a plan updates licenses
+    already issued. Both plan flags (`is_block_features`, `is_block_features_monthly`) default
+    to true, and `freemius-trial-provision.ts` mints trial keys with true; a license that
+    carries false (a per-license override, or one issued while its plan had the setting off)
+    keeps its package for good once it lapses. So check existing licenses (the Licenses list
+    or the API) for `is_block_features: false`, not only the plans.
+  - Anything else leaves the row untouched until the next day: network errors, 5xx, 429,
+    a non-JSON answer (Freemius' nginx answers an install id it does not know with a bare
+    403 page) and any other 4xx (malformed request, missing argument, `license_activated`).
+
+The grace exists because an expired `expiration` is not yet a lost customer. Freemius shows a
+license as expired until its renewal is processed, and retries a failed card 1, 3 and 5 days
+apart; the fourth failure, nine days after the first, cancels the subscription and the
+license. So the storefront's `ecommerce` gate stays open through that window, and a
+cancellation ends the row on the next check without waiting for it.
+
+The recheck used to re-call `licenses/activate.json` with the stored uid and key,
+assuming the call was idempotent. Freemius documents `license_activated` for exactly that
+call, and its success body carries no expiration, so every live install came back
+inconclusive: cancellations and expiries never reached the row, and renewals never refreshed
+the stored expiration.
 
 Package purchase and activation are ADMIN actions: the server actions re-check the
 caller's role, the onboarding step only shows its "Start free trial" / "Start" control
@@ -509,11 +585,11 @@ The value is a JSON envelope (the shared format of `libs/db/src/lib/secret-crypt
   iv: string,
   last4: string,
   updatedAt: string,
-  version: 2 // 1 before 0.23.1
+  version: 2 // 1 before 0.23.0
 }
 ```
 
-Since 0.23.1 (version 2) each key is sealed for its own row: the slot `site_settings:<key>` is the
+Since 0.23.0 (version 2) each key is sealed for its own row: the slot `site_settings:<key>` is the
 AES-GCM associated data, so the OpenRouter, Pexels and Unsplash keys open only from their own rows
 (`cortexAiSecretSlot`, `encryptStoredCortexAiSecret`, `decryptStoredCortexAiSecret` in
 `ai-config.ts`). A version 1 key still opens, and every save on `/cms/settings/cortex-ai` or the
@@ -778,7 +854,8 @@ High-level flow:
 ```txt
 NotionEditor prompt
   -> POST /api/ai/generate-blocks
-  -> require ADMIN or WRITER
+  -> getCmsActor(): ADMIN or WRITER, past any enrolled second factor
+  -> per-user request quota, cortex-ai package check
   -> generateEditorHtmlFragment()
   -> Vercel AI SDK generateText()
   -> lightweight HTML fragment validation
@@ -803,8 +880,10 @@ Request schema:
 
 Access:
 
-- Requires authenticated user.
-- Requires profile role `ADMIN` or `WRITER`.
+- Requires a session past any enrolled second factor (`getCmsActor()`): without a session the
+  route answers 401, while a factor is pending 403 "Complete two-factor verification, then try
+  again.", both before the quota, the package check or the body.
+- Requires profile role `ADMIN` or `WRITER`; any other role answers 403.
 
 Response:
 
@@ -1080,7 +1159,8 @@ Behavior:
 
 Purpose:
 
-- Update an existing top-level block on the current page or post.
+- Update an existing top-level block on the current page, post, or product (a product's
+  description blocks).
 
 Input:
 
@@ -1088,23 +1168,27 @@ Input:
 {
   blockId: number;
   blockType?: BlockType; // assertion only
+  // Names the item when no editor is open (MCP clients); ignored when one is.
+  cmsTarget?: { contentType?: 'page' | 'post' | 'product'; entityId?: number | string; slug?: string; title?: string };
   content: Record<string, unknown>;
 }
 ```
 
 Behavior:
 
-- Requires current page/post `pageContext`.
-- Refuses to update blocks outside the current page/post.
+- Requires `pageContext`, or a `cmsTarget` naming the page, post, or product when no editor is open.
+- Refuses to update blocks outside the current page, post, or product.
 - Treats `blockType` as an assertion, not a type-changing request.
 - Validates `content` with `validateBlockContent(existingBlockType, content)`.
 - Updates only `blocks.content` and `updated_at`.
+- On a product with an open `product_drafts` row, also writes the new content into the draft's
+  copy of that block (the draft block with the same id; `patchOpenProductDraft`).
 
 ### update_section_column_block
 
 Purpose:
 
-- Update an existing nested block inside a current page/post `section` block.
+- Update an existing nested block inside a `section` block of the current page, post, or product.
 
 Input:
 
@@ -1114,18 +1198,22 @@ Input:
   columnIndex: number;
   blockIndex: number;
   blockType?: BlockType; // assertion only
+  // Names the item when no editor is open (MCP clients); ignored when one is.
+  cmsTarget?: { contentType?: 'page' | 'post' | 'product'; entityId?: number | string; slug?: string; title?: string };
   content: Record<string, unknown>;
 }
 ```
 
 Behavior:
 
-- Requires current page/post `pageContext`.
-- Refuses to update parent blocks outside the current page/post.
+- Requires `pageContext`, or a `cmsTarget` naming the page, post, or product when no editor is open.
+- Refuses to update parent blocks outside the current page, post, or product.
 - Parent must be a `section` block (the only nested-column parent type; legacy
   `hero` blocks are now sections with an `is_hero` flag).
 - Validates nested content against the nested block type.
 - Validates final parent section content before saving.
+- On a product with an open `product_drafts` row, also writes the new section content into the
+  draft's copy of the parent block (the draft block with the same id; `patchOpenProductDraft`).
 
 ### fetch_ecommerce_stats
 
@@ -1650,7 +1738,7 @@ questions without a browser. All three live under prefixes the proxy allowlists:
 | --- | --- | --- |
 | `GET /api/setup/status` | none | Readiness report: `initialized` (Supabase + schema + first admin), `dbReady`, `mcpReady` (initialized + Cortex active + at least one MCP auth method), `channel`, `license`, `mcp.authMethods`, `handoff` (`agentInitiated`, `setupUrl`, `welcomeUrl`) and `nextSteps`. When `MCP_BEARER_TOKEN` is set the steps are written for an agent relaying them to a human ("Ask the user to open … and create their administrator account"; "… start the free trial at /cms/welcome"; "Keep polling"). 200 once initialized, 503 (with `Retry-After`) before. Reveals booleans and guidance only. Pure assembly in `lib/setup/readiness.ts` (unit-tested), I/O in `readiness-service.ts`. |
 | `POST /api/setup/bootstrap` | `MCP_BEARER_TOKEN` bearer | Creates the first administrator through `provisionFirstAdmin` (`lib/setup/provision-admin.ts`, the same core the `/setup` wizard's `completeSetup` now calls) and activates the environment license. 404 when no env token is configured, idempotent on a provisioned instance. |
-| `POST /api/packages/provision-trial` | none (vendor only) | On nextblock.dev (`NEXTBLOCK_LICENSE_CLAIM_ENABLED=true`): mints a 30-day Cortex AI key for a name + email. |
+| `POST /api/packages/provision-trial` | none (vendor only) | On nextblock.dev (`NEXTBLOCK_LICENSE_CLAIM_ENABLED=true`, never on the public sandbox): mints a 30-day Cortex AI key for a name + email. Cortex AI only (another package: 400 `UNKNOWN_PACKAGE`); limited per client network, per email and per instance (see "Vendor trial provisioning"). |
 
 **Agent-aware first run.** The same `MCP_BEARER_TOKEN` signal (`readCortexAiMcpEnvToken`)
 drives three UI touches so the attended headless flow needs no explanation from the agent:
@@ -1686,8 +1774,26 @@ the plan's single-site pricing (`POST .../plans/{plan}/pricing/{pricing}/license
 (`PUT /products/{product}/licenses.json`), which creates the Freemius user if needed and
 sends the welcome email carrying the key. One trial per email per product: any existing
 license for the product, whatever its state, refuses a new one (409 `TRIAL_ALREADY_USED`).
-The route rate-limits per address (5/hour) and per email (3/day), best-effort per
-process, like `claim-license`. The result is functionally the overlay's no-card trial;
+That rule fails closed: eligibility is read only from a conclusive Freemius answer, so a
+lookup that fails (non-2xx, network error, timeout) or answers with something other than
+the list it asked for is a 502 (`UPSTREAM_ERROR`), never "no license". On the bearer path the
+lookups use the SDK's typed client, because `api.user.retrieveByEmail` / `retrieveLicenses`
+return null and [] for any failure. A license minted whose assignment failed (`assigned: false`)
+belongs to no Freemius user, so the email's lookup cannot see it: the instance remembers it
+for the trial's length and refuses that email while the license stands at Freemius (asked
+again once Freemius reports it deleted or cancelled), memory only and per instance.
+
+The route mints **Cortex AI trials only** (`TRIAL_PACKAGE_IDS`): the CLI never asks for another
+package, so any other `packageId` gets the unknown-package answer (400 `UNKNOWN_PACKAGE`), and
+turning the vendor flag on for claims opens no trials of Commerce Pro or Affiliates (their
+trials go through the dashboard overlay and the claim). It answers 404 on the public sandbox
+whatever its env says. Each provision sends up to five requests on the developer key pair the
+store's other Freemius flows share, so it is limited like the claim
+(`app/api/packages/vendor-route-limits.ts`, best-effort per process): per client network (an
+IPv4 /24, an IPv6 /48; 5 an hour, 20 for the shared bucket of unreadable addresses), per email
+(3 a day) and per instance (10 provisions a minute, one log line a minute while it refuses), a
+request counted only when every limit admits it, each refusal a 429 `RATE_LIMITED` with
+`Retry-After`. The result is functionally the overlay's no-card trial;
 what it is not is a subscription, so it never auto-converts — which a no-card trial
 cannot do anyway.
 
@@ -2522,7 +2628,20 @@ The Pydantic-shaped layer here is Zod. Every layer a payload crosses:
    them, and excluded from the statement itself; until 2026-10-21 only `rows[].key`,
    `values.key` and the first `eq` filter were checked, so `delete key in
    ['is_admin_created']` sent every request to /setup. Both tools require an ADMIN
-   actor. Unknown `site_settings` keys stay open, as the bag is by design.
+   actor. Unknown `site_settings` keys stay open, as the bag is by design. After the
+   confirmation, an update or upsert on a table whose `tableConfigs` entry lists
+   `updated_at` gets it set to now wherever the call left it out (a value the call sets,
+   null included, is kept), and on `products` whatever value the call carries:
+   `read_database_records` returns the column by default, so a row read, edited and
+   upserted back would carry its old timestamp. An insert is written as the call sends
+   it. The phrase and the audit record cover the input as confirmed. Most of those
+   tables also set it in a trigger, but `products`, `product_variants`,
+   `product_attributes`, `product_attribute_terms`, `freemius_plans`, `freemius_pricing`
+   and `shipping_zones` have none (`shipping_zone_methods` only on its cost columns),
+   and the visual editor publishes a pre-0.23.4 product draft's copy of the title and
+   descriptions only while `products.updated_at` is not later than the draft's
+   `created_at` (docs/09 → "Product Drafts"). `ai-global-agent-db-tools.test.ts` checks
+   that a migration creates the column for every writable table whose entry lists it.
 7. Database. Postgres enforces `check_exactly_one_parent` on `blocks`, the JSONB
    type checks on `content_drafts`, and the custom block definition checks above.
    There is no CHECK on `blocks.content` itself: the application layers above are

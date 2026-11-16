@@ -2,8 +2,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@nextblock-cms/db/server"; // Server client for auth
 import { getS3PresignClient } from "@nextblock-cms/utils/server";
-import { PutObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { getCmsActor, isCmsStaffRole } from "../../../../lib/auth/cms-actor";
+import { presignBoundPut, presignedPutHeaders } from "../../../../lib/storage/presigned-put";
 import { getStorageBackend, getStorageBucket } from "../../../../lib/storage/provider";
 import { supabaseCreateSignedUpload } from "../../../../lib/storage/supabase-storage";
 import {
@@ -19,27 +19,42 @@ import {
 export const runtime = 'nodejs';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const PRESIGNED_URL_EXPIRES_IN_SECONDS = 300; // 5 minutes
 
 // The content-type allowlist, folder resolver, filename sanitiser, extension resolver and
 // object-key traversal guard are shared with /api/upload/proxy (and /api/media/record) via
 // ../../../../lib/storage/upload-policy: one policy to audit, applied identically everywhere.
+//
+// The declared `size` is required and is signed into the URL with the content type
+// (../../../../lib/storage/presigned-put): the browser must PUT exactly `size` bytes with the
+// returned `headers`, or storage refuses it.
+
+const SECOND_FACTOR_MESSAGE = "Complete two-factor verification, then try again.";
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const { data: { user } } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
 
 export async function POST(request: NextRequest) {
-  const supabase = createClient();
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-
-  if (authError || !user) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  // Only WRITER or ADMIN can upload, past their enrolled second factor, before anything is read or
+  // signed: a route handler never passes the CMS layout's 2FA redirect, and the URL this hands out
+  // is a bearer token for a key in the deployment's bucket. Until 2026-11-14 the role came from a
+  // cookie-client read, so a password alone (the first factor) was enough.
+  const actor = await getCmsActor();
+  if (!actor) {
+    // getCmsActor() is null without a session and while an enrolled second factor is pending. The
+    // refusal stands either way; this only picks the answer.
+    return (await hasSignedInUser())
+      ? NextResponse.json({ error: SECOND_FACTOR_MESSAGE }, { status: 403 })
+      : NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-
-  // Check user role - only WRITER or ADMIN can upload
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("role")
-    .eq("id", user.id)
-    .single();
-
-  if (!profile || !["ADMIN", "WRITER"].includes(profile.role)) {
+  if (!isCmsStaffRole(actor.role)) {
     return NextResponse.json({ error: "Forbidden: Insufficient permissions" }, { status: 403 });
   }
 
@@ -107,37 +122,39 @@ export async function POST(request: NextRequest) {
     }
 
     if (backend === 'supabase') {
-      // Native Supabase Storage: hand the browser a signed upload URL to PUT to directly.
+      // Native Supabase Storage: hand the browser a signed upload URL to PUT to directly. That
+      // URL binds neither the size nor the type; the bucket's file_size_limit and
+      // allowed_mime_types (or the project's global upload limit) cap what it accepts (docs/04 →
+      // "Upload URLs"). The headers are the same contract as on S3.
       const { signedUrl } = await supabaseCreateSignedUpload(uniqueKey);
       return NextResponse.json({
         presignedUrl: signedUrl,
         objectKey: uniqueKey,
         method: "PUT",
+        headers: presignedPutHeaders(contentType, size),
       });
     }
-
-    const command = new PutObjectCommand({
-      Bucket: bucket,
-      Key: uniqueKey,
-      ContentType: contentType,
-      // ACL: 'public-read', // R2 objects are private by default unless bucket is public or presigned URL for GET is used
-                           // For direct PUT, ACL is not typically set this way with R2. Permissions are on bucket/token.
-      Metadata: { // Optional: add any metadata
-        'uploader-user-id': user.id,
-      }
-    });
 
     if (!s3Client) {
       // Unreachable: the S3 client was verified above; keeps the type narrow without an assertion.
       throw new Error('Storage client unavailable.');
     }
-    const expiresIn = 300; // 5 minutes
-    const presignedUrl = await getSignedUrl(s3Client, command, { expiresIn });
+    // Signs Content-Length and Content-Type: the URL accepts exactly `size` bytes of `contentType`.
+    const { url: presignedUrl, headers } = await presignBoundPut(s3Client, {
+      bucket,
+      key: uniqueKey,
+      contentType,
+      contentLength: size,
+      maxBytes: MAX_FILE_SIZE,
+      expiresIn: PRESIGNED_URL_EXPIRES_IN_SECONDS,
+      metadata: { 'uploader-user-id': actor.userId },
+    });
 
     return NextResponse.json({
       presignedUrl,
-      objectKey: `${uniqueKey}`, // Send back the key prefixed with bucket name
+      objectKey: uniqueKey,
       method: "PUT",
+      headers,
     });
 
   } catch (error) {

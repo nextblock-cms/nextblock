@@ -1,7 +1,7 @@
 'use client';
 
-import { AccountNavigationMenu } from '@nextblock-cms/ecommerce';
-import { useTranslations } from '@nextblock-cms/utils';
+import { AccountNavigationMenu } from '@nextblock-cms/ecommerce/components/AccountNavigationMenu';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import {
   Avatar,
   AvatarFallback,

@@ -3,6 +3,8 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const {
+  SANDBOX_GUARDS,
+  findDeveloperKeyProblems,
   findFlagReaderProblems,
   findGuardProblems,
   findUnlistedSideEffects,
@@ -153,13 +155,19 @@ describe('sandbox guard check', () => {
       await s3.send(new PutObjectCommand({ Bucket, Key }));
       await admin.storage.from(bucket).upload(key, body);
       await supabaseRemoveObjects(keys);
+      await presignBoundPut(s3, { bucket, key, contentType, contentLength, maxBytes, expiresIn });
       await s3.send(new GetObjectCommand({ Bucket, Key }));
       link.remove();
     `;
     expect(sideEffectsInSource('fixture.ts', source)).toEqual({
       mail: ['createTransport (line 3)'],
       account: ['auth.signUp (line 4)', 'auth.admin.createUser (line 5)'],
-      storage: ['new PutObjectCommand (line 7)', 'storage.from().upload (line 8)', 'supabaseRemoveObjects (line 9)'],
+      storage: [
+        'new PutObjectCommand (line 7)',
+        'storage.from().upload (line 8)',
+        'supabaseRemoveObjects (line 9)',
+        'presignBoundPut (line 10)',
+      ],
       vendor: [],
     });
   });
@@ -467,10 +475,158 @@ describe('sandbox guard check', () => {
   });
 });
 
+describe('Freemius developer-scope reads on the sandbox', () => {
+  // 2026-11-13: the CMS "Sync from Freemius" reached the developer-scope catalog reader, the one
+  // entry that still runs on the sandbox (its reset syncs the demo catalog with the operator's
+  // pair), with only the admin check every sandbox visitor passes: 22 signed GETs a click on the key
+  // production depends on. The fixtures stand in for the signer module, the sync and its callers.
+  const SIGNER = 'libs/ecommerce/src/lib/signer.ts';
+
+  function modulesOf(files: Record<string, string>) {
+    const modules = new Map(Object.keys(files).map((repoPath) => [`/repo/${repoPath}`, { absolute: `/repo/${repoPath}`, repoPath }]));
+    return { modules, readFile: (absolute: string) => files[absolute.slice('/repo/'.length)] };
+  }
+
+  it('pins every request of the signer module to a sandbox refusal or a listed sandbox reader', () => {
+    const { modules, readFile } = modulesOf({
+      [SIGNER]: [
+        'async function getFrom(path) { return fetch(path); }',
+        "export async function request(path) { if (isSandboxEnvironment()) throw new Error('sandbox'); return getFrom(path); }",
+        'export async function openReader() { return { read: (path) => getFrom(path) }; }',
+        "export async function status() { return globalThis.fetch('/v1/developers/1/plugins.json'); }",
+        "export async function probe(options) { const fetch = options.fetch; return fetch('/x'); }",
+        "export async function relist() { const send = fetch; return send('/v1/developers/1/plugins.json'); }",
+      ].join('\n'),
+    });
+    const problems = findDeveloperKeyProblems({
+      modules,
+      readFile,
+      readers: [{ file: SIGNER, name: 'openReader' }, { file: SIGNER, name: 'gone' }],
+      signers: [SIGNER],
+      callers: new Map(),
+      guards: [{ file: SIGNER, functions: ['request'], test: 'x.test.ts', why: 'Why.' }],
+    });
+    const outside = (fn: string, line: number) =>
+      `${SIGNER}#${fn} sends a request signed with the Freemius developer key pair (fetch (line ${line})) outside a SANDBOX_GUARDS function of the module, a private helper only those reach, or a listed sandbox reader: refuse it on the sandbox (SANDBOX_GUARDS), or list it in SANDBOX_DEVELOPER_READERS (tools/scripts/lib/sandbox-guards.js) so that its callers are checked.`;
+    // `probe` calls a local named fetch, not the global one; `relist` takes the global as a value.
+    expect(problems).toEqual([
+      outside('status', 4),
+      outside('relist', 6),
+      `${SIGNER}#gone: not found. Renamed? Update SANDBOX_DEVELOPER_READERS (tools/scripts/lib/sandbox-guards.js).`,
+    ]);
+  });
+
+  it('checks every use of a sandbox reader, and of the functions that relay one, in every module', () => {
+    const { modules, readFile } = modulesOf({
+      [SIGNER]: 'export async function openReader() { return {}; }',
+      'libs/ecommerce/src/lib/sync.ts': [
+        "import { openReader } from './signer';",
+        'export async function syncAll() { const reader = await openReader(); return reader; }',
+        'export async function syncAgain() { return syncAll(); }',
+      ].join('\n'),
+      'libs/ecommerce/src/lib/actions.ts': [
+        "import { syncAll as runSync } from './sync';",
+        'export async function trigger() { await requireEcomAdmin(); if (isSandboxEnvironment()) return null; return runSync(); }',
+        'export async function sneaky() { return runSync(); }',
+        'async function helper() { return runSync(); }',
+        'export async function viaHelper() { if (isSandboxEnvironment()) return null; return helper(); }',
+      ].join('\n'),
+      'apps/nextblock/app/api/cron/other/route.ts': "import * as freemius from '@nextblock-cms/ecommerce/sync';\nexport async function GET() { return freemius.syncAll(); }",
+      'libs/ecommerce/src/barrel.ts': "export { syncAll as syncEverything } from './lib/sync';",
+      'libs/cortex/src/lib/tool.ts': "import { syncEverything } from '@nextblock-cms/ecommerce/barrel';\nexport const runTool = () => syncEverything();",
+      'libs/ecommerce/src/lib/old.ts': 'export const nothing = 1;',
+    });
+    const callers = new Map<string, unknown>([
+      ['libs/ecommerce/src/lib/sync.ts', { why: 'Why.', relays: { syncAll: 'its callers are checked', gone: 'stale' } }],
+      ['libs/ecommerce/src/lib/actions.ts', { why: 'Why.' }],
+      ['libs/ecommerce/src/lib/old.ts', { why: 'Why.' }],
+    ]);
+    const problems = findDeveloperKeyProblems({
+      modules,
+      readFile,
+      readers: [{ file: SIGNER, name: 'openReader' }],
+      signers: [],
+      callers,
+      guards: [{ file: 'libs/ecommerce/src/lib/actions.ts', functions: ['trigger', 'viaHelper'], test: 'x.test.ts', why: 'Why.' }],
+    });
+    const outside = (where: string, use: string) =>
+      `${where} uses a Freemius developer-scope read that runs on the sandbox (${use}) outside a SANDBOX_GUARDS function of the module or a private helper only those reach: refuse it on the sandbox and list the function in SANDBOX_GUARDS, or relay it by name with the reason in DEVELOPER_KEY_CALLERS (tools/scripts/lib/sandbox-guards.js), which checks its own callers too.`;
+    const unlisted = (repoPath: string, use: string) =>
+      `${repoPath} uses a Freemius developer-scope read that runs on the sandbox (${use}): refuse it there (isSandboxEnvironment()) and list the module in DEVELOPER_KEY_CALLERS (tools/scripts/lib/sandbox-guards.js) with how it behaves on the sandbox.`;
+    expect(problems).toEqual([
+      // A function that calls a relay is a reader too: syncAgain refuses nothing and relays nothing.
+      outside('libs/ecommerce/src/lib/sync.ts#syncAgain', 'syncAll (line 3)'),
+      'DEVELOPER_KEY_CALLERS relays libs/ecommerce/src/lib/sync.ts#gone, which the module does not define: renamed? Update the entry.',
+      // Through an import alias, and outside the guarded functions (a helper only guards reach is fine).
+      outside('libs/ecommerce/src/lib/actions.ts#sneaky', 'runSync (line 3)'),
+      // A namespace member, and a re-export under another name, in modules nobody listed.
+      unlisted('apps/nextblock/app/api/cron/other/route.ts', 'syncAll (line 2)'),
+      unlisted('libs/cortex/src/lib/tool.ts', 'syncEverything (line 2)'),
+      'DEVELOPER_KEY_CALLERS lists libs/ecommerce/src/lib/old.ts, which no longer uses a sandbox developer reader: remove the entry.',
+    ]);
+  });
+
+  it('fails a relay that no longer needs relaying', () => {
+    const { modules, readFile } = modulesOf({
+      [SIGNER]: 'export async function openReader() { return {}; }',
+      'libs/ecommerce/src/lib/sync.ts': [
+        "import { openReader } from './signer';",
+        'export async function syncAll() { if (isSandboxEnvironment()) return null; return openReader(); }',
+        'export async function rename() { return 1; }',
+      ].join('\n'),
+    });
+    const problems = findDeveloperKeyProblems({
+      modules,
+      readFile,
+      readers: [{ file: SIGNER, name: 'openReader' }],
+      signers: [],
+      callers: new Map([['libs/ecommerce/src/lib/sync.ts', { why: 'Why.', relays: { syncAll: 'once relayed', rename: 'never used one' } }]]),
+      guards: [{ file: 'libs/ecommerce/src/lib/sync.ts', functions: ['syncAll'], test: 'x.test.ts', why: 'Why.' }],
+    });
+    expect(problems).toEqual([
+      'DEVELOPER_KEY_CALLERS relays libs/ecommerce/src/lib/sync.ts#syncAll, which no longer uses a sandbox developer reader: remove it.',
+      'DEVELOPER_KEY_CALLERS relays libs/ecommerce/src/lib/sync.ts#rename, which no longer uses a sandbox developer reader: remove it.',
+    ]);
+  });
+});
+
+/**
+ * Review 2026-11-13 (L1): the vendor claim route checked NEXTBLOCK_LICENSE_CLAIM_ENABLED alone. With
+ * that flag copied into the sandbox env, any visitor's claims would have been looked up with the
+ * operator's Freemius keys (the developer pair, else the one-product fallback) and keys handed out.
+ */
+describe('the vendor license routes', () => {
+  type Guard = { file: string; functions: string[]; test: string; why: string };
+  const guardFor = (route: string): Guard | undefined =>
+    (SANDBOX_GUARDS as Guard[]).find((guard) => guard.file === `apps/nextblock/app/api/packages/${route}/route.ts`);
+
+  it.each(['claim-license', 'provision-trial'])('lists POST /api/packages/%s as a sandbox refusal, with its route test', (route) => {
+    expect(guardFor(route)).toMatchObject({ functions: ['POST'], test: `apps/nextblock/app/api/packages/${route}/route.test.ts` });
+  });
+
+  it('fails the claim route as soon as it checks the vendor flag alone again', () => {
+    const guard = guardFor('claim-license') as Guard;
+    const flagOnly = `
+      export async function POST(request: Request) {
+        if (process.env.NEXTBLOCK_LICENSE_CLAIM_ENABLED !== 'true') {
+          return json({ error: 'Not found.', ok: false }, 404);
+        }
+        return claim(await request.json());
+      }
+    `;
+    const readFile = (repoPath: string) => (repoPath === guard.file ? flagOnly : fs.readFileSync(path.join(REPO_ROOT, repoPath), 'utf8'));
+
+    expect(findGuardProblems([guard], readFile)).toEqual([`${guard.file}#POST: no longer checks the sandbox. ${guard.why}`]);
+    expect(findGuardProblems([guard])).toEqual([]);
+  });
+});
+
 describe('the repository', () => {
   // Scanned once at collection time, like the other repository-wide gates: under a full parallel
   // run the scan alone outlasts a test's default timeout.
-  const unlisted: string[] = findUnlistedSideEffects(scanRepository());
+  const modules = scanRepository();
+  const unlisted: string[] = findUnlistedSideEffects(modules);
+  const developerKey: string[] = findDeveloperKeyProblems({ modules });
 
   it('keeps every listed sandbox refusal, each with a test that sets the flag', () => {
     expect(findFlagReaderProblems()).toEqual([]);
@@ -479,6 +635,12 @@ describe('the repository', () => {
 
   it('says how every mail sender, account writer and storage writer behaves on the sandbox', () => {
     expect(unlisted).toEqual([]);
+  });
+
+  it('lets the Freemius developer key pair run on the sandbox only for the reset', () => {
+    // Every request the developer module signs is refused there or comes from a listed reader, and
+    // every caller of such a reader (Sync from Freemius) refuses there too or is the reset.
+    expect(developerKey).toEqual([]);
   });
 
   it('empties the bucket on every sandbox reset, which is what keeps uploads open there', () => {

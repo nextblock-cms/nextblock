@@ -19,20 +19,24 @@ const mocks = vi.hoisted(() => ({
 vi.mock('next/navigation', () => ({
   useSearchParams: () => new URLSearchParams('session_id=cs_test_1'),
 }));
-vi.mock('@nextblock-cms/utils', async (importOriginal) => ({
+vi.mock('@nextblock-cms/utils/translations-context', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useTranslations: () => ({ t: mocks.t, lang: 'en' }),
 }));
-// The real cart store and its hydration hook; the invoice UI is stubbed. Lib modules come in
-// through vi.importActual, never import(), so Nx does not see a lazy-loaded lib.
-vi.mock('@nextblock-cms/ecommerce', async () => ({
-  ...(await vi.importActual<Record<string, unknown>>('../../../../../libs/ecommerce/src/lib/cart-store')),
-  ...(await vi.importActual<Record<string, unknown>>('../../../../../libs/ecommerce/src/lib/use-cart')),
+// The page imports each ecommerce module by its own subpath (never the barrel; see
+// tools/scripts/commerce-chunking.test.ts). The real cart store (`/cart-store`) and its
+// hydration hook (`/use-cart`) stay unmocked; the invoice UI is stubbed. Stub with factories,
+// never import(): Nx would see a lazy-loaded lib.
+vi.mock('@nextblock-cms/ecommerce/components/InvoiceViewerShell', () => ({
   InvoiceViewerShell: (props: Record<string, unknown>) => {
     mocks.shellProps.push(props);
     return null;
   },
+}));
+vi.mock('@nextblock-cms/ecommerce/components/FreemiusLicensePanel', () => ({
   FreemiusLicensePanel: () => null,
+}));
+vi.mock('@nextblock-cms/ecommerce/invoice-ui', () => ({
   buildInvoiceDocumentLabels: () => ({}),
   getInvoiceLocale: () => 'en-US',
   localizeInvoicePresentationData: (invoice: unknown) => invoice,
@@ -40,7 +44,7 @@ vi.mock('@nextblock-cms/ecommerce', async () => ({
 }));
 vi.mock('./actions', () => ({ fulfillOrderAction: mocks.fulfillOrderAction }));
 
-import { useCartStore } from '@nextblock-cms/ecommerce';
+import { useCartStore } from '@nextblock-cms/ecommerce/cart-store';
 import CheckoutSuccessPage from './page';
 
 const TOKEN = 'v1.jane-doe.1793102400.0123456789abcdefghijklmnopqrstuvwxyzABCDEFG';

@@ -2014,13 +2014,14 @@ describe('Cortex AI global agent tool executors', () => {
     ]);
   });
 
-  it('set_content_images refreshes the gallery held by an open product draft', async () => {
+  it('set_content_images refreshes the gallery held by an open product draft the 0.23.4 form saved', async () => {
     const { database, supabase } = createMockSupabase({
       product_drafts: [
         {
           blocks: [],
           id: 1,
           meta: {
+            form_version: 2,
             price: 25,
             product_media: [{ media_id: 'old-media-1', sort_order: 0 }],
             sku: 'CHANCAPIEDRA',
@@ -2052,6 +2053,156 @@ describe('Cortex AI global agent tool executors', () => {
     expect((database.product_drafts[0].meta as any).product_media).toEqual([
       { media_id: 'new-media-1', sort_order: 0 },
     ]);
+    expect((database.product_drafts[0].meta as any).form_version).toBe(2);
+  });
+
+  // A product-values draft without the 0.23.4 marker may be one the old edit page autosaved over
+  // a copy of the products row (prices 100 times too high, no variants, gallery or description).
+  // The app refuses to publish one that shows it, and an empty gallery can be the only sign:
+  // rewriting the draft's product_media erased it, and the x100 prices then published. A draft
+  // without that list keeps its meta (the gallery patch leaves it alone), so nothing is refused.
+  describe('set_content_images and a product draft an earlier version saved', () => {
+    const unmarkedDraft = () => ({
+      blocks: [],
+      id: 1,
+      meta: {
+        price: 4900,
+        prices: { USD: 4900 },
+        product_media: [],
+        sku: 'CHANCAPIEDRA',
+        slug: 'chanca-piedra',
+        variants: [],
+      },
+      product_id: 'prod-1',
+    });
+    const liveGallery = [{ media_id: 'old-media-1', product_id: 'prod-1', sort_order: 0 }];
+    const products = [{ id: 'prod-1', language_id: 1, slug: 'chanca-piedra', title: 'Chanca Piedra' }];
+    const pageContext = { contentType: 'product' as const, entityId: 'prod-1', title: 'Chanca Piedra' };
+
+    it.each([
+      ['before the confirmation preview', {}],
+      ['over MCP, where confirmation is skipped', { skipConfirmation: true }],
+    ])('refuses %s and writes nothing', async (_label, extraContext) => {
+      const { calls, database, supabase } = createMockSupabase({
+        product_drafts: [unmarkedDraft()],
+        product_media: liveGallery.map((row) => ({ ...row })),
+        products: products.map((row) => ({ ...row })),
+      });
+      const imported: string[] = [];
+
+      await expect(
+        executeSetContentImages(
+          { images: ['https://images.pexels.com/photos/1/a.jpeg'] },
+          {
+            importExternalImage: async ({ url }: { url: string }) => {
+              imported.push(url);
+              return { id: 'new-media-1' };
+            },
+            pageContext,
+            revalidatePath: () => undefined,
+            supabase,
+            ...extraContext,
+          }
+        )
+      ).rejects.toThrow(
+        /Product "Chanca Piedra" has an open draft that a NextBlock version older than 0\.23\.4 saved\..*Open the product in the CMS editor first.*Nothing was changed\./
+      );
+
+      expect(imported).toEqual([]);
+      expect(database.product_media).toEqual(liveGallery);
+      expect(database.product_drafts).toEqual([unmarkedDraft()]);
+      expect(calls.filter((call) => call.operation !== 'select')).toEqual([]);
+    });
+
+    it.each([
+      ['an overlay', { title: 'Chanca Piedra, staged' }],
+      ['an empty overlay', {}],
+      [
+        'a pre-0.23.4 copy of the products row',
+        { id: 'prod-1', price: 4900, sku: 'CHANCAPIEDRA', slug: 'chanca-piedra', title: 'Chanca Piedra' },
+      ],
+      [
+        // A pre-0.23.4 draft import that kept the live gallery wrote no product_media.
+        'unmarked product values without a gallery list',
+        { price: 4900, prices: { USD: 4900 }, sku: 'CHANCAPIEDRA', slug: 'chanca-piedra', variants: [] },
+      ],
+    ])('replaces the live gallery and leaves %s as it is', async (_label, meta) => {
+      const draft = () => ({ blocks: [], id: 1, meta: JSON.parse(JSON.stringify(meta)), product_id: 'prod-1' });
+      const { database, supabase } = createMockSupabase({
+        product_drafts: [draft()],
+        product_media: liveGallery.map((row) => ({ ...row })),
+        products: products.map((row) => ({ ...row })),
+      });
+
+      const result = await executeConfirmed(
+        executeSetContentImages,
+        { images: ['https://images.pexels.com/photos/1/a.jpeg'] },
+        {
+          importExternalImage: async () => ({ id: 'new-media-1' }),
+          pageContext,
+          revalidatePath: () => undefined,
+          supabase,
+        }
+      );
+
+      expect(result).toMatchObject({ imageCount: 1, mutationExecuted: true, success: true });
+      expect(database.product_media.map((row) => row.media_id)).toEqual(['new-media-1']);
+      expect(database.product_drafts).toEqual([draft()]);
+    });
+
+    it('refuses the draft patch itself when such a draft appears after the check', async () => {
+      const { database, supabase } = createMockSupabase({
+        product_media: liveGallery.map((row) => ({ ...row })),
+        products: products.map((row) => ({ ...row })),
+      });
+
+      await expect(
+        executeConfirmed(
+          executeSetContentImages,
+          { images: ['https://images.pexels.com/photos/1/a.jpeg'] },
+          {
+            // Runs after the check and before the live write and the draft patch.
+            importExternalImage: async () => {
+              database.product_drafts.push(unmarkedDraft());
+              return { id: 'new-media-1' };
+            },
+            pageContext,
+            revalidatePath: () => undefined,
+            supabase,
+          }
+        )
+      ).rejects.toThrow(/^The product was updated, but its open draft was not: .*make this change again\.$/);
+
+      expect(database.product_drafts).toEqual([unmarkedDraft()]);
+    });
+
+    it('still mirrors a description block edit into it: a blocks-only patch leaves its meta alone', async () => {
+      const draftBlock = {
+        block_type: 'text',
+        content: { html_content: '<p>Old description</p>' },
+        id: 41,
+        language_id: 1,
+        order: 0,
+        product_id: 'prod-1',
+      };
+      const { database, supabase } = createMockSupabase({
+        blocks: [{ ...draftBlock, page_id: null, post_id: null }],
+        product_drafts: [{ ...unmarkedDraft(), blocks: [{ ...draftBlock }] }],
+        products: products.map((row) => ({ ...row })),
+      });
+
+      const result = await executeConfirmed(
+        executeUpdateContentBlock,
+        { blockId: 41, blockType: 'text', content: { html_content: '<p>New description</p>' } },
+        { pageContext, revalidatePath: () => undefined, supabase }
+      );
+
+      expect(result).toMatchObject({ blockId: 41, mutationExecuted: true, success: true });
+      expect(database.product_drafts[0].blocks).toEqual([
+        { ...draftBlock, content: { html_content: '<p>New description</p>' } },
+      ]);
+      expect(database.product_drafts[0].meta).toEqual(unmarkedDraft().meta);
+    });
   });
 
   it('set_content_images targets a product by slug with no CMS page context open', async () => {

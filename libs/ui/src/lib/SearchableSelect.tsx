@@ -2,7 +2,7 @@
 
 import * as React from 'react';
 import { Check, ChevronsUpDown, Search } from 'lucide-react';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 
 import { Button } from './button';
 import { Input } from './input';

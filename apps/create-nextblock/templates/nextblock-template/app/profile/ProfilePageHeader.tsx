@@ -1,6 +1,6 @@
 'use client';
 
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 export function ProfilePageHeader() {
   const { t } = useTranslations();

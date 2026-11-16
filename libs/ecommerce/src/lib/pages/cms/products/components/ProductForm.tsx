@@ -32,8 +32,17 @@ import {
 import {
   type EnabledPaymentProviders,
   ProductAttribute,
+  type ProductVariantOption,
   derivePaymentProviderFromProductType,
 } from '../../../../types';
+import {
+  buildCombinationKey,
+  buildVariantLabel,
+  buildVariantSku,
+  extractSelectedTermsByAttribute,
+  resolveAttributeName,
+  resolveTermValue,
+} from '../../../../variation-utils';
 import { convertMinorUnitAmount, type CurrencyRecord } from '../../../../currency';
 import {
   majorUnitAmountToMinor,
@@ -157,11 +166,88 @@ function resolveDefaultLanguageId(
   );
 }
 
+type LoadedVariant = NonNullable<ProductFormInitialData['variants']>[number];
+
+/**
+ * The options a variant's terms make, as the variations editor builds a combination's: in the
+ * attribute list's order, named in the product's language. A term the list lacks makes none.
+ */
+function buildOptionsFromAttributes(
+  termIds: string[],
+  attributes: ProductAttribute[],
+  languageCode: string | undefined
+): ProductVariantOption[] {
+  return attributes.flatMap((attribute) =>
+    attribute.terms
+      .filter((term) => termIds.includes(term.id))
+      .map((term) => ({
+        attribute_id: attribute.id,
+        attribute_name: resolveAttributeName(attribute, languageCode),
+        term_id: term.id,
+        term_value: resolveTermValue(term, languageCode),
+        term_slug: term.slug,
+      }))
+  );
+}
+
+/**
+ * The loaded variants as productSchema accepts them, repaired in the form's initial values (which the
+ * variations editor seeds from), so opening the editor still saves nothing and the first edit saves
+ * the repair. Until 0.23.4 the editor's regeneration on open repaired them, with an autosave; without
+ * it, such a variant blocked every save:
+ * - a variant with no terms (each deleted in Attribute Management; the mappings cascade) is left
+ *   out: no shopper can select it (findMatchingVariant), and 0.23.3 dropped it on open;
+ * - of variants an attribute deletion left with the same terms (Red/S and Red/M once Size is gone),
+ *   only the first is kept: findMatchingVariant only ever sells the first, the editor's rows (keyed by
+ *   their terms) wrote an edit of one into all of them, and 0.23.3 collapsed them on open too;
+ * - an empty SKU (the column takes '') gets the one generateVariantDrafts gives a new variant;
+ * - missing options, label or key (a CMS draft import's variants) come from the terms and the
+ *   attribute list. A term the list lacks stays unnamed, and the autosave shows the refusal.
+ */
+function repairLoadedVariants(
+  variants: LoadedVariant[] | undefined,
+  context: { baseSku: string; attributes: ProductAttribute[]; languageCode: string | undefined }
+): LoadedVariant[] {
+  const seenTermSets = new Set<string>();
+  return (variants ?? [])
+    .filter((variant) => Array.isArray(variant?.attribute_term_ids) && variant.attribute_term_ids.length > 0)
+    .filter((variant) => {
+      const termSet = buildCombinationKey(variant.attribute_term_ids);
+      if (seenTermSets.has(termSet)) {
+        return false;
+      }
+      seenTermSets.add(termSet);
+      return true;
+    })
+    .map((variant) => {
+      const attributeOptions = buildOptionsFromAttributes(
+        variant.attribute_term_ids,
+        context.attributes,
+        context.languageCode
+      );
+      const selectedOptions =
+        Array.isArray(variant.selected_options) && variant.selected_options.length > 0
+          ? variant.selected_options
+          : attributeOptions;
+
+      return {
+        ...variant,
+        combination_key: variant.combination_key || buildCombinationKey(variant.attribute_term_ids),
+        sku:
+          variant.sku ||
+          buildVariantSku(context.baseSku, attributeOptions.length > 0 ? attributeOptions : selectedOptions),
+        selected_options: selectedOptions,
+        label: variant.label || buildVariantLabel(selectedOptions),
+      };
+    });
+}
+
 function buildProductFormDefaults(
   initialData: ProductFormInitialData | undefined,
   targetLanguageId: string | undefined,
   availableLanguages: ProductLanguageOption[],
   currencies: CurrencyRecord[],
+  globalAttributes: ProductAttribute[],
   translationGroupId?: string
 ): z.input<typeof productSchema> {
   const defaultCurrency =
@@ -188,6 +274,12 @@ function buildProductFormDefaults(
     (initialData?.product_type
       ? derivePaymentProviderFromProductType(initialData.product_type)
       : 'stripe');
+  const languageId = resolveDefaultLanguageId(initialData, targetLanguageId, availableLanguages);
+  // The language the variations editor names terms in (ProductForm's currentLanguageCode).
+  const languageCode =
+    availableLanguages.find((language) => language.id === languageId)?.code ||
+    availableLanguages.find((language) => language.is_default)?.code ||
+    availableLanguages[0]?.code;
 
   const sanitizedDefaults = sanitizeProductFormValuesForStoreManagedCurrencies({
     product_type: (productType || 'physical') as ProductFormValues['product_type'],
@@ -202,6 +294,12 @@ function buildProductFormDefaults(
     sale_price:
       typeof initialData?.sale_price === 'number' ? initialData.sale_price / 100 : null,
     sale_prices: initialSalePrices,
+    // The product-level sale window, as stored (ISO timestamps, which SaleScheduleFields shows in
+    // local time). Left out until 0.23.4, the editor showed an empty window, and every save sent
+    // neither bound or only the one the editor touched: the RPC then cleared the window across the
+    // SKU group, or the publish kept a live bound nobody saw (one ending before the new start).
+    sale_start_at: initialData?.sale_start_at ?? null,
+    sale_end_at: initialData?.sale_end_at ?? null,
     stock: initialData?.stock || 0,
     meta_title: initialData?.meta_title || '',
     meta_description: initialData?.meta_description || '',
@@ -217,11 +315,7 @@ function buildProductFormDefaults(
     trial_period_days: initialData?.trial_period_days ?? 0,
     trial_requires_payment_method: initialData?.trial_requires_payment_method ?? false,
     status: initialData?.status || 'draft',
-    language_id: resolveDefaultLanguageId(
-      initialData,
-      targetLanguageId,
-      availableLanguages
-    ),
+    language_id: languageId,
     translation_group_id:
       initialData?.translation_group_id || translationGroupId || undefined,
     product_media:
@@ -230,12 +324,15 @@ function buildProductFormDefaults(
       })) || [],
     category_ids: initialData?.category_ids || [],
     variation_attributes: initialData?.variation_attributes || [],
-    variants:
-      initialData?.variants?.map((variant) => ({
-        ...variant,
-        prices: variant.prices || {},
-        sale_prices: variant.sale_prices || {},
-      })) || [],
+    variants: repairLoadedVariants(initialData?.variants, {
+      baseSku: initialData?.sku || '',
+      attributes: globalAttributes,
+      languageCode,
+    }).map((variant) => ({
+      ...variant,
+      prices: variant.prices || {},
+      sale_prices: variant.sale_prices || {},
+    })),
   }, currencies);
 
   return {
@@ -273,6 +370,206 @@ function buildVariantImageOptions(items: ProductMediaManagerItem[]) {
     file_path: item.file_path,
     alt: item.alt,
   }));
+}
+
+type LooseRecord = Record<string, unknown>;
+
+function isNullish(value: unknown): value is null | undefined {
+  return value === null || value === undefined;
+}
+
+/**
+ * Deep equality for form values in which a missing key, `undefined` and `null` are one value: the
+ * product save writes each of them as NULL (`?? null`, price maps drop null entries), and a draft
+ * read back from JSON has lost its `undefined` keys.
+ */
+function isSameFormValue(left: unknown, right: unknown): boolean {
+  if (isNullish(left) || isNullish(right)) {
+    return isNullish(left) && isNullish(right);
+  }
+
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => isSameFormValue(item, right[index]))
+    );
+  }
+
+  if (typeof left === 'object' && typeof right === 'object') {
+    const leftRecord = left as LooseRecord;
+    const rightRecord = right as LooseRecord;
+    return [...new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])].every((key) =>
+      isSameFormValue(leftRecord[key], rightRecord[key])
+    );
+  }
+
+  return left === right;
+}
+
+function compareText(left: string, right: string) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function sortedTexts(values: unknown[]) {
+  return values.map((value) => String(value)).sort(compareText);
+}
+
+/**
+ * The variant keys a product save writes. serializeVariantsForRpc (product-actions.ts) sends these
+ * and the attribute term ids to upsert_product_with_variants, which deletes the product's variants
+ * and inserts them again from exactly these values, with new ids, mapped to those terms.
+ */
+const SAVED_VARIANT_KEYS = [
+  'sku',
+  'upc',
+  'price',
+  'prices',
+  'sale_price',
+  'sale_prices',
+  'sale_start_at',
+  'sale_end_at',
+  'stock_quantity',
+  'main_media_id',
+] as const;
+
+/**
+ * Whether the variants the variations editor emitted equal the form's on everything a save writes:
+ * the keys above and the attribute terms in any order, with variants matched by combination_key
+ * (the list order is the editor's attribute and term order, or the order the variant rows came back
+ * in). Nothing else counts, as saving it would change nothing: the id (the RPC gives every variant a
+ * new one), the label and the option names (display, rebuilt from the terms in the product's
+ * language, so a draft saved before a term was renamed must not autosave when it is opened), the
+ * image URL, and the columns only loaded variants carry (scheduled_price, scheduled_prices,
+ * scheduled_price_at, image_url).
+ */
+function variantsMatchFormValues(current: unknown, emitted: unknown) {
+  const currentVariants = (Array.isArray(current) ? current : []) as LooseRecord[];
+  const emittedVariants = (Array.isArray(emitted) ? emitted : []) as LooseRecord[];
+
+  if (currentVariants.length !== emittedVariants.length) {
+    return false;
+  }
+
+  const currentByKey = new Map(
+    currentVariants.map((variant) => [variant?.combination_key, variant] as const)
+  );
+  if (currentByKey.size !== currentVariants.length) {
+    return false;
+  }
+
+  return emittedVariants.every((variant) => {
+    const match = currentByKey.get(variant?.combination_key);
+    if (!match) {
+      return false;
+    }
+
+    const emittedTermIds = variant.attribute_term_ids;
+    const currentTermIds = match.attribute_term_ids;
+    return (
+      SAVED_VARIANT_KEYS.every((key) => isSameFormValue(variant[key], match[key])) &&
+      isSameFormValue(
+        Array.isArray(emittedTermIds) ? sortedTexts(emittedTermIds) : emittedTermIds,
+        Array.isArray(currentTermIds) ? sortedTexts(currentTermIds) : currentTermIds
+      )
+    );
+  });
+}
+
+/** The selected terms per attribute, in any order, leaving out an attribute with none selected. */
+function canonicalVariationAttributes(value: unknown) {
+  return ((Array.isArray(value) ? value : []) as LooseRecord[])
+    .map((attribute) => ({
+      attribute_id: attribute?.attribute_id,
+      term_ids: Array.isArray(attribute?.term_ids) ? sortedTexts(attribute.term_ids) : attribute?.term_ids,
+    }))
+    .filter((attribute) => !Array.isArray(attribute.term_ids) || attribute.term_ids.length > 0)
+    .sort((left, right) =>
+      compareText(String(left.attribute_id ?? ''), String(right.attribute_id ?? ''))
+    );
+}
+
+/**
+ * Whether the selected terms the variations editor emitted equal the form's. The save never writes
+ * them (the RPC maps each variant to its own terms); they seed the editor's term buttons, and the
+ * editor seeds them from the variants' options when the form has none (a CMS draft import keeps its
+ * variants without variation_attributes), so an empty selection in the form counts as that one.
+ */
+function variationAttributesMatchFormValues(
+  current: unknown,
+  currentVariants: unknown,
+  emitted: unknown
+) {
+  const currentSelection = canonicalVariationAttributes(current);
+  const effectiveSelection =
+    currentSelection.length > 0
+      ? currentSelection
+      : canonicalVariationAttributes(
+          Object.entries(
+            extractSelectedTermsByAttribute(
+              (Array.isArray(currentVariants) ? currentVariants : []) as Array<{
+                selected_options?: ProductVariantOption[];
+              }>
+            )
+          ).map(([attribute_id, term_ids]) => ({ attribute_id, term_ids }))
+        );
+
+  return isSameFormValue(effectiveSelection, canonicalVariationAttributes(emitted));
+}
+
+/** The first field error React Hook Form holds (it nests the schema's issues in their order). */
+function findFirstFieldError(
+  errors: unknown,
+  path: Array<string | number> = []
+): { path: Array<string | number>; message: string } | null {
+  if (!errors || typeof errors !== 'object') {
+    return null;
+  }
+
+  const record = errors as LooseRecord;
+  if (typeof record.message === 'string' && record.message) {
+    return { path, message: record.message };
+  }
+
+  for (const [key, value] of Object.entries(record)) {
+    // A field error's `ref` is its input element.
+    if (key === 'ref') {
+      continue;
+    }
+
+    const found = findFirstFieldError(value, [...path, Array.isArray(errors) ? Number(key) : key]);
+    if (found) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * The status line's text for an autosave productSchema refused: the first refused field and why
+ * ("Variant 2 (Blue), sku: Variant SKU is required").
+ */
+function describeRefusedSave(errors: unknown, values: LooseRecord) {
+  const refused = findFirstFieldError(errors);
+  if (!refused) {
+    return 'a value in the form is not valid.';
+  }
+
+  const [field, index, ...rest] = refused.path;
+  if (field === 'variants' && typeof index === 'number') {
+    const variant = (Array.isArray(values.variants) ? values.variants[index] : undefined) as
+      | LooseRecord
+      | undefined;
+    const name = [variant?.label, variant?.sku].find(
+      (text): text is string => typeof text === 'string' && text.trim() !== ''
+    );
+    const where = `Variant ${index + 1}${name ? ` (${name})` : ''}${rest.length > 0 ? `, ${rest.join('.')}` : ''}`;
+    return `${where}: ${refused.message}`;
+  }
+
+  return `${refused.path.join('.') || 'form'}: ${refused.message}`;
 }
 
 // Simple slugify helper
@@ -336,6 +633,7 @@ export function ProductForm({
       targetLanguageId,
       availableLanguagesProp,
       currencies,
+      globalAttributesProp,
       translationGroupId
     ),
   });
@@ -344,6 +642,7 @@ export function ProductForm({
     register,
     handleSubmit,
     setValue,
+    getValues,
     reset,
     watch,
     setError,
@@ -396,7 +695,7 @@ export function ProductForm({
     const timer = setTimeout(() => {
       if (!isSubmitting) {
         lastSavedSnapshotRef.current = snapshot;
-        handleSubmit(onSubmit)();
+        handleSubmit(onSubmit, onAutosaveInvalid)();
       }
     }, 400);
 
@@ -445,16 +744,6 @@ export function ProductForm({
       }),
     [baseProductPrice, baseProductSalePrice, currencies, productPrices, productSalePrices]
   );
-  const initialVariantsForEditor = React.useMemo(
-    () =>
-      initialData?.variants?.map((variant) => ({
-        ...variant,
-        prices: variant.prices || {},
-        sale_prices: variant.sale_prices || {},
-      })),
-    [initialData?.variants]
-  );
-
   // Use explicit useEffect to handle slug updates
   useEffect(() => {
     if (dirtyFields.title && !isEdit) { // Only auto-update on creation or if explicitly focusing on auto-generation logic
@@ -468,6 +757,14 @@ export function ProductForm({
   );
 
   const [removedMediaIds, setRemovedMediaIds] = useState<Set<string>>(new Set());
+  // The variations editor reads its terms and variants only when it mounts. Kept mounted through a
+  // reset to new initial data (after a publish, a discard or a page refresh), it still held the
+  // variants from before the reset and emitted them with its next change, and the autosave saved
+  // them into a draft: the discarded draft's values after a discard, the pre-publish variants (old
+  // ids) after a publish. Every reset after the first (on mount, from the data the editor mounted
+  // with) remounts it from the reset values.
+  const [variationsEditorKey, setVariationsEditorKey] = useState(0);
+  const hasResetOnceRef = useRef(false);
 
   useEffect(() => {
     reset(
@@ -476,15 +773,24 @@ export function ProductForm({
         targetLanguageId,
         availableLanguagesProp,
         currencies,
+        globalAttributesProp,
         translationGroupId
       )
     );
     setMediaForManager(buildMediaManagerItems(initialData?.product_media));
     setRemovedMediaIds(new Set());
+    // A refused or failed save's message is about values the reset just replaced (a publish, a
+    // discard or a description-block save renders the form again): it stayed until the next save.
+    setSaveError(null);
     setShowVariations(Boolean(initialData?.variants?.length));
+    if (hasResetOnceRef.current) {
+      setVariationsEditorKey((key) => key + 1);
+    }
+    hasResetOnceRef.current = true;
   }, [
     availableLanguagesProp,
     currencies,
+    globalAttributesProp,
     initialData,
     reset,
     targetLanguageId,
@@ -701,10 +1007,29 @@ export function ProductForm({
       variationAttributes: ProductFormValues['variation_attributes'];
       variants: ProductFormValues['variants'];
     }) => {
+      // The variations editor emits when it mounts: the variants it was handed. Setting them with
+      // shouldDirty made React Hook Form report the form dirty, so opening any product with
+      // variants autosaved a draft with no edit: every visit created one, a block-edit or legacy
+      // draft turned into product values, and an old draft got the 0.23.4 marker before anyone read
+      // the edit page's note. An emission equal to the form on everything a save writes changes
+      // nothing; any other (a variant's price, sale, stock, SKU, UPC or image, a toggled term, a new
+      // variant priced from the product) still dirties the form and autosaves.
+      const current = getValues();
+      if (
+        variationAttributesMatchFormValues(
+          current.variation_attributes,
+          current.variants,
+          variationAttributes
+        ) &&
+        variantsMatchFormValues(current.variants, variants)
+      ) {
+        return;
+      }
+
       setValue('variation_attributes', variationAttributes, { shouldDirty: true });
       setValue('variants', variants, { shouldDirty: true, shouldValidate: true });
     },
-    [setValue]
+    [getValues, setValue]
   );
 
   const onSubmit = async (data: ProductFormValues) => {
@@ -774,11 +1099,12 @@ export function ProductForm({
         throw new Error('Product form action is not configured.');
       }
     } catch (error: any) {
-      console.error(error);
-      if (error.message === 'NEXT_REDIRECT') {
+      // A successful create ends in redirect(), which throws NEXT_REDIRECT: not an error.
+      if (error?.message === 'NEXT_REDIRECT') {
           return;
       }
-      
+      console.error(error);
+
       let errorMsg = error.message || 'An error occurred while saving.';
       if (error.code === '23505') {
         const msg = error.message?.toLowerCase() || '';
@@ -806,6 +1132,12 @@ export function ProductForm({
       setIsSubmitting(false);
       setIsSaving(false);
     }
+  };
+
+  // An autosave productSchema refuses never reaches onSubmit. With no handler the status line kept
+  // "Settings autosave in draft mode" while no edit saved, and the variant fields show no error.
+  const onAutosaveInvalid = (refused: unknown) => {
+    setSaveError(describeRefusedSave(refused, getValues() as LooseRecord));
   };
 
   const disabledBaseFieldClass = hasVariants
@@ -1055,6 +1387,7 @@ export function ProductForm({
               {showVariations && (
                 <div className="border-t pt-3">
                   <VariationsEditor
+                    key={variationsEditorKey}
                     globalAttributes={globalAttributesProp}
                     currentLanguageCode={currentLanguageCode}
                     baseSku={watch('sku') || ''}
@@ -1064,10 +1397,18 @@ export function ProductForm({
                       typeof baseProductSalePrice === 'number' ? baseProductSalePrice : null
                     }
                     baseSalePrices={productSalePrices}
+                    baseSaleStartAt={(watch('sale_start_at') as string | null | undefined) ?? null}
+                    baseSaleEndAt={(watch('sale_end_at') as string | null | undefined) ?? null}
                     currencies={currencies}
                     availableVariantImages={variantImageOptions}
-                    initialVariationAttributes={initialData?.variation_attributes}
-                    initialVariants={initialVariantsForEditor}
+                    // Read once, when the editor mounts (Manage): the form's current terms and
+                    // variants. Seeded from the page's initial data, closing the editor (Hide) and
+                    // opening it again replaced every variant edit made since with the loaded
+                    // variants, and the autosave saved that.
+                    initialVariationAttributes={
+                      getValues('variation_attributes') as ProductFormValues['variation_attributes']
+                    }
+                    initialVariants={getValues('variants') as ProductFormValues['variants']}
                     onChange={handleVariationChange}
                   />
                 </div>

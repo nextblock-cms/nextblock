@@ -5,6 +5,7 @@ import { ProductForm } from '@nextblock-cms/ecommerce';
 import MediaPickerDialog from '../media/components/MediaPickerDialog';
 import DraftStatusActions from '../components/DraftStatusActions';
 import { usePageSeo } from '../../../lib/seo/page-audit-context';
+import { useProductDraftFlag } from './ProductDraftFlagProvider';
 
 type ProductFormProps = React.ComponentProps<typeof ProductForm>;
 type ProductUpdateAction = NonNullable<ProductFormProps['updateAction']>;
@@ -14,6 +15,12 @@ type ProductFormClientShellProps = ProductFormProps & {
   productId?: string;
   /** Draft existence as computed on the server for the current render. */
   serverHasDraft?: boolean;
+  /**
+   * Computed on the server (the edit page: the caller is an ADMIN past the second factor). Anyone
+   * else sees the toolbar's Publish disabled with a note; Discard stays. publishProductVisualEditingDraft
+   * checks again, so this only spares a refused round trip.
+   */
+  canPublishProduct?: boolean;
 };
 
 const productFormSkeletonRows = ['details', 'description', 'media', 'inventory'];
@@ -21,6 +28,7 @@ const productFormSkeletonRows = ['details', 'description', 'media', 'inventory']
 export default function ProductFormClientShell({
   productId,
   serverHasDraft = false,
+  canPublishProduct = false,
   updateAction,
   ...props
 }: ProductFormClientShellProps) {
@@ -43,40 +51,36 @@ export default function ProductFormClientShell({
   );
 
   // The draft toolbar is gated on the server-computed `hasDraft`, but the form
-  // autosave writes a draft WITHOUT revalidating the route (revalidating would
-  // re-init the form and loop the autosave — see updateProductAction). Track
-  // draft existence on the client so the toolbar can appear the moment an
-  // autosave persists a draft, without a server refetch.
-  const [hasDraft, setHasDraft] = React.useState(serverHasDraft);
+  // autosave writes a draft WITHOUT revalidating the route, so the flag is latched
+  // on the client: on the edit page it is the page's shared flag, which the
+  // visibility control reads too (ProductDraftFlagProvider).
+  const { hasDraft, draftSaveCount, markDraftSaved } = useProductDraftFlag(serverHasDraft);
 
   React.useEffect(() => {
     setIsMounted(true);
   }, []);
-
-  // Keep in sync with the server whenever it reports a draft (e.g. block edits
-  // in BlockEditorArea call router.refresh(), which re-runs the page). Only ever
-  // latch ON here — publish/discard reload the whole page, which resets state.
-  React.useEffect(() => {
-    if (serverHasDraft) {
-      setHasDraft(true);
-    }
-  }, [serverHasDraft]);
 
   // Reveal the toolbar as soon as a form autosave succeeds. The autosave already
   // upserted a product_drafts row, so a draft now exists.
   const wrappedUpdateAction = React.useCallback(
     async (data: Parameters<ProductUpdateAction>[0]) => {
       const result = await updateAction!(data);
-      setHasDraft(true);
+      markDraftSaved();
       return result;
     },
-    [updateAction]
+    [markDraftSaved, updateAction]
   );
 
   return (
     <>
       {productId ? (
-        <DraftStatusActions parentId={productId} parentType="product" hasDraft={hasDraft} />
+        <DraftStatusActions
+          parentId={productId}
+          parentType="product"
+          hasDraft={hasDraft}
+          canPublish={canPublishProduct}
+          draftSaveCount={draftSaveCount}
+        />
       ) : null}
       {isMounted ? (
         <ProductForm

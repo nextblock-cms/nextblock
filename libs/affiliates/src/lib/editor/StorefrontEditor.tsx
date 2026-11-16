@@ -11,7 +11,7 @@
  *   overwrite the saved draft with an empty page.
  * - SSR safe (`immediatelyRender: false`); import it statically from a client component.
  */
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import type { Editor, JSONContent } from '@tiptap/core';
 import { NodeSelection } from '@tiptap/pm/state';
 import type { EditorProps as ProseMirrorEditorProps } from '@tiptap/pm/view';

@@ -125,6 +125,16 @@ describe('sync-template.js wiring', () => {
     expect(text).toMatch(/if \(problems\.length > 0\) \{\s*throw new Error/);
   });
 
+  it('then asks npm what it would publish and throws when the tarball would be wrong', async () => {
+    const text = await source();
+    const templateCheck = text.indexOf('findTemplateProblems(TARGET_DIR,');
+    const packCheck = text.indexOf('findPackProblems({ packageDir: PROJECT_ROOT, templateDir: TARGET_DIR })');
+
+    expect(templateCheck).toBeGreaterThan(-1);
+    expect(packCheck).toBeGreaterThan(templateCheck);
+    expect(text).toMatch(/if \(packProblems\.length > 0\) \{\s*throw new Error/);
+  });
+
   it('lets removal failures reach the retry instead of swallowing them', async () => {
     expect(await source()).not.toMatch(/\.catch\(\(\) => undefined\)/);
   });

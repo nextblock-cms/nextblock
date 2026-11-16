@@ -4,7 +4,19 @@ import { createClient } from '@nextblock-cms/db/server';
 import { revalidatePath } from 'next/cache';
 
 import type { EnabledPaymentProviders } from '../../../types';
-import { savePaymentCredentials } from '../../../payment-config';
+import { savePaymentCredentials, type RemovablePaymentSecret } from '../../../payment-config';
+
+/**
+ * The keys form's remove boxes (PaymentsClient renders `remove_<field id>` under a stored secret),
+ * each with the stored secret it deletes. Only the value `true` ticks one.
+ */
+const REMOVE_SECRET_BOXES: ReadonlyArray<readonly [box: string, field: RemovablePaymentSecret]> = [
+  ['remove_stripe_secretKey', 'stripeSecretKey'],
+  ['remove_stripe_webhookSecret', 'stripeWebhookSecret'],
+  ['remove_freemius_developerSecretKey', 'freemiusDeveloperSecretKey'],
+  ['remove_freemius_secretKey', 'freemiusSecretKey'],
+  ['remove_freemius_apiKey', 'freemiusApiKey'],
+];
 
 async function assertAdmin() {
   const supabase = await createClient();
@@ -24,6 +36,11 @@ async function assertAdmin() {
   }
 }
 
+/**
+ * CMS → Payments' keys form. `savePaymentCredentials` checks the actor again with the second factor
+ * (`requireEcomAdmin()`) before it reads or writes anything, refuses on the sandbox, and deletes
+ * each stored secret whose remove box is ticked while its field is blank.
+ */
 export async function savePaymentProviderCredentials(formData: FormData) {
   await assertAdmin();
 
@@ -35,11 +52,14 @@ export async function savePaymentProviderCredentials(formData: FormData) {
     },
     freemius: {
       developerId: String(formData.get('freemius_developerId') ?? ''),
+      developerPublicKey: String(formData.get('freemius_developerPublicKey') ?? ''),
+      developerSecretKey: String(formData.get('freemius_developerSecretKey') ?? ''),
       publicKey: String(formData.get('freemius_publicKey') ?? ''),
       productId: String(formData.get('freemius_productId') ?? ''),
       secretKey: String(formData.get('freemius_secretKey') ?? ''),
       apiKey: String(formData.get('freemius_apiKey') ?? ''),
     },
+    remove: REMOVE_SECRET_BOXES.filter(([box]) => formData.get(box) === 'true').map(([, field]) => field),
   });
 
   // The storefront buy CTAs, the CMS payments banner and the publish warning all read

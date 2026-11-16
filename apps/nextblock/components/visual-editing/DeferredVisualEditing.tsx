@@ -16,6 +16,23 @@ const NextblockVisualEditing = dynamic(
   { ssr: false }
 );
 
-export function DeferredVisualEditing() {
-  return <NextblockVisualEditing />;
+export interface DeferredVisualEditingProps {
+  /**
+   * Computed on the server: the root layout's currentUserCanPublishProductDrafts() (an ADMIN past
+   * the second factor, the check publishProductVisualEditingDraft opens with), asked only while the
+   * visual editor is on. The toolbar disables Publish on a product for anyone else, an ADMIN whose
+   * second factor is still pending included: the profile's role alone left it enabled for them, and
+   * publish refused every click. Publish checks again on the server; this only spares the round trip.
+   */
+  canPublishProducts: boolean;
+  /**
+   * Also from the root layout: the profile says ADMIN but the check above said no, so the second
+   * factor is pending (or the check failed). It only picks the note beside the disabled Publish:
+   * "Complete two-factor verification to publish product changes." instead of the admin-only one.
+   */
+  secondFactorPending: boolean;
+}
+
+export function DeferredVisualEditing({ canPublishProducts, secondFactorPending }: DeferredVisualEditingProps) {
+  return <NextblockVisualEditing canPublishProducts={canPublishProducts} secondFactorPending={secondFactorPending} />;
 }

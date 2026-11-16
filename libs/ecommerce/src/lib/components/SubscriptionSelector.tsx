@@ -8,10 +8,8 @@ import { ShoppingCart } from 'lucide-react';
 import { toast } from 'sonner';
 import { getPublicFreemiusPricing } from '../pages/cms/products/actions';
 import { Product, BillingCycle, ResolvedPlanWithPricing } from '../types';
-import {
-  majorUnitAmountToMinor,
-  useTranslations,
-} from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { majorUnitAmountToMinor } from '@nextblock-cms/utils/utils';
 import { usePriceFormatter } from '../use-price-formatter';
 import { useCurrency } from '../CurrencyProvider';
 import { convertMinorUnitAmount } from '../currency';

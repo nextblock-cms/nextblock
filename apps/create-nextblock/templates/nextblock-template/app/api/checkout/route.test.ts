@@ -331,6 +331,62 @@ describe('POST /api/checkout', () => {
     ]);
   });
 
+  /**
+   * Review 2026-11-13, round 3 (K6): the readiness refusal wrote a line on every public POST, so
+   * anyone could fill the logs of a store that is not ready. One line a minute per provider and
+   * missing set now, whatever the number of refused checkouts.
+   */
+  describe('readiness preflight', () => {
+    const UNAVAILABLE = {
+      error: 'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
+      errorKey: 'ecommerce.checkout_payments_unavailable',
+    };
+    const blockedLines = () =>
+      vi.mocked(console.error).mock.calls.map((call) => String(call[0])).filter((line) => line.startsWith('Checkout blocked:'));
+
+    beforeEach(() => {
+      // A clock far from any other test's, so lines this route remembered elsewhere are long expired.
+      vi.useFakeTimers({ now: new Date('2099-01-01T00:00:00Z'), toFake: ['Date'] });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('answers the keyed 503 before the provider runs, and logs it once a minute per provider and missing set', async () => {
+      mocks.getProviderReadiness.mockResolvedValue({ ready: false, label: 'Stripe', missing: ['Secret key', 'Webhook secret'] });
+
+      for (let i = 0; i < 20; i += 1) {
+        const { status, body } = await post({});
+        expect(status).toBe(503);
+        expect(body).toEqual(UNAVAILABLE);
+      }
+      expect(mocks.createCheckoutSession).not.toHaveBeenCalled();
+      expect(blockedLines()).toEqual(['Checkout blocked: Stripe is not ready (missing: Secret key, Webhook secret)']);
+
+      // Another missing set, or another provider, gets a line of its own.
+      mocks.getProviderReadiness.mockResolvedValue({ ready: false, label: 'Stripe', missing: ['Not enabled in CMS → Payments'] });
+      await post({});
+      await post({});
+      mocks.getProviderReadiness.mockResolvedValue({ ready: false, label: 'Freemius', missing: ['Secret key', 'Webhook secret'] });
+      const digital = { product_id: PRODUCT_A, product_type: 'digital', provider: 'freemius', quantity: 1 };
+      await post({ items: [digital] });
+      await post({ items: [digital] });
+      expect(blockedLines()).toHaveLength(3);
+      expect(mocks.getProviderReadiness).toHaveBeenLastCalledWith('freemius');
+
+      // A minute on, the first set is logged again, once.
+      vi.setSystemTime(new Date('2099-01-01T00:01:01Z'));
+      mocks.getProviderReadiness.mockResolvedValue({ ready: false, label: 'Stripe', missing: ['Webhook secret', 'Secret key'] });
+      for (let i = 0; i < 5; i += 1) {
+        expect((await post({})).status).toBe(503);
+      }
+      expect(blockedLines()).toHaveLength(4);
+      expect(blockedLines()[3]).toBe('Checkout blocked: Stripe is not ready (missing: Webhook secret, Secret key)');
+      expect(mocks.createCheckoutSession).not.toHaveBeenCalled();
+    });
+  });
+
   it('surfaces the provider rejection with its status', async () => {
     mocks.createCheckoutSession.mockResolvedValue({
       url: null,

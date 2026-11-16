@@ -1,4 +1,4 @@
-import { getCurrentCustomerOrders } from '@nextblock-cms/ecommerce/server';
+import { getCurrentCustomerOrders } from '@nextblock-cms/ecommerce/customer-orders';
 
 import { requireProfileAccountContext } from '../account-data';
 import { CustomerOrdersPageClient } from './CustomerOrdersPageClient';

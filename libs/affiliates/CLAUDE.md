@@ -94,6 +94,11 @@ files only `export *` the areas.
   compare roles with `String(role) === AFFILIATE_RETAILER_ROLE`.
 - Import `z` from `src/lib/zod-config.ts` (jitless). No `next/*` imports: the lib is React-only.
   Read undeclared env as `process.env['X']`.
+- Import `@nextblock-cms/utils` through deep subpaths (`/utils` for `cn` and the currency helpers,
+  `/translations-context`), never the barrel: it carries the authored-HTML sanitizer and Zod, and
+  the partner pages and storefronts load these modules up front.
+  `tools/scripts/root-layout-chunking.test.ts` fails when the client code of a public route (the
+  partner portal included) reaches the barrel or Zod, `src/lib/zod-config.ts` included.
 - UI copy: keys `affiliates.<area>.<snake_name>` in `src/lib/i18n/copy/<area>.ts`, EN + Québec
   French, `…` not `...`, each `{placeholder}` at most once per string, a space before `:` and `%`
   in French (a plain space in source; `createAffiliatesCopy` and the email templates render it as

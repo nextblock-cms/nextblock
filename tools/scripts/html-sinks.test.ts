@@ -106,7 +106,7 @@ describe('HTML sink check', () => {
         new Map([['apps/nextblock/components/Old.tsx', { why: 'gone' }]])
       )
     ).toEqual([
-      'apps/nextblock/components/New.tsx writes HTML into a page (dangerouslySetInnerHTML (line 1)): render authored HTML through sanitizeAuthoredBlockHtml (@nextblock-cms/utils) and list the module in HTML_SINKS (tools/scripts/lib/html-sinks.js) with why it is safe.',
+      'apps/nextblock/components/New.tsx writes HTML into a page (dangerouslySetInnerHTML (line 1)): render authored HTML through sanitizeAuthoredBlockHtml (@nextblock-cms/utils/authored-html in client code: the barrel also carries Zod) and list the module in HTML_SINKS (tools/scripts/lib/html-sinks.js) with why it is safe.',
       'HTML_SINKS lists apps/nextblock/components/Old.tsx, which no longer writes HTML into a page: remove the entry.',
     ]);
   });

@@ -1,19 +1,25 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // CommonJS script; its CLI entry is guarded by `require.main`, so requiring it runs nothing.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
 const {
+  collectDistProblems,
   findModuleFormatProblems,
   findPackagePageProblems,
+  findPackedDotPaths,
   findSideEffectsProblems,
+  findSupabaseFileProblems,
+  findSupabaseFolderProblems,
   findUndeclaredSiblingImports,
   findWorkspaceProtocolDependencies,
+  readBundledMigrationNames,
+  verifyLibDist,
 } = require('./verify-lib-dist.js');
 const { AFFILIATES_EXPORTS, publishExportsFor } = require('./lib-publish-exports.js');
+const { nextMigrationVersion } = require('./lib/migration-naming.js');
 
 const dirs: string[] = [];
 
@@ -431,5 +437,441 @@ describe('findUndeclaredSiblingImports (check 11)', () => {
         'declaring @nextblock-cms/ecom installs it under that name, so declare "@nextblock-cms/ecommerce": ' +
         '"npm:@nextblock-cms/ecom@<range>" instead',
     ]);
+  });
+});
+
+// The db tarball's shape: supabase/ holds config.toml, migrations/ and templates/ (copy-db-supabase.cjs).
+// The packed file list is passed in, so these tests never run `npm pack`.
+const DB_PACKED = [
+  'package.json',
+  'README.md',
+  'index.es.js',
+  'lib/supabase/types.d.ts',
+  'supabase/config.toml',
+  'supabase/migrations/02000_catchup_gen1.sql',
+  'supabase/migrations/02001_baseline_schema.sql',
+  'supabase/templates/magic_link.html',
+];
+// What the /setup bundle (apps/nextblock/lib/setup/migrations-bundle.ts) embeds beside that tarball. Check 14
+// compares the packed migrations with it; these tests hand it in instead of reading the real bundle.
+const DB_BUNDLE = ['02000_catchup_gen1.sql', '02001_baseline_schema.sql'];
+const WITH_DB_BUNDLE = { bundledMigrationNames: DB_BUNDLE };
+const dotPath = (file: string, fix: string) =>
+  `${file} would be published. Dot folders and dotfiles are local state, tool config or secrets ` +
+  `(the Supabase CLI's .temp/, .env files), not package content: ${fix}`;
+const DB_FIX =
+  'tools/scripts/copy-db-supabase.cjs empties dist/libs/db/supabase and copies no dot entry into it, so a stale ' +
+  'build or a step after the copy wrote it; rebuild with nx build db, and find that step if it comes back';
+const BUILD_FIX =
+  'stop the build from writing it to the dist folder; an ignore file only hides it until that file is renamed or shadowed';
+const notShipped = (file: string) =>
+  `${file} would be published. supabase/ ships only what consumers read from the package (config.toml, migrations, ` +
+  "templates); the rest is the Supabase CLI's local state (local Studio's snippets/, signing_keys.json) or " +
+  'monorepo-only (functions/): rebuild with nx build db if dist/libs/db is stale, or add the entry to ' +
+  'SUPABASE_PACKAGE_ENTRIES (tools/scripts/copy-db-supabase.cjs) once a consumer reads it';
+const missingEntry = (entry: string) =>
+  `the tarball has no supabase/${entry}: new projects copy it from the package (create-nextblock refuses a package ` +
+  `without config.toml or migrations/, and templates/ holds the Auth emails); check that libs/db/src/supabase/${entry} ` +
+  'exists and that the db build ran tools/scripts/copy-db-supabase.cjs';
+/** A check-13 problem for an entry packed in the other shape: `shape` is the one consumers read, `inside` the first path below a file entry. */
+const misshapen = (entry: string, shape: 'file' | 'folder', inside = '') =>
+  `supabase/${entry} would be published as a ${shape === 'file' ? 'folder' : 'file'}${inside ? ` (${inside})` : ''}, but ` +
+  `consumers read it as a ${shape}: new projects copy it from the package (create-nextblock refuses a package without ` +
+  `config.toml or migrations/, and templates/ holds the Auth emails); check that libs/db/src/supabase/${entry} is a ${shape} ` +
+  'and that the db build ran tools/scripts/copy-db-supabase.cjs';
+const notMigration = (file: string) =>
+  `${file} would be published. supabase/migrations holds only migrations, as top-level GGNNN_<snake_name>.sql files: ` +
+  'remove it from libs/db/src/supabase/migrations';
+const notTemplate = (file: string) =>
+  `${file} would be published. supabase/templates holds only the Auth email templates (*.html) that new projects ` +
+  'upload: remove it from libs/db/src/supabase/templates';
+const MIGRATIONS_RULE =
+  'every install applies the migrations this package ships (migrate-core and npm run update take any <digits>_*.sql), ' +
+  "so only the current generation's GGNNN_<snake_name>.sql files may ship: rename or remove it in " +
+  "libs/db/src/supabase/migrations (the Supabase CLI's migration new, db diff -f and db pull write timestamped names), " +
+  'run npm run db:migrate:check and rebuild';
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** A check-14 problem for a migration name validateMigrationNames refuses: where and how, then the rule. */
+const badMigration = (start: string) =>
+  expect.stringMatching(new RegExp(`^${escapeRegExp(start)}.*; ${escapeRegExp(MIGRATIONS_RULE)}$`));
+const BUNDLE_RULE =
+  'migrate-core and npm run update apply the migrations this package ships, while /setup on a serverless host applies the ' +
+  'ones apps/nextblock/lib/setup/migrations-bundle.ts embeds, so the two lists must match';
+const notBundled = (name: string) =>
+  `supabase/migrations/${name} would be published, but the /setup bundle does not embed it (${BUNDLE_RULE}): if it is not ` +
+  'meant for this release, take it out of libs/db/src/supabase/migrations and rebuild; if it is, run npm run ' +
+  'generate:migrations-bundle';
+const notPacked = (name: string) =>
+  `supabase/migrations/${name} is embedded in the /setup bundle, but the tarball does not ship it (${BUNDLE_RULE}): run npm ` +
+  'run generate:migrations-bundle if the bundle is stale, or restore the file in libs/db/src/supabase/migrations ' +
+  '(migrations are append-only) and rebuild';
+const shipsNone = (count: number) =>
+  `the tarball ships none of the ${count} migration${count === 1 ? '' : 's'} the /setup bundle embeds (${BUNDLE_RULE}): ` +
+  'restore them in libs/db/src/supabase/migrations as top-level files (migrations are append-only) and rebuild';
+
+describe('findPackedDotPaths (check 12)', () => {
+  it('passes a tarball without dot paths, and dots inside a name', () => {
+    expect(findPackedDotPaths('db', dist({}), new Set(DB_PACKED))).toEqual([]);
+    // An extension, a version or `env` inside a name is not a segment that starts with '.'.
+    const names = new Set(['index.d.ts', 'lib/env.es.js', 'lib/load.env.cjs', 'lib/v1.2/a.mjs']);
+    expect(findPackedDotPaths('utils', dist({}), names)).toEqual([]);
+  });
+
+  it("refuses the Supabase CLI's local state the db build copied into dist through the 0.23.4 rehearsal builds", () => {
+    // Only the copied supabase/.gitignore kept these out of the tarball; an .npmignore beside it would not have.
+    const packed = new Set([
+      ...DB_PACKED,
+      'supabase/.temp/project-ref',
+      'supabase/.temp/pooler-url',
+      'supabase/.branches/_current_branch',
+      'supabase/functions/.temp/cli-latest',
+      'supabase/.env',
+    ]);
+    expect(findPackedDotPaths('db', dist({}), packed)).toEqual([
+      dotPath('supabase/.branches/_current_branch', DB_FIX),
+      dotPath('supabase/.env', DB_FIX),
+      dotPath('supabase/.temp/pooler-url', DB_FIX),
+      dotPath('supabase/.temp/project-ref', DB_FIX),
+      dotPath('supabase/functions/.temp/cli-latest', DB_FIX),
+    ]);
+  });
+
+  it('refuses dot folders and dotfiles in any lib, .env files included', () => {
+    const packed = new Set([
+      'package.json',
+      'index.es.js',
+      '.env',
+      '.env.local',
+      'lib/.vite/manifest.json',
+      // A committed template too: no lib ships a dot path today, so one that must ship gets an explicit exception.
+      '.env.example',
+    ]);
+    expect(findPackedDotPaths('ecommerce', dist({}), packed)).toEqual([
+      dotPath('.env', BUILD_FIX),
+      dotPath('.env.example', BUILD_FIX),
+      dotPath('.env.local', BUILD_FIX),
+      dotPath('lib/.vite/manifest.json', BUILD_FIX),
+    ]);
+    // The copy-step hint is for db's supabase/ folder only.
+    expect(findPackedDotPaths('db', dist({}), new Set(['package.json', '.env.local']))).toEqual([
+      dotPath('.env.local', BUILD_FIX),
+    ]);
+  });
+});
+
+describe('findSupabaseFolderProblems (check 13)', () => {
+  it('passes a db tarball whose supabase/ holds exactly config.toml, migrations/ and templates/', () => {
+    expect(findSupabaseFolderProblems('db', dist({}), new Set(DB_PACKED))).toEqual([]);
+  });
+
+  it("refuses local state without a dot segment, which check 12 cannot see: local Studio's snippets/, signing_keys.json", () => {
+    const packed = new Set([
+      ...DB_PACKED,
+      'supabase/snippets/local.sql',
+      'supabase/snippets/customers.sql',
+      'supabase/signing_keys.json',
+      // What the denylist copy still shipped: the maintainer-only migration-ingest edge function.
+      'supabase/functions/import_map.json',
+      'supabase/functions/nextblock-migration-ingest/index.ts',
+    ]);
+    expect(findPackedDotPaths('db', dist({}), packed)).toEqual([]);
+    // One problem per top-level entry, naming its first file.
+    expect(findSupabaseFolderProblems('db', dist({}), packed)).toEqual([
+      notShipped('supabase/functions/import_map.json'),
+      notShipped('supabase/signing_keys.json'),
+      notShipped('supabase/snippets/customers.sql'),
+    ]);
+  });
+
+  it('refuses a db tarball that lost one of them (a scaffold refuses a package without config.toml or migrations/)', () => {
+    const packed = new Set(DB_PACKED.filter((file) => file !== 'supabase/config.toml' && !file.startsWith('supabase/templates/')));
+    expect(findSupabaseFolderProblems('db', dist({}), packed)).toEqual([missingEntry('config.toml'), missingEntry('templates')]);
+    const withoutSupabase = new Set(DB_PACKED.filter((file) => !file.startsWith('supabase/')));
+    expect(findSupabaseFolderProblems('db', dist({}), withoutSupabase)).toEqual([
+      missingEntry('config.toml'),
+      missingEntry('migrations'),
+      missingEntry('templates'),
+    ]);
+  });
+
+  it('counts each of them only in the shape consumers read: a file named supabase/migrations holds no migration', () => {
+    // A regular file where the migrations folder goes: checks 12 and 14 see nothing to refuse in it.
+    const fileForFolder = new Set(['package.json', 'supabase/config.toml', 'supabase/migrations', 'supabase/templates/magic_link.html']);
+    expect(findSupabaseFolderProblems('db', dist({}), fileForFolder)).toEqual([misshapen('migrations', 'folder')]);
+    expect(findPackedDotPaths('db', dist({}), fileForFolder)).toEqual([]);
+    expect(findSupabaseFileProblems('db', dist({}), fileForFolder, WITH_DB_BUNDLE)).toEqual([]);
+    // The other way round: config.toml packed as a folder, templates as a file.
+    const swapped = new Set([
+      'package.json',
+      'supabase/config.toml/config.toml',
+      'supabase/migrations/02000_catchup_gen1.sql',
+      'supabase/migrations/02001_baseline_schema.sql',
+      'supabase/templates',
+    ]);
+    expect(findSupabaseFolderProblems('db', dist({}), swapped)).toEqual([
+      misshapen('config.toml', 'file', 'supabase/config.toml/config.toml'),
+      misshapen('templates', 'folder'),
+    ]);
+  });
+
+  it('leaves dot entries to check 12, and libs other than db alone', () => {
+    expect(findSupabaseFolderProblems('db', dist({}), new Set([...DB_PACKED, 'supabase/.temp/project-ref']))).toEqual([]);
+    expect(findSupabaseFolderProblems('utils', dist({}), new Set(['package.json', 'supabase/snippets/local.sql']))).toEqual([]);
+  });
+});
+
+describe('findSupabaseFileProblems (check 14)', () => {
+  const SUPABASE_SOURCE = join(__dirname, '../../libs/db/src/supabase');
+  const realPacked = () => {
+    const migrations = readdirSync(join(SUPABASE_SOURCE, 'migrations'));
+    const templates = readdirSync(join(SUPABASE_SOURCE, 'templates'));
+    expect(migrations).toContain('02000_catchup_gen1.sql');
+    expect(templates).toContain('magic_link.html');
+    return {
+      migrations,
+      packed: new Set([
+        'package.json',
+        'supabase/config.toml',
+        ...migrations.map((name) => `supabase/migrations/${name}`),
+        ...templates.map((name) => `supabase/templates/${name}`),
+      ]),
+    };
+  };
+  const check = (packed: Iterable<string>, bundle: string[] = DB_BUNDLE) =>
+    findSupabaseFileProblems('db', dist({}), new Set(packed), { bundledMigrationNames: bundle });
+
+  it('passes the real libs/db/src/supabase migrations and templates, which the copy ships as they are, against the real /setup bundle', () => {
+    // No bundledMigrationNames: the check reads apps/nextblock/lib/setup/migrations-bundle.ts.
+    expect(findSupabaseFileProblems('db', dist({}), realPacked().packed)).toEqual([]);
+  });
+
+  it('refuses a work-in-progress migration the real /setup bundle does not embed: every install would apply it', () => {
+    const { migrations, packed } = realPacked();
+    // Named like the next migration, so the naming rule passes it.
+    const wip = `${nextMigrationVersion(migrations)}_work_in_progress.sql`;
+    expect(findSupabaseFileProblems('db', dist({}), new Set([...packed, `supabase/migrations/${wip}`]))).toEqual([notBundled(wip)]);
+  });
+
+  it('refuses a packed migration the /setup bundle lacks and a bundled one the tarball lacks (two checkouts that numbered 02005 apart)', () => {
+    const head = [
+      '02000_catchup_gen1.sql',
+      '02001_baseline_schema.sql',
+      '02002_baseline_constraints_and_indexes.sql',
+      '02003_baseline_security_and_grants.sql',
+      '02004_baseline_seed.sql',
+    ];
+    const packed = [
+      'package.json',
+      'supabase/config.toml',
+      'supabase/templates/magic_link.html',
+      ...[...head, '02005_affiliate_tier_goals.sql'].map((name) => `supabase/migrations/${name}`),
+    ];
+    expect(check(packed, [...head, '02005_consent_cookie_copy.sql'])).toEqual([
+      notBundled('02005_affiliate_tier_goals.sql'),
+      notPacked('02005_consent_cookie_copy.sql'),
+    ]);
+    // Both lists pass the naming rule and checks 12 and 13: only the comparison stops this release.
+    expect(findPackedDotPaths('db', dist({}), new Set(packed))).toEqual([]);
+    expect(findSupabaseFolderProblems('db', dist({}), new Set(packed))).toEqual([]);
+    expect(check(packed, [...head, '02005_affiliate_tier_goals.sql'])).toEqual([]);
+  });
+
+  it('refuses a Supabase CLI timestamped migration, a non-SQL file in migrations/ and a non-HTML file in templates/', () => {
+    const packed = new Set([
+      ...DB_PACKED,
+      // `supabase db pull` / `migration new` / `db diff -f` output: migrate-core and npm run update would apply it.
+      'supabase/migrations/20261114120000_remote_schema.sql',
+      'supabase/migrations/notes.txt',
+      'supabase/templates/Thumbs.db',
+    ]);
+    // The timestamped file is not in the bundle either, but its name is the problem to fix first.
+    expect(check(packed)).toEqual([
+      notMigration('supabase/migrations/notes.txt'),
+      notTemplate('supabase/templates/Thumbs.db'),
+      badMigration('supabase/migrations/20261114120000_remote_schema.sql: does not match GGNNN_name.sql'),
+    ]);
+    // Checks 12 and 13 let all three through: no dot segment, and the folders themselves ship.
+    expect(findPackedDotPaths('db', dist({}), packed)).toEqual([]);
+    expect(findSupabaseFolderProblems('db', dist({}), packed)).toEqual([]);
+  });
+
+  it('gives a .sql file without a <digits>_ prefix the remove-it message, not db:migrate:check, which never lists it', () => {
+    const problems = check([...DB_PACKED, 'supabase/migrations/seed.sql']);
+    expect(problems).toEqual([notMigration('supabase/migrations/seed.sql')]);
+    expect(problems.join('\n')).not.toContain('db:migrate:check');
+  });
+
+  it('refuses what validateMigrationNames refuses: a gap (a migration removed upstream), a second generation, a subfolder', () => {
+    expect(check([...DB_PACKED, 'supabase/migrations/02099_obsolete.sql'])).toEqual([
+      badMigration('supabase/migrations/02099_obsolete.sql: sequence gap or duplicate'),
+    ]);
+    // The mixed-generation error names no file, so the unbundled 03000 is reported too.
+    expect(check([...DB_PACKED, 'supabase/migrations/03000_catchup_gen2.sql'])).toEqual([
+      badMigration('supabase/migrations: mixed squash generations on disk: 2, 3'),
+      notBundled('03000_catchup_gen2.sql'),
+    ]);
+    expect(check([...DB_PACKED, 'supabase/migrations/archive/02002_old.sql'])).toEqual([
+      notMigration('supabase/migrations/archive/02002_old.sql'),
+    ]);
+  });
+
+  it('refuses a migrations/ folder that holds no top-level <digits>_*.sql file (only stray files, a subfolder or dot paths), in one problem for the whole bundle', () => {
+    const withoutMigrations = DB_PACKED.filter((file) => !file.startsWith('supabase/migrations/'));
+    // Only a stray file, a subfolder or a dot path (check 12's) there: nothing to compare name by name.
+    expect(check([...withoutMigrations, 'supabase/migrations/seed.sql'])).toEqual([notMigration('supabase/migrations/seed.sql'), shipsNone(2)]);
+    expect(check([...withoutMigrations, 'supabase/migrations/archive/02000_catchup_gen1.sql'])).toEqual([
+      notMigration('supabase/migrations/archive/02000_catchup_gen1.sql'),
+      shipsNone(2),
+    ]);
+    expect(check([...withoutMigrations, 'supabase/migrations/.temp/cli-latest'])).toEqual([shipsNone(2)]);
+    expect(check([...withoutMigrations, 'supabase/migrations/seed.sql'], ['02000_catchup_gen1.sql'])).toEqual([
+      notMigration('supabase/migrations/seed.sql'),
+      shipsNone(1),
+    ]);
+    // A bundle that embeds nothing has nothing the tarball could lack.
+    expect(check([...withoutMigrations, 'supabase/migrations/seed.sql'], [])).toEqual([notMigration('supabase/migrations/seed.sql')]);
+  });
+
+  it('leaves dot entries to check 12, a missing folder or a file in its place to check 13, and libs other than db alone', () => {
+    expect(check([...DB_PACKED, 'supabase/migrations/.temp/cli-latest', 'supabase/templates/.DS_Store'])).toEqual([]);
+    const withoutMigrations = DB_PACKED.filter((file) => !file.startsWith('supabase/migrations/'));
+    expect(check(withoutMigrations)).toEqual([]);
+    expect(check([...withoutMigrations, 'supabase/migrations'])).toEqual([]);
+    expect(findSupabaseFileProblems('utils', dist({}), new Set(['package.json', 'supabase/migrations/notes.txt']))).toEqual([]);
+  });
+});
+
+describe('readBundledMigrationNames (the /setup bundle check 14 compares with)', () => {
+  /** A bundle file in the shape tools/scripts/generate-migrations-bundle.ts writes. */
+  const bundleFile = (body: string) => join(dist({ 'migrations-bundle.ts': body }), 'migrations-bundle.ts');
+  const generated = (entries: Array<{ version: string; name: string; sql: string }>) =>
+    bundleFile(
+      '// AUTO-GENERATED by tools/scripts/generate-migrations-bundle.ts — do not edit by hand.\n\n' +
+        'export interface BundledMigration {\n  version: string;\n  name: string;\n  sql: string;\n}\n\n' +
+        `export const MIGRATIONS_BUNDLE: BundledMigration[] = ${JSON.stringify(entries, null, 2)};\n`
+    );
+
+  it("reads each entry's name, whatever its SQL says (the catch-up quotes retired file names)", () => {
+    const file = generated([
+      {
+        version: '02000',
+        name: '02000_catchup_gen1.sql',
+        sql: "-- replays 00000000000030_old.sql\nselect '02099_decoy.sql' as name;\n-- {\"version\": \"02098\", \"name\": \"02098_decoy.sql\"}\n",
+      },
+      { version: '02001', name: '02001_baseline_schema.sql', sql: 'create table t ("name" text);\n' },
+    ]);
+    expect(readBundledMigrationNames(file)).toEqual(['02000_catchup_gen1.sql', '02001_baseline_schema.sql']);
+  });
+
+  it('reads the real bundle: every migration file in libs/db/src/supabase/migrations, in order', () => {
+    const folder = readdirSync(join(__dirname, '../../libs/db/src/supabase/migrations')).filter((name) => /^\d+_.*\.sql$/.test(name));
+    expect(readBundledMigrationNames()).toEqual(folder.sort());
+  });
+
+  it('throws, naming npm run generate:migrations-bundle, when it cannot find the names', () => {
+    const regenerate = '; regenerate it with npm run generate:migrations-bundle';
+    expect(() => readBundledMigrationNames(join(dist({}), 'missing.ts'))).toThrow(`missing.ts cannot be read (ENOENT)${regenerate}`);
+    expect(() => readBundledMigrationNames(bundleFile('export const OTHER_BUNDLE = [];\n'))).toThrow(
+      `declares no MIGRATIONS_BUNDLE array${regenerate}`
+    );
+    expect(() => readBundledMigrationNames(bundleFile('export const MIGRATIONS_BUNDLE = [{ "version": "02000", "sql": "" }];\n'))).toThrow(
+      `has a MIGRATIONS_BUNDLE entry (index 0) without a string "name"${regenerate}`
+    );
+  });
+});
+
+// A db dist folder without a build: the manifest and README the other checks read. The packed list
+// leaves out the JavaScript and declarations, which checks 5 and 11 would read from disk.
+const dbDist = () =>
+  dist({
+    'package.json': {
+      name: '@nextblock-cms/db',
+      license: 'AGPL-3.0-or-later',
+      repository: { type: 'git', url: 'git+https://github.com/nextblock-cms/nextblock.git', directory: 'libs/db' },
+    },
+    'README.md': '# @nextblock-cms/db\n',
+  });
+const SUPABASE_PACKED = ['package.json', 'README.md', ...DB_PACKED.filter((file) => file.startsWith('supabase/'))];
+
+describe('collectDistProblems (the gate verifyLibDist runs on the npm pack file list)', () => {
+  // Without a build, check 2 finds the db subpaths the app imports unresolvable; these tests are about 12 to 14.
+  const supabaseProblems = (problems: string[]) =>
+    problems.filter((problem) => /^(dot path|supabase folder|supabase file): /.test(problem));
+
+  it('passes the db supabase/ folder the copy writes', () => {
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), new Set(SUPABASE_PACKED), WITH_DB_BUNDLE))).toEqual([]);
+  });
+
+  it('reports a packed supabase/.temp/project-ref (check 12) and local Studio snippets (check 13)', () => {
+    const packed = new Set([...SUPABASE_PACKED, 'supabase/.temp/project-ref', 'supabase/snippets/local.sql']);
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), packed, WITH_DB_BUNDLE))).toEqual([
+      `dot path: ${dotPath('supabase/.temp/project-ref', DB_FIX)}`,
+      `supabase folder: ${notShipped('supabase/snippets/local.sql')}`,
+    ]);
+  });
+
+  it('reports a timestamped migration and a stray template file (check 14)', () => {
+    const packed = new Set([...SUPABASE_PACKED, 'supabase/migrations/20261114120000_remote_schema.sql', 'supabase/templates/Thumbs.db']);
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), packed, WITH_DB_BUNDLE))).toEqual([
+      `supabase file: ${notTemplate('supabase/templates/Thumbs.db')}`,
+      badMigration('supabase file: supabase/migrations/20261114120000_remote_schema.sql: does not match GGNNN_name.sql'),
+    ]);
+  });
+
+  it('reports a regular file where supabase/migrations goes (check 13), and a folder that holds no migration (check 14)', () => {
+    const fileForFolder = new Set(['package.json', 'supabase/config.toml', 'supabase/migrations', 'supabase/templates/magic_link.html']);
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), fileForFolder, WITH_DB_BUNDLE))).toEqual([
+      `supabase folder: ${misshapen('migrations', 'folder')}`,
+    ]);
+    const strayOnly = new Set(['package.json', 'supabase/config.toml', 'supabase/migrations/seed.sql', 'supabase/templates/magic_link.html']);
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), strayOnly, WITH_DB_BUNDLE))).toEqual([
+      `supabase file: ${notMigration('supabase/migrations/seed.sql')}`,
+      `supabase file: ${shipsNone(2)}`,
+    ]);
+  });
+
+  it('hands check 14 the bundledMigrationNames option: a migration the bundle lacks, and a bundled one the tarball lacks', () => {
+    const packed = new Set([...SUPABASE_PACKED, 'supabase/migrations/02002_baseline_constraints_and_indexes.sql']);
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), packed, WITH_DB_BUNDLE))).toEqual([
+      `supabase file: ${notBundled('02002_baseline_constraints_and_indexes.sql')}`,
+    ]);
+    const bundle = [...DB_BUNDLE, '02002_baseline_constraints_and_indexes.sql'];
+    expect(supabaseProblems(collectDistProblems('db', dbDist(), new Set(SUPABASE_PACKED), { bundledMigrationNames: bundle }))).toEqual([
+      `supabase file: ${notPacked('02002_baseline_constraints_and_indexes.sql')}`,
+    ]);
+  });
+});
+
+describe('verifyLibDist (the release gate release-lib.js runs)', () => {
+  it('stops the release with every problem in the file list its packer returns, a packed supabase/.temp/project-ref included', () => {
+    const distDir = dbDist();
+    const listPackedFiles = vi.fn(() => new Set([...SUPABASE_PACKED, 'supabase/.temp/project-ref']));
+
+    let message = '';
+    try {
+      verifyLibDist('db', { distDir, listPackedFiles, manifestFinalized: true, ...WITH_DB_BUNDLE });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(listPackedFiles).toHaveBeenCalledTimes(1);
+    expect(listPackedFiles).toHaveBeenCalledWith(distDir);
+    expect(message).toMatch(/^@nextblock-cms\/db is not publishable \(\d+ problems?\):\n/);
+    expect(message.split('\n')).toContain(`  - dot path: ${dotPath('supabase/.temp/project-ref', DB_FIX)}`);
+    expect(message).not.toContain('supabase file: ');
+  });
+
+  it('hands its other options to the checks: a bundle that embeds a migration the tarball lacks stops the release', () => {
+    // A name the real bundle does not hold, so only the bundle handed in can report it.
+    const bundledMigrationNames = [...DB_BUNDLE, '02002_from_another_checkout.sql'];
+
+    let message = '';
+    try {
+      verifyLibDist('db', { distDir: dbDist(), listPackedFiles: () => SUPABASE_PACKED, manifestFinalized: true, bundledMigrationNames });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message.split('\n')).toContain(`  - supabase file: ${notPacked('02002_from_another_checkout.sql')}`);
   });
 });

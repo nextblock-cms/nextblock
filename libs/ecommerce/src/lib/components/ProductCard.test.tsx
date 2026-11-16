@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ addToCartProps: [] as Array<Record<string, unknown>> }));
 
-vi.mock('@nextblock-cms/utils', async (importOriginal) => ({
+vi.mock('@nextblock-cms/utils/translations-context', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useTranslations: () => ({ t: (key: string) => key, lang: 'en' }),
 }));

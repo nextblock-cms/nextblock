@@ -34,7 +34,7 @@ import { updateProfile, type ProfileUpdateData } from '../server-actions/custome
 import { addressesMatch, emptyCustomerAddress, normalizeCustomerAddress } from '../customer';
 import { createClient, type Database } from '@nextblock-cms/db';
 import { Globe, Phone, User as UserIcon, Upload } from 'lucide-react';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { resolveMediaUrlWithSupabaseFallback } from '@nextblock-cms/utils/media-url';
 import { countries, normalizeCountryCode } from '../countries';
 

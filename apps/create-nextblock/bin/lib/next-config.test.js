@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 
@@ -16,6 +16,27 @@ const here = dirname(fileURLToPath(import.meta.url));
 const APP_NEXT_CONFIG = resolve(here, '../../../nextblock/next.config.js');
 
 const appSource = readFileSync(APP_NEXT_CONFIG, 'utf8');
+
+/** Run a next.config.js in a sandbox (stub requires, empty env) and return what it exports, as plain JSON. */
+function evaluateNextConfig(source) {
+  const cjsModule = { exports: {} };
+  const sandbox = {
+    module: cjsModule,
+    exports: cjsModule.exports,
+    __dirname: '/project',
+    __filename: '/project/next.config.js',
+    process: { env: {}, cwd: () => '/project' },
+    URL,
+    require: (id) => {
+      if (id === 'node:path' || id === 'path') return posix;
+      if (id === 'node:fs' || id === 'fs') return { existsSync: () => false };
+      if (id === '@vercel/toolbar/plugins/next') return { withVercelToolbar: () => (config) => config };
+      throw new Error(`unexpected require('${id}')`);
+    },
+  };
+  vm.runInNewContext(source, sandbox, { filename: 'next.config.js' });
+  return JSON.parse(JSON.stringify(cjsModule.exports, (key, value) => (typeof value === 'function' ? `[function ${key}]` : value)));
+}
 
 describe('patchNextConfigForStandalone', () => {
   it("every required patch still finds its anchor in the app's next.config.js", () => {
@@ -71,6 +92,17 @@ describe('patchNextConfigForStandalone', () => {
 
     const patched = patchNextConfigForStandalone(appSource).replace(/\r\n/g, '\n');
     expect(patched).toContain("    '@nextblock-cms/affiliates',\n  ],");
+  });
+
+  it("keeps the app's postcss browser alias, so a new scaffold's client bundles get the stub, not postcss", () => {
+    const scaffold = evaluateNextConfig(patchNextConfigForStandalone(appSource));
+
+    // No standalone patch touches turbopack.resolveAlias: the scaffold has exactly the app's aliases.
+    expect(scaffold.turbopack.resolveAlias).toEqual(evaluateNextConfig(appSource).turbopack.resolveAlias);
+    expect(scaffold.turbopack.resolveAlias.postcss).toEqual({ browser: './lib/browser-stubs/postcss.cjs' });
+    // The stub ships in the template (lib/ is copied verbatim). Projects scaffolded before 0.23.4
+    // get the same entry from `npm run update` (apps/nextblock/tools/lib/postcss-browser-alias.mjs).
+    expect(existsSync(resolve(here, '../../../nextblock', scaffold.turbopack.resolveAlias.postcss.browser))).toBe(true);
   });
 
   it('preserves CRLF line endings when the source uses them', () => {

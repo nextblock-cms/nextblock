@@ -6,6 +6,7 @@ import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import sharp from 'sharp';
 import { Readable } from 'stream';
 import { getPlaiceholder } from 'plaiceholder';
+import { getCmsActor, isCmsStaffRole } from '../../../lib/auth/cms-actor';
 import {
   getStorageBackend,
   getStorageBucket,
@@ -15,7 +16,7 @@ import {
   supabaseDownloadObject,
   supabaseUploadObject,
 } from '../../../lib/storage/supabase-storage';
-import { isPartnerUploadKey, isSafeObjectKey } from '../../../lib/storage/upload-policy';
+import { isAcceptableClientObjectKey } from '../../../lib/storage/upload-policy';
 
 // Helper to convert stream to buffer
 async function streamToBuffer(stream: Readable): Promise<Buffer> {
@@ -48,28 +49,38 @@ const TARGET_SIZES = [
 const TARGET_FORMAT = 'avif';
 const TARGET_MIME_TYPE = 'image/avif';
 
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
+
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const {
+      data: { user },
+    } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
+  }
+}
+
 export async function POST(request: NextRequest) {
   // This endpoint reads AND writes arbitrary storage objects by key with the server's storage
   // credentials, so it must not be callable unauthenticated. It is a CMS tool (the media upload
-  // pipeline), reachable only from /cms, so require a staff session. Without this, an anonymous
-  // caller could read any object by key (blur-preview exfiltration), write processed variants, or
-  // drive sharp to exhaust the server.
-  {
-    const supabase = await createClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-    }
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('id', user.id)
-      .single();
-    if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
-    }
+  // pipeline), reachable only from /cms, so require a staff session past its enrolled second
+  // factor: a route handler never passes the CMS layout's 2FA redirect, and until 2026-11-14 a
+  // cookie-client role read let a staff password alone (the first factor) through. Without this,
+  // an anonymous caller could read any object by key (blur-preview exfiltration), write processed
+  // variants, or drive sharp to exhaust the server.
+  const actor = await getCmsActor();
+  if (!actor) {
+    // getCmsActor() is null without a session and while an enrolled second factor is pending. The
+    // refusal stands either way; this only picks the answer.
+    return (await hasSignedInUser())
+      ? NextResponse.json({ error: SECOND_FACTOR_MESSAGE }, { status: 403 })
+      : NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!isCmsStaffRole(actor.role)) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
   const backend = getStorageBackend();
@@ -123,14 +134,20 @@ export async function POST(request: NextRequest) {
     if (
       typeof originalObjectKey !== 'string' ||
       originalObjectKey.includes('..') ||
-      // The shared key policy also refuses '.' segments, empty segments, backslashes and control
-      // characters, so './affiliates/pages/...' cannot slip past the partner check below.
-      !isSafeObjectKey(originalObjectKey) ||
       originalObjectKey.startsWith('/') ||
       /^[a-z][a-z0-9+.-]*:\/\//i.test(originalObjectKey) ||
-      // Partner uploads (affiliates/avatars/… and affiliates/pages/…) are not media: processing one would read a partner's
-      // object and write six variants into their prefix, which counts against their caps.
-      isPartnerUploadKey(originalObjectKey)
+      // The policy for a key a client hands back (lib/storage/upload-policy.ts): the shared key
+      // rules ('.' and empty segments, backslashes and control characters refused, so
+      // './affiliates/pages/...' cannot slip past), only the characters the upload routes mint (no
+      // '%': on the Supabase backend the storage server decodes '%61ffiliates/pages/...' into a
+      // partner's prefix), and no partner upload (affiliates/avatars/… and affiliates/pages/…):
+      // processing one would read a partner's object and write six variants into their prefix,
+      // which counts against their caps. It must also end in an allowed media extension, as every
+      // key the upload routes mint does (non-images included, so they still reach the early return
+      // below): the variant keys are the text before the last '.', so until 2026-11-14
+      // `uploads/photo` wrote its six variants at the bucket root (`_xlarge.avif`, …) and
+      // `uploads/2026.11/photo` wrote them as `uploads/2026_<label>.avif`, outside its folder.
+      !isAcceptableClientObjectKey(originalObjectKey, { requireAllowedExtension: true })
     ) {
       return NextResponse.json({ error: 'Invalid objectKey.' }, { status: 400 });
     }

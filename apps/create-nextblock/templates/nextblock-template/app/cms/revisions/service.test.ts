@@ -16,6 +16,8 @@ const REVISION_UNIQUE_KEYS: Record<string, string> = {
 
 class FakeDb {
   tables: Record<string, Row[]> = {};
+  /** Every update payload in call order, so a test can tell which write carried a column. */
+  updates: Array<{ table: string; payload: Row }> = [];
   /**
    * Simulates a concurrent writer: the next insert into this table raises 23505, and
    * onCollision runs first so the test can apply whatever the winner already committed.
@@ -71,6 +73,7 @@ class FakeQuery {
   update(payload: Row) {
     this.mode = 'update';
     this.payload = payload;
+    this.db.updates.push({ table: this.table, payload });
     return this;
   }
 
@@ -183,6 +186,7 @@ import {
   createProductRevision,
   reconstructPageVersionContent,
   restorePageToVersion,
+  restorePostToVersion,
   restoreProductToVersion,
 } from "./service";
 
@@ -494,5 +498,114 @@ describe("products", () => {
     expect(result).toMatchObject({ success: true });
     expect(db.tables['products'][0]!.title).toBe("Widget");
     expect(db.tables['product_drafts']).toHaveLength(0);
+  });
+});
+
+describe("restore sets updated_at in the write that restores the meta", () => {
+  const stale = "2026-01-01T00:00:00.000Z";
+  const productId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const productMeta = {
+    custom_canonical: null,
+    description_json: null,
+    language_id: 1,
+    meta_description: null,
+    meta_title: null,
+    published_at: null,
+    short_description: "A widget",
+    slug: "widget",
+    status: "active",
+    title: "Widget",
+  };
+  // Own literals: "replays diffs onto the nearest snapshot" stores the shared seededContent
+  // object itself, and reconstructing patches it in place (seededMeta.title becomes "Second").
+  const pageMeta = {
+    custom_canonical: null,
+    feature_image_id: null,
+    language_id: 1,
+    meta_description: null,
+    meta_title: null,
+    published_at: null,
+    slug: "about",
+    status: "published",
+    title: "About",
+  };
+  const postMeta = { ...pageMeta, excerpt: null, label: null, slug: "news", subtitle: null, title: "News" };
+
+  // products.updated_at has no trigger behind it, and the visual editor publishes a pre-0.23.4
+  // product draft's copy of the title and descriptions only while products.updated_at is not
+  // later than the draft's created_at. A restore that left it alone rewrote those fields while
+  // the row still looked unchanged, so a draft that survived (nothing checks the draft delete)
+  // could publish its copy straight back over the restore. Pages and posts also get it from
+  // their trigger; the write sets it for all three alike.
+  const cases = [
+    {
+      label: "product",
+      restore: () => restoreProductToVersion(productId, 1, "user-1"),
+      seed: () =>
+        new FakeDb({
+          blocks: [],
+          product_drafts: [],
+          product_revisions: [
+            {
+              author_id: null, content: { blocks: [], meta: productMeta }, id: 1,
+              product_id: productId, revision_type: "snapshot", version: 1,
+            },
+          ],
+          products: [{ id: productId, version: 2, ...productMeta, title: "Renamed", updated_at: stale }],
+        }),
+      table: "products",
+      title: "Widget",
+    },
+    {
+      label: "page",
+      restore: () => restorePageToVersion(1, 1, "user-1"),
+      seed: () =>
+        new FakeDb({
+          blocks: [],
+          content_drafts: [],
+          page_revisions: [
+            {
+              author_id: null, content: { blocks: [], meta: pageMeta }, id: 1,
+              page_id: 1, revision_type: "snapshot", version: 1,
+            },
+          ],
+          pages: [{ id: 1, version: 2, ...pageMeta, title: "Rewritten", updated_at: stale }],
+        }),
+      table: "pages",
+      title: "About",
+    },
+    {
+      label: "post",
+      restore: () => restorePostToVersion(5, 1, "user-1"),
+      seed: () =>
+        new FakeDb({
+          blocks: [],
+          content_drafts: [],
+          post_revisions: [
+            {
+              author_id: null, content: { blocks: [], meta: postMeta }, id: 1,
+              post_id: 5, revision_type: "snapshot", version: 1,
+            },
+          ],
+          posts: [{ id: 5, version: 2, ...postMeta, title: "Edited", updated_at: stale }],
+        }),
+      table: "posts",
+      title: "News",
+    },
+  ];
+
+  it.each(cases)("$label", async ({ restore, seed, table, title }) => {
+    db = seed();
+    const startedAt = Date.now();
+
+    const result = await restore();
+
+    expect(result).toMatchObject({ success: true });
+    const metaWrite = db.updates.find(write => write.table === table && write.payload['title'] === title);
+    expect(metaWrite, `the ${table} update that restores the title`).toBeDefined();
+    const stamp = metaWrite?.payload['updated_at'];
+    expect(stamp).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/));
+    expect(Date.parse(stamp)).toBeGreaterThanOrEqual(startedAt);
+    expect(db.tables[table]?.[0]?.updated_at).toBe(stamp);
   });
 });

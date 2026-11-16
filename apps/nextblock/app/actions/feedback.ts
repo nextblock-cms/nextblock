@@ -1,6 +1,7 @@
 "use server";
 
 import { createClient } from "@nextblock-cms/db/server";
+import { getCmsActor, isCmsStaffRole } from "../../lib/auth/cms-actor";
 import { PRODUCT_FEEDBACK_INBOX, sendEmail } from "./email";
 
 interface FeedbackData {
@@ -39,14 +40,22 @@ export async function submitFeedback(data: FeedbackData) {
       return { success: false, error: "You must be signed in to send feedback." };
     }
 
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, full_name')
-      .eq('id', user.id)
-      .maybeSingle();
-    if (profile?.role !== 'ADMIN' && profile?.role !== 'WRITER') {
+    // sendEmail reads the SMTP settings and credentials with the service role, and a server action
+    // never passes the CMS layout's 2FA redirect, so a role read alone is the first factor:
+    // getCmsActor() also refuses a session whose enrolled second factor is pending (2026-11-13).
+    const actor = await getCmsActor();
+    if (!actor) {
+      return { success: false, error: "Complete two-factor verification, then try again." };
+    }
+    if (!isCmsStaffRole(actor.role)) {
       return { success: false, error: "You do not have permission to send feedback." };
     }
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name')
+      .eq('id', user.id)
+      .maybeSingle();
 
     const subject = (data.subject ?? '').slice(0, MAX_SUBJECT_LENGTH);
     const message = (data.message ?? '').slice(0, MAX_MESSAGE_LENGTH);

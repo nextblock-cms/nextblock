@@ -5,7 +5,7 @@ import { FormMessage, Message } from "../../../components/form-message";
 import { SubmitButton } from "../../../components/submit-button";
 import { Alert, AlertDescription, Button, Input, Label } from "@nextblock-cms/ui";
 import Link from "next/link";
-import { useTranslations } from "@nextblock-cms/utils";
+import { useTranslations } from "@nextblock-cms/utils/translations-context";
 import { useSearchParams } from "next/navigation";
 import { ArrowRight, CheckCircle2, Mail } from "lucide-react";
 

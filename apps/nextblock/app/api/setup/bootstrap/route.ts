@@ -101,7 +101,9 @@ export async function POST(request: Request) {
           ? 409
           : result.code === 'invalid_input'
             ? 400
-            : 503;
+            : result.code === 'sandbox'
+              ? 403
+              : 503;
 
       return json({ code: result.code.toUpperCase(), error: result.error, ok: false }, status);
     }

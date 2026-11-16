@@ -1,16 +1,15 @@
 'use client';
 
+import type { FreemiusOrderLicense, InvoicePresentationData } from '@nextblock-cms/ecommerce';
+import { FreemiusLicensePanel } from '@nextblock-cms/ecommerce/components/FreemiusLicensePanel';
+import { InvoiceViewerShell } from '@nextblock-cms/ecommerce/components/InvoiceViewerShell';
 import {
-  FreemiusLicensePanel,
-  type FreemiusOrderLicense,
-  InvoiceViewerShell,
-  type InvoicePresentationData,
   buildInvoiceDocumentLabels,
   getInvoiceLocale,
   localizeInvoicePresentationData,
   translateOrFallback,
-} from '@nextblock-cms/ecommerce';
-import { useTranslations } from '@nextblock-cms/utils';
+} from '@nextblock-cms/ecommerce/invoice-ui';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 
 import type { ProfileAccountSummary, ProfileAccountUser } from '../../account-types';
 import { ProfileAccountSidebar } from '../../ProfileAccountSidebar';

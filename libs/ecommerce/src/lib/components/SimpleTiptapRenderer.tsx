@@ -1,5 +1,5 @@
 import React from 'react';
-import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils';
+import { sanitizeAuthoredBlockHtml } from '@nextblock-cms/utils/authored-html';
 
 interface TiptapMark {
   type: string;

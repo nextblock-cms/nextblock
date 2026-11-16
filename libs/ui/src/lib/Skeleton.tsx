@@ -1,5 +1,5 @@
 "use client";
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 
 function Skeleton({
   className,

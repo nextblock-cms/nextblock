@@ -1,4 +1,4 @@
--- NextBlock DB security posture check (2026-10-19 red-team; migrations 02022, 02023, 02025-02028, 02030, 02035, 02036, 02037, 02038).
+-- NextBlock DB security posture check (2026-10-19 red-team; migrations 02022, 02023, 02025-02028, 02030, 02035, 02036, 02037, 02038, 02041).
 --
 -- Self-contained before/after harness for the RLS / trigger fixes in
 -- 02022_security_hardening_writer_boundary_and_aal.sql (sections 1-12), the aal2 widening
@@ -37,7 +37,9 @@
 -- last send of an unconfirmed batch and a week for an acknowledged one PayPal does not hold, the PayPal
 -- refund advice), and the secret rows of site_settings of
 -- 02038_site_settings_secret_rows_service_role_only.sql (section 42: service role only, whatever
--- the admin's second factor). It creates throwaway fixtures, emulates PostgREST exactly (SET LOCAL ROLE + request.jwt.claims;
+-- the admin's second factor), and the first-admin flag of
+-- 02041_site_settings_admin_created_flag_service_role_only.sql (section 43: no API role writes
+-- site_settings.is_admin_created; anon still reads it). It creates throwaway fixtures, emulates PostgREST exactly (SET LOCAL ROLE + request.jwt.claims;
 -- SET LOCAL reverts at each DO block's exit), prints PASS/FAIL per assertion, and ROLLS BACK so
 -- the database is left untouched.
 --
@@ -72,7 +74,10 @@
 --                  aal2, or without a factor, still reads, updates, copies, inserts, upserts and
 --                  deletes the secret rows, and those deletes also fail its service-role line
 --                  (section 42 prints the same seven FAIL lines at every level above).
---   After  02038:  every check prints PASS (256), with or without the post-apply pass. Run it on
+--   After  02038:  every check prints PASS (258 of 263) except the five hole checks of section 43:
+--                  an ADMIN at aal2, or without a factor, still updates, upserts, renames a row into
+--                  and deletes site_settings.is_admin_created, so its value does not survive either.
+--   After  02041:  every check prints PASS (263), with or without the post-apply pass. Run it on
 --                  a database that went through that pass (a deployed one, or a replay followed
 --                  by GRANTS_SQL from apps/nextblock/tools/lib/migrate-core.mjs): that is where
 --                  grant regressions show up.
@@ -180,16 +185,17 @@ BEGIN
   RAISE NOTICE '%  WRITER cannot insert site_settings.global_css', CASE WHEN denied THEN 'PASS' ELSE 'FAIL' END;
 END $$;
 
--- 3. ADMIN (no MFA factor) CAN write a sensitive key
+-- 3. ADMIN (no MFA factor) CAN write an ADMIN-tier key. Until 02041 this probed is_admin_created,
+--    which no API role may write since (section 43).
 RESET ROLE;
 DO $$
 DECLARE allowed boolean := false;
 BEGIN
   PERFORM set_config('request.jwt.claims','{"sub":"aa000000-0000-0000-0000-0000000000a1","role":"authenticated","aal":"aal1"}',true);
   EXECUTE 'SET LOCAL ROLE authenticated';
-  UPDATE public.site_settings SET value=value WHERE key='is_admin_created';
+  UPDATE public.site_settings SET value=value WHERE key='store_contact';
   allowed := FOUND;
-  RAISE NOTICE '%  ADMIN (no factor) can write site_settings.is_admin_created', CASE WHEN allowed THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  ADMIN (no factor) can write an ADMIN-tier site_settings key (store_contact)', CASE WHEN allowed THEN 'PASS' ELSE 'FAIL' END;
 END $$;
 
 -- 4. package_activations: WRITER reads nothing
@@ -3717,6 +3723,87 @@ BEGIN
   RAISE NOTICE '%  ADMIN without a factor still reads and writes the rest of the ADMIN tier (payment_public)', CASE WHEN tier_a2 THEN 'PASS' ELSE 'FAIL' END;
   RAISE NOTICE '%  anon reads no secret row', CASE WHEN n_anon = 0 THEN 'PASS' ELSE 'FAIL' END;
   RAISE NOTICE '%  the service role still reads and writes every secret row', CASE WHEN n_service = array_length(v_secret_keys, 1) AND w_service THEN 'PASS' ELSE 'FAIL' END;
+END $$;
+
+-- 43. site_settings.is_admin_created (02041): no API role writes it. The flag drives the proxy's
+--     first-boot gate and /setup. On the public sandbox, where every visitor is the factor-less
+--     demo admin, a false flag locked the demo on /setup (the reset cron included) and opened the
+--     first-admin wizard to anyone (2026-11-13). a1 signs in at aal2 with its TOTP factor (check 5),
+--     a2 at aal1 with none (section 31 switched it off): is_admin_mfa() passes for both, and neither
+--     may update, upsert, rename another row into, or delete the flag. For the rename the owner
+--     parks the flag row first, so nothing but RLS can refuse it. anon still reads the flag and the
+--     service role still writes it, checked first: before 02041 the DELETE below removed the row,
+--     and the five hole checks printed FAIL.
+RESET ROLE;
+DO $$
+DECLARE
+  v_admins text[] := ARRAY[
+    '{"sub":"aa000000-0000-0000-0000-0000000000a1","role":"authenticated","aal":"aal2"}',
+    '{"sub":"aa000000-0000-0000-0000-0000000000a2","role":"authenticated","aal":"aal1"}'];
+  v_before jsonb;
+  i integer;
+  n integer;
+  n_anon integer;
+  w_service boolean;
+  updated boolean := false;
+  upsert_denied boolean := true;
+  rename_denied boolean := true;
+  n_deleted integer := 0;
+BEGIN
+  SELECT value INTO v_before FROM public.site_settings WHERE key = 'is_admin_created';
+
+  PERFORM set_config('request.jwt.claims', '{"role":"anon"}', true);
+  EXECUTE 'SET LOCAL ROLE anon';
+  SELECT count(*) INTO n_anon FROM public.site_settings WHERE key = 'is_admin_created';
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+  EXECUTE 'SET LOCAL ROLE service_role';
+  UPDATE public.site_settings SET value = value WHERE key = 'is_admin_created';
+  w_service := FOUND;
+  EXECUTE 'RESET ROLE';
+
+  FOR i IN 1 .. array_length(v_admins, 1) LOOP
+    PERFORM set_config('request.jwt.claims', v_admins[i], true);
+    EXECUTE 'SET LOCAL ROLE authenticated';
+
+    UPDATE public.site_settings SET value = 'false'::jsonb WHERE key = 'is_admin_created';
+    updated := updated OR FOUND;
+
+    BEGIN
+      INSERT INTO public.site_settings (key, value) VALUES ('is_admin_created', 'false'::jsonb)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+      upsert_denied := false;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+
+    EXECUTE 'RESET ROLE';
+    UPDATE public.site_settings SET key = 'sv_admin_created_parked' WHERE key = 'is_admin_created';
+    EXECUTE 'SET LOCAL ROLE authenticated';
+    BEGIN
+      UPDATE public.site_settings SET key = 'is_admin_created' WHERE key = 'store_contact';
+      IF FOUND THEN rename_denied := false; END IF;
+    EXCEPTION WHEN insufficient_privilege THEN NULL;
+    END;
+    EXECUTE 'RESET ROLE';
+    UPDATE public.site_settings SET key = 'store_contact' WHERE key = 'is_admin_created';
+    UPDATE public.site_settings SET key = 'is_admin_created' WHERE key = 'sv_admin_created_parked';
+    EXECUTE 'SET LOCAL ROLE authenticated';
+
+    WITH d AS (DELETE FROM public.site_settings WHERE key = 'is_admin_created' RETURNING key)
+    SELECT count(*) INTO n FROM d;
+    n_deleted := n_deleted + n;
+
+    EXECUTE 'RESET ROLE';
+  END LOOP;
+  PERFORM set_config('request.jwt.claims', '', true);
+
+  RAISE NOTICE '%  ADMIN at aal2, or without a factor, cannot update site_settings.is_admin_created', CASE WHEN NOT updated THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  ADMIN cannot upsert site_settings.is_admin_created', CASE WHEN upsert_denied THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  ADMIN cannot rename another site_settings row into is_admin_created', CASE WHEN rename_denied THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  ADMIN cannot delete site_settings.is_admin_created', CASE WHEN n_deleted = 0 THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  site_settings.is_admin_created keeps its value through every attempt', CASE WHEN v_before IS NOT NULL AND (SELECT s.value FROM public.site_settings s WHERE s.key = 'is_admin_created') IS NOT DISTINCT FROM v_before THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  anon still reads site_settings.is_admin_created (the proxy''s first-boot gate)', CASE WHEN n_anon = 1 THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  the service role still writes site_settings.is_admin_created', CASE WHEN w_service THEN 'PASS' ELSE 'FAIL' END;
 END $$;
 
 \echo '==========================================================================='

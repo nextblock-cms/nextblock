@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo } from 'react';
-import { useOptionalTranslations } from '@nextblock-cms/utils';
+import { useOptionalTranslations } from '@nextblock-cms/utils/translations-context';
 
 import type { AffiliateLocale } from '../core/types';
 import { useAffiliatesCopyContext } from './affiliates-copy-provider';

@@ -31,6 +31,7 @@ export type ProvisionFirstAdminFailure =
   | 'invalid_input'
   | 'race_lost'
   | 'reset_failed'
+  | 'sandbox'
   | 'schema_failed'
   | 'service_role_missing'
   | 'settings_failed';
@@ -64,6 +65,19 @@ async function waitForSchemaCache(
 export async function provisionFirstAdmin(
   input: ProvisionFirstAdminInput,
 ): Promise<ProvisionFirstAdminResult> {
+  // The public sandbox never runs first-boot setup: its administrator is the published demo
+  // account, which every reset restores. Its first-admin flag can still read false (a reset that
+  // could not restore the demo admin), and then this would let any visitor create an account with
+  // any address there (2026-11-13).
+  if (process.env.NEXT_PUBLIC_IS_SANDBOX === 'true') {
+    return {
+      code: 'sandbox',
+      error:
+        'Setup is disabled on the public sandbox: its administrator is the demo account, which the next reset (every 15 minutes) restores.',
+      ok: false,
+    };
+  }
+
   const willReset = input.resetFirst === true;
 
   // A reset deliberately re-installs over an existing DB, so the one-shot guard is

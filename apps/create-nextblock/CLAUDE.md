@@ -31,7 +31,12 @@ Running from source needs the CLI's own deps: `npm install --prefix apps/create-
 - `templates/nextblock-template/**` is generated output: committed, shipped, and the update
   source for `apps/nextblock/tools/update.mjs`. Never edit it.
 - `prepack` runs the sync, so `npm pack` / `npm publish` regenerate the template from the working
-  tree; inspect with `npm pack --dry-run --ignore-scripts`.
+  tree; inspect with `npm pack --dry-run --ignore-scripts`. The sync ends with that dry run
+  (`scripts/lib/pack-check.js`): it fails when a template file is missing from the tarball or a
+  local `.env` file would ship. npm packs the template by its `.gitignore` (a copy of
+  apps/nextblock's), so fix a drop with a `!` negation in `apps/nextblock/.gitignore`, never with a
+  template `.npmignore` or by deleting the template's `.gitignore`. `pack-check.test.js` packs a
+  fixture with real npm (about 15 s).
 
 Gotchas: from source the CLI reads lib `^versions` and root overrides; the published tarball
 falls back to `latest` and baked-in overrides, so `npm run test-create` and `npm create nextblock`

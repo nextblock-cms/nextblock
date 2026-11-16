@@ -1,6 +1,7 @@
 'use client';
 
-import { formatPrice as formatPriceForLocale, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { formatPrice as formatPriceForLocale } from '@nextblock-cms/utils/utils';
 
 /** The regional locale prices are formatted in, from the site language. */
 export function getPriceLocale(lang?: string | null) {

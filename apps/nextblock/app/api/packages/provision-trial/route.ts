@@ -3,6 +3,13 @@ import { NextResponse } from 'next/server';
 import { provisionFreemiusTrialLicense } from '@nextblock-cms/ecommerce/server';
 import { getPackageById } from '@nextblock-cms/utils';
 
+import {
+  UNKNOWN_CLIENT_NETWORK,
+  createVendorAdmission,
+  resolveVendorClientNetwork,
+  type VendorLimit,
+} from '../vendor-route-limits';
+
 /**
  * Vendor-side endpoint: mint a free trial key for a headless install.
  *
@@ -10,77 +17,44 @@ import { getPackageById } from '@nextblock-cms/utils';
  * can scaffold a site with Cortex AI (and therefore the MCP server) working, without
  * anyone opening the dashboard to click "Start free trial". Only the deployment that
  * sells the packages (nextblock.dev) enables it — the same
- * `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true` and vendor Freemius credentials as
- * `/api/packages/claim-license`; every other install answers 404.
+ * `NEXTBLOCK_LICENSE_CLAIM_ENABLED=true` and vendor Freemius credentials (the developer key
+ * pair) as `/api/packages/claim-license`; every other install answers 404.
+ *
+ * It mints Cortex AI trials only (`TRIAL_PACKAGE_IDS`): the CLI never asks for anything else, and
+ * turning the vendor flag on for claims must not open trial minting for every package in the
+ * registry. Another package id gets the unknown-package answer.
  *
  * The CLI writes the returned key to the project's env as NEXTBLOCK_LICENSE_KEY and the
  * app activates it on first use (lib/packages/env-license.ts). Nothing here reveals
  * whether an arbitrary email exists beyond the "already has a license" refusal, which
- * only the email's owner has any use for; the rate limits below blunt probing.
+ * only the email's owner has any use for. Each provision spends the developer key pair the store's
+ * other Freemius flows share (`vendor-route-limits.ts`): limited per client network, per email and
+ * per instance.
  */
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const DEFAULT_PACKAGE_ID = 'cortex-ai';
+/** The packages this route mints trials for: the one the CLI asks for. */
+const TRIAL_PACKAGE_IDS: ReadonlySet<string> = new Set([DEFAULT_PACKAGE_ID]);
 
-const RATE_LIMIT_MAX_BUCKETS = 10_000;
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
-/** Per address: a person scaffolds a handful of projects a day, not dozens an hour. */
-const PER_ADDRESS_LIMIT = { max: 5, windowMs: HOUR_MS };
-/** Callers whose address cannot be determined share one stricter bucket. */
-const UNKNOWN_ADDRESS_LIMIT = { max: 20, windowMs: HOUR_MS };
+/** Per client network (an IPv4 /24, an IPv6 /48): a person scaffolds a handful of projects a day, not dozens an hour. */
+const NETWORK_LIMIT: VendorLimit = { max: 5, windowMs: HOUR_MS };
+/** Callers whose address cannot be read share one bucket, so it gets more room, never a free pass. */
+const UNKNOWN_NETWORK_LIMIT: VendorLimit = { max: 20, windowMs: HOUR_MS };
 /** Per email: retries after a transient failure, not a farm. */
-const PER_EMAIL_LIMIT = { max: 3, windowMs: DAY_MS };
+const EMAIL_LIMIT: VendorLimit = { max: 3, windowMs: DAY_MS };
+/** Provisions this instance runs per window, all callers together (each sends up to five Freemius requests). */
+const INSTANCE_LIMIT: VendorLimit = { max: 10, windowMs: 60_000 };
+const MAX_BUCKETS_PER_SCOPE = 10_000;
 
-/**
- * Best-effort, per-process limiter (not shared across serverless instances, resets on
- * cold start). The real ceiling is Freemius-side: one license per email per product.
- */
-const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
-
-function isRateLimited(key: string, limit: { max: number; windowMs: number }, now = Date.now()) {
-  for (const [bucketKey, bucket] of rateLimitBuckets) {
-    if (bucket.resetAt <= now) {
-      rateLimitBuckets.delete(bucketKey);
-    }
-  }
-
-  if (rateLimitBuckets.size >= RATE_LIMIT_MAX_BUCKETS && !rateLimitBuckets.has(key)) {
-    return true;
-  }
-
-  const bucket = rateLimitBuckets.get(key);
-
-  if (!bucket) {
-    rateLimitBuckets.set(key, { count: 1, resetAt: now + limit.windowMs });
-    return false;
-  }
-
-  bucket.count += 1;
-
-  return bucket.count > limit.max;
-}
-
-/** Prefer the platform-set address headers over the client-appendable x-forwarded-for. */
-function resolveClientAddress(request: Request) {
-  const candidates = [
-    request.headers.get('x-vercel-forwarded-for'),
-    request.headers.get('x-real-ip'),
-    request.headers.get('cf-connecting-ip'),
-    request.headers.get('x-forwarded-for')?.split(',')[0],
-  ];
-
-  for (const candidate of candidates) {
-    const trimmed = candidate?.trim();
-
-    if (trimmed) {
-      return trimmed;
-    }
-  }
-
-  return null;
-}
+const admitProvision = createVendorAdmission({
+  instance: INSTANCE_LIMIT,
+  instanceRefusalLine: `[Trial provision] ${INSTANCE_LIMIT.max} trial provisions ran on this instance this minute; refusing more until the minute is over.`,
+  maxBucketsPerScope: MAX_BUCKETS_PER_SCOPE,
+});
 
 function readString(value: unknown, maxLength: number) {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength
@@ -92,9 +66,15 @@ function readString(value: unknown, maxLength: number) {
 const EMAIL_PATTERN =
   /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
 
-function json(body: Record<string, unknown>, status: number) {
-  return NextResponse.json(body, { headers: { 'Cache-Control': 'no-store' }, status });
+function json(body: Record<string, unknown>, status: number, headers: Record<string, string> = {}) {
+  return NextResponse.json(body, { headers: { 'Cache-Control': 'no-store', ...headers }, status });
 }
+
+const REFUSALS: Record<string, string> = {
+  email: 'Too many trial requests for this email. Try again tomorrow.',
+  instance: 'The trial service is busy. Try again in a minute.',
+  network: 'Too many trial requests from your network. Try again later.',
+};
 
 export async function POST(request: Request) {
   // The public sandbox never mints licenses, even with the vendor flag copied into its env: a trial
@@ -103,22 +83,9 @@ export async function POST(request: Request) {
     return json({ error: 'Not found.', ok: false }, 404);
   }
 
-  const address = resolveClientAddress(request);
-
-  if (
-    address
-      ? isRateLimited(`ip:${address}`, PER_ADDRESS_LIMIT)
-      : isRateLimited('unknown', UNKNOWN_ADDRESS_LIMIT)
-  ) {
-    return json(
-      { code: 'RATE_LIMITED', error: 'Too many trial requests from this address. Try again later.', ok: false },
-      429
-    );
-  }
-
   const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
 
-  if (!body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return json({ code: 'INVALID_REQUEST', error: 'Invalid request body.', ok: false }, 400);
   }
 
@@ -133,7 +100,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const pkg = getPackageById(packageId);
+  const pkg = TRIAL_PACKAGE_IDS.has(packageId) ? getPackageById(packageId) : null;
 
   if (!pkg || !pkg.fm_product_id || !pkg.fm_plan_id) {
     return json({ code: 'UNKNOWN_PACKAGE', error: 'Unknown NextBlock package.', ok: false }, 400);
@@ -146,10 +113,17 @@ export async function POST(request: Request) {
     );
   }
 
-  if (isRateLimited(`email:${email}`, PER_EMAIL_LIMIT)) {
+  const network = resolveVendorClientNetwork(request);
+  const admission = admitProvision([
+    { scope: 'network', key: network, limit: network === UNKNOWN_CLIENT_NETWORK ? UNKNOWN_NETWORK_LIMIT : NETWORK_LIMIT },
+    { scope: 'email', key: email, limit: EMAIL_LIMIT },
+  ]);
+
+  if (!admission.admitted) {
     return json(
-      { code: 'RATE_LIMITED', error: 'Too many trial requests for this email. Try again tomorrow.', ok: false },
-      429
+      { code: 'RATE_LIMITED', error: REFUSALS[admission.refusedBy] ?? REFUSALS['network'], ok: false },
+      429,
+      { 'Retry-After': String(admission.retryAfterSeconds) }
     );
   }
 

@@ -3,6 +3,7 @@ import { isSandboxEnvironment } from '@nextblock-cms/db/server';
 import { minorUnitAmountToMajor } from '@nextblock-cms/utils';
 
 import type { CouponDiscountType, CouponProviderScope } from './coupons';
+import { freemiusDeveloperRequest, toFreemiusId, withFreemiusDeveloperScope } from './freemius-developer-api';
 import { computeFreemiusSaleDiscountPercent } from './freemius-pricing';
 import {
   readFreemiusEnvValue,
@@ -15,7 +16,8 @@ import { hydrateFreemiusEnvFromDb } from './payment-config';
  * login is published. Its reset syncs the store from the operator's Freemius developer account,
  * so its products carry the operator's real product ids: a coupon pushed from there would be live
  * on them and outlive every reset (the reset drops only the mapping rows). Thrown by
- * freemiusCouponRequest and recorded as the coupon's sync error; the coupons screen shows it too.
+ * freemiusCouponRequest (before the developer key pair or a bearer is resolved) and recorded as
+ * the coupon's sync error; the coupons screen shows it too.
  */
 export const FREEMIUS_COUPON_SANDBOX_MESSAGE = "Coupons aren't sent to Freemius in the sandbox: its checkout is simulated.";
 
@@ -85,17 +87,41 @@ async function freemiusCouponRequest(input: {
 
   // Overlay any CMS-configured Freemius credentials (DB-first) before the sync env reads.
   await hydrateFreemiusEnvFromDb();
-  const apiKey = getFreemiusApiKey(input.productId);
+
+  // Both ids land in a signed request path: digits only.
+  const productId = toFreemiusId(input.productId);
+  const couponId = input.couponId ? toFreemiusId(input.couponId) : null;
+
+  if (!productId || (input.couponId && !couponId)) {
+    throw new Error('Refused a Freemius coupon request for an id that is not a Freemius id.');
+  }
+
+  const couponPath = couponId ? `/${couponId}` : '';
+
+  // The developer key pair first: it reaches every product of the account, no per-product token.
+  // A 401/403 refuses the request before anything is written, so the product's bearer may try next.
+  const viaDeveloper = await withFreemiusDeveloperScope(productId, () =>
+    freemiusDeveloperRequest({
+      method: input.method,
+      path: `/plugins/${productId}/coupons${couponPath}.json`,
+      body: input.method === 'DELETE' ? null : input.body || {},
+    })
+  );
+
+  if (viaDeveloper.handled) {
+    return viaDeveloper.value as any;
+  }
+
+  const apiKey = getFreemiusApiKey(productId);
 
   if (!apiKey) {
     throw new Error(
-      `Missing Freemius API bearer token for product ${input.productId}. Set FREEMIUS_API_KEY or FREEMIUS_CHECKOUT_PRODUCTS_JSON[${input.productId}].apiKey.`
+      `No Freemius credentials reach product ${productId}: add the developer key pair under CMS → Payments, or set FREEMIUS_API_KEY or FREEMIUS_CHECKOUT_PRODUCTS_JSON[${productId}].apiKey.`
     );
   }
 
-  const couponPath = input.couponId ? `/${input.couponId}` : '';
   const response = await fetch(
-    `https://api.freemius.com/v1/products/${input.productId}/coupons${couponPath}.json`,
+    `https://api.freemius.com/v1/products/${productId}/coupons${couponPath}.json`,
     {
       method: input.method,
       headers: {
@@ -516,7 +542,7 @@ export async function deleteCouponFromFreemius(input: {
   client: SupabaseLikeClient;
 }) {
   // A mapping row on the sandbox can name any remote coupon (a visitor can write one as the demo
-  // admin), and the delete would carry the operator's bearer: send nothing there.
+  // admin), and the delete would carry the operator's developer key or bearer: send nothing there.
   if (isSandboxEnvironment()) {
     return;
   }

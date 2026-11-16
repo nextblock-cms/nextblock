@@ -4,6 +4,8 @@ import { useRef, useState } from 'react';
 import { Image as ImageIcon, Loader2, UploadCloud, X } from 'lucide-react';
 import { Button, Input, Label } from '@nextblock-cms/ui';
 
+import { presignedPutFetchHeaders } from '../../../../lib/storage/presigned-put-client';
+
 export type ImageR2Value = {
   alt?: string;
   file_name?: string;
@@ -108,9 +110,11 @@ export function ImageR2Picker({
         throw new Error(presignedPayload.error || 'Could not prepare the upload.');
       }
 
+      // The URL is signed for this file's size and type: send exactly the returned headers
+      // (the browser sets Content-Length from the body itself).
       const uploadResponse = await fetch(presignedPayload.uploadUrl, {
         body: file,
-        headers: presignedPayload.headers ?? { 'Content-Type': file.type },
+        headers: presignedPutFetchHeaders(presignedPayload.headers, file),
         method: 'PUT',
       });
 

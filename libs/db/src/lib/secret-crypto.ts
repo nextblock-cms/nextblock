@@ -13,7 +13,7 @@ import 'server-only';
 // Every envelope is sealed for one slot: the row and field it is stored in
 // (`site_settings:email_secret:pass`), passed to AES-GCM as associated data. A reader names
 // its own slot, so an envelope copied from another row or field fails to open instead of
-// handing its plaintext to the wrong consumer. Before 0.23.1 (version 1) envelopes carried no
+// handing its plaintext to the wrong consumer. Before 0.23.0 (version 1) envelopes carried no
 // slot and opened anywhere: until the 2026-11-04 fix (migration 02038) an admin session could
 // copy the Stripe key's envelope into the SMTP password over PostgREST, save its own SMTP
 // host and receive the key through SMTP AUTH. Version 1 envelopes are still read, and each
@@ -23,7 +23,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes }
 export const SECRET_ENVELOPE_ALGORITHM = 'aes-256-gcm';
 /** Every new envelope: sealed with its slot as associated data, opens only in that slot. */
 export const SECRET_ENVELOPE_VERSION = 2;
-/** Written before 0.23.1 without associated data: opens in any slot until it is re-sealed. */
+/** Written before 0.23.0 without associated data: opens in any slot until it is re-sealed. */
 export const LEGACY_SECRET_ENVELOPE_VERSION = 1;
 
 export type SecretEnvelopeVersion =
@@ -151,12 +151,12 @@ export function decryptSecret(params: {
   encryptionSecret: string;
   /**
    * The slot the caller reads. A version 2 envelope sealed for any other slot fails to open; a
-   * version 1 envelope (before 0.23.1) opens in any slot until its screen re-seals it.
+   * version 1 envelope (before 0.23.0) opens in any slot until its screen re-seals it.
    */
   slot: SecretSlot;
 }): string {
   const envelope = assertEnvelope(params.envelope);
-  // A compiled caller from before 0.23.1 passes no slot: it keeps reading version 1 envelopes
+  // A compiled caller from before 0.23.0 passes no slot: it keeps reading version 1 envelopes
   // and never opens a version 2 one. TypeScript callers cannot omit it.
   const associatedData = params.slot === undefined ? null : slotData(params.slot);
   if (envelope.version === SECRET_ENVELOPE_VERSION && associatedData === null) {

@@ -16,7 +16,7 @@ import { getCartItemActivePrice, useCartSubtotal } from '../cart-store';
 import { useCart } from '../use-cart';
 import { isDigitalItem } from '../types';
 import Link from 'next/link';
-import { useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { usePriceFormatter } from '../use-price-formatter';
 import { ShippingEstimator } from './ShippingEstimator';
 import { useCurrency } from '../CurrencyProvider';

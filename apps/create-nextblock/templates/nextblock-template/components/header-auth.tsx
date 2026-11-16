@@ -6,7 +6,7 @@ import { Button } from "@nextblock-cms/ui";
 import { signOutAction } from "../app/actions";
 import { useAuth } from "../context/AuthContext";
 import { clearSandboxCortexKey } from "../lib/cortex-ai/sandbox-headers";
-import { useTranslations } from "@nextblock-cms/utils";
+import { useTranslations } from "@nextblock-cms/utils/translations-context";
 
 import {
   DropdownMenu,

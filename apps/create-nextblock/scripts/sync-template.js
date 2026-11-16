@@ -7,6 +7,7 @@ import fs from 'fs-extra';
 import chalk from 'chalk';
 import { STANDALONE_ESLINT_CONFIG } from '../bin/lib/eslint-config.js';
 import { retryTransientFsErrors } from './lib/fs-retry.js';
+import { findPackProblems } from './lib/pack-check.js';
 import { findTemplateProblems } from './lib/template-check.js';
 import { shouldSyncTemplateDoc } from './lib/template-docs.js';
 
@@ -134,6 +135,15 @@ async function ensureTemplateSync() {
     throw new Error(`The synced template is incomplete:\n  - ${problems.join('\n  - ')}`);
   }
 
+  // A complete template on disk can still ship incomplete: npm packs the template by its
+  // .gitignore (a copy of apps/nextblock's), which dropped .env.example and .env.docker.example
+  // from every published CLI until 0.23.4. So ask npm what it would pack (scripts/lib/pack-check.js).
+  console.log(chalk.blue('Checking what npm would publish (npm pack --dry-run)'));
+  const packProblems = await findPackProblems({ packageDir: PROJECT_ROOT, templateDir: TARGET_DIR });
+  if (packProblems.length > 0) {
+    throw new Error(`npm would publish a broken create-nextblock:\n  - ${packProblems.join('\n  - ')}`);
+  }
+
   console.log(chalk.green('Template sync complete.'));
 }
 
@@ -231,6 +241,8 @@ pnpm-debug.log*
 
 supabase/.temp
 supabase/.branches
+supabase/signing_keys.json
+supabase/snippets/
 
 # Local safety copies written by \`npm run update\` when it replaces a framework file.
 .nextblock-backup/
@@ -271,10 +283,10 @@ async function ensureClientTranslations() {
   }
 
   let content = await fs.readFile(providersPath, 'utf8');
-  const wrapperImportPath = '@nextblock-cms/utils';
+  const wrapperImportPath = '@nextblock-cms/utils/translations-context';
   const wrapperImportStatement = `import { TranslationsProvider } from '${wrapperImportPath}';`;
   const existingImportRegex =
-    /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@nextblock-cms\/utils['"];?/;
+    /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@nextblock-cms\/utils(?:\/translations-context)?['"];?/;
   const legacyImportRegex =
     /import\s+\{\s*TranslationsProvider\s*\}\s*from\s*['"]@\/lib\/client-translations['"];?/;
 

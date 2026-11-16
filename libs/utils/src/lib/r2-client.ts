@@ -7,14 +7,15 @@ if (typeof window !== 'undefined') {
   throw new Error(SERVER_ONLY_ERROR_MESSAGE);
 }
 
-import { S3Client, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { S3Client, DeleteObjectsCommand, type S3ClientConfig } from "@aws-sdk/client-s3";
 
 let cachedClient: S3Client | null = null;
 let cachedPresignClient: S3Client | null = null;
 let warnedMissingEnv = false;
 
-// See libs/utils/src/server.ts for the rationale behind preferPublicEndpoint / forcePathStyle.
-function buildClient(preferPublicEndpoint = false): S3Client | null {
+// See libs/utils/src/server.ts for the rationale behind preferPublicEndpoint / forcePathStyle and
+// forPresign (no default checksum of the empty body in presigned upload URLs).
+function buildClient(preferPublicEndpoint = false, forPresign = false): S3Client | null {
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
@@ -33,7 +34,7 @@ function buildClient(preferPublicEndpoint = false): S3Client | null {
     return null;
   }
 
-  return new S3Client({
+  const config: S3ClientConfig = {
     region: process.env.R2_REGION || "auto",
     endpoint,
     forcePathStyle: process.env.R2_FORCE_PATH_STYLE === "true",
@@ -41,7 +42,11 @@ function buildClient(preferPublicEndpoint = false): S3Client | null {
       accessKeyId,
       secretAccessKey,
     },
-  });
+  };
+  if (forPresign) {
+    config.requestChecksumCalculation = "WHEN_REQUIRED";
+  }
+  return new S3Client(config);
 }
 
 export async function getS3Client(): Promise<S3Client | null> {
@@ -52,11 +57,8 @@ export async function getS3Client(): Promise<S3Client | null> {
 }
 
 export async function getS3PresignClient(): Promise<S3Client | null> {
-  if (!process.env.R2_S3_PUBLIC_ENDPOINT) {
-    return getS3Client();
-  }
   if (!cachedPresignClient) {
-    cachedPresignClient = buildClient(true);
+    cachedPresignClient = buildClient(true, true);
   }
   return cachedPresignClient;
 }

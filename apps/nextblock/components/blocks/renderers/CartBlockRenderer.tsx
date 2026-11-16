@@ -1,5 +1,5 @@
 import React from 'react';
-import { Cart } from '@nextblock-cms/ecommerce/components/Cart';
+import { LazyCart } from '../../commerce/LazyCommerceClients';
 import PaymentReadinessBoundary from '../../commerce/PaymentReadinessBoundary';
 import type { VisualEditAttributes } from '../../../lib/visual-editing/types';
 
@@ -11,7 +11,7 @@ export default function CartBlockRenderer({ visualEditAttributes }: CartBlockRen
   return (
     <div {...visualEditAttributes}>
       <PaymentReadinessBoundary>
-        <Cart />
+        <LazyCart />
       </PaymentReadinessBoundary>
     </div>
   );

@@ -58,7 +58,6 @@ vi.mock('@nextblock-cms/db/server', () => ({
   getSsgSupabaseClient: () => ssgClient(),
   getServiceRoleSupabaseClient: mocks.getServiceRoleSupabaseClient,
 }));
-vi.mock('@nextblock-cms/ecommerce', () => vi.importActual('../../../../../../libs/ecommerce/src/lib/currency'));
 vi.mock('@nextblock-cms/affiliates/server', () => vi.importActual('../../../../../../libs/affiliates/src/lib/repository'));
 vi.mock('../../../../lib/storage/provider', () => ({ resolveMediaBaseUrl: () => 'https://media.test' }));
 vi.mock('../../../../lib/affiliates/image-origins', () => ({ getStorefrontImageOrigins: () => ['https://media.test'] }));

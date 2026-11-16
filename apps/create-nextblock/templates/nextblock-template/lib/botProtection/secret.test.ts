@@ -108,7 +108,7 @@ describe('bot protection secret at rest', () => {
     expect(readStoredBotProtectionSecret(stripe)).toEqual({ secretKey: '', storage: 'unreadable' });
   });
 
-  it('re-seals an envelope from before 0.23.1 for its field, and nothing else', () => {
+  it('re-seals an envelope from before 0.23.0 for its field, and nothing else', () => {
     const legacy = { secretKey: legacyEnvelope(SECRET, TEST_KEY) };
     expect(readStoredBotProtectionSecret(legacy)).toEqual({ secretKey: SECRET, storage: 'encrypted' });
 

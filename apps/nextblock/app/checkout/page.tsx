@@ -1,7 +1,7 @@
-import { Checkout } from '@nextblock-cms/ecommerce';
+import { Checkout } from '@nextblock-cms/ecommerce/components/Checkout';
 import PaymentReadinessBoundary from '../../components/commerce/PaymentReadinessBoundary';
 import { createClient } from '@nextblock-cms/db/server';
-import { getDefaultUserAddresses } from '@nextblock-cms/ecommerce/server';
+import { getDefaultUserAddresses } from '@nextblock-cms/ecommerce/customer-addresses';
 import { getUcpCartCheckoutItems } from '../lib/ucp/server';
 import { UcpCartHydrator } from './UcpCartHydrator';
 

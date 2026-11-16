@@ -1,6 +1,7 @@
 'use client';
 
-import { cn, useTranslations } from '@nextblock-cms/utils';
+import { useTranslations } from '@nextblock-cms/utils/translations-context';
+import { cn } from '@nextblock-cms/utils/utils';
 import { useState } from 'react';
 
 import { translateOrFallback } from '../invoice-ui';

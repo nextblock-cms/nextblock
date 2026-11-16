@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
   toastError: vi.fn(),
 }));
 
-vi.mock('@nextblock-cms/utils', async (importOriginal) => ({
+vi.mock('@nextblock-cms/utils/translations-context', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useTranslations: () => ({ t: (key: string) => key, lang: 'en' }),
 }));

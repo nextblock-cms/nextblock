@@ -2,7 +2,7 @@ import 'server-only';
 
 import Stripe from 'stripe';
 import { getStripeClient, resolveStripeKeyLivemode } from '../stripe/client';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { countries } from '../countries';
 import {
   CheckoutSessionInput,
@@ -181,6 +181,70 @@ async function upsertStripeCheckoutCustomer(input: {
   } catch (error) {
     console.error('Failed to upsert Stripe customer for checkout prefill:', error);
     return null;
+  }
+}
+
+/**
+ * The keyed 503 for a checkout this store cannot take a payment for right now (seeded EN + FR as
+ * `ecommerce.checkout_payments_unavailable`): Stripe refused the configured key, or the order could
+ * not record its Checkout Session.
+ */
+function paymentsUnavailableResult() {
+  return {
+    error:
+      'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
+    errorKey: 'ecommerce.checkout_payments_unavailable',
+    errorStatus: 503,
+    url: null,
+  };
+}
+
+/**
+ * Stores a new Checkout Session's id on its pending order. The checkout success page finds a Stripe
+ * order only through this column: it asks Stripe about a session only once an order stores its id
+ * (`app/checkout/success/actions.ts`), so made-up ids never spend the operator's Stripe rate limit.
+ * True only when the order row took the id: an error, a request that threw and an update that
+ * matched no row are all false.
+ */
+async function saveStripeSessionIdOnOrder(
+  supabase: SupabaseClient<any>,
+  orderId: string,
+  sessionId: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('orders')
+      .update({ stripe_session_id: sessionId })
+      .eq('id', orderId)
+      .select('id');
+
+    if (error) {
+      console.error('Failed to save Stripe session ID on order:', error);
+      return false;
+    }
+
+    if (!Array.isArray(data) || data.length === 0) {
+      console.error(`Failed to save Stripe session ID on order ${orderId}: no order row was updated.`);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Failed to save Stripe session ID on order:', error);
+    return false;
+  }
+}
+
+/**
+ * Expires a Checkout Session that its order could not record, so it never takes a payment the
+ * success page would answer with "Order not found". Best effort: its URL never left the server, so a
+ * session that stays open is one nobody can reach, and Stripe expires it after 24 hours.
+ */
+async function expireUnrecordedStripeSession(stripe: Stripe, sessionId: string, orderId: string) {
+  try {
+    await stripe.checkout.sessions.expire(sessionId);
+  } catch (error) {
+    console.error(`Failed to expire the Stripe Checkout Session that order ${orderId} could not record:`, error);
   }
 }
 
@@ -862,13 +926,13 @@ export class StripeProvider implements PaymentProvider {
         },
       });
 
-      const { error: updateOrderError } = await supabase
-        .from('orders')
-        .update({ stripe_session_id: session.id })
-        .eq('id', orderId);
-
-      if (updateOrderError) {
-        console.error('Failed to save Stripe session ID on order:', updateOrderError);
+      // The URL leaves the server only once the order stores the session id: a session the order
+      // could not record would take the payment and then show the buyer "Order not found" on the
+      // success page. It is expired instead, the order fails, and the shopper gets the keyed 503.
+      if (!(await saveStripeSessionIdOnOrder(supabase, orderId, session.id))) {
+        await expireUnrecordedStripeSession(stripe, session.id, orderId);
+        await supabase.from('orders').update({ status: 'failed' }).eq('id', orderId);
+        return paymentsUnavailableResult();
       }
 
       return { url: session.url };
@@ -884,13 +948,7 @@ export class StripeProvider implements PaymentProvider {
         error?.type === 'StripeAuthenticationError';
 
       if (isConfigError) {
-        return {
-          error:
-            'This store is not able to take payments right now. Please contact the seller to complete your purchase.',
-          errorKey: 'ecommerce.checkout_payments_unavailable',
-          errorStatus: 503,
-          url: null,
-        };
+        return paymentsUnavailableResult();
       }
 
       return {

@@ -387,20 +387,48 @@ The cron route then, in this order:
   error-and-warning alarm otherwise: one `warnings` entry for a backend or bucket mismatch, and one
   per endpoint variable whose origin differs
 - empties the R2 bucket, so nothing a visitor uploaded outlives the run, uploads the seed assets,
-  and executes the generated reset SQL (Step A deletes every auth user but the two preserved ids)
+  and executes the generated reset SQL. Step A deletes every auth user but the two preserved ids
+  and `demo@nextblock.dev`, whatever its id. Step E makes the users it kept `ADMIN`, and Step F
+  sets `is_admin_created`, all inside the reset transaction
 - restores the demo admin right away: re-creates `demo@nextblock.dev` when missing, otherwise
   re-asserts its published password and deletes every second factor on it (`auth.users` rows and
   `auth.mfa_factors` survive the SQL, and the demo session is public). A failure is logged, never
   thrown, and nothing that runs later can skip this step
+- sets `site_settings.is_admin_created` to `true` and makes the demo admin's profile `ADMIN`
+  (`pinSandboxAdmin`). It sets the flag even when the restore failed: a false flag sends every
+  visitor to `/setup`
 - writes the core media rows
-- with `FREEMIUS_ECOMMERCE_SANDBOX_KEY`: activates Commerce Pro, syncs the Freemius products, then
-  dresses the catalog, shop pages and categories (an error here ends the run with a 500, except in
-  the Affiliates product dressing, which runs in its own transaction and only logs)
+- with `FREEMIUS_ECOMMERCE_SANDBOX_KEY`: activates Commerce Pro, syncs the Freemius products (the
+  only Freemius sync on the sandbox: the CMS Sync from Freemius refuses there), then dresses the
+  catalog, shop pages and categories (an error here ends the run with a 500, except in the
+  Affiliates product dressing, which runs in its own transaction and only logs)
 - activates Cortex AI when its sandbox key is set, then seeds the store data (branding, the admin
   profile, demo orders)
 - with `FREEMIUS_AFFILIATES_SANDBOX_KEY`: activates the package and seeds the demo partners
   (`partner@nextblock.dev` at `/partners/studio-nova`, and Atelier Boréal) in their own transaction
   after the reset committed (docs/15 → "Sandbox demo")
+
+**If the sandbox shows the setup wizard.** That means `is_admin_created` reads false. On
+2026-11-13 cms.nextblock.dev sent every page, `/sign-in` and the reset cron itself to `/setup`, so
+the reset never ran again. Since then the proxy lets `/api/cron/reset-sandbox` through its
+first-boot gate, so the next run (within 15 minutes) repairs the flag and the demo admin. Since
+`02041` no API session can write the flag, and `provisionFirstAdmin` refuses on the sandbox, so
+nobody can create an account through `/setup` meanwhile. Check it with
+`curl https://cms.nextblock.dev/api/setup/status` (`hasAdmin`). To repair it at once, run the
+cron's own call in the sandbox project's SQL editor:
+
+```sql
+select net.http_get(
+  url := 'https://cms.nextblock.dev/api/cron/reset-sandbox',
+  headers := jsonb_build_object('Authorization', 'Bearer ' ||
+    (select decrypted_secret from vault.decrypted_secrets where name = 'sandbox_cron_secret')),
+  timeout_milliseconds := 90000
+);
+```
+
+On a deployment older than that fix, set the flag first
+(`update public.site_settings set value = 'true'::jsonb where key = 'is_admin_created';`), because
+the proxy redirects that call too.
 
 The app refuses every sign-up on the sandbox (docs/15 → "What a visitor can and cannot do
 there"), but GoTrue itself still accepts one from anyone holding the publishable key and mails the
@@ -421,6 +449,14 @@ address they typed. On the sandbox's Supabase project, keep:
   sandbox apps whose rate limits you can afford to see exhausted, never the production keys.
 - **`OPENROUTER_API_KEY` only if you accept the free-model traffic.** A visitor without their own
   key falls back to it, locked to free models for text and alt text.
+- **The Freemius developer key pair for the reset alone.** The reset's product sync needs it, and
+  it is the pair production's checkouts, license links, claims, trials, coupon pushes and webhook
+  checks depend on, so nothing a visitor can trigger spends it: Sync from Freemius
+  (`triggerFreemiusSync`, `triggerSingleProductSync`) refuses on the sandbox, the Sync Full Store
+  button is disabled, and order pages read no license there. `findDeveloperKeyProblems`
+  (`tools/scripts/lib/sandbox-guards.js`) fails `security:check` on any other caller of the
+  catalog reader (`DEVELOPER_KEY_CALLERS`). Until 2026-11-13 each Sync click sent about 22 signed
+  requests on that pair, with no limit.
 
 ## Deployment Notes
 
@@ -488,7 +524,13 @@ keep these rules when touching the public surface:
   layout fetches its locale-independent chrome in a single `Promise.all`; on Vercel
   every sequential `unstable_cache` read is a network round trip, and a cold refill
   showed up in Lighthouse as a 633 ms body delay. Draft mode bypasses the cache
-  automatically.
+  automatically. While the visual editor is on (draft mode, or
+  `NEXTBLOCK_VISUAL_EDITING_ENABLED`) the layout also asks
+  `currentUserCanPublishProductDrafts()` for the toolbar's product Publish flag
+  (`getCmsActor()`: the session, the second-factor state and the caller's
+  profile), loading `lib/visual-editing/product-drafts.ts` through `import()`;
+  the toolbar's second-factor note reuses the profile the layout already reads.
+  With the editor off a request loads and reads nothing more.
 - **Keep the first frame cheap for the compositor.** `SectionBlockRenderer` promotes a
   section to its own GPU layer (`transform-gpu`, `preserve-3d`) only when it has a
   background image; every other section is a plain `isolate`. Hero cards must not use
@@ -505,12 +547,74 @@ keep these rules when touching the public surface:
   visible within 60 s. Never add `export const fetchCache = 'force-no-store'` to a public
   segment: Next disables `unstable_cache` under it — that single line had switched off
   all layout caching on `/[slug]`, `/article/[slug]` and `/product/[slug]`.
+- **Commerce code ships only where it renders.** A route loads every client component its
+  server graph reaches: Turbopack puts them all in the route's entry chunks (`entryJSFiles`),
+  Next writes a `<script async>` for each, and a Server Component's `import()` does not split
+  them (Next documents this), so the `components/blocks/ecommerceRendererLoaders.ts` imports
+  defer server work only. Two rules keep the store off blog posts and landing pages. On public
+  routes, the CMS layout and the block editors, import `@nextblock-cms/ecommerce` through deep
+  subpaths (`/product-actions`, `/currency`, `/components/Cart`, `/pages/cms/payments/queries`,
+  …): the main barrel re-exports every storefront component and the CMS `ProductForm`,
+  `/server` every CMS commerce screen, and one value import of either adds all of them to the
+  route (`import type` is erased, so it is fine). And the commerce block renderers draw their
+  client components through `components/commerce/LazyCommerceClients.tsx` (`next/dynamic` in a
+  Client Component), which still renders them on the server and preloads their chunks, but
+  only on a page that renders the block. Its `import()`s name app modules: the library's
+  components go through the one-line re-exports in `components/commerce/lazy/`, because an
+  `import()` of a library makes Nx treat the whole library as lazy-loaded and
+  `@nx/enforce-module-boundaries` then refuses every static import of it in the app (ESLint
+  reads Nx's cached project graph, so run an `nx` command first or a stale graph hides the
+  error). On 2026-11-04 this took the home page from 398 KB to
+  213 KB of gzipped JavaScript (the CMS product, shipping, coupon and payment forms, the
+  checkout and the Supabase browser client the reviews use were all on it) and a product page
+  from 402 KB to 297 KB, its lazy details and reviews chunks included.
+  `experimental.optimizePackageImports` made no difference: the monorepo resolves the libs
+  from source. `tools/scripts/commerce-chunking.test.ts` guards both rules. The
+  `@nextblock-cms/utils` barrel did the same from the root layout: it re-exports
+  `custom-blocks.ts` (all of Zod and the custom-block schemas) and, since 0.23.4's allowlist
+  sanitizer, `authored-html.ts` (sanitize-html and htmlparser2, about 39 KB gzipped), and the
+  package declares no `sideEffects`, so the layout's `TranslationsProvider`, `useTranslations`
+  and `cn` imports and every ui primitive's `cn` put all of it on every page (255.1 KB gzipped on
+  the home page in the 0.23.4 verification build). Client code on public routes, and the ui,
+  storefront and partner components of the libraries, import utils through deep subpaths
+  (`@nextblock-cms/utils/utils`, `/translations-context`, `/color`, …; `/authored-html` only in a
+  component that sanitizes in the browser) and import no Zod, so neither the sanitizer nor Zod is
+  in a public route's entry chunks any more. Tests mock the deep module
+  (`vi.mock('@nextblock-cms/utils/translations-context', …)`): vitest mocks by resolved file, so a
+  barrel mock never reaches code that imports a deep module.
+  `tools/scripts/root-layout-chunking.test.ts` walks the root layout's and every public route's
+  client graph and every lazy chunk those load (an `import()` in client code, or the file a Web
+  Worker or a service worker names: `new Worker(new URL('./x.worker.ts', import.meta.url))`,
+  `SharedWorker`, `navigator.serviceWorker.register(new URL('./sw.ts', import.meta.url))`, also
+  read through `window.`, `globalThis.` or `self.`; a path written without `./`, `'sw.ts'`, is
+  read as `./sw.ts` and as written), and the chunks those load in turn (the in-page editors
+  aside): it refuses the barrel and Zod everywhere, `import('zod')` included (a package is no
+  module the walk can enter, so the call counts in the graph that makes it), and the sanitizer,
+  `import('sanitize-html')` included, outside the chunks its `SANITIZING_LAZY_CHUNKS` lists with
+  why (a listed chunk may also load `/authored-html` with `import()`). A `?query` or `#hash`
+  (`zod?client`) or a path into node_modules counts as the package it loads, and an import, or a
+  worker's or service worker's `new URL(...)`, whose path the walk cannot read, or one that
+  resolves to a file the scan skips (a script, a test; the generated files aside), fails the
+  check; a URL held in a variable (`new Worker(url)`) is not followed. Re-measured on 2026-11-14
+  (a production `next build`, the union of `entryJSFiles` below): the home page loads 125.0 KB
+  gzipped (255.3 KB with the framework's `rootMainFiles`), and `/[slug]`, `/cart`, `/checkout`,
+  `/product/[slug]`, `/article/[slug]` and `/setup` each load about 130 KB less than before. On
+  public pages Zod now rides only in the in-page visual editor's chunks, and the sanitizer only
+  there and in the lazy chunks of the featured_product and product_details blocks, which a page
+  loads only when it renders them.
 - **Measure before and after.** `npx lighthouse <url> --preset=desktop` (and the
   default mobile run) against a production build; decode the payload size from the
   `__next_f` script and check `observedFirstContentfulPaint` vs `observedFirstPaint`
   in the JSON — a gap there is the parser-blocking symptom above. Locally, start the
   build with `next start apps/nextblock` (the Nx `dist/` copy can be stale from another
-  checkout, and `next start` on a stale copy crashes in `setupFsCheck`).
+  checkout, and `next start` on a stale copy crashes in `setupFsCheck`). For JavaScript
+  weight, `npx nx run nextblock:build-base` needs no env: what a route loads up front is the
+  union of `entryJSFiles` in `.next/server/app/<route>/page_client-reference-manifest.js`
+  (evaluate it with `vm`; it assigns `globalThis.__RSC_MANIFEST`), and
+  `.next/server/app/<route>/page/react-loadable-manifest.json` lists the lazy chunks. To see
+  why a module is there, run `next analyze -o` in `apps/nextblock`, then
+  `next analyze export --route /`: its JSON Lines hold each chunk's source files with sizes and
+  the import graph, so a breadth-first search from the page finds the chain.
 
 Seeded marketing copy is content, not code: colour-contrast or markup fixes to it are
 forward-only data migrations scoped by content signature (see `02006`), never edits
@@ -669,13 +773,46 @@ accident:
 - `products.short_description` renders through `ShortDescription`
   (`libs/ecommerce/src/lib/components/ShortDescription.tsx`) everywhere: HTML when the row
   contains markup (older rows carry embeds), otherwise escaped text with line breaks.
+- The footer's "Cookie settings" control (`components/privacy/CookieSettingsButton.tsx`) is a
+  button, not a link: it reopens the Law 25 consent banner on the stored choice through
+  `components/privacy/consent-banner-control.ts`, and renders only while the root layout mounts
+  the banner (CMS → Settings → Privacy). A reopen moves focus into the banner; Close and Escape
+  keep the stored choice and record nothing; every close returns focus to the control. A first
+  visit never takes focus and closes only on a decision. Copy: `components/privacy/consent-copy.ts`,
+  seeded by 02042.
+  Withdrawing a category the stored choice granted (analytics or marketing: the banner's `decide`
+  runs `withdrawConsent` from `lib/privacy/consent-withdrawal.ts`) sends Consent Mode a denied
+  update (`gtag('consent', 'update', …)`, or the same command on GTM's `dataLayer`), expires every
+  Google tag cookie (`_ga`, `_ga_*`, `_gid`, `_gat*`, `_gac_*`, `_dc_gtm_*`, `_gcl_*`, host-only and
+  on each parent domain, `_ga` and `_gid` on a marketing-only withdrawal too), waits up to 4 s for
+  the decision's `privacy_consent_logs` request, then reloads the page once: unmounting
+  `ConsentGatedAnalytics` cannot unload gtag.js, gtm.js or an injected custom script. Granting
+  more, the same choice and a first decision never reload. The record is best effort: the request
+  is a server action, which Next queues behind any pending router action and sends without
+  `keepalive`, so one not sent within the 4 s is lost to the reload. After the reload
+  `ConsentGatedAnalytics` loads GA, GTM and the consented custom scripts only while analytics is
+  granted. No tag is gated on marketing and no Consent Mode default is set, so when marketing alone
+  is withdrawn and analytics stays granted they load again, and a GTM container's advertising tags
+  follow that container's own consent settings.
 
 ## Current Repo Notes
 
-Two repo facts are worth keeping in mind while contributing:
+Three repo facts are worth keeping in mind while contributing:
 
 - the workspace import path is `@nextblock-cms/ecommerce`, but the current
   `libs/ecommerce/package.json` name is still `@nextblock-cms/ecom`
 - a standalone `npx nx run ecommerce:build --skip-nx-cache` check is currently
   not green, so use app-level validation and targeted tracing until that build
   target is repaired
+- `import()` and `require()` in the app and the libraries take a string literal: a template
+  literal with a substitution makes Turbopack bundle every file in the folder it names, tests
+  included, which broke every standalone build from 0.23.0 to 0.23.3 (`Can't resolve 'vitest'`).
+  The folder sweeps `require.context` and `import.meta.glob` (Next types the latter for
+  Turbopack) are refused called, stored or destructured (`const { glob } = import.meta`), and so
+  is `import.meta` used as a whole value (`const meta = import.meta`, `import.meta[key]`); its
+  other members stay fine (`import.meta.url`, `const { env } = import.meta`). A cast or type
+  arguments hide no call (`(require as any).context(...)` compiles to `require.context(...)`),
+  Node's `require` is never stored or passed on (a local binding named `require` may be), and
+  `module.require()` and `new URL(..., import.meta.url)` take a literal too. Block editors load
+  through `app/cms/blocks/components/blockEditorLoaders.ts`;
+  `tools/scripts/dynamic-import-specifiers.test.ts` guards the rule

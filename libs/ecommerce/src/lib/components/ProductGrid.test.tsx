@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
  * first row eager, so images below the fold do not compete with the first paint.
  */
 
-vi.mock('@nextblock-cms/utils', async (importOriginal) => ({
+vi.mock('@nextblock-cms/utils/translations-context', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   useTranslations: () => ({ t: (key: string) => key, lang: 'en' }),
 }));

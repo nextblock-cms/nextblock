@@ -23,7 +23,7 @@ vi.mock('@nextblock-cms/db/server', () => ({
   verifyPackageOnline: vi.fn(async () => true),
 }));
 
-vi.mock('@nextblock-cms/ecommerce/server', () => ({
+vi.mock('@nextblock-cms/ecommerce/stripe/client', () => ({
   getStripeClient: mocks.getStripeClient,
   StripeNotConfiguredError: class StripeNotConfiguredError extends Error {},
 }));

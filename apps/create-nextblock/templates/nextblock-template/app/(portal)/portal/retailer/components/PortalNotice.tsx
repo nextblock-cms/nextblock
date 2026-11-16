@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 
 /**
  * A status banner of the portal (welcome, in review, changes requested, suspended…). Pure markup

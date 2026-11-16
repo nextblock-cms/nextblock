@@ -4,7 +4,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { CheckCircle2 } from 'lucide-react';
 import { Button, Label } from '@nextblock-cms/ui';
-import { cn } from '@nextblock-cms/utils';
+import { cn } from '@nextblock-cms/utils/utils';
 import { AFFILIATE_PORTAL_PAYOUTS_PATH } from '@nextblock-cms/affiliates';
 
 import { openStripeExpressDashboard, refreshStripeConnectStatus, startStripeConnectOnboarding } from '../actions';

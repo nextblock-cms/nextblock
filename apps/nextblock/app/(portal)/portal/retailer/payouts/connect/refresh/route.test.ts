@@ -18,7 +18,6 @@ vi.mock('../../../../../../../lib/affiliates/connect-service', () => ({ createAf
 vi.mock('next/cache', () => ({ unstable_cache: (fn: unknown) => fn }));
 vi.mock('next/headers', () => ({ headers: async () => new Headers() }));
 vi.mock('@nextblock-cms/db/server', () => ({ getSsgSupabaseClient: vi.fn() }));
-vi.mock('@nextblock-cms/ecommerce', () => vi.importActual('../../../../../../../../../libs/ecommerce/src/lib/currency'));
 vi.mock('@nextblock-cms/affiliates/server', () => vi.importActual('../../../../../../../../../libs/affiliates/src/lib/repository'));
 vi.mock('../../../../../../../lib/storage/provider', () => ({ resolveMediaBaseUrl: () => '' }));
 vi.mock('../../../../../../../lib/affiliates/image-origins', () => ({ getStorefrontImageOrigins: () => [] }));

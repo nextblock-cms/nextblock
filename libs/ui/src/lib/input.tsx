@@ -1,6 +1,6 @@
 import * as React from "react";
 
-import { cn } from "@nextblock-cms/utils";
+import { cn } from "@nextblock-cms/utils/utils";
 
 export type InputProps = React.InputHTMLAttributes<HTMLInputElement>;
 

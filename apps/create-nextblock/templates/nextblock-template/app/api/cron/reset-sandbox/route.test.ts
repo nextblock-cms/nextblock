@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { NextRequest } from 'next/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ListObjectsV2Command } from '@aws-sdk/client-s3';
@@ -151,6 +153,12 @@ function fakeDatabase() {
   });
   return { sql, statements, parameters };
 }
+
+/** pinSandboxAdmin's statements, as fakeDatabase records them (`$` for each value). */
+const FLAG_UPSERT =
+  "INSERT INTO public.site_settings (key, value) VALUES ('is_admin_created', 'true'::jsonb) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value";
+const PROFILE_PIN =
+  "INSERT INTO public.profiles (id, full_name, website, role, updated_at) VALUES ($, 'Nextblock CMS', 'https://nextblock.dev', 'ADMIN', now()) ON CONFLICT (id) DO UPDATE SET role = 'ADMIN', updated_at = now()";
 
 /** The values of the ADMIN profile upsert (the demo admin's id), or undefined when none ran. */
 function profileValues(db: ReturnType<typeof fakeDatabase>): unknown[] | undefined {
@@ -557,8 +565,11 @@ describe('sandbox reset: the demo admin is restored first', () => {
     expect((await GET(request('Bearer reset-cron-secret'))).status).toBe(200);
 
     const resetSql = sql.unsafe.mock.invocationCallOrder[0] as number;
-    // The first statement after the SQL is removeSandboxPromoSections' DELETE.
-    expect(db.statements[0]).toMatch(/^DELETE FROM public\.blocks WHERE block_type = 'section'/);
+    // The first statements after the SQL pin the first-admin flag and the demo admin's role
+    // (pinSandboxAdmin), then removeSandboxPromoSections' DELETE.
+    expect(db.statements[0]).toBe(FLAG_UPSERT);
+    expect(db.statements[1]).toBe(PROFILE_PIN);
+    expect(db.statements[2]).toMatch(/^DELETE FROM public\.blocks WHERE block_type = 'section'/);
     const firstLaterStatement = sql.mock.invocationCallOrder[0] as number;
     for (const restoreStep of [authAdmin.listUsers, authAdmin.updateUserById, authAdmin.mfa.listFactors, authAdmin.mfa.deleteFactor]) {
       expect(restoreStep.mock.invocationCallOrder[0]).toBeGreaterThan(resetSql);
@@ -627,6 +638,73 @@ describe('sandbox reset: the demo admin is restored first', () => {
     expect(printed('error')).toContain('Failed to restore the demo admin: auth unavailable');
     expect(printed('error')).toContain('Failed to seed store data: auth unavailable');
     expect(profileValues(db)).toBeUndefined();
+  });
+});
+
+/**
+ * 2026-11-13: cms.nextblock.dev read is_admin_created = false, so the proxy sent every visitor (and
+ * the reset cron) to /setup. The SQL re-seeds the flag as false, and only a preserved account
+ * (Step F) or a demo admin re-created through the handle_new_user trigger turned it back on.
+ */
+describe("sandbox reset: the first-admin flag and the demo admin's role are pinned", () => {
+  it('sets the flag and pins the restored demo admin as ADMIN right after the restore, before every later step', async () => {
+    const db = configureReset();
+
+    expect((await GET(request('Bearer reset-cron-secret'))).status).toBe(200);
+
+    expect(db.statements.slice(0, 2)).toEqual([FLAG_UPSERT, PROFILE_PIN]);
+    expect(db.parameters[1]).toEqual(['demo-admin']);
+    const pinned = db.sql.mock.invocationCallOrder[0] as number;
+    expect(db.authAdmin.updateUserById.mock.invocationCallOrder[0]).toBeLessThan(pinned);
+    expect(db.authAdmin.mfa.listFactors.mock.invocationCallOrder[0]).toBeLessThan(pinned);
+  });
+
+  it('pins a re-created demo admin, without relying on the trigger that made the first account ADMIN', async () => {
+    const db = configureReset();
+    db.authAdmin.listUsers.mockResolvedValueOnce({ data: { users: [] }, error: null });
+    db.authAdmin.createUser.mockResolvedValueOnce({ data: { user: { id: 'new-demo-admin' } }, error: null });
+
+    expect((await GET(request('Bearer reset-cron-secret'))).status).toBe(200);
+
+    expect(db.statements.slice(0, 2)).toEqual([FLAG_UPSERT, PROFILE_PIN]);
+    expect(db.parameters[1]).toEqual(['new-demo-admin']);
+  });
+
+  it('sets the flag even when the demo admin cannot be restored, so the sandbox never opens /setup', async () => {
+    const db = configureReset();
+    db.authAdmin.listUsers.mockResolvedValue({ data: null, error: new Error('auth unavailable') });
+
+    expect((await GET(request('Bearer reset-cron-secret'))).status).toBe(200);
+
+    expect(db.statements[0]).toBe(FLAG_UPSERT);
+    expect(db.statements).not.toContain(PROFILE_PIN);
+    expect(printed('warn')).toContain('No demo admin to pin');
+  });
+
+  it('pins nothing on a refused request', async () => {
+    const db = configureReset();
+    expect((await GET(request('Bearer wrong-secret'))).status).toBe(401);
+    expect(db.statements).toEqual([]);
+  });
+});
+
+describe('sandbox reset SQL: the demo admin survives Step A whatever its id', () => {
+  // The module is mocked away above; the generated file (npm run generate:sandbox) is read as text.
+  const generated = readFileSync(path.join(__dirname, 'sandboxResetSql.ts'), 'utf8').replace(/\r\n/g, '\n');
+
+  it('keeps the demo admin by its published address as well as by the two preserved ids', () => {
+    expect(generated).toMatch(
+      /DELETE FROM auth\.users\s+WHERE id NOT IN \([^)]*\)\s+AND email IS DISTINCT FROM 'demo@nextblock\.dev';/
+    );
+  });
+
+  it('anchors that account as ADMIN in Step E, so Step F sets the first-admin flag inside the reset transaction', () => {
+    const stepE = generated.slice(generated.indexOf('-- Step E:'), generated.indexOf('-- Step F:'));
+    expect(stepE).toContain("OR preserved_user.email = 'demo@nextblock.dev'");
+    expect(stepE).toMatch(/SELECT preserved_user\.id, NULL, NULL, NULL, NULL, 'ADMIN'/);
+    expect(generated.slice(generated.indexOf('-- Step F:'))).toMatch(
+      /UPDATE public\.site_settings\s+SET value = 'true'::jsonb\s+WHERE key = 'is_admin_created'/
+    );
   });
 });
 

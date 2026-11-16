@@ -5,21 +5,29 @@ const mocks = vi.hoisted(() => ({ client: null as unknown }));
 vi.mock('@supabase/supabase-js', () => ({
   createClient: () => mocks.client,
 }));
-vi.mock('@nextblock-cms/db/server', () => ({
-  createClient: () => ({}),
-  getServiceRoleSupabaseClient: () => ({}),
-}));
+vi.mock('@nextblock-cms/db/server', async () => {
+  // The real predicate: without it the checkout's key read threw inside the mock and was swallowed.
+  const { isSandboxEnvironment } = await vi.importActual<{ isSandboxEnvironment: () => boolean }>(
+    '../../../db/src/lib/config-resolve'
+  );
+  return {
+    createClient: () => ({}),
+    getServiceRoleSupabaseClient: () => ({}),
+    isSandboxEnvironment,
+  };
+});
+// What freemius-pricing-server.ts takes from the barrel (currency.ts imports
+// '@nextblock-cms/utils/utils', which this mock does not replace).
 vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number, currencyCode?: string | null) =>
-    `${currencyCode || 'USD'} ${amount}`,
-  getCurrencyMinorUnitFactor: () => 100,
   majorUnitAmountToMinor: (amount: number) => Math.round(amount * 100),
-  minorUnitAmountToMajor: (amount: number) => amount / 100,
-  normalizeCurrencyCode: (code?: string | null) => (code || 'USD').trim().toUpperCase(),
 }));
 vi.mock('server-only', () => ({}));
-// Credentials come from the stubbed env below, never from site_settings.
-vi.mock('./payment-config', () => ({ hydrateFreemiusEnvFromDb: async () => undefined }));
+// Credentials come from the stubbed env below, never from site_settings, and no developer key pair is
+// configured: the checkout opens with the one-product keys, as an install without a pair does.
+vi.mock('./payment-config', () => ({
+  hydrateFreemiusEnvFromDb: async () => undefined,
+  resolveFreemiusDeveloperCredentialCandidates: async () => [],
+}));
 
 import { getCouponQuote } from './coupon-server';
 import {
@@ -474,15 +482,31 @@ describe('FreemiusProvider.createCheckoutSession pricing', () => {
   beforeEach(() => {
     vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'http://127.0.0.1:54321');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'service-role-test-key');
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
     vi.stubEnv('FREEMIUS_PUBLIC_KEY', 'pk_test_public');
+    vi.stubEnv('FREEMIUS_SECRET_KEY', '');
     vi.stubEnv('FREEMIUS_SANDBOX_ENABLED', 'false');
     vi.stubEnv('FREEMIUS_CHECKOUT_PRODUCTS_JSON', '');
     vi.stubEnv('FREEMIUS_PRODUCT_ID', '');
+    // Nothing here may reach Freemius, and no step may fail quietly into a fallback.
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('no Freemius call expected');
+    }));
+    vi.spyOn(console, 'error');
+    vi.spyOn(console, 'warn');
   });
 
   afterEach(() => {
-    vi.unstubAllEnvs();
-    mocks.client = null;
+    try {
+      expect(console.error).not.toHaveBeenCalled();
+      expect(console.warn).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+      mocks.client = null;
+    }
   });
 
   async function checkout(

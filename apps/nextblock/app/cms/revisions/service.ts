@@ -388,9 +388,14 @@ async function restoreInternal(
     return { error: `Version ${targetVersion} has no restorable metadata.` };
   }
 
+  // updated_at rides on the meta write itself. Pages and posts have a trigger that sets it;
+  // products have none, the sitemap's lastModified reads it, and the visual editor publishes a
+  // pre-0.23.4 product draft's copy of the title and descriptions only while products.updated_at
+  // is not later than the draft's created_at (lib/visual-editing/product-draft-meta.ts).
+  // deleteDraftFor removes that draft below, but nothing checks that it did.
   const { error: updateError } = await supabase
     .from(spec.parentTable)
-    .update(metaUpdate)
+    .update({ ...metaUpdate, updated_at: new Date().toISOString() })
     .eq('id', parentId);
   if (updateError) {
     return { error: `Failed to update ${spec.label.toLowerCase()}: ${updateError.message}` };

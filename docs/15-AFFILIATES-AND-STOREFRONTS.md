@@ -112,14 +112,21 @@ registry, the checkout charges the plan. With both ids set:
   with `NEXTBLOCK_LICENSE_PACKAGE=affiliates`, activates it through
   `activateLicenseKeyWithFreemius` (`lib/packages/activate-license.ts`). Activation calls
   Freemius' public license API: an install needs no Freemius key.
-- The vendor routes accept it: `POST /api/packages/claim-license` (hands the buyer's CMS its key
-  right after a dashboard purchase or trial) and `POST /api/packages/provision-trial` (headless
-  trials) look the product up in the registry deployed on nextblock.dev, so nextblock.dev must run
-  this registry before anyone buys. Both read the license with that product's Freemius keys
-  (`resolveFreemiusCheckoutCredentials`): the one product saved under CMS → Payments, else its
-  entry in `FREEMIUS_CHECKOUT_PRODUCTS_JSON` (`"43273": {"publicKey", "secretKey", "apiKey"}`, the
-  apiKey being the Bearer token). Without them the claim fails and the buyer pastes the key
-  Freemius emailed them; the purchase itself and the activation are unaffected.
+- The vendor claim accepts it: `POST /api/packages/claim-license` (hands the buyer's CMS its key
+  right after a dashboard purchase or trial) looks the product up in the registry deployed on
+  nextblock.dev, so nextblock.dev must run this registry before anyone buys. It reaches Freemius
+  with the vendor's developer key pair, which covers 43273 like every product of the account
+  (docs/02 → "Freemius keys": nothing per product to configure). Without a pair it falls back to
+  that product's own keys (`resolveFreemiusCheckoutCredentials`: its entry in
+  `FREEMIUS_CHECKOUT_PRODUCTS_JSON`, `"43273": {"publicKey", "secretKey", "apiKey"}`, the apiKey
+  being the Bearer token, else the one product saved under CMS → Payments). Without either the
+  claim fails and the buyer pastes the key Freemius emailed them; the purchase itself and the
+  activation are unaffected. `POST /api/packages/provision-trial` (headless trials for
+  `create-nextblock --non-interactive`) mints Cortex AI trials only: it answers an Affiliates
+  request as an unknown package (400 `UNKNOWN_PACKAGE`), so an Affiliates trial always starts from
+  the dashboard (the Freemius overlay's real trial, then the claim). Both routes answer 404 on the
+  public sandbox and are limited per client network and per instance (docs/08 → "Buying from the
+  dashboard" and "Vendor trial provisioning").
 - An install sees the ids only once it runs a `@nextblock-cms/utils` that carries them: an older
   one cannot activate an Affiliates key at all. Publish that release as a minor version, since
   scaffolds pin `^0.x.y` and an older packages screen would otherwise offer Affiliates to installs
@@ -147,9 +154,10 @@ What the product was set up with on 2026-10-29, and what is left (dashboard labe
    store's short description. Never rename the product or plan title: the store slug, and so
    `purchase_url`, is built from both.
 3. **Refund policy** 30 days (the store copy promises it); license keys shown to customers.
-4. **Keys** for the claim route, as above, then the **webhook** listener
-   (`https://nextblock.dev/api/webhooks/freemius`, all events) once the product's secret is
-   deployed: until then every delivery answers 401.
+4. **Webhook** listener (`https://nextblock.dev/api/webhooks/freemius`, all events). With the
+   developer key pair deployed (CMS → Payments, or `FREEMIUS_DEVELOPER_*`), deliveries verify with
+   43273's own secret, which the app reads from Freemius: no key to paste. Without one, the
+   product's keys must be configured first (as above), or every delivery answers 401.
 
 The store page is migration `02032` (vendor-only: it runs where the Commerce Pro store product
 exists, which is nextblock.dev). It creates the English product the way the Freemius store sync
@@ -161,7 +169,9 @@ sync rewrites title, slug, short description, price and status. `purchase_url` i
 Deploy nextblock.dev with the whole Affiliates release before anyone buys, then publish the
 libraries in order, `@nextblock-cms/affiliates` for the first time, before the CLI.
 
-The public sandbox imports every product of the developer account at each reset and dresses
+The public sandbox imports every product of the developer account at each reset, and only then:
+Sync from Freemius is turned off for its visitors (it would spend the developer key pair
+production depends on), so the demo shows what the last reset imported. The reset dresses
 Affiliates like Cortex AI (see "Sandbox demo"). Set `FREEMIUS_AFFILIATES_SANDBOX_KEY` there to a
 placeholder such as `sandbox-affiliates-demo`: the reset writes it into `package_activations` as
 is and never sends it to Freemius, and its last four characters show on the card, so never use a
@@ -1000,10 +1010,19 @@ The Stripe endpoint must send six events (CMS → Payments lists them):
 
 ### Freemius
 
-`app/api/webhooks/freemius/route.ts` verifies the signature, then handles `payment.refund`,
-`payment.refunded`, `payment.dispute.lost` and `payment.dispute.closed` **instead of** the order
-sync (whose purchase-data path would read the refunded purchase as paid). Every one is a full
-refund: the order is found by license id, moved to `refunded` when paid or shipped
+`app/api/webhooks/freemius/route.ts` verifies the signature with the secret of the event's own
+product (`getFreemiusWebhookVerification`: read with the developer key pair, so a refund or dispute
+of any product the account sells verifies without per-product keys; an event it cannot check
+answers 503, so Freemius redelivers it). It hands the verified product id to the handlers,
+`handleFreemiusRefundWebhookEvent(event, { productId })` and
+`handleFreemiusDisputeWebhookEvent(event, { productId })`, which touch only orders of that product:
+an order of another product is skipped (`product_mismatch`), so no commission is voided, held or
+released for it. An order that stores no `freemius_product_id` (placed before checkout stored it,
+or imported) is that product's only when every one of its items names a product carrying that
+Freemius Product ID; the id is then written to the order (docs/02 → "Webhook flow"). It handles `payment.refund`, `payment.refunded`, `payment.dispute.lost` and
+`payment.dispute.closed` **instead of** the order sync (whose purchase-data path would read the
+refunded purchase as paid). Every one is a full refund: the order is found by license id, moved
+to `refunded` when paid or shipped
 (`applyFreemiusOrderState` pins `refunded`), and `apply_affiliate_refund(full)` runs. A refund of
 a renewal payment (`is_renewal`) changes nothing, because renewals never earned.
 `payment.dispute.created` holds the commission and `payment.dispute.won` releases it
@@ -1754,16 +1773,32 @@ partner keeps at most two avatars: the approved one and a newer one waiting for 
 
 These objects are not media-library rows, and no staff path touches the partner namespaces
 `affiliates/avatars/` and `affiliates/pages/` (`PARTNER_UPLOAD_NAMESPACES` and
-`isPartnerUploadKey`, one definition in `lib/storage/upload-policy.ts`, which also collapses
-repeated slashes): `/api/upload/proxy` and `/api/upload/presigned-url` refuse a folder inside them
-(`resolveUploadFolder`), `/api/process-image` refuses such a key (it would read the partner's
-object and write six variants into their prefix), `/api/media/record` refuses to record one, and
-the `/cms/media` delete and move actions never touch one or move media into them
-(`lib/storage/media-object-keys.ts`). So a WRITER cannot fill a partner's upload caps, plant files
-in their prefix, or remove their files through a decoy media row. The rest of `affiliates/` is an
-ordinary media folder: an install that already keeps its own media there (the media library
-takes free-text folders) keeps its upload, move and delete paths. `media-object-keys.test.ts`
-fails when the partner pipeline builds a key outside `PARTNER_UPLOAD_NAMESPACES`.
+`isPartnerUploadKey`, one definition in `lib/storage/upload-policy.ts`, which counts a key wherever
+storage could put it: a `?` or `#` counts outright, percent-escapes decoded, repeated slashes
+collapsed, dot segments resolved both after decoding and, as the URL parser does, before it, on the
+raw key and on the key storage-js `upload()` sends with its repeated slashes collapsed):
+`/api/upload/proxy` and `/api/upload/presigned-url` refuse a folder inside them
+(`resolveUploadFolder`), and so does `/api/media/r2-presigned`, the custom-block image route
+(`validateR2PresignedUploadPayload`; its signer refuses such a key too, any key holding a `?` or
+`#`, and the spellings only the URL parser's order puts in a namespace: until 2026-11-14 it signed
+them, so a WRITER or a sandbox visitor could fill a partner's image allowance),
+`/api/process-image` refuses such a key (it would read the partner's object and write six
+variants into their prefix), `/api/media/record` refuses a payload that names one in any field,
+and the `/cms/media` delete and move actions never touch one or move media into them
+(`lib/storage/media-object-keys.ts`), and a product publish deletes no media at all (since 0.23.4;
+before, on R2 it deleted every key listed by the media row of an image dropped from a gallery that
+nothing else used). The two routes that take keys from the client judge every
+key in the request with `isAcceptableClientObjectKey`, which also refuses any `%`, `?` or `#`: on
+the native Supabase backend the storage server decodes `%61ffiliates/pages/…` into a partner's
+prefix and the URL path ends at a `?` or `#`, and until 2026-11-14 the image processor took such a
+key. So a WRITER cannot fill a partner's upload caps, plant files in their prefix, or remove their
+files through a decoy media row. The rest of `affiliates/` is an ordinary media folder: an install
+that already keeps its own media there (the media library takes free-text folders) keeps its
+upload, move and delete paths. `media-object-keys.test.ts` fails when the partner pipeline builds a
+key outside `PARTNER_UPLOAD_NAMESPACES`, and `lib/storage/partner-upload-namespaces.test.ts` when a
+staff key builder lets any spelling of one into a namespace (percent-encoded, path-ending,
+empty-segment and escaped-separator spellings included), the signer signs one for a payload nobody
+validated, or the client-key predicate takes one back.
 
 ### Payouts page
 
@@ -3444,9 +3479,10 @@ what ships and why.
 - **Error pages:** outside the partner portal the app has no `error.tsx` / `loading.tsx` yet; an
   error in the CMS, the shop or the public pages shows Next's built-in English page.
 - **The next payout date** in the portal is an estimate.
-- **Existing standalone projects** get `@nextblock-cms/affiliates` from `npm run update`, but
-  `next.config.js` and `tailwind.config.js` are never touched: add it to `transpilePackages` (the
-  updater warns) and the Tailwind `content` list yourself (docs/13).
+- **Existing standalone projects** get `@nextblock-cms/affiliates` from `npm run update`, but the
+  update adds no package to `next.config.js` (its only edit there is the `postcss` browser alias)
+  and leaves `tailwind.config.js` to you: add the package to `transpilePackages` (the updater warns)
+  and to the Tailwind `content` list yourself (docs/13).
 
 ## Related docs
 

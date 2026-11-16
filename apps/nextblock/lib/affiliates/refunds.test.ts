@@ -37,9 +37,11 @@ vi.mock('@nextblock-cms/db/server', () => ({
   verifyPackageOnline: mocks.verifyPackageOnline,
   getServiceRoleSupabaseClient: mocks.getServiceRoleSupabaseClient,
 }));
-vi.mock('@nextblock-cms/ecommerce/server', () => ({
+vi.mock('@nextblock-cms/ecommerce/stripe/order-sync', () => ({
   syncStripeOrderRefundFromEvent: mocks.syncStripeOrderRefundFromEvent,
   syncStripeOrderDisputeFromEvent: mocks.syncStripeOrderDisputeFromEvent,
+}));
+vi.mock('@nextblock-cms/ecommerce/freemius-order-sync', () => ({
   syncFreemiusOrderRefundFromWebhookEvent: mocks.syncFreemiusOrderRefundFromWebhookEvent,
   syncFreemiusOrderDisputeFromWebhookEvent: mocks.syncFreemiusOrderDisputeFromWebhookEvent,
 }));
@@ -307,6 +309,19 @@ describe('handleFreemiusRefundWebhookEvent', () => {
 
     await expect(handleFreemiusRefundWebhookEvent(FREEMIUS_EVENT)).rejects.toThrow('affiliate void failed');
   });
+
+  it('hands the order sync the verified product explicitly, whatever plugin_id the event carries', async () => {
+    // Review 2026-11-13, round 2: the binding to the verified product relied on the route
+    // overwriting event.plugin_id before calling this handler.
+    mocks.syncFreemiusOrderRefundFromWebhookEvent.mockResolvedValue(freemiusRefund({ orderId: null, statusUpdated: false, reason: 'product_mismatch' }));
+    const event = { ...FREEMIUS_EVENT, plugin_id: 24851 };
+
+    const result = await handleFreemiusRefundWebhookEvent(event, { productId: '28609' });
+
+    expect(mocks.syncFreemiusOrderRefundFromWebhookEvent).toHaveBeenCalledWith({ event, productId: '28609' });
+    expect(result).toMatchObject({ handled: false, orderId: null, affiliate: 'skipped' });
+    expect(mocks.applyAffiliateRefund).not.toHaveBeenCalled();
+  });
 });
 
 describe('handleStripeDisputeWebhookEvent', () => {
@@ -404,5 +419,14 @@ describe('handleFreemiusDisputeWebhookEvent', () => {
     mocks.syncFreemiusOrderDisputeFromWebhookEvent.mockRejectedValue(new Error('Order lookup failed'));
 
     await expect(handleFreemiusDisputeWebhookEvent(DISPUTE_EVENT)).rejects.toThrow('Order lookup failed');
+  });
+
+  it('hands the dispute sync the verified product explicitly, whatever plugin_id the event carries', async () => {
+    mocks.syncFreemiusOrderDisputeFromWebhookEvent.mockResolvedValue(freemiusDispute({ orderId: null, reason: 'product_mismatch' }));
+    const event = { ...DISPUTE_EVENT, plugin_id: '24851' };
+
+    await expect(handleFreemiusDisputeWebhookEvent(event, { productId: '28609' })).resolves.toMatchObject({ handled: false, affiliate: 'skipped' });
+    expect(mocks.syncFreemiusOrderDisputeFromWebhookEvent).toHaveBeenCalledWith({ event, productId: '28609' });
+    expect(mocks.setAffiliateCommissionDispute).not.toHaveBeenCalled();
   });
 });

@@ -86,7 +86,7 @@ export function buildBotProtectionSecretValue(secretKey: string): BotProtectionS
 
 /**
  * The row to write back on a save that submits no new secret, when the stored envelope predates
- * slot binding (0.23.1) and still opens: the same secret, sealed for this field. Null when there
+ * slot binding (0.23.0) and still opens: the same secret, sealed for this field. Null when there
  * is nothing to re-seal.
  */
 export function resealStoredBotProtectionSecret(value: unknown): BotProtectionSecretValue | null {

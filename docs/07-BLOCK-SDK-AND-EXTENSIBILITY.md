@@ -69,8 +69,12 @@ The app already has an internal registry in
 
 That registry is richer than the SDK because it also includes:
 
-- filename-based editor loading
-- filename-based renderer loading
+- the editor's file name (`editorComponentFilename`), which the CMS resolves through
+  `apps/nextblock/app/cms/blocks/components/blockEditorLoaders.ts`, one string-literal `import()`
+  per editor (a computed `import()` bundles the whole folder, tests included)
+- a renderer file name (`rendererComponentFilename`); the public site loads renderers by block
+  type through `apps/nextblock/components/blocks/publicRendererLoaders.ts` and
+  `ecommerceRendererLoaders.ts`
 - CMS-specific helper metadata
 - in-repo block defaults for built-in block types
 
@@ -88,9 +92,32 @@ abstraction.
 Today, adding a built-in block to the app usually means updating:
 
 - the app block registry
-- a CMS editor component
-- a front-end renderer component
+- a CMS editor component in `apps/nextblock/app/cms/blocks/editors/` (a default export), plus its
+  entry in `apps/nextblock/app/cms/blocks/components/blockEditorLoaders.ts` (below)
+- a front-end renderer component, plus its loader in
+  `apps/nextblock/components/blocks/publicRendererLoaders.ts` (or `ecommerceRendererLoaders.ts`)
 - any supporting schemas or helpers
+
+The editor's entry in `BLOCK_EDITOR_LOADERS` is keyed by the registry's `editorComponentFilename`
+without its extension, as in `FaqBlockEditor: () => import('../editors/FaqBlockEditor'),`, with the
+key quoted when it is not an identifier
+(`'faq/FaqBlockEditor': () => import('../editors/faq/FaqBlockEditor'),`). Without the entry the CMS
+opens nothing for the block, and the browser console logs "No editor component found" with the
+line to add; through 0.23.3 the file alone was enough. A block whose definition sets
+`EditorComponent` opens that component instead and needs neither (except `section`, whose editor
+`EditableBlock` always opens by its file name). In the monorepo `blockEditorLoaders.test.ts` fails
+while a block with fields and no `EditorComponent` has no entry. A standalone project has no vitest
+to run it, so `npm run update` names each editor the registry names whose file is in that folder
+but has no entry (in the monorepo too; docs/13 → "Block editors the CMS cannot open"). That check
+relies on three rules:
+
+- write `editorComponentFilename` in the registry as a string literal, with a name of ASCII
+  letters, digits, `_`, `$`, `-` and single dots (`/` between folders; test, spec, story and
+  declaration names are skipped)
+- set `EditorComponent` in the same object literal as `editorComponentFilename` (neither through a
+  spread), or the check may name that block's file
+- keep each map entry `key: value`, as in `key: () => import('…')` (a spread, a shorthand, a method
+  or a computed key turns the check off)
 
 The existing registry already exposes enough information to support:
 

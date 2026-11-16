@@ -1,7 +1,8 @@
 import { createClient } from "@nextblock-cms/db/server";
 import { redirect } from "next/navigation";
-import { CustomerProfileForm, addressesMatch } from "@nextblock-cms/ecommerce";
-import { getDefaultUserAddresses } from "@nextblock-cms/ecommerce/server";
+import { CustomerProfileForm } from "@nextblock-cms/ecommerce/components/CustomerProfileForm";
+import { addressesMatch } from "@nextblock-cms/ecommerce/customer";
+import { getDefaultUserAddresses } from "@nextblock-cms/ecommerce/customer-addresses";
 import MediaPickerDialog from "../cms/media/components/MediaPickerDialog";
 import { ProfilePageHeader } from "./ProfilePageHeader";
 import { ProfilePageMissingState } from "./ProfilePageMissingState";

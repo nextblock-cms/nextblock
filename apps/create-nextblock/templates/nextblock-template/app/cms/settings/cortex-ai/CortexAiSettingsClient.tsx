@@ -77,6 +77,17 @@ import {
 
 const CORTEX_AI_SETTINGS_CHANGED_EVENT = 'nextblock:cortex-ai-settings-changed';
 
+/**
+ * Agent tuning mirrors what the save action accepts (`normalizeCortexAiAgentSettings` and the
+ * `CORTEX_AI_AGENT_SETTINGS_BOUNDS` / `_DEFAULTS` of libs/cortex ai-config.ts, which this client
+ * cannot import: the cortex barrel is server-only). CortexAiSettingsClient.test.tsx pins the inputs'
+ * ranges and defaults to those constants, and the output-token step to 1. A browser refuses to
+ * submit a number input whose value is off its step (min + n × step): the output-token input had
+ * step 256 from 256, so the default 16,000 (and any other saved value off that grid) blocked every
+ * Save until it was changed.
+ */
+const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
+
 type CortexAiSettingsClientProps = {
   /**
    * Shared-sandbox mode. Server-backed settings become read-only because the
@@ -240,7 +251,11 @@ export function CortexAiSettingsClient({
   const [appNameInput, setAppNameInput] = useState(unsplashAppName || '');
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [unlimitedTokens, setUnlimitedTokens] = useState(agentSettings.maxOutputTokens === null);
-  const [maxTokensInput, setMaxTokensInput] = useState(String(agentSettings.maxOutputTokens ?? 16000));
+  // A whole number, as the save action stores it: the input's step is 1, so any stored value is
+  // valid and the form saves without touching the field.
+  const [maxTokensInput, setMaxTokensInput] = useState(
+    String(Math.round(agentSettings.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS))
+  );
   const [maxStepsInput, setMaxStepsInput] = useState(String(agentSettings.maxSteps));
   const [temperatureInput, setTemperatureInput] = useState(String(agentSettings.temperature));
   const [timeoutInput, setTimeoutInput] = useState(String(Math.round(agentSettings.responseTimeoutMs / 1000)));
@@ -844,7 +859,7 @@ export function CortexAiSettingsClient({
                       type="number"
                       min={256}
                       max={200000}
-                      step={256}
+                      step={1}
                       value={maxTokensInput}
                       onChange={(e) => setMaxTokensInput(e.target.value)}
                       disabled={unlimitedTokens || isSandbox}

@@ -1,4 +1,4 @@
-import { S3Client, DeleteObjectsCommand } from "@aws-sdk/client-s3";
+import { S3Client, DeleteObjectsCommand, type S3ClientConfig } from "@aws-sdk/client-s3";
 
 export {
   encodedRedirect,
@@ -22,7 +22,15 @@ let warnedMissingEnv = false;
 // R2_S3_ENDPOINT (http://minio:9000) but presigned URLs must be signed for the browser-facing
 // host (http://localhost:9000). On Cloudflare R2 both overrides are unset, so behaviour is
 // unchanged. R2_FORCE_PATH_STYLE='true' enables path-style addressing (required by MinIO).
-function buildClient(preferPublicEndpoint = false): S3Client | null {
+//
+// `forPresign` builds the client that signs browser upload URLs: it adds a request checksum only
+// when an operation requires one, and PutObject does not. With the SDK's default (WHEN_SUPPORTED,
+// since @aws-sdk/client-s3 3.729) every presigned PutObject URL signed
+// `x-amz-checksum-crc32=AAAAAA==`, the CRC32 of the EMPTY body present at signing time, plus
+// `x-amz-sdk-checksum-algorithm=CRC32`. A store that validates checksums holds the uploaded file
+// to that value and refuses it. Server-side writes keep the default: they send the real body, so
+// their checksum is right.
+function buildClient(preferPublicEndpoint = false, forPresign = false): S3Client | null {
   const accountId = process.env.R2_ACCOUNT_ID;
   const accessKeyId = process.env.R2_ACCESS_KEY_ID;
   const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
@@ -41,7 +49,7 @@ function buildClient(preferPublicEndpoint = false): S3Client | null {
     return null;
   }
 
-  return new S3Client({
+  const config: S3ClientConfig = {
     region: process.env.R2_REGION || "auto",
     endpoint,
     forcePathStyle: process.env.R2_FORCE_PATH_STYLE === "true",
@@ -49,7 +57,11 @@ function buildClient(preferPublicEndpoint = false): S3Client | null {
       accessKeyId,
       secretAccessKey,
     },
-  });
+  };
+  if (forPresign) {
+    config.requestChecksumCalculation = "WHEN_REQUIRED";
+  }
+  return new S3Client(config);
 }
 
 export async function getS3Client(): Promise<S3Client | null> {
@@ -60,16 +72,15 @@ export async function getS3Client(): Promise<S3Client | null> {
 }
 
 /**
- * S3 client used ONLY to sign upload URLs handed to the browser. Identical to getS3Client()
- * on Cloudflare R2; when R2_S3_PUBLIC_ENDPOINT is set (self-hosted MinIO) it signs URLs for
- * the browser-reachable host so direct-from-browser PUT uploads succeed.
+ * S3 client used ONLY to sign upload URLs handed to the browser (the app's `presignBoundPut`).
+ * Unlike getS3Client() it never adds a default request checksum, which a presigned URL would
+ * carry as the checksum of an empty body (see buildClient). When R2_S3_PUBLIC_ENDPOINT is set
+ * (self-hosted MinIO) it also signs URLs for the browser-reachable host, so direct PUT uploads
+ * succeed. Cached separately from getS3Client().
  */
 export async function getS3PresignClient(): Promise<S3Client | null> {
-  if (!process.env.R2_S3_PUBLIC_ENDPOINT) {
-    return getS3Client();
-  }
   if (!cachedPresignClient) {
-    cachedPresignClient = buildClient(true);
+    cachedPresignClient = buildClient(true, true);
   }
   return cachedPresignClient;
 }

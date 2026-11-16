@@ -34,8 +34,10 @@ import {
 import { getActiveLanguagesServerSide } from '@nextblock-cms/db/server';
 import type { Database } from '@nextblock-cms/db';
 import { headers, cookies, draftMode } from 'next/headers';
+import { after } from 'next/server';
 import { verifyPackageOnline } from '@nextblock-cms/db/server';
 import { unstable_cache } from 'next/cache';
+import { maybeRevalidatePackageActivations } from '../lib/packages/revalidate-activations';
 import { createStaticSupabaseClient, getSiteSettings } from './lib/site-settings';
 import {
   DEFAULT_OG_IMAGE,
@@ -325,6 +327,11 @@ async function loadLayoutData() {
     };
   }
 
+  // After the response, ask Freemius about any license that is due (once a day per row, see
+  // maybeRevalidatePackageActivations). From here and not the CMS layout: a store has to get
+  // through its renewal date while nobody opens the CMS, and master declares no crons.
+  after(() => maybeRevalidatePackageActivations());
+
   const supabase = createSupabaseServerClient();
   const cookieStore = await cookies();
 
@@ -587,6 +594,20 @@ export default async function RootLayout({
   const resolvedGtmId = privacySettings.gtm_id || '';
   const visualEditingEnabled =
     draft.isEnabled || process.env.NEXTBLOCK_VISUAL_EDITING_ENABLED === 'true';
+  // The toolbar's Publish on a product draft: only an ADMIN past the second factor may publish one
+  // (publishProductVisualEditingDraft opens with requireCmsAdmin()), and the profile's role alone
+  // left it enabled for an ADMIN whose second factor is pending. Asked only while the visual
+  // editor is on, through import(), so any other request loads and reads nothing more.
+  const canPublishProductDrafts = visualEditingEnabled
+    ? await import('../lib/visual-editing/product-drafts')
+        .then((drafts) => drafts.currentUserCanPublishProductDrafts())
+        .catch(() => false)
+    : false;
+  // Only for the note beside the disabled Publish: an ADMIN the check refused is waiting for the
+  // second factor (getCmsActor() returns null until it is verified, while the profile read above
+  // still says ADMIN), or the check failed. The toolbar then asks for the second factor instead of
+  // saying that an administrator publishes; the flag above alone decides whether Publish works.
+  const secondFactorPending = visualEditingEnabled && !canPublishProductDrafts && profile?.role === 'ADMIN';
   const isVercelDeployment = process.env.VERCEL === '1';
   // Speed Insights works only in a production build on Vercel. Anywhere else it fails loudly:
   // in development it loads a debug script from va.vercel-scripts.com, which the CSP blocks, and
@@ -680,7 +701,12 @@ export default async function RootLayout({
           </AppShell>
 
           {isEcommerceActive && <DeferredCartDrawer />}
-          {visualEditingEnabled && <DeferredVisualEditing />}
+          {visualEditingEnabled && (
+            <DeferredVisualEditing
+              canPublishProducts={canPublishProductDrafts}
+              secondFactorPending={secondFactorPending}
+            />
+          )}
           {Toolbar && <Toolbar nonce={nonce} />}
           {privacySettings.banner_enabled && <ConsentBanner />}
         </Providers>

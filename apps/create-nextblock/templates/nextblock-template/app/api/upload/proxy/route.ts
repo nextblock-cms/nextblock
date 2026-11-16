@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@nextblock-cms/db/server';
 import { getS3Client } from '@nextblock-cms/utils/server';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { getCmsActor, isCmsStaffRole } from '../../../../lib/auth/cms-actor';
 import { getStorageBackend, getStorageBucket } from '../../../../lib/storage/provider';
 import { supabaseUploadObject } from '../../../../lib/storage/supabase-storage';
 import {
@@ -20,15 +21,17 @@ import {
 export const runtime = 'nodejs';
 
 // This route is the CMS media uploader's server-side path (MediaUploadForm in the app and in
-// @nextblock-cms/ecommerce). It is NOT under /cms, so the proxy's role gate never sees it: every
-// check has to live here. Only staff may upload, the body is capped before it is buffered, the
-// declared type must be a media/document type the library knows how to serve, and the object key
-// is rebuilt from sanitized parts so a crafted filename or folder can never escape its prefix.
+// @nextblock-cms/ecommerce). It is NOT under /cms, so neither the proxy's role gate nor the CMS
+// layout's 2FA redirect sees it: every check has to live here. Only staff past their enrolled
+// second factor may upload, the body is capped before it is buffered, the declared type must be a
+// media/document type the library knows how to serve, and the object key is rebuilt from
+// sanitized parts so a crafted filename or folder can never escape its prefix.
 
 /** Hard cap on the request body (and therefore the file). 25 MB; Vercel's own ~4.5 MB limit still wins there. */
 const UPLOAD_PROXY_MAX_BYTES = 25 * 1024 * 1024;
 const UPLOAD_PROXY_MAX_MB = UPLOAD_PROXY_MAX_BYTES / (1024 * 1024);
-const UPLOAD_PROXY_STAFF_ROLES = ['ADMIN', 'WRITER'] as const;
+
+const SECOND_FACTOR_MESSAGE = 'Complete two-factor verification, then try again.';
 
 const UNSUPPORTED_TYPE_MESSAGE =
   'Unsupported file type. Upload an image (AVIF, GIF, JPEG, PNG, WebP, SVG, ICO, BMP), a video (MP4, WebM, OGG, MOV), a PDF, or a text/office document.';
@@ -99,23 +102,30 @@ async function parseMultipart(request: NextRequest, body: Uint8Array<ArrayBuffer
   }
 }
 
-export async function POST(request: NextRequest) {
-  const supabase = createClient();
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-
-  if (authError || !user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+/** True when the request carries a signed-in user (to word a refusal; never to grant anything). */
+async function hasSignedInUser(): Promise<boolean> {
+  try {
+    const { data: { user } } = await createClient().auth.getUser();
+    return Boolean(user);
+  } catch {
+    return false;
   }
+}
 
-  // Staff only (ADMIN / WRITER), exactly like presigned-url and media/record. Any signed-in
-  // customer used to get through here with nothing but a session.
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('role')
-    .eq('id', user.id)
-    .single();
-
-  if (!profile || !(UPLOAD_PROXY_STAFF_ROLES as readonly string[]).includes(profile.role)) {
+export async function POST(request: NextRequest) {
+  // Staff only (ADMIN / WRITER), past their enrolled second factor, exactly like presigned-url,
+  // r2-presigned, process-image and media/record, and before a byte of the body is read. Any
+  // signed-in customer used to get through here with nothing but a session; until 2026-11-14 a
+  // staff password alone (the first factor) still did.
+  const actor = await getCmsActor();
+  if (!actor) {
+    // getCmsActor() is null without a session and while an enrolled second factor is pending. The
+    // refusal stands either way; this only picks the answer.
+    return (await hasSignedInUser())
+      ? NextResponse.json({ error: SECOND_FACTOR_MESSAGE }, { status: 403 })
+      : NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (!isCmsStaffRole(actor.role)) {
     return NextResponse.json({ error: 'Forbidden: Insufficient permissions' }, { status: 403 });
   }
 
@@ -182,7 +192,7 @@ export async function POST(request: NextRequest) {
         ContentType: contentType,
         ContentLength: buffer.byteLength,
         Metadata: {
-          'uploader-user-id': user.id,
+          'uploader-user-id': actor.userId,
         },
       });
       await s3Client.send(command);

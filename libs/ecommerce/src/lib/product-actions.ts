@@ -1,5 +1,4 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { deleteMediaFiles } from '@nextblock-cms/utils/server';
 import type { Database } from '@nextblock-cms/db/types';
 import type { ProductFormValues } from './product-schema';
 import { syncSharedInventoryForSavedProduct } from './shared-inventory';
@@ -609,13 +608,81 @@ export async function createProduct(supabase: SupabaseClient<Database>, data: Pr
   return product;
 }
 
-export async function updateProduct(supabase: SupabaseClient<Database>, id: string, data: ProductFormValues) {
-  const { data: currentProductMedia } = await supabase
-    .from('product_media')
-    .select('media_id')
-    .eq('product_id', id);
+const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-  const currentMediaIds = currentProductMedia?.map(pm => pm.media_id) || [];
+type ProductGalleryRow = { product_id: string; media_id: string; sort_order: number };
+
+/**
+ * The gallery a save writes, checked before any write: the values' `product_media` in order, each
+ * media id once, and only ids that still have a media row. Null when the values carry no gallery
+ * (the gallery is then left as it is). An image deleted from the media library while a draft still
+ * listed it failed the whole insert on product_media_media_id_fkey, and the old delete-then-insert
+ * left the product with no gallery while the save reported success.
+ */
+async function resolveProductGalleryRows(
+  supabase: SupabaseClient<Database>,
+  id: string,
+  data: ProductFormValues
+): Promise<ProductGalleryRow[] | null> {
+  if (!Array.isArray(data.product_media)) return null;
+
+  const orderedIds: string[] = [];
+  for (const item of data.product_media) {
+    const rawId = (item as { media_id?: unknown } | null)?.media_id;
+    // Lowercased: Postgres returns uuids lowercase, so an uppercase spelling would read as deleted.
+    const mediaId = typeof rawId === 'string' ? rawId.toLowerCase() : null;
+    if (mediaId && MEDIA_ID_PATTERN.test(mediaId) && !orderedIds.includes(mediaId)) {
+      orderedIds.push(mediaId);
+    }
+  }
+  if (orderedIds.length === 0) return [];
+
+  const { data: existingMedia, error } = await supabase.from('media').select('id').in('id', orderedIds);
+  if (error) throw new Error(`The product's gallery could not be checked: ${error.message}`);
+
+  const existingIds = new Set((existingMedia ?? []).map((row: { id: string }) => row.id));
+  return orderedIds
+    .filter((mediaId) => existingIds.has(mediaId))
+    .map((mediaId, index) => ({ product_id: id, media_id: mediaId, sort_order: index }));
+}
+
+/**
+ * Writes the gallery: the listed images upserted in their order, then the images it no longer lists
+ * unlinked. One statement each, both checked, so a failure throws with the gallery as it was (or
+ * with every listed image in it) instead of empty.
+ *
+ * A product save never deletes media. An image dropped from the gallery stays in the media library
+ * with its files, where an editor can delete it once nothing uses it. Until 0.23.4 this function
+ * deleted every dropped image that no product, post, logo or variant used, its media row and, on R2,
+ * every storage key the row listed. Image blocks, section backgrounds, text blocks and the social
+ * image keep their own copy of a key and were never checked, and the ids could come from a draft
+ * any WRITER can write over PostgREST (product_drafts RLS checks the role only), so an ADMIN's
+ * publish could delete media the ADMIN never saw (security review 2026-11-15).
+ */
+async function writeProductGallery(supabase: SupabaseClient<Database>, id: string, rows: ProductGalleryRow[] | null) {
+  if (rows === null) return;
+
+  if (rows.length > 0) {
+    const { error: upsertError } = await supabase.from('product_media').upsert(rows, { onConflict: 'product_id,media_id' });
+    if (upsertError) throw new Error(`The product's gallery was not saved: ${upsertError.message}`);
+  }
+
+  let unlink = supabase.from('product_media').delete().eq('product_id', id);
+  if (rows.length > 0) {
+    unlink = unlink.not('media_id', 'in', `(${rows.map((row) => row.media_id).join(',')})`);
+  }
+  const { error: unlinkError } = await unlink;
+  if (unlinkError) throw new Error(`The product's gallery was not saved: ${unlinkError.message}`);
+}
+
+/**
+ * Saves a product's form values: the product row and its variants (`upsert_product_with_variants`),
+ * the gallery (only `product_media`; a top-level `media_id` is ignored, the form never writes one),
+ * taxability, SEO fields, the sale schedule, shared inventory and categories.
+ */
+export async function updateProduct(supabase: SupabaseClient<Database>, id: string, data: ProductFormValues) {
+  // Checked before the first write, so a gallery that cannot be resolved stops the save untouched.
+  const galleryRows = await resolveProductGalleryRows(supabase, id, data);
 
   const { data: productId, error } = await supabase.rpc('upsert_product_with_variants', {
     product_payload: buildProductRpcPayload(data, id),
@@ -623,97 +690,13 @@ export async function updateProduct(supabase: SupabaseClient<Database>, id: stri
 
   if (error || !productId) throw error || new Error('Failed to update product');
 
-  if (data.product_media) {
-    await supabase.from('product_media').delete().eq('product_id', id);
-    if (data.product_media.length > 0) {
-      const mediaInserts = data.product_media.map((item, index) => ({
-        product_id: id,
-        media_id: item.media_id,
-        sort_order: index,
-      }));
-      await supabase.from('product_media').insert(mediaInserts);
-    }
-  } else if (data.media_id) {
-     await supabase.from('product_media').delete().eq('product_id', id);
-     await supabase.from('product_media').insert({
-      product_id: id,
-      media_id: data.media_id,
-      sort_order: 0,
-    });
-  }
+  await writeProductGallery(supabase, id, galleryRows);
 
   await persistProductTaxability(supabase, productId, data.is_taxable);
 
   await persistProductSeoMeta(supabase, productId, data);
 
   await persistProductSaleSchedule(supabase, productId, data);
-
-  const newMediaIds = data.product_media
-    ? data.product_media.map(m => m.media_id)
-    : (data.media_id ? [data.media_id] : []);
-    
-  const explicitlyRemovedIds = data.explicitly_removed_media_ids || [];
-  const calculatedRemovedIds = currentMediaIds.filter(id => !newMediaIds.includes(id));
-  const removedMediaIds = Array.from(new Set([...calculatedRemovedIds, ...explicitlyRemovedIds]));
-  
-  if (removedMediaIds.length > 0) {
-    for (const removedId of removedMediaIds) {
-      const { count: productUsageCount } = await supabase
-        .from('product_media')
-        .select('*', { count: 'exact', head: true })
-        .eq('media_id', removedId);
-      
-      if (productUsageCount && productUsageCount > 0) continue;
-
-      const { count: postsUsageCount } = await supabase
-          .from('posts')
-          .select('*', { count: 'exact', head: true })
-          .eq('feature_image_id', removedId);
-
-      if (postsUsageCount && postsUsageCount > 0) continue;
-
-      const { count: logosUsageCount } = await supabase
-          .from('logos')
-          .select('*', { count: 'exact', head: true })
-          .eq('media_id', removedId);
-      
-      if (logosUsageCount && logosUsageCount > 0) continue;
-
-      const { count: variantUsageCount } = await supabase
-        .from('product_variants')
-        .select('*', { count: 'exact', head: true })
-        .eq('main_media_id', removedId);
-
-      if (variantUsageCount && variantUsageCount > 0) continue;
-
-      // Delete the media row FIRST and read back the rows actually removed. Under RLS
-      // (media_delete_policy, migration 02022 §9) the cookie-scoped session only deletes media it
-      // uploaded (or any row when ADMIN); a non-owner match removes zero rows. Deleting the
-      // storage files before the DB row would destroy the objects while the row survived — an
-      // orphaned record the product save would silently leave behind. Only purge files for a row
-      // we were allowed to delete.
-      const { data: deletedMediaRows } = await supabase
-        .from('media')
-        .delete()
-        .eq('id', removedId)
-        .select('object_key, variants');
-
-      const deletedMedia =
-        deletedMediaRows && deletedMediaRows.length > 0 ? deletedMediaRows[0] : null;
-      if (deletedMedia) {
-         const keysToDelete: string[] = [];
-         if (deletedMedia.object_key) keysToDelete.push(deletedMedia.object_key);
-         if (deletedMedia.variants && Array.isArray(deletedMedia.variants)) {
-             deletedMedia.variants.forEach((v: any) => {
-                 if (v?.objectKey) keysToDelete.push(v.objectKey);
-             });
-         }
-         if (keysToDelete.length > 0) {
-           await deleteMediaFiles(keysToDelete);
-         }
-      }
-    }
-  }
 
   await syncSharedInventoryForSavedProduct(productId, data);
 
@@ -762,6 +745,10 @@ export async function copyProductFromLanguage(
       title: sourceProduct.title,
       short_description: sourceProduct.short_description,
       description_json: sourceProduct.description_json,
+      // As the product RPC and the Freemius sync do: the sitemap's lastModified reads it, and the
+      // visual editor publishes a pre-0.23.4 draft's copy of the title and descriptions only while
+      // updated_at is not later than the draft's created_at.
+      updated_at: new Date().toISOString(),
     })
     .eq('id', targetProductId);
 

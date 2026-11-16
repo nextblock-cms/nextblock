@@ -1,15 +1,21 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Row = Record<string, any>;
 
-vi.mock('@nextblock-cms/db/server', () => ({
-  getServiceRoleSupabaseClient: () => ({}),
-}));
-vi.mock('@nextblock-cms/utils', () => ({
-  formatPrice: (amount: number) => String(amount),
-  getCurrencyMinorUnitFactor: () => 100,
-}));
+vi.mock('@nextblock-cms/db/server', async () => {
+  // The real predicate (a dependency-free module). Without it the purchase-data read of the webhook
+  // sync threw inside the mock, and the sync swallowed that as "Failed to retrieve purchase data".
+  const { isSandboxEnvironment } = await vi.importActual<{ isSandboxEnvironment: () => boolean }>(
+    '../../../db/src/lib/config-resolve'
+  );
+  return { getServiceRoleSupabaseClient: () => ({}), isSandboxEnvironment };
+});
 vi.mock('server-only', () => ({}));
+// No developer key pair and no stored keys: the purchase data comes from the configured env (none here).
+vi.mock('./payment-config', () => ({
+  hydrateFreemiusEnvFromDb: async () => undefined,
+  resolveFreemiusDeveloperCredentialCandidates: async () => [],
+}));
 
 const invoiceMocks = vi.hoisted(() => ({
   assignInvoiceMetadata: vi.fn(async () => ({ invoiceNumber: 'INV-1', paidAt: '2026-10-01T00:00:00Z' })),
@@ -373,6 +379,17 @@ describe('syncFreemiusOrderFromWebhookEvent keeps a refunded order refunded', ()
   beforeEach(() => {
     invoiceMocks.assignInvoiceMetadata.mockClear();
     invoiceMocks.applyOrderInventoryDeduction.mockClear();
+    vi.stubEnv('NEXT_PUBLIC_IS_SANDBOX', '');
+    for (const name of ['FREEMIUS_CHECKOUT_PRODUCTS_JSON', 'FREEMIUS_PUBLIC_KEY', 'FREEMIUS_SECRET_KEY', 'FREEMIUS_API_KEY', 'FREEMIUS_PRODUCT_ID']) {
+      vi.stubEnv(name, '');
+    }
+    // A happy path that logs an error passed through a swallowed failure.
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   it('does not revive a refunded order on a later payment event', async () => {
@@ -387,6 +404,7 @@ describe('syncFreemiusOrderFromWebhookEvent keeps a refunded order refunded', ()
     expect(result).toMatchObject({ orderId: PAID_ORDER, status: 'refunded' });
     expect(orders[0].status).toBe('refunded');
     expect(invoiceMocks.assignInvoiceMetadata).not.toHaveBeenCalled();
+    expect(console.error).not.toHaveBeenCalled();
   });
 
   it('still marks a pending order paid on a positive payment', async () => {
@@ -401,5 +419,21 @@ describe('syncFreemiusOrderFromWebhookEvent keeps a refunded order refunded', ()
     expect(result).toMatchObject({ status: 'paid' });
     expect(orders[0].status).toBe('paid');
     expect(invoiceMocks.assignInvoiceMetadata).toHaveBeenCalledTimes(1);
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it('reads the purchase data of a Freemius license id without an error (none configured: the event alone decides)', async () => {
+    const orders = [paidOrder({ status: 'pending', freemius_license_id: '9001' })];
+    const db = fakeOrders(orders);
+
+    const result = await syncFreemiusOrderFromWebhookEvent({
+      event: { type: 'payment.created', plugin_id: '28609', objects: { payment: { license_id: 9001, gross: 250 } } },
+      client: db.client,
+      productId: '28609',
+    });
+
+    expect(result).toMatchObject({ orderId: PAID_ORDER, status: 'paid' });
+    expect(orders[0].status).toBe('paid');
+    expect(console.error).not.toHaveBeenCalled();
   });
 });

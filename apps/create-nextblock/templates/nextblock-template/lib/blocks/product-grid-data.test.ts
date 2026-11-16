@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
  * cover. Without a media base the grid keeps its Supabase Storage fallback for bucket keys.
  */
 
-vi.mock('@nextblock-cms/ecommerce/server', () => ({ getProducts: vi.fn() }));
+vi.mock('@nextblock-cms/ecommerce/product-actions', () => ({ getProducts: vi.fn() }));
 vi.mock('@nextblock-cms/db/server', () => ({ getSsgSupabaseClient: vi.fn() }));
 
 import { mapProductRowToUiProduct } from './product-grid-data';
