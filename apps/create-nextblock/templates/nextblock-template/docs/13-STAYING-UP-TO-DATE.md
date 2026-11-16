@@ -597,6 +597,7 @@ Most releases need nothing beyond `npm run update`. These ask for a step of your
   from blocks b
   cross join lateral jsonb_path_query(b.content, 'lax $.**.media_id') as j(media_id)
   where jsonb_typeof(j.media_id) = 'string'
+    and j.media_id #>> '{}' <> ''  -- an image background with no image picked stores ''
     and not exists (select 1 from media m where m.id::text = j.media_id #>> '{}');
 
   select s.value ->> 'media_id' as media_id, s.value ->> 'object_key' as object_key
