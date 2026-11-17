@@ -183,15 +183,31 @@ describe('PaymentsClient Freemius section', () => {
     expect(markup).toContain('value="pk_dev_public"');
   });
 
-  it('says how many products a working developer pair reaches, and where an env pair should move', () => {
+  it('says how many products a working developer pair reaches, and which env names it comes from', () => {
     const working = render(false, { state: 'working', source: 'cms', productIds: ['24851', '28609', '43273'] });
     expect(working).toContain('Freemius accepts the developer keys: they reach 3 products.');
     expect(working).not.toContain('FREEMIUS_DEVELOPER_PUBLIC_KEY');
 
+    // FREEMIUS_PUBLIC_KEY / FREEMIUS_SECRET_KEY are a supported home for the pair (installs that ran
+    // Sync from Freemius kept it there): the screen names them, like the developer names, and asks
+    // for no rename.
     const legacy = render(false, { state: 'working', source: 'env-legacy', productIds: ['24851'] });
     expect(legacy).toContain('they reach 1 product.');
-    expect(legacy).toContain('<code>FREEMIUS_PUBLIC_KEY</code>');
-    expect(legacy).toContain('rename those <code>FREEMIUS_DEVELOPER_PUBLIC_KEY</code>');
+    expect(legacy).toContain(
+      'They come from the <code>FREEMIUS_PUBLIC_KEY</code> and <code>FREEMIUS_SECRET_KEY</code> environment variables.'
+    );
+    expect(legacy).not.toContain('rename');
+    expect(legacy).not.toContain('FREEMIUS_DEVELOPER_PUBLIC_KEY');
+
+    const env = render(false, { state: 'working', source: 'env', productIds: ['24851'] });
+    expect(env).toContain(
+      'They come from the <code>FREEMIUS_DEVELOPER_PUBLIC_KEY</code> and <code>FREEMIUS_DEVELOPER_SECRET_KEY</code> environment variables.'
+    );
+
+    // A pair typed into the CMS one-product fields still gets the move hint: the developer fields
+    // sit right above them.
+    const cmsLegacy = render(false, { state: 'working', source: 'cms-legacy', productIds: ['24851'] });
+    expect(cmsLegacy).toContain('They were entered in the one-product fields below: move them to the developer fields.');
   });
 
   it.each([
@@ -468,5 +484,89 @@ describe('PaymentsClient remove boxes', () => {
     expect(render()).toContain(
       'Leave a secret blank to keep the stored value, or tick the remove box under it to delete it when you save: its environment variable, if one is set, then applies again.'
     );
+  });
+});
+
+describe('PaymentsClient one-product keys section', () => {
+  type FreemiusCredentials = PaymentsClientProps['credentials']['freemius'];
+
+  const EMPTY_ONE_PRODUCT: FreemiusCredentials = {
+    developerId: '4242',
+    developerPublicKey: '',
+    hasDeveloperSecretKey: false,
+    publicKey: '',
+    productId: '',
+    hasSecretKey: false,
+    hasApiKey: false,
+  };
+  const WORKING: FreemiusDeveloperStatus = { state: 'working', source: 'env-legacy', productIds: ['24851', '28609', '43273'] };
+
+  function renderSection(freemiusDeveloper: FreemiusDeveloperStatus | null, freemius: Partial<FreemiusCredentials> = {}): string {
+    return renderToStaticMarkup(
+      <PaymentsClient
+        initialEnabledProviders={{ stripe: false, freemius: true }}
+        configStatus={{ stripe: { hasKeys: false, missing: ['Secret key'] }, freemius: { hasKeys: true, missing: [] } }}
+        credentials={{
+          stripe: { publishableKey: '', hasSecretKey: false, hasWebhookSecret: false },
+          freemius: { ...EMPTY_ONE_PRODUCT, ...freemius },
+          envFallbackActive: false,
+        }}
+        freemiusDeveloper={freemiusDeveloper}
+        saveAction={async () => undefined}
+        saveCredentialsAction={async () => undefined}
+      />
+    );
+  }
+
+  /** The section's opening tag. */
+  function sectionTag(markup: string): string {
+    const match = markup.match(/<details[^>]*id="freemius-one-product-keys"[^>]*>/);
+    expect(match, 'the one-product keys section renders').not.toBeNull();
+    return match?.[0] ?? '';
+  }
+
+  it('folds away while the developer keys work and every one-product field is empty', () => {
+    const markup = renderSection(WORKING);
+
+    expect(sectionTag(markup)).not.toContain('open');
+    expect(markup).toContain('One product’s keys (optional)');
+    expect(markup).toContain('· not needed while the developer keys work');
+    // Folded, not removed: the fields stay in the form, so a save posts them blank, as before.
+    for (const id of ['freemius_productId', 'freemius_publicKey', 'freemius_secretKey', 'freemius_apiKey']) {
+      expect(markup).toContain(`id="${id}"`);
+    }
+    // Nothing is stored, so there is no remove box to hide.
+    expect(markup).not.toContain('Remove the stored secret key');
+    expect(markup).not.toContain('Remove the stored API key');
+  });
+
+  it.each<[string, Partial<FreemiusCredentials>]>([
+    ['a Product ID', { productId: '24851' }],
+    ['a public key', { publicKey: 'pk_product_public' }],
+    ['a stored secret key', { hasSecretKey: true }],
+    ['a stored API key', { hasApiKey: true }],
+  ])('stays open while the fields hold %s, even with working developer keys', (_label, freemius) => {
+    const markup = renderSection(WORKING, freemius);
+
+    expect(sectionTag(markup)).toContain('open=""');
+    expect(markup).not.toContain('not needed while the developer keys work');
+  });
+
+  it('a Product ID of spaces alone counts as empty', () => {
+    expect(sectionTag(renderSection(WORKING, { productId: '   ', publicKey: ' ' }))).not.toContain('open');
+  });
+
+  it.each<[string, FreemiusDeveloperStatus | null]>([
+    ['no developer status yet', null],
+    ['no developer pair', { state: 'missing', source: null, productIds: [] }],
+    ['a refused pair', { state: 'refused', source: null, productIds: [] }],
+    ['an unreachable Freemius', { state: 'unreachable', source: null, productIds: [] }],
+    ['an unchecked pair', { state: 'unchecked', source: null, productIds: [] }],
+    ['the public sandbox', { state: 'sandbox', source: null, productIds: [] }],
+  ])('stays open with %s: the one-product keys may be the only keys', (_label, status) => {
+    const markup = renderSection(status);
+
+    expect(sectionTag(markup)).toContain('open=""');
+    expect(markup).not.toContain('not needed while the developer keys work');
   });
 });

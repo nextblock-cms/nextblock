@@ -425,17 +425,19 @@ reads `unreachable`.
 The candidates, most authoritative first (`resolveFreemiusDeveloperCredentialCandidates` in
 `payment-config.ts`): the CMS developer fields, the developer env names, then the single-product
 names, CMS and env. Installs that run Sync from Freemius kept the developer pair under
-`FREEMIUS_PUBLIC_KEY` / `FREEMIUS_SECRET_KEY`, so those still work as the pair: the env value is
-read as the deployment set it, even after `hydrateFreemiusEnvFromDb` wrote the CMS single-product
-keys over the same names, and the Payments screen says when the pair comes from there. Move it to
-the developer names and put one product's keys there (with its Product ID), or leave them empty.
+`FREEMIUS_PUBLIC_KEY` / `FREEMIUS_SECRET_KEY`, and those names stay a supported home for it: the env
+value is read as the deployment set it, even after `hydrateFreemiusEnvFromDb` wrote the CMS
+single-product keys over the same names, and the Payments screen only says the pair comes from
+there. It asks to move a pair only out of the CMS one-product fields, under the developer fields.
 The key policy below keeps a pair it knows from opening checkouts or verifying webhooks as a
 product's keys: one that works, one that shares a key with a dedicated pair, or one Freemius
 accepted earlier in this instance's life. For the product `FREEMIUS_PRODUCT_ID` binds, the one gap
 is an instance that has not yet seen Freemius accept that pair: one started after a revocation, or
 one whose developer checks Freemius has not answered yet (a cold start during a throttle or an
-outage). Move the pair out of the one-product names (the 0.23.4 upgrade notes say how), and after
-you rotate the developer pair, delete the old one from every field, the one-product names included.
+outage). So set no Product ID while the pair sits in the one-product names; to put one product's
+keys there (with its Product ID), first move the pair to the developer names (the 0.23.4 upgrade
+notes say how). After you rotate the developer pair, delete the old one from every field, the
+one-product names included.
 A route still on the synchronous check accepts that secret in any state ("Webhook flow").
 
 **Removing a stored key.** A blank field keeps its stored secret. To delete one, tick the remove
@@ -484,7 +486,11 @@ or `unavailable` (429, 5xx, network).
 **The product keys remain the fallback**, for installs without a developer pair and for products of
 another Freemius account: the screen's one-product fields (`FREEMIUS_PUBLIC_KEY`,
 `FREEMIUS_SECRET_KEY`, `FREEMIUS_API_KEY` after hydration), `FREEMIUS_CHECKOUT_PRODUCTS_JSON` for more
-products, and the bearer `@freemius/sdk` calls. A 401/403 on the developer pair, which refuses
+products, and the bearer `@freemius/sdk` calls. CMS → Payments folds those fields into a closed
+"One product’s keys (optional)" section while the developer pair works and none of them holds a
+value (Product ID, public key, a stored secret or API key); otherwise it stays open. The closed
+section still posts its fields, all blank, so a save changes nothing there. A 401/403 on the
+developer pair, which refuses
 before anything is written, hands a read or a coupon write over to them; a trial does so only before
 its license exists. A `FREEMIUS_CHECKOUT_PRODUCTS_JSON` that is not JSON holds no entries, and is
 logged once per value with the error's name and position only: V8's message quotes the text around
@@ -662,8 +668,8 @@ opens a checkout with a developer public key this instance knows (working, dedic
 by Freemius earlier in its life). For the product `FREEMIUS_PRODUCT_ID` names, the one gap is an
 instance that has not yet seen Freemius accept that pair: one started after a revocation, or one
 whose developer checks Freemius has not answered yet (a cold start during a throttle or an outage).
-Move the pair out of the one-product names (the 0.23.4 upgrade notes say how), and after you rotate
-the developer pair, delete the old one from every field, the one-product names included
+So set no Product ID while the pair sits in the one-product names, and after you rotate the
+developer pair, delete the old one from every field, the one-product names included
 (`freemius-keys-end-to-end.test.ts` pins this residual). The blocked log
 line names the product id, the source and the policy reason (enum values, never key material, such
 as `one_product_keys_are_developer_pair`, `one_product_keys_not_this_product` or

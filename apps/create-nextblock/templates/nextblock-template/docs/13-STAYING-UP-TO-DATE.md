@@ -760,15 +760,17 @@ Most releases need nothing beyond `npm run update`. These ask for a step of your
   name (a mistyped ID included) and that has no JSON entry, or whose JSON entry lacks a `publicKey`,
   now answers 503 at checkout and 401 to webhooks (503 while a configured developer pair is refused
   or cannot be asked) instead of using the one-product keys.
-- **Move the developer pair out of the one-product names** (`FREEMIUS_PUBLIC_KEY` /
-  `FREEMIUS_SECRET_KEY`, or the CMS one-product fields) into the developer fields or
-  `FREEMIUS_DEVELOPER_*`, and put the product's keys (with its Product ID) in their place. A pair
-  left there still works as the pair, but no longer opens checkouts or verifies webhooks as a
-  product's keys, Product ID or not. For the product the Product ID binds, the one gap is an
-  instance that has not yet seen Freemius accept that pair: one started after a revocation, or one
-  whose developer checks Freemius has not answered yet (a cold start during a throttle or an
-  outage). So move it, and after you rotate the developer pair, delete the old one from every
-  field, the one-product names included: in CMS → Payments clear the public key fields that hold
+- **The developer pair may stay in the one-product env names** (`FREEMIUS_PUBLIC_KEY` /
+  `FREEMIUS_SECRET_KEY`), where installs that ran Sync from Freemius kept it: it still works as
+  the pair, but no longer opens checkouts or verifies webhooks as a product's keys, Product ID or
+  not. So set no Product ID while it sits there: for the product a Product ID binds, the one gap
+  is an instance that has not yet seen Freemius accept that pair (one started after a revocation,
+  or one whose developer checks Freemius has not answered yet: a cold start during a throttle or
+  an outage). To use those names for one product's keys (with its Product ID), first move the
+  pair into the developer fields or `FREEMIUS_DEVELOPER_*`. A pair typed into the CMS one-product
+  fields belongs in the developer fields above them; when the env names hold the same pair,
+  removing the CMS copy is enough. After you rotate the developer pair, delete the old one from
+  every field, the one-product names included: in CMS → Payments clear the public key fields that hold
   it, tick the remove box under each stored secret it fills (developer secret key, one-product
   secret key, API key) and save, then clear the env names that hold it. Each instance drops the
   removed values at its next Freemius request once its 60-second cache expires, giving each name

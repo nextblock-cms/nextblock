@@ -533,7 +533,8 @@ describe('one-product keys beside a dedicated developer pair Freemius refuses', 
  * under the one-product names therefore honours it as the keys of the product FREEMIUS_PRODUCT_ID
  * binds: one started after a revocation, or a cold start whose developer checks Freemius has not
  * answered (429/502). Closing it would cost one-product installs their offline binding, so it is
- * documented (move the pair out of those names) and pinned here: a change to it must be deliberate.
+ * documented (set no Product ID while the pair sits in those names) and pinned here: a change to it
+ * must be deliberate.
  */
 describe('documented residual: a live developer pair that FREEMIUS_PRODUCT_ID binds under the one-product names', () => {
   beforeEach(() => {

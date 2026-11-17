@@ -312,11 +312,12 @@ const DEVELOPER_SOURCE_NOTES: Partial<Record<NonNullable<FreemiusDeveloperStatus
       environment variables.
     </>
   ),
+  // A supported home for the pair (installs that ran Sync from Freemius kept it there): say where
+  // it comes from, as for the developer names, and ask for no move.
   'env-legacy': (
     <>
-      They come from the <code>FREEMIUS_PUBLIC_KEY</code> and <code>FREEMIUS_SECRET_KEY</code> environment variables:
-      rename those <code>FREEMIUS_DEVELOPER_PUBLIC_KEY</code> and <code>FREEMIUS_DEVELOPER_SECRET_KEY</code>, or enter the
-      keys here.
+      They come from the <code>FREEMIUS_PUBLIC_KEY</code> and <code>FREEMIUS_SECRET_KEY</code>{' '}
+      environment variables.
     </>
   ),
   'cms-legacy': <>They were entered in the one-product fields below: move them to the developer fields.</>,
@@ -430,6 +431,17 @@ function ProviderCredentialsCard({
 }) {
   const storedPlaceholder = '•••••••• (stored — leave blank to keep)';
   const sandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
+  const freemius = credentials.freemius;
+  // The one-product fields matter only without a working developer pair, or once they hold
+  // something: fold them away while the developer keys work and every field is empty, so the
+  // screen leads with the keys in use. A closed <details> still submits its fields, all blank
+  // here, which saves nothing new; it opens on its own once any of them holds a value.
+  const oneProductKeysInUse =
+    freemius.productId.trim() !== '' ||
+    freemius.publicKey.trim() !== '' ||
+    freemius.hasSecretKey ||
+    freemius.hasApiKey;
+  const foldOneProductKeys = freemiusDeveloper?.state === 'working' && !oneProductKeysInUse;
 
   return (
     <Card className="flex h-full flex-col">
@@ -577,53 +589,65 @@ function ProviderCredentialsCard({
               productId={credentials.freemius.productId}
             />
 
-            <h4 className="pt-1 text-xs font-semibold">
-              One product&rsquo;s keys (optional)
-            </h4>
-            <p className="text-xs text-muted-foreground">
-              Only needed without developer keys, or for a product they
-              can&rsquo;t reach (one from another Freemius account): these fields
-              hold the keys of one Freemius product (in Freemius: the product
-              &rarr; Settings &rarr; API &amp; Keys). Each product in CMS &rarr;
-              Products keeps its own Freemius Product ID and Plan ID for
-              checkout. More such products go in the{' '}
-              <code>FREEMIUS_CHECKOUT_PRODUCTS_JSON</code> environment variable.
-            </p>
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              <CredentialField
-                id="freemius_productId"
-                label="Product ID (optional)"
-                defaultValue={credentials.freemius.productId}
-                hint="The product these keys belong to. Fill it in, also for a product outside your developer account: the keys then serve that product only and keep working while Freemius is slow or busy. Leave it empty only on a one-product store with no Developer ID. Developer keys never go here."
-              />
-              <CredentialField
-                id="freemius_publicKey"
-                label="Public key"
-                defaultValue={credentials.freemius.publicKey}
-                placeholder="pk_…"
-                hint="Opens the Freemius checkout."
-              />
-              <CredentialField
-                id="freemius_secretKey"
-                label="Secret key"
-                type="password"
-                placeholder={
-                  credentials.freemius.hasSecretKey ? storedPlaceholder : 'sk_…'
-                }
-                hint="Proves that webhooks really come from Freemius."
-                removeLabel={credentials.freemius.hasSecretKey ? 'Remove the stored secret key' : undefined}
-              />
-              <CredentialField
-                id="freemius_apiKey"
-                label="API key"
-                type="password"
-                placeholder={
-                  credentials.freemius.hasApiKey ? storedPlaceholder : 'API key'
-                }
-                hint="The API bearer token from the same Freemius page. Shows license keys on orders and sends coupons to Freemius."
-                removeLabel={credentials.freemius.hasApiKey ? 'Remove the stored API key' : undefined}
-              />
-            </div>
+            <details
+              id="freemius-one-product-keys"
+              open={!foldOneProductKeys}
+              className="space-y-3 pt-1"
+            >
+              <summary className="cursor-pointer text-xs font-semibold">
+                One product&rsquo;s keys (optional)
+                {foldOneProductKeys ? (
+                  <span className="font-normal text-muted-foreground">
+                    {' '}
+                    &middot; not needed while the developer keys work
+                  </span>
+                ) : null}
+              </summary>
+              <p className="text-xs text-muted-foreground">
+                Only needed without developer keys, or for a product they
+                can&rsquo;t reach (one from another Freemius account): these fields
+                hold the keys of one Freemius product (in Freemius: the product
+                &rarr; Settings &rarr; API &amp; Keys). Each product in CMS &rarr;
+                Products keeps its own Freemius Product ID and Plan ID for
+                checkout. More such products go in the{' '}
+                <code>FREEMIUS_CHECKOUT_PRODUCTS_JSON</code> environment variable.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                <CredentialField
+                  id="freemius_productId"
+                  label="Product ID (optional)"
+                  defaultValue={credentials.freemius.productId}
+                  hint="The product these keys belong to. Fill it in, also for a product outside your developer account: the keys then serve that product only and keep working while Freemius is slow or busy. Leave it empty only on a one-product store with no Developer ID. Developer keys never go here."
+                />
+                <CredentialField
+                  id="freemius_publicKey"
+                  label="Public key"
+                  defaultValue={credentials.freemius.publicKey}
+                  placeholder="pk_…"
+                  hint="Opens the Freemius checkout."
+                />
+                <CredentialField
+                  id="freemius_secretKey"
+                  label="Secret key"
+                  type="password"
+                  placeholder={
+                    credentials.freemius.hasSecretKey ? storedPlaceholder : 'sk_…'
+                  }
+                  hint="Proves that webhooks really come from Freemius."
+                  removeLabel={credentials.freemius.hasSecretKey ? 'Remove the stored secret key' : undefined}
+                />
+                <CredentialField
+                  id="freemius_apiKey"
+                  label="API key"
+                  type="password"
+                  placeholder={
+                    credentials.freemius.hasApiKey ? storedPlaceholder : 'API key'
+                  }
+                  hint="The API bearer token from the same Freemius page. Shows license keys on orders and sends coupons to Freemius."
+                  removeLabel={credentials.freemius.hasApiKey ? 'Remove the stored API key' : undefined}
+                />
+              </div>
+            </details>
           </div>
 
           {credentials.envFallbackActive && (
