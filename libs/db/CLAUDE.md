@@ -13,6 +13,11 @@ Entry points: `@nextblock-cms/db` (browser `createClient`, Row types); `/server`
   `NEXT_PUBLIC_SUPABASE_ANON_KEY → SUPABASE_ANON_KEY → NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY →
   SUPABASE_PUBLISHABLE_KEY`; service `SUPABASE_SERVICE_ROLE_KEY → SUPABASE_SECRET_KEY`.
   Bracket-access undeclared names (`noPropertyAccessFromIndexSignature`).
+- With no URL or no key, `createClient()` and `getSsgSupabaseClient()` build on
+  `src/lib/supabase/unconfigured.ts`: a `.invalid` host and a fetch that answers every request
+  locally (421, `NEXTBLOCK_SUPABASE_NOT_CONFIGURED`). Never fall back to a placeholder host:
+  `dummy.supabase.co` cost a fresh scaffold ~1,300 connection attempts per build
+  (`unconfigured.test.ts`; docs/04 → "Unconfigured clients").
 - Encryption key chain: `NEXTBLOCK_ENCRYPTION_KEY → CORTEX_AI_ENCRYPTION_KEY → HMAC of the
   service key`; rotating the service key invalidates the derived key.
 - Migrations `src/supabase/migrations/GGNNN_<snake_name>.sql` (GG = squash generation, NNN =

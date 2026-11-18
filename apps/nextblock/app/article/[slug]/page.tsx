@@ -40,7 +40,8 @@ interface PostPageProps {
 export async function generateStaticParams(): Promise<ResolvedPostParams[]> {
   // Cookie-free SSG client. getSsgSupabaseClient() resolves the Supabase URL/anon key
   // under every alias the Vercel integration may inject (incl. the new publishable key)
-  // and degrades to a dummy client when unconfigured (the query below then returns []).
+  // and, when unconfigured, returns a client that answers "not configured" without a
+  // request (the query below then returns []).
   const supabase = getSsgSupabaseClient();
 
   const { data: posts, error } = await supabase

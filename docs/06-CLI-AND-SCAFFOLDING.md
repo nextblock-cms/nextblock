@@ -326,44 +326,138 @@ republish.)
 
 ### Release commands
 
-- `npm run release:all -- <version>` — build **and publish every package** at one
-  synchronized version, in dependency order:
-  `utils → ui → sdk → db → editor → ecom → cortex → affiliates`, then `release-cli.js`
-  (which stamps the root + template + `create-nextblock`, re-syncs the template, and
-  publishes the CLI). Pass an explicit semver (e.g. `0.10.2`); `--dry-run` prints the plan
-  only. `affiliates` depends on `utils` and `ui` and goes after `cortex`; every lib goes
-  before the CLI, whose template depends on all of them.
+`node tools/scripts/release-all.js <version>` (the `release:all` script) builds **and publishes
+every package** at one synchronized version, in two phases, so that **one npm browser approval
+covers every publish**:
+
+1. **Build and verify; publish nothing.** Stamps `<version>` into the eight libs, the root,
+   `apps/nextblock` and `create-nextblock` with `npm version` (every lib first, the ones already on
+   npm included, so sibling ranges resolve to the release). Then it syncs the CLI template and packs
+   `create-nextblock` (first, because the sync is the step most likely to fail), and builds each
+   lib, finalizes the premium manifests, packs it, and runs the pre-publish checks below on the
+   packed file list. Every tarball lands in `dist/release` beside `release-manifest.json` (file
+   names and the integrity npm reported). When any step fails, every stamped file is put back as
+   the run found it (the template's `package.json` gets back only its `version`: the sync rewrote
+   the rest from `apps/nextblock`) and nothing has been published.
+2. **Publish back to back.** Before the first publish it checks every tarball against its integrity,
+   runs `npm whoami`, and asks npm again which versions are out. Then it runs `npm publish <tarball>`
+   for `utils → ui → sdk → db → editor → ecom → cortex → affiliates → create-nextblock`, one after
+   another (each lib's siblings go out before it, and the CLI last: new scaffolds install the libs
+   at `latest`). The first publish opens the browser approval, and the other uploads follow inside
+   the same approval window. Rehearsed on 2026-11-17, phase 1 took about 7 minutes and phase 2
+   (with `npm publish --dry-run`, so no uploads) about 3, a minute of it the CLI: npm unpacks a
+   tarball to read its manifest, which is slow for 1,180 files on Windows. If the window still runs
+   out, npm asks once more at the last package; approve again.
+
+`npm publish <tarball>` runs no lifecycle script, so phase 2 neither builds nor re-runs the CLI's
+`prepack` template sync: phase 1 packs `create-nextblock` with `--ignore-scripts` right after the
+sync, and `apps/create-nextblock/scripts/check-tarball.js` reads that tarball back
+(`npm pack <tarball> --dry-run --json`) and requires every template file on disk in it, no local
+env file, and the `bin` script. What was checked is what ships. (A folder publish in
+`apps/create-nextblock` still runs `prepack`.) Every publish pins npmjs with `--registry` and
+`--@nextblock-cms:registry`.
+
+Options:
+
+- `--dry-run` prints both phases and changes nothing. `--rehearse` runs both phases for real but
+  publishes with `npm publish --dry-run`, then restores every version stamp; the template stays
+  re-synced from `apps/nextblock`, as `npm run sync:create-nextblock` leaves it (its `package.json`
+  gets back only its `version`).
+- `--build-only` runs phase 1 (unattended, about 7 minutes); `--publish-only` runs phase 2 from
+  `dist/release` when you are at the browser. It refuses tarballs from a rehearsal, from another
+  version, or from a phase 1 that did not finish, and any tarball that changed after it was packed.
+- Pass an explicit version (e.g. `0.23.6`). `major`, `minor` and `patch` work only while every
+  package is at one version and npm has that version of every package: they are applied once, to
+  that version. Phase 1 leaves the checkout stamped and phase 2 never restores it, so after a
+  release that stopped part way, or a `--build-only` run, a keyword would bump past that release
+  (0.23.6 half published, then all of 0.23.7): it is refused, and running the explicit version
+  again resumes. `--publish-only` takes the explicit version only. Unknown options are refused.
+- Versions are plain `x.y.z`: a pre-release (`0.24.0-rc.0`, or `prerelease` and the other `pre*`
+  keywords) is refused by all three scripts. npm publishes one only under a dist-tag (`--tag`;
+  npm 11 refuses it otherwise, and npm 10 made it `latest`), and a published `create-nextblock`
+  installs the libs at `latest`, so a pre-release scaffold would get the last stable libs. Build
+  metadata (`0.23.6+build.1`) is refused too: `npm version` and `npm publish` drop it, so
+  `release-lib.js` and `release-cli.js` would stamp and publish `0.23.6`, and `release-all.js`'s
+  phase 1 would stop at its first pack check (npm packed `0.23.6`, not the version asked for).
+- Call the script with `node`. Windows PowerShell drops the `--` of `npm run release:all -- …`, and
+  npm then keeps `--dry-run` for itself; the script honours `npm_config_dry_run` (and the other
+  modes' `npm_config_*`) as a safety net, and says so.
+
+Single packages, with the same steps:
+
 - `npm run build:<lib>` (`build:utils|ui|db|editor|sdk|ecom|cortex|affiliates`) and
-  `node tools/scripts/release-lib.js <lib> <version>` — build + publish a **single** lib
-  (`<lib>` is the nx project name, so use `ecommerce`, which maps to the published
-  `@nextblock-cms/ecom`). `npx nx build <lib>` only *compiles*, it does not publish.
+  `node tools/scripts/release-lib.js <lib> <version>` build + publish a **single** lib (`<lib>` is
+  the nx project name, so use `ecommerce`, which maps to the published `@nextblock-cms/ecom`) from
+  a tarball in `dist/release-lib`. `--dry-run` builds and packs for real, ends with
+  `npm publish --dry-run`, and restores the version. `npm run build:<lib> --dry-run` works too:
+  npm exports the flag as `npm_config_dry_run`, which the script reads and then clears, since an
+  `npm pack` that inherits it writes no tarball (the release's own `npm pack` also passes
+  `--dry-run=false`; the sync's pack check is a dry run on purpose).
+- `npm run build:cli` (`release-cli.js`) publishes `create-nextblock` alone, from a tarball in
+  `dist/release-cli`; use it only when no lib changed since the last lib publish (0.23.2 shipped a
+  template that needed an unpublished utils). Its `--dry-run` prints the steps only.
+- A failure in either restores the version stamps. After a failed `npm publish`, the script first
+  asks npm which tarball it serves as that version (`dist.integrity`): this run's tarball (a lost
+  response, a timeout after the upload) counts as published, and the stamps stay, as the checkout
+  must match what npm serves; another tarball means npm had the version before the run, so nothing
+  was published and the run fails (update a checkout that is behind npm before releasing again;
+  if npm's copy is the older code, release a version above npm's latest). When npm lists nothing,
+  the stamps are restored with a hint: if npm accepted the upload it can take minutes to list it,
+  and re-running the explicit version then counts it as published; otherwise fix the error npm
+  printed first (a missing login; or a version below npm's latest, which needs a dist-tag the
+  scripts never pass: update a checkout that is behind npm, or release a version above npm's
+  latest). `npx nx build <lib>` only *compiles*, it does not publish.
 
-### npm 2FA / OTP (and capturing a log)
+The plan and the failure handling live in `tools/scripts/lib/release-pipeline.js` (tested with fake
+steps in `release-pipeline.test.ts`), the side effects in `tools/scripts/lib/release-steps.js`.
 
-Publishing requires a one-time password if the npm account has 2FA. **Piping the command
-output breaks the interactive OTP prompt** — `npm run release:all -- … 2>&1 | Tee-Object …`
-(or `| tee`) fails with `npm error code EOTP` because npm no longer has a TTY. Either:
+### npm's browser approval (and capturing a log)
+
+The npm account uses auth-type web. The first `npm publish` prints an approval link (ENTER opens
+it), one approval covers about five minutes of publishes, and an unanswered prompt expires after
+about seven (`E404` on `/-/v1/done`). The old `release:all` built each package right before
+publishing it, so nine packages took about 15 minutes, asked for two or three approvals, and three
+0.23.5 attempts (2026-11-17) died on prompts that expired between builds. Phase 2 now publishes
+everything back to back, so start it (`--publish-only`, or the end of a full run) only when you can
+approve in the browser.
+
+**Piping the command output breaks the prompt** — `… 2>&1 | Tee-Object …` (or `| tee`) fails with
+`npm error code EOTP` because npm no longer has a TTY. Either:
 
 - set an npm **Automation** token (`npm config set //registry.npmjs.org/:_authToken …`),
   which bypasses 2FA — then piping to a log file is fine; or
-- capture with PowerShell `Start-Transcript -Path release.log; npm run release:all -- … ;
+- capture with PowerShell `Start-Transcript -Path release.log; node tools/scripts/release-all.js … ;
   Stop-Transcript`, which records the session while npm keeps its terminal.
 
-With an explicit version, `release:all` asks npm first and skips every lib already published at
-that version (it only stamps the local `package.json`, so later libs resolve the right sibling
-range), which makes re-running the same version after a partial failure a resume. With a bump
-keyword (`patch`, `minor`, …) it cannot pre-check: finish a partial release by running the
-**remaining** libs individually (`node tools/scripts/release-lib.js <lib> <version>` … then
-`release-cli.js <version>`), or bump to a fresh version and re-run the whole thing.
+**Resuming.** A package already on npm at the target version is skipped in both phases (never
+rebuilt or republished, only stamped), so re-running the same version after a partial failure
+finishes the release. When phase 2 stops (an expired approval, a network error), the checkout stays
+stamped at the release version and `dist/release` keeps the verified tarballs:
+`node tools/scripts/release-all.js <version> --publish-only` publishes what is not out yet, with one
+new approval and no rebuild. A failed publish is checked against npm once, and a version that turns
+out to be there counts as published. npm can take a few minutes to list a new version, so check that
+each tarball URL (`https://registry.npmjs.org/<name>/-/<file>.tgz`) answers 200 before tagging or
+announcing. To abandon a release after phase 1, restore the stamped `package.json` and
+`package-lock.json` files it names. The automatic restore puts those files back as that run found
+them, and Ctrl+C skips it (the release scripts install no Ctrl+C handler, so the process ends at
+once). After an interrupted real release, run the same explicit version again to resume it, or
+restore the files to abandon it. After an interrupted `--rehearse` (in either phase), restore them
+by hand: a second rehearsal of the same version starts from the stamped files and puts those back
+(it warns when it starts on a checkout that already reads the version). A keyword run refuses
+too: when every package carries the stamped version and npm answers, its message names both an
+interrupted rehearsal and a stopped release as the possible cause; when a Ctrl+C during stamping
+left the folders uneven, it says to put the version lines back first.
 
 ### The pre-publish check
 
-`release-lib.js` builds with `NODE_ENV=production`, finalizes the premium libraries'
-manifests (`ecommerce`, `cortex` and `affiliates`: entry points, the `exports` map, sibling
-`workspace:` specs resolved to published versions in `dependencies`, `optionalDependencies` and
-`peerDependencies`, public access, no `nx` field), and then runs
-`tools/scripts/verify-lib-dist.js <lib>` before `npm publish`. A
-failed check aborts the release and restores the version. The check must come AFTER the
+The release build (`buildLibArtifact` in `tools/scripts/lib/release-steps.js`, run by phase 1 of
+`release-all.js` and by `release-lib.js`) builds with `NODE_ENV=production`, finalizes the premium
+libraries' manifests (`ecommerce`, `cortex` and `affiliates`: entry points, the `exports` map,
+sibling `workspace:` specs resolved to published versions in `dependencies`, `optionalDependencies`
+and `peerDependencies`, public access, no `nx` field), packs the lib, and then runs the
+`tools/scripts/verify-lib-dist.js` checks on the packed tarball's file list before anything is
+published. A failed check aborts the release, deletes that tarball, and restores the version
+stamps. The check must come AFTER the
 manifest step: `ecommerce` builds with the raw source `package.json`, which has no `exports`
 at all, so checking first rejected every subpath (that is what stopped the first 0.19.1
 attempt). The three `exports` maps live in `tools/scripts/lib-publish-exports.js`
@@ -382,7 +476,7 @@ in 0.19.0 and broke `next build` in every generated project:
 
 | Check | What went wrong |
 | :-- | :-- |
-| Development build | Without `NODE_ENV=production` a release build can run in development mode: `@nx/vite/plugin` resolves every Vite config in development mode while Nx computes the project graph, Vite then sets `NODE_ENV=development` in that process, and with plugin isolation off (as in `release-lib.js`) the build task inherits it. plugin-react then emits `jsxDEV(..., this)` with the builder's absolute paths, and `this` is illegal in a file with inline server actions ("Server Actions cannot use `this`"). |
+| Development build | Without `NODE_ENV=production` a release build can run in development mode: `@nx/vite/plugin` resolves every Vite config in development mode while Nx computes the project graph, Vite then sets `NODE_ENV=development` in that process, and with plugin isolation off (as in the release build, `tools/scripts/lib/release-steps.js`) the build task inherits it. plugin-react then emits `jsxDEV(..., this)` with the builder's absolute paths, and `this` is illegal in a file with inline server actions ("Server Actions cannot use `this`"). |
 | Consumed subpaths | With `preserveModules`, only modules reachable from a build entry are emitted. A module imported **only** through its subpath (`@nextblock-cms/utils/script-safety`) shipped a `.d.ts` and no JavaScript. Give it its own `build.lib.entry`. |
 | Lost exports | `libs/db` and `libs/utils` track stale compiled twins (`foo.js` beside `foo.ts`). Vite resolves `.js` before `.ts` by default, so the package was assembled from months-old code. Both configs now set `resolve.extensions` with TypeScript first, and so does the root `vitest.config.ts`: until 0.21 the tests ran the twins too. |
 
@@ -424,7 +518,7 @@ that will ship:
 
 | Check | What went wrong |
 | :-- | :-- |
-| Workspace dependencies | The premium builds copy the raw source `package.json` (`"@nextblock-cms/utils": "workspace:*"`), and `release-lib.js` resolves those specs only for a lib it finalizes. A new lib without that step would publish a manifest every `npm install` refuses (`EUNSUPPORTEDPROTOCOL`), and the monorepo, which never installs from `dist/`, would not notice. `release-lib.js` runs the check with `manifestFinalized: true`, so every `workspace:` spec fails there; on a plain `nx build` the sections the finalize step rewrites are skipped. |
+| Workspace dependencies | The premium builds copy the raw source `package.json` (`"@nextblock-cms/utils": "workspace:*"`), and the release build resolves those specs only for a lib it finalizes. A new lib without that step would publish a manifest every `npm install` refuses (`EUNSUPPORTEDPROTOCOL`), and the monorepo, which never installs from `dist/`, would not notice. The release build runs the check with `manifestFinalized: true`, so every `workspace:` spec fails there; on a plain `nx build` the sections the finalize step rewrites are skipped. |
 
 A tenth check (also added with `affiliates`) covers the manifest's `sideEffects` list:
 
@@ -446,7 +540,7 @@ what its consumers read, in the shape they read it, and a fourteenth holds the f
 | Check | What went wrong |
 | :-- | :-- |
 | Dot paths | `db`'s build copied `libs/db/src/supabase` into the dist whole, and through the 0.23.4 rehearsal builds that brought the Supabase CLI's local state along: `.temp/` (the linked project ref, the pooler URL, the local start secrets) and `.branches/`. Only the copied `supabase/.gitignore` kept them out of the tarball: npm honours a nested ignore file inside a `files` whitelist, so renaming it, or adding an `.npmignore` beside it (even an empty one replaces it), would have published them. `tools/scripts/copy-db-supabase.cjs` now copies an allowlist with no dot entry at any depth into a folder it empties first (next two rows), and check 12 refuses any packed path with a segment that starts with `.` (npm itself never packs `.npmrc`, `.gitignore` or `.npmignore`). No lib ships a dot path today; one that must gets an explicit, commented exception in the check, never a looser rule. |
-| Supabase folder | The first fix was a denylist (`.temp/`, `.branches/`, `.env*` but `*.example`), and the Supabase CLI also keeps local state in `supabase/` that is not a dot path, which check 12 cannot see: local Studio's saved SQL snippets (`snippets/`) and `supabase gen signing-key`'s `signing_keys.json`. Consumers read only `config.toml`, `migrations/` and `templates/` from the package (create-nextblock's `ensureSupabaseAssets`, `npm run update`, the build hook's `migrate-core`); `functions/` holds the maintainer-only migration-ingest edge function, deployed from `libs/db/src`. The copy now takes exactly those three (`SUPABASE_PACKAGE_ENTRIES`), fails the build when one is missing, and owns `dist/libs/db/supabase`: it empties the folder before copying, and refuses any other destination, a link, and a destination whose real path is, holds or sits inside the source. Its first allowlist version merged instead, and vite-plugin-dts, which declares every file `tsconfig.lib.json` includes, had already written `supabase/functions/nextblock-migration-ingest/index.d.ts` there, so check 13 (the tarball's `supabase/` holds exactly the three entries) refused every fresh `db` build; `libs/db/vite.config.ts` now also excludes `src/supabase/**` from the declarations. Check 13 counts each entry only in the shape consumers read (`config.toml` as a file, `migrations/` and `templates/` as folders with a file in them), so a regular file named `supabase/migrations` is refused, not counted. The emptying copy first checked its destination as written, so a link above it (`dist/libs/db` as a junction into `libs/db/src`) let a run of the copy empty `libs/db/src/supabase`; it now compares real paths first (the OS realpath, which also expands Windows 8.3 short names). That guards the copy step only: `nx build db` runs `vite build` before it, and Vite's `emptyOutDir` empties `../../dist/libs/db` through such a link (all of `libs/db/src` in that example) before the copy can refuse. `release-lib.js` deletes `dist/libs/db` (`fs.rmSync`, which unlinks a link there and keeps its target) before it builds, so a release is not exposed to a link at `dist/libs/db` itself; never link `dist/` or anything below it into the checkout. `copy-db-supabase.test.ts` fails when a consumer reads an entry the list leaves out, when a stale file survives the copy, and when a wrong destination, a link or a junction into, around or inside the source is not refused (a source spelled with 8.3 short names too, where the temp folder has one). |
+| Supabase folder | The first fix was a denylist (`.temp/`, `.branches/`, `.env*` but `*.example`), and the Supabase CLI also keeps local state in `supabase/` that is not a dot path, which check 12 cannot see: local Studio's saved SQL snippets (`snippets/`) and `supabase gen signing-key`'s `signing_keys.json`. Consumers read only `config.toml`, `migrations/` and `templates/` from the package (create-nextblock's `ensureSupabaseAssets`, `npm run update`, the build hook's `migrate-core`); `functions/` holds the maintainer-only migration-ingest edge function, deployed from `libs/db/src`. The copy now takes exactly those three (`SUPABASE_PACKAGE_ENTRIES`), fails the build when one is missing, and owns `dist/libs/db/supabase`: it empties the folder before copying, and refuses any other destination, a link, and a destination whose real path is, holds or sits inside the source. Its first allowlist version merged instead, and vite-plugin-dts, which declares every file `tsconfig.lib.json` includes, had already written `supabase/functions/nextblock-migration-ingest/index.d.ts` there, so check 13 (the tarball's `supabase/` holds exactly the three entries) refused every fresh `db` build; `libs/db/vite.config.ts` now also excludes `src/supabase/**` from the declarations. Check 13 counts each entry only in the shape consumers read (`config.toml` as a file, `migrations/` and `templates/` as folders with a file in them), so a regular file named `supabase/migrations` is refused, not counted. The emptying copy first checked its destination as written, so a link above it (`dist/libs/db` as a junction into `libs/db/src`) let a run of the copy empty `libs/db/src/supabase`; it now compares real paths first (the OS realpath, which also expands Windows 8.3 short names). That guards the copy step only: `nx build db` runs `vite build` before it, and Vite's `emptyOutDir` empties `../../dist/libs/db` through such a link (all of `libs/db/src` in that example) before the copy can refuse. The release build (`buildLibArtifact`) deletes `dist/libs/db` (`fs.rmSync`, which unlinks a link there and keeps its target) before it builds, so a release is not exposed to a link at `dist/libs/db` itself; never link `dist/` or anything below it into the checkout. `copy-db-supabase.test.ts` fails when a consumer reads an entry the list leaves out, when a stale file survives the copy, and when a wrong destination, a link or a junction into, around or inside the source is not refused (a source spelled with 8.3 short names too, where the temp folder has one). |
 | Supabase files | Check 13 passes any file inside an allowed folder. Every install applies what ships in `supabase/migrations` (`migrate-core` and `npm run update` take any `<digits>_*.sql`), so a file the Supabase CLI writes with a timestamped name (`migration new`, `db diff -f`, `db pull`) left in `libs/db/src/supabase/migrations` would sort after every `GGNNN` version and run on every downstream database, and the release never runs `npm run db:migrate:check`. Check 14 holds the packed migrations to `validateMigrationNames` (`GGNNN_<snake_name>.sql`, one generation, contiguous from `000`), refuses any other file or a subfolder there (a `seed.sql` too, which no applier runs and `db:migrate:check` never lists), and allows only `*.html` in `supabase/templates` (the Auth email templates new projects upload). A correctly named migration can still be a work in progress, so check 14 also compares the packed file names with the ones `apps/nextblock/lib/setup/migrations-bundle.ts` embeds (what `/setup` applies on a serverless host, read with the TypeScript parser): a migration the bundle lacks, or a bundled one the tarball lacks, stops the release (take a file not meant for it out of the folder, otherwise run `npm run generate:migrations-bundle`), and a `migrations/` folder that holds no top-level `<digits>_*.sql` file (only stray files, a subfolder or dot paths) is one problem for the whole bundle. That also keeps a serverless `/setup` and `npm run update` from applying different sets of migrations; it compares names, not SQL, so a migration edited after the bundle was generated still passes. A work in progress that was bundled too still ships, so the releasing checkout must hold only the migrations meant for that release. |
 
 ### How the libraries build
@@ -471,7 +565,7 @@ What the configs must now do themselves:
   chunks would stay in the tarball.
 - Copy files the build does not write with `copyIntoDist()` from
   `tools/vite/lib-build-plugins.mjs`: `README.md`, and the raw `package.json` for `cortex`,
-  `ecommerce` and `affiliates`, which `release-lib.js` finalizes. `sdk` and `db` copy their README in
+  `ecommerce` and `affiliates`, which the release build finalizes. `sdk` and `db` copy their README in
   `afterBuild` instead: their configs are `.ts`, which the root lint config checks with
   `@nx/enforce-module-boundaries`, and `tools/` belongs to the root project. The executor's
   `assets` option was not in its schema and never copied anything, so only `sdk` (through

@@ -1,7 +1,7 @@
-// The `exports` maps that release-lib.js writes into the premium libraries' dist
-// package.json right before `npm publish`.
+// The `exports` maps that the release build (lib/release-steps.js, run by release-all.js and
+// release-lib.js) writes into the premium libraries' dist package.json before it packs them.
 //
-// They live here, not inline in release-lib.js, because verify-lib-dist.js needs them too.
+// They live here, not inline in the release build, because verify-lib-dist.js needs them too.
 // The ecommerce Vite build copies the raw source manifest, which has no `exports` at all, so
 // a check that runs on a plain `nx build ecommerce` output (or before the finalize step, as
 // the first version of the release gate did) sees every consumed subpath as unresolvable.

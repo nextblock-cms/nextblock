@@ -23,6 +23,8 @@ authority for schema, triggers, grants, and policies.
 - `getActiveLanguagesServerSide()`
 - `getServiceRoleSupabaseClient()`
 - `getSsgSupabaseClient()`
+- the unconfigured-client parts (`UNCONFIGURED_SUPABASE_URL`, `UNCONFIGURED_SUPABASE_KEY`,
+  `unconfiguredSupabaseFetch`, `SUPABASE_NOT_CONFIGURED_CODE`; see "Unconfigured clients")
 - package activation helpers such as `verifyPackageOnline()`
 
 Practical usage in the app is split by trust level:
@@ -40,6 +42,40 @@ passed 1000 rows with `02031`: its readers go through `readAllTranslationRows`
 (`apps/nextblock/lib/i18n/translation-pages.ts`, which moves on by the rows it received and stops
 on an empty page), and `tools/scripts/translations-pagination.test.ts` fails on a
 `.from('translations')` read of many rows without `.range()`.
+
+### Unconfigured clients
+
+A project can build before anyone connects Supabase: the first `npm run build` or deploy of a
+fresh scaffold or clone may come before `/setup` collects the credentials (`create-nextblock`
+itself never builds, and its Docker profile builds with a URL and key). With no Supabase URL or no
+key, `createClient()`
+(server), `getSsgSupabaseClient()` and the app's `createStaticSupabaseClient()`
+(`app/lib/site-settings.ts`) still return a client, built on `libs/db/src/lib/supabase/unconfigured.ts`
+(exported from `@nextblock-cms/db/server`):
+
+- its URL is `UNCONFIGURED_SUPABASE_URL` (`https://unconfigured.supabase.invalid`), which never
+  resolves: RFC 2606 reserves `.invalid`;
+- its `global.fetch` is `unconfiguredSupabaseFetch`, which answers every PostgREST, Auth, Storage
+  and Functions request on the spot with HTTP 421 and the code `NEXTBLOCK_SUPABASE_NOT_CONFIGURED`
+  (`SUPABASE_NOT_CONFIGURED_CODE`): no DNS lookup, no socket, no wait.
+
+Callers treat that answer like any failed query and use their defaults, and while the install is
+unconfigured the proxy redirects every request outside its setup allowlist to `/setup`. Half an
+env (a URL without a key, or the reverse) counts as unconfigured, so stand-in credentials never
+reach a real project.
+`getServiceRoleSupabaseClient()` and the browser `createClient()` still throw.
+
+Never fall back to a placeholder host. Until 0.23.5 the fallback was `https://dummy.supabase.co`,
+on Supabase's real domain, and postgrest-js retries a failed GET three times, 1 s, 2 s and 4 s
+apart: a fresh scaffold made about 1,300 connection attempts to it per build (2026-11-17). The
+answer is a 4xx on purpose: auth-js retries any 5xx, postgrest-js a 503, a 520 or a rejected fetch,
+and postgrest-js reads a 404 as an empty result. `libs/db/src/lib/supabase/unconfigured.test.ts`
+and `apps/nextblock/app/lib/site-settings.test.ts` run each unconfigured client with the global
+fetch stubbed and every socket refused, and `tools/scripts/supabase-host-literals.test.ts` fails
+on a Supabase URL written into code in `apps/nextblock` (its build hook in `tools/` and its Node
+`scripts/` included: both ship in every scaffold) or `libs`; tests, generated files, the stale
+compiled `.js` twins beside `.ts` sources and the Deno edge function are out of its scope
+(allow-list: `SUPABASE_HOST_LITERALS` in `tools/scripts/lib/supabase-host-literals.js`, with why).
 
 ### Service-role boundary
 

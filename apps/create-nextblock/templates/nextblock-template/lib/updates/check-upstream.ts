@@ -3,9 +3,11 @@ import 'server-only';
 //
 // Two responsibilities, both writing into system_alerts via the service-role client
 // (the key this install already has — no GitHub secrets required):
-//   1. checkForUpstreamUpdate(): poll the public GitHub Releases API, compare the latest
-//      release against this install's package.json version, and on a NON-git (standalone)
-//      install record a 'runtime_update_available' alert with a tarball download link.
+//   1. checkForUpstreamUpdate(): resolve the newest published version (the npm registry, with
+//      GitHub's latest release as the fallback), compare it against this install's version,
+//      and on a NON-git (standalone) install record a 'runtime_update_available' alert whose
+//      links are for that version only, the download in this install's own layout
+//      (resolveUpdateLinks).
 //   2. checkForSyncConflicts(): for git-backed installs, poll THIS fork's issues for the
 //      'nextblock-sync-conflict' label the sync workflow opens, and mirror open ones into
 //      'merge_conflict' alerts (clearing them when the issue closes). This is the "pull"
@@ -29,6 +31,12 @@ const RELEASES_API = `https://api.github.com/repos/${UPSTREAM_REPO}/releases/lat
 // hand and lag (they have, in practice, sat many minor versions behind the real version —
 // which silently disabled this whole check). Releases stay as the fallback.
 const NPM_REGISTRY_API = 'https://registry.npmjs.org/create-nextblock/latest';
+// One create-nextblock version's tarball: the standalone template `npm run update` installs. npm
+// never lets a published version be replaced, so the file here is that version for good.
+const NPM_TARBALL_BASE = 'https://registry.npmjs.org/create-nextblock/-/create-nextblock-';
+// The versions a link is built from: x.y.z with an optional prerelease. Nothing in it can leave
+// the URL path segment it goes into.
+const LINKABLE_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 // The sync workflow tags its conflict issues with this hidden body marker. We match on it
 // (not on a label) so a label that failed to create on GitHub can't hide a real conflict.
 const CONFLICT_MARKER = '<!-- nextblock-sync-conflict -->';
@@ -42,6 +50,7 @@ export interface UpstreamUpdateResult {
   latestVersion: string | null;
   updateAvailable: boolean;
   track: UpdateTrack;
+  // The four below are for latestVersion only, or absent (resolveUpdateLinks).
   htmlUrl?: string;
   tarballUrl?: string;
   zipballUrl?: string;
@@ -49,6 +58,32 @@ export interface UpstreamUpdateResult {
   alertRecorded: boolean;
   error?: string;
 }
+
+/** The fields of GitHub's latest release this module reads. */
+export interface UpstreamRelease {
+  tag_name?: string;
+  html_url?: string;
+  tarball_url?: string;
+  zipball_url?: string;
+  published_at?: string;
+}
+
+/** Where the update notice's download link comes from (resolveUpdateLinks). */
+export type UpdateLinkSource = 'release' | 'tag' | 'npm' | 'none';
+
+export interface UpdateLinks {
+  source: UpdateLinkSource;
+  tarballUrl?: string;
+  zipballUrl?: string;
+  htmlUrl?: string;
+  publishedAt?: string;
+}
+
+/**
+ * What GitHub said about the tag `v<version>` (upstreamTagStatus): 'missing' only when it answered
+ * that there is no such tag, 'unknown' when it could not answer or was not asked.
+ */
+export type UpstreamTagStatus = 'exists' | 'missing' | 'unknown';
 
 export interface SyncConflictResult {
   ok: boolean;
@@ -196,20 +231,115 @@ function detectTrack(): UpdateTrack {
   return 'standalone';
 }
 
+/** A release's version: its tag without the leading `v`, or null. */
+function releaseVersion(release: UpstreamRelease | null): string | null {
+  return release?.tag_name?.trim().replace(/^v/i, '') || null;
+}
+
+/** GitHub's source archive of one upstream tag. */
+function tagArchiveUrl(tag: string, format: 'tar.gz' | 'zip'): string {
+  return `https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${tag}.${format}`;
+}
+
+/**
+ * The update notice's download and release-notes links, always for the version it announces.
+ *
+ * GitHub releases are cut by hand, for some versions only, so npm is usually ahead of the latest
+ * one. Through 0.23.5 the links came from that release whatever its version: an install on 0.23.4
+ * was told 0.23.5 was out and handed the 0.23.4 archive and notes.
+ *
+ * Release notes and the publish date come from GitHub's latest release, only when its tag is the
+ * announced version: nothing else has them for that version. The download is in the install's
+ * own layout:
+ * - A flat project (what `npm create nextblock` makes): that version's create-nextblock tarball,
+ *   the standalone template `npm run update` installs, when npm announced the version; else none.
+ *   A GitHub source archive is the monorepo layout, which cannot be unpacked over a flat project.
+ * - A monorepo: the matching release's archives, else those of the tag `v<version>` unless GitHub
+ *   says that tag is missing (0.23.2 and 0.23.3 went to npm with no tag at all, and the archive of
+ *   a missing tag is a 404), else none. A tag GitHub could not answer about (the unauthenticated
+ *   API's 60 requests an hour, or no network) still gets its archives: archive downloads are
+ *   outside that limit and work as soon as the tag exists, while an alert keeps the links it was
+ *   first recorded with. Never the create-nextblock tarball: that is the flat template, which
+ *   cannot be unpacked over apps/ + libs/.
+ * A version that is not plain x.y.z[-prerelease] gets no links.
+ */
+export function resolveUpdateLinks({
+  latestVersion,
+  npmVersion,
+  release,
+  tagStatus,
+  monorepo,
+}: {
+  latestVersion: string;
+  npmVersion: string | null;
+  release: UpstreamRelease | null;
+  /** What GitHub said about the tag `v<latestVersion>`; only a monorepo reads it. */
+  tagStatus: UpstreamTagStatus;
+  /** This install has the monorepo layout (isMonorepoInstall); false for a flat project. */
+  monorepo: boolean;
+}): UpdateLinks {
+  if (!LINKABLE_VERSION.test(latestVersion)) return { source: 'none' };
+
+  const releaseTag = release?.tag_name?.trim() ?? '';
+  const matching = release && releaseTag && releaseVersion(release) === latestVersion ? release : null;
+  const notes = matching
+    ? { htmlUrl: matching.html_url || undefined, publishedAt: matching.published_at || undefined }
+    : {};
+  const npmTarball = npmVersion === latestVersion ? `${NPM_TARBALL_BASE}${latestVersion}.tgz` : null;
+
+  if (!monorepo) {
+    return npmTarball ? { source: 'npm', tarballUrl: npmTarball, ...notes } : { source: 'none', ...notes };
+  }
+  if (matching) {
+    return {
+      source: 'release',
+      tarballUrl: matching.tarball_url || tagArchiveUrl(releaseTag, 'tar.gz'),
+      zipballUrl: matching.zipball_url || tagArchiveUrl(releaseTag, 'zip'),
+      ...notes,
+    };
+  }
+  if (tagStatus !== 'missing') {
+    const tag = `v${latestVersion}`;
+    return { source: 'tag', tarballUrl: tagArchiveUrl(tag, 'tar.gz'), zipballUrl: tagArchiveUrl(tag, 'zip') };
+  }
+  return { source: 'none' };
+}
+
+/**
+ * Whether the upstream repository has the tag `v<version>`, from GitHub's refs API: 'missing' only
+ * when GitHub answers that it has no such tag, 'unknown' when it cannot answer (unauthenticated,
+ * the API allows 60 requests an hour per address, and a serverless host shares its address; or no
+ * network). A monorepo is offered the tag's archive unless the tag is missing (resolveUpdateLinks).
+ */
+async function upstreamTagStatus(version: string): Promise<UpstreamTagStatus> {
+  if (!LINKABLE_VERSION.test(version)) return 'missing';
+  const tag = `v${version}`;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${UPSTREAM_REPO}/git/ref/tags/${tag}`, {
+      headers: githubHeaders(),
+      signal: AbortSignal.timeout(15_000),
+      next: { revalidate: 3600 },
+    });
+    if (res.status === 404) return 'missing';
+    if (!res.ok) return 'unknown';
+    // The single-ref endpoint matches exactly; reading the answer keeps a prefix match (what the
+    // plural `git/refs` endpoint returns) from counting as the tag.
+    const body = (await res.json()) as { ref?: unknown } | null;
+    return body?.ref === `refs/tags/${tag}` ? 'exists' : 'missing';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /**
  * Determine the newest published NextBlock version. The npm registry is authoritative
- * (see NPM_REGISTRY_API); GitHub Releases is the fallback and also supplies the release
- * notes / archive links when a release exists.
+ * (see NPM_REGISTRY_API); GitHub's latest release is the fallback, and its links are used only
+ * when it is the version announced (resolveUpdateLinks).
  */
 async function resolveLatestRelease(): Promise<{
   latestVersion: string | null;
-  release: {
-    tag_name?: string;
-    html_url?: string;
-    tarball_url?: string;
-    zipball_url?: string;
-    published_at?: string;
-  } | null;
+  npmVersion: string | null;
+  release: UpstreamRelease | null;
   error?: string;
 }> {
   const [npmVersion, githubResult] = await Promise.all([
@@ -236,7 +366,7 @@ async function resolveLatestRelease(): Promise<{
     })(),
   ]);
 
-  const tagVersion = githubResult.release?.tag_name?.trim().replace(/^v/i, '') || null;
+  const tagVersion = releaseVersion(githubResult.release);
   // Whichever source is ahead wins: a hand-cut tag can lag npm, and npm can lag a
   // release that was published before the packages went out.
   const latestVersion =
@@ -248,6 +378,7 @@ async function resolveLatestRelease(): Promise<{
 
   return {
     latestVersion,
+    npmVersion,
     release: githubResult.release,
     // Only surface the GitHub error when npm did not answer either.
     error: latestVersion ? undefined : githubResult.error,
@@ -270,30 +401,36 @@ export async function checkForUpstreamUpdate(): Promise<UpstreamUpdateResult> {
     alertRecorded: false,
   };
 
-  const { latestVersion, release, error } = await resolveLatestRelease();
+  const { latestVersion, npmVersion, release, error } = await resolveLatestRelease();
   if (error) return { ...base, error };
   if (!latestVersion) return { ...base, ok: true }; // nothing published yet
 
-  const tag = release?.tag_name?.trim() || `v${latestVersion}`;
-  const tarballUrl =
-    release?.tarball_url || `https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${tag}.tar.gz`;
-  const zipballUrl =
-    release?.zipball_url || `https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${tag}.zip`;
   const updateAvailable = compareSemver(latestVersion, currentVersion) > 0;
+  // Git-backed installs auto-merge via Track A — no runtime update alert for them.
+  const recordsAlert = updateAvailable && track === 'standalone';
+  const monorepo = isMonorepoInstall();
+  // The alert is where these links are shown, so GitHub is asked about the tag (one more API
+  // request) only when one may be recorded, the install is a monorepo (a flat project is never
+  // offered a GitHub archive) and the latest release is not the announced version. Otherwise the
+  // tag counts as unknown, which still links that version.
+  const tagStatus: UpstreamTagStatus =
+    recordsAlert && monorepo && releaseVersion(release) !== latestVersion
+      ? await upstreamTagStatus(latestVersion)
+      : 'unknown';
+  const links = resolveUpdateLinks({ latestVersion, npmVersion, release, tagStatus, monorepo });
 
   const result: UpstreamUpdateResult = {
     ...base,
     ok: true,
     latestVersion,
     updateAvailable,
-    htmlUrl: release?.html_url,
-    tarballUrl,
-    zipballUrl,
-    publishedAt: release?.published_at,
+    htmlUrl: links.htmlUrl,
+    tarballUrl: links.tarballUrl,
+    zipballUrl: links.zipballUrl,
+    publishedAt: links.publishedAt,
   };
 
-  // Git-backed installs auto-merge via Track A — no runtime update alert for them.
-  if (!updateAvailable || track !== 'standalone') return result;
+  if (!recordsAlert) return result;
 
   try {
     const supabase = getServiceRoleSupabaseClient();
@@ -322,9 +459,9 @@ export async function checkForUpstreamUpdate(): Promise<UpstreamUpdateResult> {
         latest_version: latestVersion,
         current_version: currentVersion,
         update_command: 'npm run update',
-        download_url: tarballUrl,
-        zipball_url: zipballUrl,
-        html_url: release?.html_url ?? null,
+        download_url: links.tarballUrl ?? null,
+        zipball_url: links.zipballUrl ?? null,
+        html_url: links.htmlUrl ?? null,
       },
     });
     if (insertError) {

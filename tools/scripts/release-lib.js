@@ -1,241 +1,105 @@
 #!/usr/bin/env node
 
-const { execSync } = require('node:child_process');
+// Build and publish ONE library (npm run build:<lib>):
+//
+//   node tools/scripts/release-lib.js <library> [<version>|patch|minor|major] [--dry-run]
+//
+// `<library>` is the libs/ folder (use `ecommerce` for @nextblock-cms/ecom). For a release of every
+// package use release-all.js: it runs these same steps for all of them first and publishes
+// afterwards, inside one npm approval. Steps (lib/release-steps.js): stamp libs/<lib>/package.json,
+// build with Nx, finalize the premium manifests, pack into dist/release-lib, run the
+// verify-lib-dist checks on the packed files, and `npm publish <tarball>`. A failure restores the
+// version stamp (unless npm serves this very tarball after all: see settleSingleReleaseFailure),
+// and so does --dry-run, which builds and packs for real and ends with `npm publish --dry-run`.
+// Versions are plain x.y.z: pre-releases are refused (lib/release-pipeline.js says why).
+
 const fs = require('node:fs');
 const path = require('node:path');
-const { publishExportsFor } = require('./lib-publish-exports');
-const { verifyLibDist } = require('./verify-lib-dist');
+const { UsageError, parseSingleReleaseArgs, settleSingleReleaseFailure } = require('./lib/release-pipeline');
+const steps = require('./lib/release-steps');
 
-const args = process.argv.slice(2);
+const USAGE = 'Usage: node tools/scripts/release-lib.js <library> [<version>|patch|minor|major] [--dry-run]';
 
-if (args.length === 0) {
-  console.error(
-    'Usage: node tools/scripts/release-lib.js <library> [<version>|patch|minor|major] [--dry-run]',
-  );
-  process.exit(1);
-}
-
-// Accepts an npm bump keyword (patch/minor/major) OR an explicit semver (e.g. 0.8.0).
-function isVersionSpec(value) {
-  return (
-    typeof value === 'string' &&
-    (['major', 'minor', 'patch', 'premajor', 'preminor', 'prepatch', 'prerelease'].includes(
-      value,
-    ) ||
-      /^\d+\.\d+\.\d+([-+].+)?$/.test(value))
-  );
-}
-
-const library = args[0];
-const versionArg = args.slice(1).find((a) => !a.startsWith('--'));
-const versionSpec = isVersionSpec(versionArg) ? versionArg : 'patch';
-const dryRun = args.includes('--dry-run');
-
-const workspaceRoot = process.cwd();
-const libDir = path.join(workspaceRoot, 'libs', library);
-const packageJsonPath = path.join(libDir, 'package.json');
-const distDir = path.join(workspaceRoot, 'dist', 'libs', library);
-const nxProject = library;
-
-if (!fs.existsSync(packageJsonPath)) {
-  console.error(`Library package.json not found at ${packageJsonPath}`);
-  process.exit(1);
-}
-
-const originalPackageJsonRaw = fs.readFileSync(packageJsonPath, 'utf8');
-const lockfilePath = path.join(libDir, 'package-lock.json');
-const hadLockfile = fs.existsSync(lockfilePath);
-let version;
-let packageName;
-
-function run(command, options = {}) {
-  execSync(command, { stdio: 'inherit', shell: true, ...options });
-}
-
-// @nextblock-cms/db -> libs/db ; @nextblock-cms/ecom -> libs/ecommerce ;
-// @nextblock-cms/cortex -> libs/cortex (the legacy @nextblock/ scope is still
-// handled below as a defensive fallback for any un-migrated reference).
-function resolveSiblingVersion(depName) {
-  const suffix = depName.startsWith('@nextblock-cms/')
-    ? depName.replace('@nextblock-cms/', '')
-    : depName.startsWith('@nextblock/')
-      ? depName.replace('@nextblock/', '')
-      : depName;
-  const dir = suffix === 'ecom' ? 'ecommerce' : suffix;
-  const siblingPkgPath = path.join(workspaceRoot, 'libs', dir, 'package.json');
+async function main() {
+  let options;
   try {
-    const siblingPkg = JSON.parse(fs.readFileSync(siblingPkgPath, 'utf8'));
-    if (siblingPkg.version) return `^${siblingPkg.version}`;
-  } catch {
-    // fall through to a floating spec
-  }
-  return 'latest';
-}
-
-// Every section npm installs from: a `workspace:` spec left in any of them fails the
-// consumer's install with EUNSUPPORTEDPROTOCOL (verify-lib-dist.js check 9 refuses it).
-const INSTALLED_DEPENDENCY_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDependencies'];
-
-function resolveWorkspaceDeps(pkg) {
-  for (const section of INSTALLED_DEPENDENCY_SECTIONS) {
-    const deps = pkg[section];
-    if (!deps) continue;
-    for (const depName of Object.keys(deps)) {
-      const spec = deps[depName];
-      if (typeof spec === 'string' && spec.startsWith('workspace:')) {
-        if (depName === '@nextblock-cms/ecommerce') {
-          deps[depName] = `npm:@nextblock-cms/ecom@${resolveSiblingVersion('@nextblock-cms/ecom')}`;
-          continue;
-        }
-        deps[depName] = resolveSiblingVersion(depName);
-      }
+    options = parseSingleReleaseArgs(process.argv.slice(2), process.env, { withLibrary: true });
+  } catch (error) {
+    if (error instanceof UsageError) {
+      console.error(`${error.message}\n${USAGE}`);
+      return 1;
     }
+    throw error;
   }
-}
+  const { library, versionSpec, dryRun } = options;
+  // Read above. Every child npm would read it too: `npm pack` would then write no tarball (and the
+  // publish already passes --dry-run itself when this is a dry run).
+  delete process.env.npm_config_dry_run;
 
-// The source-available premium libs (ecommerce, cortex, affiliates) are published publicly to
-// npmjs and gated at runtime via verifyPackageOnline('<package id>'). Their Vite builds copy
-// the raw source package.json, which may lack entry points and still has workspace:* deps
-// and the `nx` field, so normalize it for publish. `publishExportsFor(library)` (shared with
-// the publish check) decides which libs get this step and the exports map they ship.
-function finalizeDistPackageJson(distPkgPath, library, exportsMap) {
-  const pkg = JSON.parse(fs.readFileSync(distPkgPath, 'utf8'));
-
-  pkg.main = './index.cjs';
-  pkg.module = './index.es.js';
-  pkg.types = './index.d.ts';
-  pkg.exports = exportsMap;
-
-  resolveWorkspaceDeps(pkg);
-
-  pkg.publishConfig = { access: 'public' };
-  delete pkg.nx; // workspace-internal metadata, not for the published package
-
-  fs.writeFileSync(distPkgPath, JSON.stringify(pkg, null, 2) + '\n');
-  console.log(
-    `✓ Normalized ${library} dist package.json (entry points + resolved sibling deps + public access)`,
-  );
-}
-
-try {
-  const pkg = JSON.parse(originalPackageJsonRaw);
-  packageName = pkg.name;
-
-  console.log(`\n🚀 Releasing ${packageName} (${library})`);
-
-  if (fs.existsSync(distDir)) {
-    console.log(`→ Cleaning dist directory: ${distDir}`);
-    fs.rmSync(distDir, { recursive: true, force: true });
+  const libDir = `libs/${library}`;
+  const packageJsonPath = path.join(steps.workspaceRoot, libDir, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) {
+    console.error(`Library package.json not found at ${packageJsonPath}\n${USAGE}`);
+    return 1;
   }
 
-  console.log(`→ Setting version (${versionSpec})`);
-  const versionCommand = `npm version ${versionSpec} --no-git-tag-version --allow-same-version`;
-  run(versionCommand, { cwd: libDir });
+  const stagingDir = path.join(steps.workspaceRoot, 'dist', 'release-lib');
+  const stamps = steps.snapshotFiles([`${libDir}/package.json`, `${libDir}/package-lock.json`]);
+  const restoreStamps = (reason) => {
+    const restored = stamps.restore();
+    if (restored.length > 0) console.log(`↺ ${reason}: restored ${restored.join(', ')}.`);
+    return restored;
+  };
 
-  const updatedPackageJson = JSON.parse(
-    fs.readFileSync(packageJsonPath, 'utf8'),
-  );
-  version = updatedPackageJson.version;
-  console.log(`✓ Version bumped to ${version}`);
-
-  console.log('\n→ Building with Nx');
-  // The build target is plain `vite build` (inferred by @nx/vite/plugin) after the lib's `typecheck`.
-  // It never built sibling libs: each lib externalizes them and reads their types from source.
-  const buildCommand = `npx nx run ${nxProject}:build --skip-nx-cache`;
-  // Run with the nx daemon OFF: the persistent daemon accumulates memory across the
-  // sequential per-lib builds in `release:all` and was OOM-killing the bundler ("cannot
-  // allocate memory"). Daemon-off recomputes the graph per invocation and frees it on exit.
-  //
-  // ...and with plugin ISOLATION off too. Daemon-off makes every nx invocation fork a
-  // worker process per plugin, which then waits on a socket handshake ("load" message)
-  // that nx hard-times-out at 10s. Mid-`release:all` — machine already loaded from the
-  // preceding lib builds — that handshake intermittently misses the window and the run
-  // dies with "Plugin worker ... exited unexpectedly" / "Failed to load 1 default Nx
-  // plugin(s)". Loading plugins in-process removes the fork, the socket, and the timeout.
-  //
-  // NODE_ENV is forced to production. Left unset, the build can run in development mode:
-  // @nx/vite/plugin resolves every Vite config in development mode while Nx computes the
-  // project graph, and Vite then sets NODE_ENV=development in that process. With plugin
-  // isolation off (above) that process is this nx run, and the `vite build` task inherits it,
-  // so plugin-react emits `jsxDEV(..., this)` with this machine's absolute source
-  // paths. That shipped in 0.19.0: the `this` argument is illegal inside files with inline
-  // server actions, so every scaffolded project failed `next build` with "Server Actions
-  // cannot use `this`" (85 times, all from @nextblock-cms/ecom).
-  run(buildCommand, {
-    cwd: workspaceRoot,
-    env: { ...process.env, NODE_ENV: 'production', NX_DAEMON: 'false', NX_ISOLATE_PLUGINS: 'false' },
-  });
-
-  if (!fs.existsSync(distDir)) {
-    throw new Error(`Build output not found at ${distDir}`);
-  }
-
-  // Source-available premium libs copy raw package.json files during Vite builds;
-  // normalize their manifests (entry points + resolved sibling deps) before publish.
-  const publishExports = publishExportsFor(library);
-  if (publishExports) {
-    finalizeDistPackageJson(path.join(distDir, 'package.json'), library, publishExports);
-  }
-
-  // Never publish a build that would break `next build` in a scaffolded project: development
-  // JSX, consumed subpaths that were not emitted, or exports lost to a stale `.js` twin.
-  // Runs AFTER the manifests are finalized, so it judges the package.json that actually
-  // ships (`manifestFinalized`: a `workspace:` spec left in it now is a real problem). Run
-  // before, it rejected ecommerce 0.19.1: the raw manifest has no `exports` yet.
-  console.log('\n→ Verifying the build is publishable');
-  verifyLibDist(library, { manifestFinalized: true });
-  console.log('✓ Build verified');
-
-  // -------------------------------------------------------------------------
-  // PUBLISH TO NPM (PUBLIC)
-  // Every package — including premium commerce — is published publicly to npmjs.
-  // Premium features are source-available and gated at runtime via
-  // verifyPackageOnline() + checkout license confirmation (the Cortex AI model);
-  // there is no private GitHub Packages registry or ghost-stub twin.
-  // -------------------------------------------------------------------------
-  console.log('\n→ Publishing to npm (Public)');
-
-  // Local .npmrc forces the public registry for this scope, overriding any global config.
-  const distNpmrcPath = path.join(distDir, '.npmrc');
-  const publicNpmrcContent = [
-    'registry=https://registry.npmjs.org',
-    '@nextblock-cms:registry=https://registry.npmjs.org',
-    'always-auth=true',
-  ].join('\n');
-
-  fs.writeFileSync(distNpmrcPath, publicNpmrcContent);
-  console.log('✓ Created local .npmrc in dist to force npmjs.org registry');
-
-  const publishArgs = ['npm', 'publish', '--access', 'public'];
-  if (dryRun) {
-    publishArgs.push('--dry-run');
-  }
-
+  let packageName;
+  let version;
+  let artifact;
+  let stage = 'build';
   try {
-    run(publishArgs.join(' '), { cwd: distDir });
-    console.log(
-      `\n✅ Published ${packageName}@${version}${dryRun ? ' (dry run)' : ''}\n`,
-    );
-  } finally {
-    if (fs.existsSync(distNpmrcPath)) fs.unlinkSync(distNpmrcPath);
-  }
+    packageName = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')).name;
+    console.log(`\n🚀 Releasing ${packageName} (${library})${dryRun ? ' (DRY RUN: npm publish --dry-run, version restored at the end)' : ''}`);
 
-  if (!hadLockfile && fs.existsSync(lockfilePath)) {
-    fs.rmSync(lockfilePath);
+    steps.prepareStaging(stagingDir);
+    console.log(`→ Setting version (${versionSpec})`);
+    version = steps.stampVersion(libDir, versionSpec);
+
+    console.log('\n→ Building with Nx');
+    artifact = steps.buildLibArtifact(library, { stagingDir });
+    if (artifact.name !== packageName || artifact.version !== version) {
+      throw new Error(`npm packed ${artifact.name}@${artifact.version}, expected ${packageName}@${version}.`);
+    }
+
+    // Every package, premium commerce included, is published publicly to npmjs: premium features
+    // are source-available and gated at runtime via verifyPackageOnline().
+    console.log('\n→ Publishing to npm (public)');
+    stage = 'publish';
+    steps.publishTarball(artifact.tarballPath, { dryRun });
+    console.log(`\n✅ Published ${artifact.name}@${artifact.version}${dryRun ? ' (dry run)' : ''}\n`);
+
+    if (dryRun) restoreStamps('Dry run');
+    return 0;
+  } catch (error) {
+    console.error('\n❌ Release failed.');
+    if (error instanceof Error) console.error(error.message);
+    const settled = await settleSingleReleaseFailure({
+      stage,
+      dryRun,
+      name: packageName,
+      version,
+      integrity: artifact?.integrity,
+      steps: { publishedIntegrity: steps.publishedIntegrity, restore: () => restoreStamps('Reverted the version') },
+      log: (line) => console.log(line),
+    });
+    return settled.published ? 0 : 1;
   }
-} catch (error) {
-  console.error('\n❌ Release failed.');
-  if (version === undefined) {
-    // Version bump did not succeed, nothing to revert.
-  } else {
-    console.log('↺ Reverting package.json to previous version.');
-    fs.writeFileSync(packageJsonPath, originalPackageJsonRaw, 'utf8');
-  }
-  if (!hadLockfile && fs.existsSync(lockfilePath)) {
-    fs.rmSync(lockfilePath, { force: true });
-  }
-  if (error instanceof Error) {
-    console.error(error.message);
-  }
-  process.exit(1);
 }
+
+main().then(
+  (code) => {
+    process.exitCode = code;
+  },
+  (error) => {
+    console.error(`\n❌ release-lib failed: ${error instanceof Error ? error.stack || error.message : error}`);
+    process.exitCode = 1;
+  },
+);

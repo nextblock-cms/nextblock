@@ -4,14 +4,15 @@
 //   node tools/scripts/verify-lib-dist.js <lib>        (utils | ui | sdk | db | editor | ecommerce | cortex | affiliates)
 //   node tools/scripts/verify-lib-dist.js              (every lib that has a dist/libs/<lib> build)
 //
-// release-lib.js calls `verifyLibDist` right after the Nx build and before `npm publish`.
-// Every check here exists because the failure it catches shipped once and was invisible
+// The release build (lib/release-steps.js, phase 1 of release-all.js and release-lib.js) calls
+// `verifyLibDist` after the Nx build, on the file list of the packed tarball, before anything is
+// published. Every check here exists because the failure it catches shipped once and was invisible
 // inside the monorepo, where `@nextblock-cms/*` resolves through tsconfig paths straight to
 // TypeScript source; it only broke `next build` in scaffolded projects, which install the
 // published packages:
 //
 //   1. Development JSX. Unless NODE_ENV is `production`, a release build can inherit
-//      NODE_ENV=development from Nx's project-graph step (see release-lib.js), so plugin-react
+//      NODE_ENV=development from Nx's project-graph step (see lib/release-steps.js), so plugin-react
 //      emitted `jsxDEV(..., this)` with the builder's absolute source paths. Besides leaking
 //      `C:/Users/...` and shipping the dev runtime, the `this` argument is illegal inside a file
 //      with inline server actions ("Server Actions cannot use `this`"), which failed every
@@ -48,7 +49,7 @@
 //      `../../docs/...` (a 404 on npmjs.com), five manifests dropped `license`, and cortex and
 //      ecom pointed `repository` at a GitHub repo that does not exist.
 //   9. `workspace:` dependency specs in the manifest. The premium libs' builds copy the raw
-//      source package.json (`"@nextblock-cms/utils": "workspace:*"`); release-lib.js resolves
+//      source package.json (`"@nextblock-cms/utils": "workspace:*"`); the release build resolves
 //      them to the sibling versions, but only for a lib it finalizes. A new lib without that
 //      step would publish a manifest every `npm install` refuses (EUNSUPPORTEDPROTOCOL), and
 //      the monorepo, which never installs from dist, would not notice.
@@ -260,7 +261,7 @@ function findUnresolvableSubpaths(library, distDir) {
   if (!fs.existsSync(manifestPath)) return [`${path.relative(workspaceRoot, manifestPath)} is missing`];
 
   // A plain `nx build ecommerce` leaves the raw source manifest, which has no `exports`;
-  // release-lib.js writes the map just before publish. Judge the map that will ship.
+  // the release build writes the map before it packs. Judge the map that will ship.
   const exportsMap =
     JSON.parse(fs.readFileSync(manifestPath, 'utf8')).exports ?? publishExportsFor(library) ?? {};
   const problems = [];
@@ -795,10 +796,11 @@ const DEPENDENCY_SECTIONS = ['dependencies', 'optionalDependencies', 'peerDepend
 
 /**
  * `workspace:` specs left in the dist manifest. Judges the manifest that will ship, like checks
- * 2, 5 and 7: when `manifestFinalized` is false (a plain `nx build`, before release-lib.js has
- * run) the `dependencies` of a lib that release-lib.js finalizes (it has a `publishExportsFor`
+ * 2, 5 and 7: when `manifestFinalized` is false (a plain `nx build`, before the release build has
+ * run) the `dependencies` of a lib the release build finalizes (it has a `publishExportsFor`
  * map) are still to be resolved, so only the sections that step does not rewrite count.
- * release-lib.js passes `manifestFinalized: true`, and then every `workspace:` spec is a problem.
+ * The release build (lib/release-steps.js) passes `manifestFinalized: true`, and then every
+ * `workspace:` spec is a problem.
  */
 function findWorkspaceProtocolDependencies(library, distDir, { manifestFinalized = false } = {}) {
   const manifestPath = path.join(distDir, 'package.json');

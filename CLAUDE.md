@@ -228,9 +228,16 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   `apps/nextblock/tools/lib/managed-overrides.mjs` (old value into `previous`, so `npm run
   update` moves existing projects) plus `SHIPPED` in `fallback-overrides.test.js`, which fails
   until all of them agree.
-- Publish order utils → ui → sdk → db → editor → ecommerce → cortex → affiliates → CLI
-  (`npm run release:all`, or one lib with `npm run build:<lib>`, e.g. `build:affiliates`); npm
-  2FA needs an OTP per publish and piping output breaks the prompt (`EOTP`).
+- Release with `node tools/scripts/release-all.js <version>` (node, not `npm run`: PowerShell
+  drops the `--`). Phase 1 stamps every package, syncs the template, builds, verifies and packs all
+  nine into `dist/release` and publishes nothing (a failure restores the stamps); phase 2 runs
+  `npm publish <tarball>` for utils → ui → sdk → db → editor → ecommerce → cortex → affiliates →
+  CLI back to back, inside one npm web approval (about 5 minutes). `--dry-run` plans, `--rehearse`
+  publishes with `--dry-run` and restores the stamps, `--build-only` / `--publish-only` split the
+  phases; a version already on npm is skipped, so re-running the same explicit version resumes (a
+  `patch`/`minor`/`major` keyword is refused until npm has the stamped version of every package;
+  pre-releases are refused). One lib: `npm run build:<lib>`. Never pipe the output (the approval
+  needs the TTY, `EOTP`). docs/06 → "Release commands".
 - The root layout never reads the `affiliates.` translation rows (`getCachedTranslations`
   filters `affiliates.%` in the query; `excludeAffiliateTranslationRows` is a second filter), so
   the global `useTranslations().t('affiliates.…')` returns the key. Affiliates UI reads

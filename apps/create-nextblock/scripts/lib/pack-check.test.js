@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -6,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  findMissingBinFiles,
   findPackProblems,
   findPackedEnvFiles,
   findUnpackedTemplateFiles,
@@ -13,6 +15,7 @@ import {
   isNeverPackedByNpm,
   parsePackedFiles,
   runNpmPackDryRun,
+  runNpmPackTarball,
 } from './pack-check.js';
 
 // The app's own .gitignore: the sync copies it into the template byte for byte.
@@ -199,6 +202,44 @@ describe('runNpmPackDryRun', () => {
   });
 });
 
+describe('runNpmPackTarball', () => {
+  it('asks npm to read the packed tarball itself, running nothing', () => {
+    const exec = vi.fn(() => '[]');
+
+    expect(runNpmPackTarball('/work/dist/release/create-nextblock-1.0.0.tgz', { exec })).toBe('[]');
+    expect(exec).toHaveBeenCalledWith(
+      'npm pack "/work/dist/release/create-nextblock-1.0.0.tgz" --dry-run --ignore-scripts --json',
+      expect.objectContaining({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
+  });
+
+  it("names the tarball and the end of npm's stderr when npm cannot read it", () => {
+    const exec = vi.fn(() => {
+      throw Object.assign(new Error('Command failed'), { stderr: 'npm error code TAR_BAD_ARCHIVE\nnpm error Unrecognized archive format\n' });
+    });
+
+    expect(() => runNpmPackTarball('/work/x.tgz', { exec })).toThrow(
+      'npm pack --dry-run could not read /work/x.tgz: npm error code TAR_BAD_ARCHIVE npm error Unrecognized archive format',
+    );
+  });
+});
+
+describe('findMissingBinFiles', () => {
+  it('reports a bin script the tarball lacks, in either bin form', () => {
+    expect(findMissingBinFiles({ name: 'create-nextblock', bin: { 'create-nextblock': 'bin/create-nextblock.js' } }, ['package.json'])).toEqual([
+      'bin/create-nextblock.js (the `create-nextblock` command) is not in the tarball',
+    ]);
+    expect(findMissingBinFiles({ name: 'create-nextblock', bin: './bin/cli.js' }, ['package.json'])).toEqual([
+      'bin/cli.js (the `create-nextblock` command) is not in the tarball',
+    ]);
+  });
+
+  it('passes when every bin script ships, or there is none', () => {
+    expect(findMissingBinFiles({ bin: { 'create-nextblock': './bin/create-nextblock.js' } }, ['bin/create-nextblock.js'])).toEqual([]);
+    expect(findMissingBinFiles({ name: 'x' }, [])).toEqual([]);
+  });
+});
+
 describe('findPackProblems', () => {
   let packageDir;
   let templateDir;
@@ -282,6 +323,31 @@ describe('npm pack with the real apps/nextblock/.gitignore', () => {
       expect(packed, file).not.toContain(`${TEMPLATE}/${file}`);
     }
     expect(problems).toEqual([]);
+  }, 120_000);
+
+  // release:all publishes the packed file without a prepack, so check-tarball.js reads it back.
+  it('reads a really packed tarball back, and notices a template file added after packing', async () => {
+    const packageDir = join(root, 'cli');
+    const templateDir = join(packageDir, TEMPLATE);
+    await put(packageDir, 'package.json', JSON.stringify({ name: 'pack-check-fixture', version: '1.0.0', bin: { fixture: 'bin/cli.js' } }));
+    await put(packageDir, 'bin/cli.js', '#!/usr/bin/env node\n');
+    await put(templateDir, '.gitignore', await readFile(APP_GITIGNORE, 'utf8'));
+    for (const file of ['.env.example', 'gitignore', 'app/page.tsx']) await put(templateDir, file, 'X=\n');
+    const out = join(root, 'out');
+    await mkdir(out);
+    const [report] = JSON.parse(
+      execSync(`npm pack --ignore-scripts --json --pack-destination "${out}"`, { cwd: packageDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    );
+
+    const output = runNpmPackTarball(join(out, report.filename));
+    const packed = parsePackedFiles(output);
+    expect(packed).toEqual(expect.arrayContaining(['bin/cli.js', `${TEMPLATE}/.env.example`, `${TEMPLATE}/app/page.tsx`]));
+    await expect(findPackProblems({ packageDir, templateDir, pack: () => output })).resolves.toEqual([]);
+
+    await put(templateDir, 'app/late.tsx', 'export {};\n');
+    await expect(findPackProblems({ packageDir, templateDir, pack: () => output })).resolves.toEqual([
+      expect.stringMatching(/^templates\/nextblock-template\/app\/late\.tsx is not in the tarball/),
+    ]);
   }, 120_000);
 
   it('catches the 0.23.3 tarball: without the negations npm drops both env templates', async () => {

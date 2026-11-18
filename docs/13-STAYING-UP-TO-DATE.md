@@ -73,7 +73,8 @@ cannot be unpacked over a flat project at all, and the project has no remote to 
 (`npm create nextblock` runs `git init`, with no initial commit and no remote). The
 published `create-nextblock` package, by contrast, ships the complete standalone template
 under `templates/nextblock-template/` — the exact artifact the project was scaffolded from —
-and is versioned in lockstep with the app by `tools/scripts/release-cli.js`.
+and is versioned in lockstep with the app by the release scripts (`tools/scripts/release-all.js`,
+or `release-cli.js` for a CLI-only release).
 
 ### Standalone updates are a real 3-way merge, not an overwrite
 
@@ -327,10 +328,31 @@ and records a `runtime_update_available` alert — an **indigo banner** on the d
 naming the version you're on, the version available, and the command to run.
 
 The version signal is the **npm registry** (`create-nextblock`'s `latest` dist-tag), with
-GitHub Releases as a fallback and as the source of release-notes/archive links. npm is
-authoritative because releases are cut by hand and have in practice sat several minor
-versions behind the real version — which silently disabled this check entirely. Whichever
-source is ahead wins.
+GitHub's latest release as a fallback. npm is authoritative because releases are cut by hand,
+for some versions only, and have in practice sat several minor versions behind the real
+version — which silently disabled this check entirely. Whichever source is ahead wins.
+
+The banner's links are always for the version it announces (`resolveUpdateLinks` in
+`lib/updates/check-upstream.ts`). **Release notes** link GitHub's latest release only when it is
+that version. **Download latest** is in the project's own layout (`isMonorepoInstall()`):
+
+| Layout | Download latest |
+| :--- | :--- |
+| Standalone project (flat app) | `create-nextblock-<version>.tgz` from npm, the standalone template `npm run update` installs; none while a GitHub release is ahead of npm |
+| Nx monorepo (shows this banner only when the app cannot resolve its GitHub repository, or with `NEXTBLOCK_UPDATE_TRACK=standalone`) | the latest release's source archive when the release is that version, else the source archive of the tag `v<version>`, unless GitHub answers that the tag does not exist (as for 0.23.2 and 0.23.3): then none |
+
+A standalone project is never offered a GitHub source archive, and a monorepo never the npm
+tarball: each is the other's layout, which cannot be unpacked over it (see "Why standalone installs
+update from npm, not from a GitHub release" above). Through 0.23.5 both links came from GitHub's
+latest release whatever its version, so with npm ahead an install on 0.23.4 was told 0.23.5 was out
+and offered the 0.23.4 archive and notes. The tag is looked up (one more GitHub API request) only
+for a monorepo about to record an alert whose latest release is not that version. When GitHub
+cannot answer (the unauthenticated API allows 60 requests an hour per address), the tag's archive is
+linked all the same: archive downloads are outside that limit and work as soon as the tag exists.
+An alert keeps the links it was recorded with (a release cut later for the same version does not
+change them), so a poll between the npm publish and the tag push records a monorepo alert with no
+download link; the banner still names the version and `npm run update`, which merges upstream in a
+git clone.
 
 Dismissing the banner is respected: the dedupe key is the *version*, not the unresolved
 state, so a dismissed alert is not re-inserted on the next poll, while a genuinely newer

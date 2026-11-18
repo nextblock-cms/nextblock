@@ -4,6 +4,11 @@ import { createServerClient, type CookieOptions } from '@supabase/ssr';
 import { createClient as createSupabaseJsClient } from '@supabase/supabase-js';
 import { cookies } from 'next/headers';
 import { Database } from './types';
+import {
+  UNCONFIGURED_SUPABASE_KEY,
+  UNCONFIGURED_SUPABASE_URL,
+  unconfiguredSupabaseFetch,
+} from './unconfigured';
 
 const SERVER_ONLY_ERROR_MESSAGE =
   'This module cannot be imported from a Client Component module. It should only be used from a Server Component.';
@@ -24,32 +29,32 @@ type SupabaseCookiePayload = {
 
 // This is the standard server client creation function from the Vercel example.
 //
-// When the app is unconfigured (no Supabase env yet — e.g. a fresh `git clone`
-// before the browser /setup wizard has run) we fall back to a harmless dummy host
-// instead of throwing, so the process can boot far enough to render `/setup`. Real
-// queries against the dummy host simply fail and are handled by callers (the
-// middleware redirects unconfigured traffic to /setup, so these clients are rarely
-// exercised in that state). This mirrors getSsgSupabaseClient's existing approach.
+// When the app is unconfigured (no Supabase env yet — e.g. a fresh scaffold or `git clone`
+// before the browser /setup wizard has run) we build the client on ./unconfigured.ts
+// instead of throwing, so the process can boot far enough to render `/setup`: it answers
+// every query with a "not configured" error and never sends a request. Callers handle the
+// error (the middleware redirects unconfigured traffic to /setup, so these clients are
+// rarely exercised in that state). getSsgSupabaseClient does the same.
 export const createClient = () => {
   // Accept every alias the Vercel Supabase integration may inject (the non-prefixed
   // names AND the new `sb_publishable_…` publishable key) as fallbacks, so a one-click
   // deploy works whichever copy of the vars the integration set. Keep this alias order
   // in sync with apps/nextblock/lib/setup/env-status.ts (a published lib can't import it).
   const supabaseUrl =
-    process.env['NEXT_PUBLIC_SUPABASE_URL'] ||
-    process.env['SUPABASE_URL'] ||
-    'https://dummy.supabase.co';
+    process.env['NEXT_PUBLIC_SUPABASE_URL'] || process.env['SUPABASE_URL'];
   const supabaseAnonKey =
     process.env['NEXT_PUBLIC_SUPABASE_ANON_KEY'] ||
     process.env['SUPABASE_ANON_KEY'] ||
     process.env['NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY'] ||
-    process.env['SUPABASE_PUBLISHABLE_KEY'] ||
-    'dummy-anon-key';
+    process.env['SUPABASE_PUBLISHABLE_KEY'];
+  // Both or neither: a real URL with a stand-in key would still send every query there.
+  const configured = supabaseUrl && supabaseAnonKey ? { supabaseUrl, supabaseAnonKey } : null;
 
   return createServerClient(
-    supabaseUrl,
-    supabaseAnonKey,
+    configured?.supabaseUrl ?? UNCONFIGURED_SUPABASE_URL,
+    configured?.supabaseAnonKey ?? UNCONFIGURED_SUPABASE_KEY,
     {
+      ...(configured ? {} : { global: { fetch: unconfiguredSupabaseFetch } }),
       cookies: {
         getAll: async () => {
           try {

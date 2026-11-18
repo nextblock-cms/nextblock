@@ -6016,7 +6016,7 @@ flowchart TB
         BrowserClient[createClient<br/>client.ts]
         ServerClient[createClient<br/>server.ts + cookies]
         ServiceClient[getServiceRoleSupabaseClient<br/>BYPASSES RLS]
-        SsgClient[getSsgSupabaseClient<br/>dummy fallback]
+        SsgClient[getSsgSupabaseClient<br/>offline when unconfigured]
         MiddlewareClient[updateSession<br/>middleware.ts]
     end
 
@@ -6062,7 +6062,7 @@ flowchart TB
 | `createBrowserClient` | `client.ts` | Browser-only components; per-invocation context |
 | `createClient` (server) | `server.ts` | RSC, Server Actions, Route Handlers; reads/writes cookies via `cookies()` |
 | `getServiceRoleSupabaseClient` | `server.ts` | Cron jobs, Stripe/Freemius webhooks — **bypasses RLS**; requires `SUPABASE_SERVICE_ROLE_KEY` |
-| `getSsgSupabaseClient` | `ssg-client.ts` | Build-time static generation; dummy fallback prevents build crashes when env vars missing |
+| `getSsgSupabaseClient` | `ssg-client.ts` | Build-time static generation; with no Supabase env it returns an unconfigured client (`unconfigured.ts`) that answers every request locally, so the build neither crashes nor opens a connection (docs/04 → "Unconfigured clients") |
 | `updateSession` | `middleware.ts` | Session sync invoked from the request proxy (per §3.8.1) |
 
 All server-side factories contain `typeof window !== 'undefined'` guards to prevent accidental bundling into client code, and `package-validation.ts` uses the `server-only` npm package to enforce the boundary statically at build time.

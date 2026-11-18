@@ -103,6 +103,42 @@ export function runNpmPackDryRun(packageDir, { exec = execSync } = {}) {
 }
 
 /**
+ * Runs `npm pack <tarball> --dry-run --json` and returns its stdout: npm reads an already packed
+ * tarball and lists the files in it, in the same JSON as a folder's dry run. release:all publishes
+ * that file with `npm publish <tarball>`, which runs no prepack, so it is checked as packed
+ * (scripts/check-tarball.js). A tarball spec runs no lifecycle script; --ignore-scripts says so.
+ */
+export function runNpmPackTarball(tarballPath, { exec = execSync } = {}) {
+  try {
+    return exec(`npm pack "${tarballPath}" --dry-run --ignore-scripts --json`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    const detail = String(error?.stderr || error?.message || error)
+      .trim()
+      .split(/\r?\n/)
+      .slice(-3)
+      .join(' ');
+    throw new Error(`npm pack --dry-run could not read ${tarballPath}: ${detail}`);
+  }
+}
+
+/**
+ * The `bin` scripts of `manifest` (a package.json) that `packedFiles` lacks, one line each: a
+ * tarball without them installs a `create-nextblock` command that cannot start.
+ */
+export function findMissingBinFiles(manifest, packedFiles) {
+  const bin = typeof manifest?.bin === 'string' ? { [manifest.name]: manifest.bin } : (manifest?.bin ?? {});
+  const packed = new Set(packedFiles);
+  return Object.entries(bin)
+    .map(([command, target]) => [command, String(target).replace(/\\/g, '/').replace(/^\.\//, '')])
+    .filter(([, target]) => !packed.has(target))
+    .map(([command, target]) => `${target} (the \`${command}\` command) is not in the tarball`);
+}
+
+/**
  * What `npm publish` would get wrong, one line per problem: a template file it would leave out,
  * or a local env file it would publish. An empty list means the tarball is right. `pack` returns
  * npm's JSON output for `packageDir`; tests pass their own instead of running npm.

@@ -3,6 +3,11 @@ import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 import { createClient as createSupabaseJsClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db';
+import {
+  UNCONFIGURED_SUPABASE_KEY,
+  UNCONFIGURED_SUPABASE_URL,
+  unconfiguredSupabaseFetch,
+} from '@nextblock-cms/db/server';
 import { resolveSupabaseAnonKey, resolveSupabaseUrl } from '../../lib/setup/env-status';
 import { resolveSupabaseServiceKey } from '../../lib/setup/service-key';
 import { parseSiteSocialImageSetting, SITE_SOCIAL_IMAGE_SETTING_KEY } from '@nextblock-cms/utils/seo';
@@ -35,22 +40,27 @@ export interface SiteSettings {
  * route `generateMetadata` functions.
  */
 export function createStaticSupabaseClient() {
-  // Fall back to a dummy host when unconfigured (fresh clone, pre-/setup) so the
-  // root layout can still render rather than crashing the whole app on boot. Callers
-  // (getSiteSettings + the getCached* helpers) already swallow failures and use
-  // fallbacks, and loadLayoutData short-circuits before reaching here when there is
-  // no Supabase env at all.
-  const supabaseUrl = resolveSupabaseUrl() || 'https://dummy.supabase.co';
-  const supabaseKey =
-    resolveSupabaseServiceKey() || resolveSupabaseAnonKey() || 'dummy-anon-key';
+  const supabaseUrl = resolveSupabaseUrl();
+  const supabaseKey = resolveSupabaseServiceKey() || resolveSupabaseAnonKey();
+  const auth = {
+    persistSession: false,
+    autoRefreshToken: false,
+    detectSessionInUrl: false,
+  };
 
-  return createSupabaseJsClient<Database>(supabaseUrl, supabaseKey, {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-      detectSessionInUrl: false,
-    },
-  });
+  // Unconfigured (fresh clone or scaffold, pre-/setup, a build with no env): instead of
+  // crashing the app on boot, a client that answers every query with a "not configured"
+  // error and sends no request (docs/04 → "Unconfigured clients"). Callers (getSiteSettings
+  // + the getCached* helpers) already swallow failures and use fallbacks, and
+  // loadLayoutData short-circuits before reaching here when there is no Supabase env.
+  if (!supabaseUrl || !supabaseKey) {
+    return createSupabaseJsClient<Database>(UNCONFIGURED_SUPABASE_URL, UNCONFIGURED_SUPABASE_KEY, {
+      auth,
+      global: { fetch: unconfiguredSupabaseFetch },
+    });
+  }
+
+  return createSupabaseJsClient<Database>(supabaseUrl, supabaseKey, { auth });
 }
 
 /**
@@ -70,9 +80,9 @@ export const getSiteSettings = cache(unstable_cache(
       socialImage: null,
     };
 
-    // Unconfigured instance (pre-/setup): the static client would point at the dummy
-    // host, so the fetch fails with a noisy DNS error before falling back. Skip it and
-    // return SEO defaults directly. (generateMetadata calls this even on /setup.)
+    // Unconfigured instance (pre-/setup): the static client would only answer "not
+    // configured", so skip the query and return SEO defaults directly. (generateMetadata
+    // calls this even on /setup.)
     if (!process.env.NEXT_PUBLIC_SUPABASE_URL) {
       return fallback;
     }

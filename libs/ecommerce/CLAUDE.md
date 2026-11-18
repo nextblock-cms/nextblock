@@ -121,8 +121,9 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
 ## Gotchas
 - A new app-imported subpath that no barrel re-exports must be added to `build.lib.entry`, or
   standalone installs break while the monorepo works.
-- `npx nx build ecommerce` copies the raw `package.json` into a clean dist; only
-  `tools/scripts/release-lib.js` writes the exports map. Validate commerce changes at the app level.
+- `npx nx build ecommerce` copies the raw `package.json` into a clean dist; only the release
+  build (`tools/scripts/lib/release-steps.js`, run by `release-all.js` and `release-lib.js`) writes
+  the exports map. Validate commerce changes at the app level.
 - The cart's `affiliateRef` (the Affiliates storefront token) lives exactly as long as the cart:
   set items through `withCartItems` (`cart-store.ts`) so every path that empties the cart drops
   it, and keep `pendingAffiliateRef` (a storefront link's token, promoted by the next successful

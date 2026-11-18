@@ -160,7 +160,7 @@ function scriptKindFor(fileName) {
 }
 
 function parse(source, fileName) {
-  return ts.createSourceFile(fileName, source.replace(/^﻿/, ''), ts.ScriptTarget.Latest, true, scriptKindFor(fileName));
+  return ts.createSourceFile(fileName, source.replace(/^\uFEFF/, ''), ts.ScriptTarget.Latest, true, scriptKindFor(fileName));
 }
 
 const isWrapper = (node) =>
