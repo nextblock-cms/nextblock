@@ -2,9 +2,13 @@ import { defineConfig } from 'vite';
 import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
+import { fileURLToPath } from 'url';
 // eslint-disable-next-line @nx/enforce-module-boundaries -- a build-time helper every lib config shares, not a library dependency
 import { rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
+// An ES module (.mts), as every other lib config: a .ts config is read as CommonJS here (the root
+// package.json sets no "type"), which Vite's native config loader refuses.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = path.resolve(__dirname, 'package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
@@ -59,7 +63,7 @@ export default defineConfig({
       // dist/libs/db/supabase/functions/, which verify-lib-dist.js check 13 refuses. The copy step
       // (tools/scripts/copy-db-supabase.cjs) also empties dist/libs/db/supabase before it copies.
       // The tests are left out too: through 0.23.5 four `*.test.d.ts` files shipped.
-      exclude: ['vite.config.ts', 'src/supabase/**', 'src/**/*.test.ts', 'src/**/*.spec.ts'],
+      exclude: ['vite.config.mts', 'src/supabase/**', 'src/**/*.test.ts', 'src/**/*.spec.ts'],
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/db',

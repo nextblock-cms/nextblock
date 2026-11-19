@@ -2322,7 +2322,7 @@ The workspace operates a dual build strategy: Next.js's native build pipeline fo
 | `@vitejs/plugin-react` | React/JSX transformation |
 | `vite-tsconfig-paths` | TypeScript path alias resolution |
 
-Libraries `libs/ui`, `libs/db`, `libs/editor`, `libs/sdk`, and `libs/utils` are bundled via Vite. Each library's `vite.config.ts` imposes package-specific concerns — `libs/ui` patches client directives, `libs/utils` separates client/server entries, and `libs/db` appends a `copy-db-supabase.cjs` post-step to propagate migration assets.
+Libraries `libs/ui`, `libs/db`, `libs/editor`, `libs/sdk`, and `libs/utils` are bundled via Vite. Each library's `vite.config.mts` imposes package-specific concerns — `libs/ui` patches client directives, `libs/utils` separates client/server entries, and `libs/db` appends a `copy-db-supabase.cjs` post-step to propagate migration assets.
 
 #### 3.6.2.2 Library Bundling — `@nx/js:tsc`
 
@@ -2547,10 +2547,10 @@ The premium `libs/ecommerce` is guarded at runtime by the `verifyPackageOnline('
 - `libs/sdk/package.json` — `@nextblock-cms/sdk`
 - `libs/environment.d.ts` — `NodeJS.ProcessEnv` augmentation for all environment variables
 - `libs/db/src/lib/package-validation.ts` — `verifyPackageOnline` with 60-second `unstable_cache`
-- `libs/db/vite.config.ts` — Vite library build + `copy-db-supabase.cjs` post-step
-- `libs/ui/vite.config.ts` — Vite build with client-directive patching
-- `libs/utils/vite.config.ts` — Vite build with client/server separation
-- `libs/editor/vite.config.ts` — Vite build with workspace alias resolution
+- `libs/db/vite.config.mts` — Vite library build + `copy-db-supabase.cjs` post-step
+- `libs/ui/vite.config.mts` — Vite build with client-directive patching
+- `libs/utils/vite.config.mts` — Vite build with client/server separation
+- `libs/editor/vite.config.mts` — Vite build with workspace alias resolution
 - `docs/04-DATABASE-AND-AUTH.md` — Proxy-vs-middleware rationale
 - `docs/05-DEVELOPER-GUIDE.md` — Operational handbook
 
@@ -8993,7 +8993,7 @@ No dedicated mocking libraries (e.g., `sinon`, `nock`, `msw`) are installed. The
 
 #### 6.6.2.4 Code Coverage Requirements
 
-**No code coverage thresholds are defined.** No coverage reporter (c8, istanbul, nyc) is installed or configured. No `vitest.config.ts` file exists to declare coverage thresholds; the Vitest runtime configuration is inferred entirely by the `@nx/vitest` plugin from Nx convention.
+**No code coverage thresholds are defined.** No coverage reporter (c8, istanbul, nyc) is installed or configured. The root `vitest.config.mts` (path aliases, the JSX transform, the worktree exclude) declares no coverage thresholds.
 
 A registered but unapplied migration in `migrations.json` (`@nx/vitest` `update-22-6-0-prefix-reports-directory`) relates to future coverage report path normalization, indicating that coverage reporting remains architecturally possible but is not currently exercised.
 
@@ -9424,7 +9424,7 @@ While the current posture is intentional, the Nx workspace is pre-configured to 
 | Expansion | Enablement Mechanism |
 |:--|:--|
 | Additional unit tests in any library | Add `*.test.ts` file; `@nx/vitest` auto-infers the target |
-| Coverage enforcement | Create `vitest.config.ts` in a project; Nx generator supports `--coverage` |
+| Coverage enforcement | Add a `coverage` block to the root `vitest.config.mts`; Nx generator supports `--coverage` |
 | Component testing (React Testing Library) | Install `@testing-library/react`; use existing `jsdom` environment shim |
 | E2E testing (Playwright / Cypress) | Install framework; create `apps/nextblock-e2e` project per Nx convention |
 | CI integration (GitHub Actions) | Create `.github/workflows/ci.yml` invoking `nx affected -t test,lint,build` |
@@ -9466,7 +9466,7 @@ The accepted tradeoff in §5.3.1 ("Vitest-only — Limited end-to-end coverage")
 
 - The system has an **intentionally minimal testing strategy** formalized as an ADR in §5.3.1.
 - The **sole automated test file** is `libs/utils/tests/translation-workspace.test.ts`, containing six Vitest test cases across two `describe` blocks.
-- **Vitest** is integrated via the `@nx/vitest` plugin with `testTargetName: "test"`; no `vitest.config.ts` file exists in the workspace.
+- **Vitest** is integrated via the `@nx/vitest` plugin with `testTargetName: "test"`; the runs use the root `vitest.config.mts` (no per-project test targets: `npx vitest run <path>`).
 - **No CI/CD test automation exists** — the repository contains no `.github/workflows/` directory; Vercel builds the application and Node scripts publish libraries, neither of which runs tests.
 - **Manual QA harnesses** in `libs/editor/src/lib/components/test/` provide human-operated validation for editor surfaces but are not automated tests.
 - **Quality assurance substitutes** for an automated test pyramid via TypeScript `strict: true`, ESLint `@nx/enforce-module-boundaries`, accessibility lints, RLS at the database layer, signed-webhook verification at integration boundaries, and build-time type safety.
@@ -9500,13 +9500,13 @@ The accepted tradeoff in §5.3.1 ("Vitest-only — Limited end-to-end coverage")
 - `eslint.config.mjs` — ESLint flat config with `@nx/enforce-module-boundaries` (compensating static-analysis gate)
 - `libs/utils/tests/translation-workspace.test.ts` — The sole automated test file; 6 test cases across `deriveTranslationCategory` and `CSV helpers` describe blocks
 - `libs/utils/src/lib/translation-workspace.ts` — Source module under test
-- `libs/utils/project.json` / `libs/utils/package.json` / `libs/utils/vite.config.ts` — No explicit test target; auto-inferred by `@nx/vitest`
+- `libs/utils/project.json` / `libs/utils/package.json` / `libs/utils/vite.config.mts` — No explicit test target; auto-inferred by `@nx/vitest`
 - `libs/editor/src/lib/components/test/FeatureValidationTest.tsx` — Manual QA harness (not automated)
 - `libs/editor/src/lib/components/test/NotionEditorEnhancedTest.tsx` — Manual QA harness
 - `libs/editor/src/lib/components/test/UndoRedoTest.tsx` — Manual QA harness
 - `libs/editor/tsconfig.lib.json` — Excludes all `*.test.*`/`*.spec.*` patterns from builds
 - `libs/ui/tsconfig.lib.json`, `libs/utils/tsconfig.lib.json`, `libs/ecommerce/tsconfig.lib.json` — Same test exclusion pattern; `libs/ecommerce` additionally excludes placeholder `jest.config.ts`/`test-setup.ts`
-- `libs/sdk/vite.config.ts` — Contains `/// <reference types='vitest' />` type hint but no Vitest config block
+- `libs/sdk/vite.config.mts` — Contains `/// <reference types='vitest' />` type hint but no Vitest config block
 - `apps/create-nextblock/package.json` — npm-init stub `"test": "echo \"Error: no test specified\" && exit 1"`
 - `apps/nextblock/project.json` — No test target declared
 - `tools/scripts/release-lib.js` — Library release pipeline; runs `npx nx run ${nxProject}:build --skip-nx-cache --with-deps` with no test invocation

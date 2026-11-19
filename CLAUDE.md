@@ -30,7 +30,7 @@ would have caught it. CI (`.github/workflows/security.yml`) re-runs the gates on
 
 Dependencies: `utils` → `ui` → `editor`; `utils` → `db`; `db,ui,utils` → `ecommerce`;
 `db,utils,ecommerce` → `cortex`; `utils,ui` → `affiliates`; the app consumes all; libs never
-import the app. Import via `@nextblock-cms/*` (`tsconfig.base.json` paths; `vitest.config.ts`
+import the app. Import via `@nextblock-cms/*` (`tsconfig.base.json` paths; `vitest.config.mts`
 mirrors all but `db/types`).
 
 ## Content model (Postgres JSONB)

@@ -14,7 +14,7 @@ CMS registry and the only consumer live in `apps/nextblock` (`lib/blocks/blockRe
 - New runtime imports must be listed in `package.json` (`@nx/dependency-checks`).
 
 ## Gotchas
-- The published `package.json` is written by `vite.config.ts` afterBuild; `dependencies` and
+- The published `package.json` is written by `vite.config.mts` afterBuild; `dependencies` and
   `license` in the source manifest never ship. It declares `zod` and `lucide-react` as peers (the
   types name them; ranges from the root `package.json`), which `verify-lib-dist.js` check 15
   requires.

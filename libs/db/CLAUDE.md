@@ -32,7 +32,7 @@ Entry points: `@nextblock-cms/db` (browser `createClient`, Row types); `/server`
   source), empties it and copies `SUPABASE_PACKAGE_ENTRIES` (`config.toml`, `migrations/`,
   `templates/`: what create-nextblock, `npm run update` and migrate-core read), no dot entry at
   any depth; a consumer reading a new entry means adding it there (`copy-db-supabase.test.ts`).
-  `functions/` (the Deno edge function, also out of the dts step: `vite.config.ts` `exclude`) and
+  `functions/` (the Deno edge function, also out of the dts step: `vite.config.mts` `exclude`) and
   the CLI's local state (`.temp/`, `.branches/`, local Studio's `snippets/`, `signing_keys.json`)
   never ship.
 - The real-path check guards the copy only: vite's `emptyOutDir` empties `dist/libs/db` first,
@@ -42,7 +42,7 @@ Entry points: `@nextblock-cms/db` (browser `createClient`, Row types); `/server`
   `migrations/` file that is not a top-level `<digits>_*.sql` passing `validateMigrationNames`, a
   non-`.html` template, and packed migration names that differ from those the `/setup` bundle
   embeds (names only, not the SQL: run `npm run generate:migrations-bundle` after adding one).
-- Every bare import stays external, so the manifest `vite.config.ts` writes declares the
+- Every bare import stays external, so the manifest `vite.config.mts` writes declares the
   third-party ones (`verify-lib-dist.js` check 15): `@supabase/supabase-js`, `@supabase/ssr` and
   `server-only` as dependencies, `next` as an OPTIONAL peer (create-nextblock depends on this
   package for `supabase/` alone, and npm installs a required peer: all of Next.js). A new external

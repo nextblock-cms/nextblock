@@ -48,7 +48,7 @@ only: no build entry reaches it, so the package ships no JavaScript for it.
   CommonJS ones, so it overwrites real ESM output and its CommonJS files get overwritten (the
   hand-written server entry did both through 0.20).
 - The stale tracked twins (`src/lib/server-utils.js`, `src/server.js`) are ignored:
-  `resolve.extensions` puts `.ts` first here and in the root `vitest.config.ts`, so the `.ts`
+  `resolve.extensions` puts `.ts` first here and in the root `vitest.config.mts`, so the `.ts`
   sources are what ships and what the tests run.
 - `src/lib/authored-html.ts` is the boundary for authored HTML (an allowlist on `sanitize-html`; it
   imports nothing else and touches no DOM). The library writes allowed `<style>` text unescaped

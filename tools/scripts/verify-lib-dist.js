@@ -88,7 +88,7 @@
 //      supabase/migrations is refused, and holds no migration for check 14 to compare).
 //      The copy empties dist/libs/db/supabase before it copies: the db build's dts step declared
 //      the Deno edge function there (supabase/functions/nextblock-migration-ingest/index.d.ts,
-//      until libs/db/vite.config.ts excluded src/supabase), and a merge kept it, so this check
+//      until libs/db/vite.config.mts excluded src/supabase), and a merge kept it, so this check
 //      refused every fresh db build.
 //  14. The files inside db's supabase/migrations and supabase/templates, which check 13 passes
 //      once the folder is allowed. Every install applies what ships in migrations/ (the build

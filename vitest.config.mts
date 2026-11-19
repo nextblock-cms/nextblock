@@ -1,5 +1,10 @@
 import { configDefaults, defineConfig } from 'vitest/config';
 import path from 'path';
+import { fileURLToPath } from 'url';
+
+// An ES module (.mts): the root package.json sets no "type", so a .ts config would be read as CommonJS,
+// which Vite's native config loader (planned as the default in a later major) refuses.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   // Vite 8 transforms TS/JSX with Oxc, which takes `jsx` from the nearest tsconfig.json.

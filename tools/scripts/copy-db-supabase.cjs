@@ -120,7 +120,7 @@ async function refuseOverlap(source, dest) {
  * Makes `destDir` hold exactly SUPABASE_PACKAGE_ENTRIES from `sourceDir`, minus every dot entry.
  * The copy owns its destination, so it empties it first: a merge kept whatever an earlier step
  * left there. The db build's dts step wrote supabase/functions/nextblock-migration-ingest/index.d.ts
- * (the Deno edge function's declaration, until libs/db/vite.config.ts excluded src/supabase), and
+ * (the Deno edge function's declaration, until libs/db/vite.config.mts excluded src/supabase), and
  * verify-lib-dist.js check 13 then refused every db release; a stale build's CLI state or an
  * obsolete migration would have survived the same way. `options.distDir` is the db dist directory:
  * `destDir` must be its supabase/ (resolveSupabaseDest), and must not really be, hold or sit inside
