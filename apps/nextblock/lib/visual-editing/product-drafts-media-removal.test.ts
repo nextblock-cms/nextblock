@@ -14,11 +14,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * blocks, section backgrounds or the social image use are never referenced by a foreign key, so even
  * an honest gallery drop could delete files a live page still showed.
  *
- * The REAL publishProductVisualEditingDraft (requireCmsAdmin, classify, completeProductDraftValues,
- * claim, block swap, revision, draft delete) and the REAL updateProduct, over a fake cookie client
- * that answers as RLS does for an ADMIN (media_delete_policy is is_admin(): any row) and records
- * every write. Only the network edges are mocked: getProduct (the live row), the S3 client, the
- * inventory sync, the revision helpers, the second-factor evaluation and next/cache.
+ * Since migration 02043 the publish is one call, `publish_product_draft`: the REAL
+ * publishProductVisualEditingDraft (requireCmsAdmin, classify, completeProductDraftValues) and the REAL
+ * buildProductDraftPublishValues build its arguments here, over a fake cookie client that records every
+ * write and the call. What the function does with the gallery (one upsert of the listed images, one
+ * unlink of the rest, never a media row: the dropped image keeps its row) runs against a real database
+ * in tools/scripts/product-draft-publish.db.test.ts and security-verify.sql section 44; that file also
+ * holds the migration's text to the same rule, without a database.
  */
 
 const PRODUCT_ID = '123e4567-e89b-42d3-a456-426614174000';
@@ -28,112 +30,59 @@ const OTHER_UPLOADER_IMAGE = '33333333-3333-4333-8333-333333333333';
 
 const mocks = vi.hoisted(() => ({
   s3Send: vi.fn(),
-  syncSharedInventoryForSavedProduct: vi.fn(),
   getProduct: vi.fn(),
-  getFullProductContent: vi.fn(),
-  createProductRevision: vi.fn(),
   revalidatePath: vi.fn(),
   syncProductSaleCouponToFreemius: vi.fn(),
+  rpc: vi.fn(),
   role: 'ADMIN' as string,
   draftMeta: {} as Record<string, unknown>,
   liveGallery: [] as string[],
-  log: [] as Array<Record<string, any>>,
+  writes: [] as Array<[string, string]>,
 }));
-
-type Query = {
-  table: string;
-  op: 'select' | 'insert' | 'update' | 'delete' | 'upsert';
-  columns?: string;
-  head: boolean;
-  filters: Array<[string, ...unknown[]]>;
-  values?: unknown;
-  options?: unknown;
-  returning?: string;
-  single: boolean;
-};
-
-const EXISTING_MEDIA = [LIVE_IMAGE, DECOY, OTHER_UPLOADER_IMAGE];
-
-function resolve(q: Query) {
-  const filter = (name: string, column: string) => q.filters.find((f) => f[0] === name && f[1] === column);
-  if (q.table === 'profiles') return { data: { role: mocks.role }, error: null };
-  if (q.table === 'product_drafts') {
-    if (q.op === 'select') {
-      return {
-        data: {
-          id: 7,
-          product_id: PRODUCT_ID,
-          author_id: 'writer-1',
-          meta: mocks.draftMeta,
-          blocks: [],
-          created_at: '2026-11-15T01:00:00.000Z',
-          updated_at: '2026-11-15T01:00:00.000Z',
-        },
-        error: null,
-      };
-    }
-    if (q.op === 'update') return { data: [{ id: 7 }], error: null }; // the claim
-    return { data: null, error: null };
-  }
-  if (q.table === 'blocks') return { data: [], error: null };
-  if (q.table === 'media' && q.op === 'select') {
-    const ids = (filter('in', 'id')?.[2] ?? []) as string[];
-    return { data: ids.filter((id) => EXISTING_MEDIA.includes(id)).map((id) => ({ id })), error: null };
-  }
-  if (q.table === 'products') {
-    if (q.op === 'select' && q.single) return { data: { id: PRODUCT_ID, sku: 'PRO', sale_price: null, sale_prices: {} }, error: null };
-    if (q.op === 'select') return { data: [{ id: PRODUCT_ID }], error: null };
-    return { data: null, error: null };
-  }
-  return { data: null, error: null, count: 0 };
-}
 
 function makeCookieClient() {
   return {
     auth: { getUser: async () => ({ data: { user: { id: 'admin-1' } }, error: null }) },
     rpc: async (fn: string, args: unknown) => {
-      mocks.log.push({ table: `rpc:${fn}`, op: 'rpc', values: args });
-      return { data: PRODUCT_ID, error: null };
+      mocks.rpc(fn, args);
+      return {
+        data: { product_id: PRODUCT_ID, previous_slug: 'pro-plugin', slug: 'pro-plugin', payment_provider: 'stripe', wrote_values: true },
+        error: null,
+      };
     },
     from(table: string) {
-      const q: Query = { table, op: 'select', head: false, filters: [], single: false };
+      let op = 'select';
       const chain: Record<string, any> = {};
-      chain.select = (columns?: string, options?: { head?: boolean }) => {
-        if (q.op === 'select') {
-          q.columns = columns;
-          q.head = Boolean(options?.head);
-        } else {
-          q.returning = columns;
+      const answer = () => {
+        if (table === 'profiles') return { data: { role: mocks.role }, error: null };
+        if (table === 'product_drafts') {
+          return {
+            data: {
+              id: 7,
+              product_id: PRODUCT_ID,
+              author_id: 'writer-1',
+              meta: mocks.draftMeta,
+              blocks: [],
+              created_at: '2026-11-15T01:00:00.000Z',
+              updated_at: '2026-11-15T01:00:00.000Z',
+            },
+            error: null,
+          };
         }
-        return chain;
+        return { data: null, error: null };
       };
-      for (const name of ['eq', 'neq', 'in', 'is', 'gt', 'gte', 'lt', 'lte', 'or', 'not', 'filter', 'match']) {
-        chain[name] = (...args: unknown[]) => {
-          q.filters.push([name, ...args]);
+      for (const name of ['select', 'eq', 'neq', 'in', 'not', 'order', 'range', 'limit']) chain[name] = () => chain;
+      for (const name of ['insert', 'update', 'delete', 'upsert']) {
+        chain[name] = () => {
+          op = name;
+          mocks.writes.push([name, table]);
           return chain;
         };
       }
-      chain.order = () => chain;
-      chain.range = () => chain;
-      chain.limit = () => chain;
-      for (const name of ['insert', 'update', 'delete', 'upsert'] as const) {
-        chain[name] = (values?: unknown, options?: unknown) => {
-          q.op = name;
-          q.values = values;
-          q.options = options;
-          return chain;
-        };
-      }
-      chain.single = async () => {
-        q.single = true;
-        mocks.log.push(q);
-        return resolve(q);
-      };
-      chain.maybeSingle = chain.single;
-      chain.then = (onFulfilled: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) => {
-        mocks.log.push(q);
-        return Promise.resolve(resolve(q)).then(onFulfilled, onRejected);
-      };
+      chain.single = async () => answer();
+      chain.maybeSingle = async () => answer();
+      chain.then = (onFulfilled: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(op === 'select' ? answer() : { data: null, error: null }).then(onFulfilled, onRejected);
       return chain;
     },
   };
@@ -150,10 +99,7 @@ vi.mock('@nextblock-cms/db/server', () => ({
   getSsgSupabaseClient: vi.fn(),
 }));
 vi.mock('@nextblock-cms/utils/server', () => ({ getS3Client: async () => ({ send: mocks.s3Send }) }));
-vi.mock('@nextblock-cms/ecommerce/shared-inventory', () => ({
-  syncSharedInventoryForSavedProduct: mocks.syncSharedInventoryForSavedProduct,
-}));
-// The real updateProduct; only the live read is canned.
+// The real buildProductDraftPublishValues; only the live read is canned.
 vi.mock('@nextblock-cms/ecommerce/product-actions', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getProduct: mocks.getProduct,
@@ -164,8 +110,6 @@ vi.mock('@nextblock-cms/ecommerce/freemius-coupons', () => ({
 vi.mock('../auth/twoFactor', () => ({
   evaluateTwoFactor: async () => ({ status: 'satisfied', userId: 'admin-1', mfaType: null }),
 }));
-vi.mock('../../app/cms/revisions/utils', () => ({ getFullProductContent: mocks.getFullProductContent }));
-vi.mock('../../app/cms/revisions/service', () => ({ createProductRevision: mocks.createProductRevision }));
 
 import { publishProductVisualEditingDraft } from './product-drafts';
 
@@ -194,24 +138,27 @@ const LIVE_PRODUCT = {
   updated_at: '2026-11-01T00:00:00.000Z',
 };
 
-const writesTo = (table: string) => mocks.log.filter((q) => q.table === table && q.op !== 'select');
+/** The product values the one publish call carried. */
+function publishedValues(): Record<string, unknown> {
+  expect(mocks.rpc).toHaveBeenCalledTimes(1);
+  expect(mocks.rpc.mock.calls[0][0]).toBe('publish_product_draft');
+  return mocks.rpc.mock.calls[0][1].p_values;
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, 'error').mockImplementation(() => undefined);
-  mocks.log.length = 0;
+  mocks.writes.length = 0;
   mocks.role = 'ADMIN';
   mocks.liveGallery = [LIVE_IMAGE];
   mocks.getProduct.mockImplementation(async () => ({
     data: { ...LIVE_PRODUCT, product_media: mocks.liveGallery.map((media_id, sort_order) => ({ media_id, sort_order })) },
     error: null,
   }));
-  mocks.getFullProductContent.mockResolvedValue({ meta: {}, blocks: [] });
-  mocks.createProductRevision.mockResolvedValue({ success: true, version: 2, recorded: true });
 });
 
 describe('a product publish never deletes media (security review 2026-11-15)', () => {
-  it("ignores a WRITER-written draft's hidden media_id and explicitly_removed_media_ids: the gallery stays as the edit page showed it", async () => {
+  it("never hands the function a WRITER-written draft's hidden media_id or explicitly_removed_media_ids: the gallery stays as the edit page showed it", async () => {
     // What a WRITER can PATCH over PostgREST: the live SKU (classified as product values), the 0.23.4
     // marker (no old-draft check), a top-level media_id, and media ids to "remove".
     mocks.draftMeta = {
@@ -221,20 +168,24 @@ describe('a product publish never deletes media (security review 2026-11-15)', (
       explicitly_removed_media_ids: [LIVE_IMAGE, OTHER_UPLOADER_IMAGE],
     };
 
-    const result = await publishProductVisualEditingDraft(PRODUCT_ID);
-    expect(result).toEqual({ success: true });
+    await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({ success: true });
 
-    // The RPC wrote the live values back.
-    const rpc = mocks.log.find((q) => q.table === 'rpc:upsert_product_with_variants');
-    expect(rpc?.values?.product_payload).toMatchObject({ sku: 'PRO', title: 'Pro plugin', price: 4900 });
-
-    // No gallery write (the draft carries no product_media), no media row deleted, no object removed.
-    expect(writesTo('product_media')).toEqual([]);
-    expect(writesTo('media')).toEqual([]);
+    const values = publishedValues();
+    // The live values go back.
+    expect(values).toMatchObject({ sku: 'PRO', title: 'Pro plugin', price: 4900 });
+    // No gallery (the draft carries no product_media: the function leaves the gallery as it is), and
+    // neither key reaches the function under any name.
+    expect(values.gallery_media_ids).toBeNull();
+    expect(values).not.toHaveProperty('media_id');
+    expect(values).not.toHaveProperty('explicitly_removed_media_ids');
+    expect(JSON.stringify(values)).not.toContain(DECOY);
+    expect(JSON.stringify(values)).not.toContain(OTHER_UPLOADER_IMAGE);
+    // Nothing written outside the call, no object removed.
+    expect(mocks.writes).toEqual([]);
     expect(mocks.s3Send).not.toHaveBeenCalled();
   });
 
-  it('only unlinks an image a draft drops from the gallery: its media row and files stay', async () => {
+  it('sends only the gallery the draft lists when it drops an image: the function unlinks it and keeps its media row', async () => {
     mocks.liveGallery = [LIVE_IMAGE, DECOY];
     mocks.draftMeta = {
       sku: 'PRO',
@@ -243,14 +194,12 @@ describe('a product publish never deletes media (security review 2026-11-15)', (
       explicitly_removed_media_ids: [DECOY],
     };
 
-    const result = await publishProductVisualEditingDraft(PRODUCT_ID);
-    expect(result).toEqual({ success: true });
+    await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({ success: true });
 
-    expect(writesTo('product_media').map((q) => [q.op, q.values, q.filters])).toEqual([
-      ['upsert', [{ product_id: PRODUCT_ID, media_id: LIVE_IMAGE, sort_order: 0 }], []],
-      ['delete', undefined, [['eq', 'product_id', PRODUCT_ID], ['not', 'media_id', 'in', `(${LIVE_IMAGE})`]]],
-    ]);
-    expect(writesTo('media')).toEqual([]);
+    const values = publishedValues();
+    expect(values.gallery_media_ids).toEqual([LIVE_IMAGE]);
+    expect(values).not.toHaveProperty('explicitly_removed_media_ids');
+    expect(mocks.writes).toEqual([]);
     expect(mocks.s3Send).not.toHaveBeenCalled();
   });
 
@@ -261,7 +210,7 @@ describe('a product publish never deletes media (security review 2026-11-15)', (
     const result = await publishProductVisualEditingDraft(PRODUCT_ID);
 
     expect(result).toEqual({ success: false, error: 'Only an administrator can publish products.' });
-    expect(writesTo('product_media')).toEqual([]);
-    expect(writesTo('media')).toEqual([]);
+    expect(mocks.rpc).not.toHaveBeenCalled();
+    expect(mocks.writes).toEqual([]);
   });
 });

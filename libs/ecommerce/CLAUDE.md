@@ -67,6 +67,33 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   `form_version: 2`: the app checks only unstamped product values for the pre-0.23.4 damage, so
   every writer of product values stamps it. The app keeps its own copy of the literal (a 'use
   server' module exports only async functions): `product-draft-marker.test.ts` fails on drift.
+  Its UPDATE selects the row back: none means a publish (or a discard) deleted the draft after the
+  read, and the values start a new draft instead of being reported saved. The values carry
+  `stock_baseline` (`productSchema`, lenient on purpose: a hidden field that refused a value would
+  block every autosave), the stock the app's edit page loaded per SKU: `ProductForm` passes
+  `initialData.stock_baseline` through unseen and never computes one (only the page knows whether
+  its data is live or a draft's). With a draft open the page records the live stock as the baseline
+  and shows what that draft's publish would write (docs/09 → "Stock: only what the editor changed").
+- A product draft publishes through `public.publish_product_draft` (migration 02043: one
+  transaction under the product and draft row locks), with `buildProductDraftPublishValues(values)`
+  as `p_values`: `updateProduct()`'s RPC payload in minor units without `id`, `status`, `metadata`
+  or the provider, plus the SEO fields, `gallery_media_ids` and `category_ids` (null leaves the
+  gallery or categories as they are). The function (`private.apply_product_draft_values`) keeps
+  each variant row whose attribute term set matches (id, order item links, cart lines, scheduled
+  prices) and writes what `updateProduct()` wrote, in its order, except the stock: since 02044 the
+  values carry `stock_baseline` (serialized SKU-trimmed, whole quantities only; null without one),
+  and the function, once it has locked the inventory rows a sale could hold against it, leaves a
+  SKU's `inventory_items` row alone when the draft's quantity equals the loaded one or the current
+  one, applies the difference to the current quantity otherwise (a sale made while the page was
+  open stays sold), writes a SKU the baseline lacks as typed, refuses a quantity that is not a
+  number, plain decimal text or null (NBP04), and answers `stock_adjusted` (`already_live`,
+  `moved`), which the app warns of (docs/09 → "Stock: only what the editor changed"). The sale's
+  deduction takes an order's SKUs in the order the publish locks them in, since 02044: keep
+  `applyOrderInventoryDeductionViaSql` (`order-inventory.ts`) in step (`order-inventory.test.ts`).
+  A field added to the values changes both sides: `tools/scripts/product-draft-publish.db.test.ts`
+  runs the builder against the function on a real database. `updateProduct()` is not the publish
+  path any more (nothing in the app calls it; its RPC still re-creates every variant, and with
+  `syncSharedInventoryForSavedProduct` it writes every quantity it is handed).
 - ProductForm autosaves 400 ms after anything React Hook Form marks dirty, so opening it must dirty
   nothing: its defaults and `EditProductPage`'s initial data carry every column a save writes back
   (`ProductForm.sale-window.test.tsx`, `EditProductPage.test.tsx`), `VariationsEditor` starts from
@@ -81,10 +108,18 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   in zod's default words) blocks every autosave, named on the status line, until it is fixed, a
   term toggle rebuilds the list or the draft is discarded. A draft variant that kept its options
   when its term was deleted saves, and that draft's publish fails on `variant_attribute_mapping`
-  until a toggle rebuilds the list.
+  until a toggle rebuilds the list. A list field that is not a list loads empty (`listOrEmpty`,
+  `repairLoadedVariants`), and variation attributes, a variant's label and key, and its options
+  load only as the form can read them (`readVariationAttributes`, `isReadableVariantOption`; else
+  from its terms), as `buildVariantSku` reads only text: each threw on mount or blocked every
+  autosave (`ProductForm.list-fields.test.tsx`). `serializeVariantsForRpc` passes a variant list
+  that is not a list on for the function to refuse (NBP04), never as no variants, which would
+  delete every live variant.
 - `VariationsEditor` regenerates only when the selected terms change, by value (a currency change
   would too, but ProductForm remounts it on that reset): never on open or on the product's SKU,
   prices or sale, and only deselecting the last term empties the list (`VariationsEditor.test.tsx`).
+  It opens on the variation attributes it can read and, when none selects a term, on the selection
+  the variants' own options make, as `ProductForm`'s change check assumes.
   `generateVariantDrafts` keeps an existing variant's own price maps and sale, an empty one
   included (`previous ? previous.x ?? <empty> : base`, never `previous?.x ?? base`); only a new
   combination takes the form's amounts as they are, and the product's sale window only with a sale
@@ -92,12 +127,25 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
 - The product page (`ProductDetailsLayout`) shows a selected variant's own resolved sale price
   (`null`: no sale), the one Stripe checkout charges, never the product's; the product's only with
   no variant selected (`ProductDetailsLayout.test.tsx`).
-- `updateProduct()` never deletes media: the gallery is one checked upsert of the listed images
-  (deduplicated, only ids that still have a media row, checked before the first write) and one checked
-  unlink of the rest; a top-level `media_id` and `explicitly_removed_media_ids` are ignored. Never add
-  media deletion to a save path: image blocks, section backgrounds, text blocks and the social image
-  keep their own copy of a key that no foreign key tracks, and a save's values can be a draft any
-  WRITER can write (`product-actions.test.ts`).
+- `updateProduct()` and the draft publish never delete media: the gallery is one upsert of the
+  listed images (deduplicated, only ids that still have a media row) and one unlink of the rest,
+  each checked in `updateProduct()` (the ids resolved before its first write) and inside the
+  publish's transaction; a top-level `media_id` and `explicitly_removed_media_ids` are ignored
+  (`buildProductDraftPublishValues` has no field for either). Never add media deletion to a save
+  path: image blocks, section backgrounds, text blocks and the social image keep their own copy of a
+  key that no foreign key tracks, and a save's values can be a draft any WRITER can write
+  (`product-actions.test.ts`, `product-drafts-media-removal.test.ts`, security-verify.sql section 44).
+- A gallery has one reading, `product-gallery.ts` (import-free, subpath `/product-gallery`):
+  `normalizeProductGallery` (the list's order, ids lowercased and once, uuids only; an entry's
+  `sort_order` and embedded `media` count for nothing) for `updateProduct()`, the form's draft save
+  (`toProductGalleryDraftEntries`: bare `{ media_id }`) and the app's edit page and draft checks;
+  `publish_product_draft` reads `gallery_media_ids` by the same rules in SQL (02043), then keeps only
+  ids with a media row, as the edit page draws only those (a `product_media` that is not a list
+  publishes no gallery: the live one stays, and the edit page shows it);
+  `orderProductGalleryEntries` for the order ProductForm shows and saves. Never draw a tile from a
+  draft's own entry, or read a gallery another way: the edit page once showed a WRITER-written
+  draft's embedded live images while publish wrote another main image (the app's
+  `gallery-parity.test.tsx`).
 - Every write that changes `products.title`, `short_description` or `description_json` sets
   `updated_at` (no trigger does; the sitemap and the app's pre-0.23.4 draft rule read it), as the
   product RPC, the Freemius sync and `copyProductFromLanguage` do (`providers/freemius.test.ts`,

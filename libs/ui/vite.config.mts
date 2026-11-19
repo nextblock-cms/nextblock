@@ -4,7 +4,7 @@ import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
-import { clientDirectiveOnEntries, copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
+import { clientDirectiveOnEntries, copyIntoDist, rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resolveFrom = (...segments: string[]) => path.resolve(__dirname, ...segments);
@@ -14,17 +14,48 @@ const packageJsonPath = resolveFrom('package.json');
 // (see rolldownOptions.external below). Copied into the published manifest by afterBuild.
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
-const { version, dependencies, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+const { version, dependencies: externalDependencies, license, repository } = JSON.parse(
+  fs.readFileSync(packageJsonPath, 'utf8')
+);
+// The bundle inlines class-variance-authority and the radix primitives, but the declarations import
+// them by name (`VariantProps<typeof buttonVariants>`, `React.ComponentPropsWithoutRef<typeof
+// DialogPrimitive.Root>`). Nothing in a scaffold installed them, so `variant` and `size` did not
+// exist on Button and Badge (457 errors in every scaffold through 0.23.5, hidden by
+// `typescript.ignoreBuildErrors`) and every dialog, menu and select took `any` props. Declared so the
+// types resolve; the JavaScript still uses its inlined copies. tools/scripts/verify-lib-dist.js
+// check 15 refuses a declaration import nothing declares.
+const dependencies = {
+  ...externalDependencies,
+  ...rootPackageRanges([
+    'class-variance-authority',
+    '@radix-ui/react-avatar',
+    '@radix-ui/react-checkbox',
+    '@radix-ui/react-dialog',
+    '@radix-ui/react-dropdown-menu',
+    '@radix-ui/react-label',
+    '@radix-ui/react-popover',
+    '@radix-ui/react-progress',
+    '@radix-ui/react-radio-group',
+    '@radix-ui/react-select',
+    '@radix-ui/react-separator',
+    '@radix-ui/react-tooltip',
+  ]),
+};
 // peerDependencies: @nextblock-cms/utils, which the bundle imports by name (`@nextblock-cms/*`
 // stays external below), at the version libs/utils carries when this build runs. release:all
 // bumps utils before it builds ui (LIBS in tools/scripts/release-all.js), so the range names the
 // release that goes out with this one. A peer, so the app and ui share one copy. Through 0.22.5
 // ui declared none. tools/scripts/verify-lib-dist.js check 11 refuses an undeclared sibling import.
+// react and react-dom (external below) are peers too: the app's single copy. Through 0.23.5 the
+// manifest named neither.
 const utilsVersion = JSON.parse(fs.readFileSync(resolveFrom('../utils/package.json'), 'utf8')).version;
 if (typeof utilsVersion !== 'string' || !/^\d+\.\d+\.\d+/.test(utilsVersion)) {
   throw new Error("libs/utils/package.json has no version for ui's peerDependencies");
 }
-const peerDependencies = { '@nextblock-cms/utils': `^${utilsVersion}` };
+const peerDependencies = {
+  '@nextblock-cms/utils': `^${utilsVersion}`,
+  ...rootPackageRanges(['react', 'react-dom']),
+};
 
 export default defineConfig({
   root: __dirname,
@@ -48,7 +79,7 @@ export default defineConfig({
           main: 'index.js',
           module: 'index.mjs',
           types: 'index.d.ts',
-          ...(dependencies ? { dependencies } : {}),
+          dependencies,
           peerDependencies,
           exports: {
             '.': {

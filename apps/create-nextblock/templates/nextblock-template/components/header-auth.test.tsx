@@ -34,26 +34,29 @@ vi.mock('@nextblock-cms/utils/translations-context', () => ({
 
 // The real menu renders its items in a portal only once opened; flatten it so the items render.
 // Items keep their click handler (sign-out); a handler never shows in the static markup.
-vi.mock('@nextblock-cms/ui', () => {
-  const Pass = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+// One object serves all three modules: the template sync rewrites every
+// `@nextblock-cms/ui/<component>` specifier to the `@nextblock-cms/ui` barrel, and a scaffold keeps
+// only the last of several mocks of one module, so each mock must carry every component (the sync
+// then keeps one of the identical lines).
+const ui = vi.hoisted(() => {
+  const Block = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+  const Inline = ({ children }: { children?: ReactNode }) => <span>{children}</span>;
   return {
-    DropdownMenu: Pass,
-    DropdownMenuContent: Pass,
+    DropdownMenu: Block,
+    DropdownMenuContent: Block,
     DropdownMenuItem: ({ children, onClick }: { children?: ReactNode; onClick?: () => void }) => (
       <div onClick={onClick}>{children}</div>
     ),
-    DropdownMenuLabel: Pass,
+    DropdownMenuLabel: Block,
     DropdownMenuSeparator: () => <hr />,
-    DropdownMenuTrigger: Pass,
+    DropdownMenuTrigger: Block,
+    Avatar: Inline,
+    AvatarFallback: Inline,
+    AvatarImage: () => null,
+    Button: ({ children }: { children?: ReactNode }) => <>{children}</>,
   };
 });
-vi.mock('@nextblock-cms/ui', () => {
-  const Pass = ({ children }: { children?: ReactNode }) => <span>{children}</span>;
-  return { Avatar: Pass, AvatarFallback: Pass, AvatarImage: () => null };
-});
-vi.mock('@nextblock-cms/ui', () => ({
-  Button: ({ children }: { children?: ReactNode }) => <>{children}</>,
-}));
+vi.mock('@nextblock-cms/ui', () => ui);
 
 import AuthButton from './header-auth';
 

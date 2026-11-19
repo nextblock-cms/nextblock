@@ -86,7 +86,7 @@ const LIVE = {
   translation_group_id: GROUP_ID,
   updated_at: '2026-09-01T10:00:00+00:00',
   languages: { code: 'en' },
-  product_media: [{ media_id: 'media-1', sort_order: 0, media: { file_path: 'a.webp' } }],
+  product_media: [{ media_id: 'aaaaaaaa-0001-4001-8001-000000000001', sort_order: 0, media: { file_path: 'a.webp' } }],
   product_variants: [
     {
       id: VARIANT_ID,
@@ -244,7 +244,7 @@ describe('the edit page repairs an old draft whose live price moved, through the
       price: 59,
       prices: { USD: 59 },
       stock: 7,
-      product_media: [{ media_id: 'media-1' }],
+      product_media: [{ media_id: 'aaaaaaaa-0001-4001-8001-000000000001' }],
       description_json: RICH_DESCRIPTION,
     });
     expect(values.variants).toHaveLength(1);
@@ -298,7 +298,7 @@ describe('the edit page repairs an old draft whose live price moved, through the
       stock: 0,
       variation_attributes: [{ attribute_id: ATTR_COLOR, term_ids: [TERM_RED] }],
       variants: [rebuilt],
-      product_media: [{ media_id: 'media-1' }],
+      product_media: [{ media_id: 'aaaaaaaa-0001-4001-8001-000000000001' }],
       description_json: RICH_DESCRIPTION,
     };
     expect(findPoisonedProductDraftFields(old, LIVE)).toEqual(['prices', 'sale_prices', 'variants']);

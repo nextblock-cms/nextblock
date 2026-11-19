@@ -365,6 +365,9 @@ The sandbox automation is code-driven.
 - concatenates the SQL in lexical order
 - writes the generated payload to
   `apps/nextblock/app/api/cron/reset-sandbox/sandboxResetSql.ts`
+- must run after every migration change, with `npm run generate:migrations-bundle`:
+  `tools/scripts/generated-migration-copies.test.ts` (in `security:check`) fails while the payload
+  or the `/setup` bundle differs from the migration files
 
 `npm run sandbox:reset`:
 

@@ -2,14 +2,16 @@ import { describe, expect, it } from 'vitest';
 
 import {
   applyVariantSelection,
+  buildVariantSku,
   findMatchingVariant,
   generateVariantDrafts,
   getAvailableTermIdsForAttribute,
+  isReadableVariantOption,
   normalizeSelectionsToAvailableVariants,
   type ProductVariantDraft,
   type VariationSelectionGroup,
 } from './variation-utils';
-import type { ProductAttribute, ProductVariant } from './types';
+import type { ProductAttribute, ProductVariant, ProductVariantOption } from './types';
 
 const term = (attributeId: string, id: string) => ({ attribute_id: attributeId, id, value: id });
 
@@ -59,6 +61,68 @@ describe('applyVariantSelection', () => {
 describe('getAvailableTermIdsForAttribute', () => {
   it('with no constraints lists every term some variant uses (what the picker may disable against)', () => {
     expect([...getAvailableTermIdsForAttribute(variants, 'color', {})].sort()).toEqual(['blue', 'red']);
+  });
+});
+
+const RED_OPTION: ProductVariantOption = { attribute_id: 'color', attribute_name: 'Color', term_id: 'red', term_value: 'Red', term_slug: 'red' };
+
+function withoutKey(record: object, key: string) {
+  const copy: Record<string, unknown> = { ...record };
+  delete copy[key];
+  return copy;
+}
+
+describe('buildVariantSku', () => {
+  it("is the product's SKU plus each option's term slug, or its value slugified", () => {
+    expect(buildVariantSku(' TEE ', [RED_OPTION, { ...RED_OPTION, term_slug: undefined, term_value: 'Navy  Blue!' }])).toBe('TEE-RED-NAVY-BLUE');
+  });
+
+  // Review 2026-11-18 (round 4): ProductForm fills a loaded variant's empty SKU with this, and a product draft
+  // can hold anything (any WRITER can PATCH one): these made ProductForm throw when it mounted in the browser
+  // ("Cannot read properties of undefined (reading 'toLowerCase')", "value.toLowerCase is not a function",
+  // "….toUpperCase is not a function", "baseSku.trim is not a function"), which lost the edit page for every
+  // reader (its client shell renders the form only after mount, and /cms has no error boundary).
+  it('reads only text: an option, a slug, a value or a product SKU that is not text adds nothing', () => {
+    const unreadable = [{}, { term_value: 5 }, { term_slug: 7 }, { term_slug: {}, term_value: [] }, null, 5, 'x', []] as unknown as ProductVariantOption[];
+
+    expect(buildVariantSku('TEE', [...unreadable, RED_OPTION])).toBe('TEE-RED');
+    expect(buildVariantSku(5 as unknown as string, [RED_OPTION])).toBe('RED');
+    expect(buildVariantSku(null as unknown as string, unreadable)).toBe('');
+    expect(buildVariantSku('TEE', 'x' as unknown as ProductVariantOption[])).toBe('TEE');
+  });
+
+  it("falls back to the option's value when its term slug is empty or not text", () => {
+    expect(buildVariantSku('TEE', [{ ...RED_OPTION, term_slug: '', term_value: 'Navy  Blue!' }])).toBe('TEE-NAVY-BLUE');
+    expect(
+      buildVariantSku('TEE', [{ ...RED_OPTION, term_slug: {} as unknown as string, term_value: 'Navy  Blue!' }])
+    ).toBe('TEE-NAVY-BLUE');
+  });
+});
+
+describe('isReadableVariantOption', () => {
+  it('takes an object with a text attribute id, attribute name, term id and term value, and a text term slug when it has one', () => {
+    expect(isReadableVariantOption(RED_OPTION)).toBe(true);
+    expect(isReadableVariantOption(withoutKey(RED_OPTION, 'term_slug'))).toBe(true);
+
+    for (const option of [
+      null,
+      undefined,
+      5,
+      'x',
+      [],
+      Object.assign([], RED_OPTION),
+      {},
+      { term_value: 5 },
+      { ...RED_OPTION, term_value: 5 },
+      { ...RED_OPTION, term_slug: null },
+      { ...RED_OPTION, term_slug: 7 },
+      withoutKey(RED_OPTION, 'attribute_id'),
+      withoutKey(RED_OPTION, 'attribute_name'),
+      withoutKey(RED_OPTION, 'term_id'),
+      withoutKey(RED_OPTION, 'term_value'),
+    ]) {
+      expect(isReadableVariantOption(option), JSON.stringify(option)).toBe(false);
+    }
   });
 });
 

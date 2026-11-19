@@ -63,6 +63,10 @@ async function applyOrderInventoryDeductionViaSql(orderId: string) {
         return;
       }
 
+      // The lines in the order of the SKU each one locks below (the variant's when variant_id is set,
+      // else the product's), as apply_order_inventory_deduction takes them since migration 02044 and
+      // publish_product_draft locks inventory rows: two writers taking the same SKUs in one order never
+      // hold each other's next row (order-inventory.test.ts holds this query to the function's).
       const orderItems = await sql<
         {
           product_id: string | null;
@@ -77,6 +81,13 @@ async function applyOrderInventoryDeductionViaSql(orderId: string) {
         FROM public.order_items
         WHERE order_id = ${orderId}
         GROUP BY product_id, variant_id
+        ORDER BY CASE
+                   WHEN order_items.variant_id IS NOT NULL
+                     THEN (SELECT v.sku FROM public.product_variants v WHERE v.id = order_items.variant_id)
+                   ELSE (SELECT p.sku FROM public.products p WHERE p.id = order_items.product_id)
+                 END,
+                 product_id,
+                 variant_id
       `;
 
       for (const item of orderItems) {

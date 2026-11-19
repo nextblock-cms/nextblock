@@ -25,7 +25,10 @@ vi.mock('next/navigation', () => ({
   usePathname: () => '/cms/dashboard',
   useRouter: () => router,
 }));
-vi.mock('@nextblock-cms/ui/button', () => ({
+// One object serves both ui modules: the template sync rewrites every `@nextblock-cms/ui/<component>`
+// specifier to the `@nextblock-cms/ui` barrel, and a scaffold keeps only the last of several mocks of
+// one module, so each mock must carry every component (the sync then keeps one of the identical lines).
+const ui = vi.hoisted(() => ({
   Button: ({
     children,
     size: _size,
@@ -36,10 +39,10 @@ vi.mock('@nextblock-cms/ui/button', () => ({
       {children}
     </button>
   ),
-}));
-vi.mock('@nextblock-cms/ui/textarea', () => ({
   Textarea: (props: TextareaHTMLAttributes<HTMLTextAreaElement>) => <textarea {...props} />,
 }));
+vi.mock('@nextblock-cms/ui/button', () => ui);
+vi.mock('@nextblock-cms/ui/textarea', () => ui);
 vi.mock('@nextblock-cms/utils', () => ({
   cn: (...classes: unknown[]) => classes.filter((value) => typeof value === 'string' && value).join(' '),
 }));

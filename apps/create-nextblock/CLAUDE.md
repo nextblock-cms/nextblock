@@ -25,9 +25,16 @@ Running from source needs the CLI's own deps: `npm install --prefix apps/create-
 - `scripts/sync-template.js` (`npm run sync:create-nextblock`) empties and regenerates
   `templates/nextblock-template/` from `apps/nextblock`, root `docs/`,
   `libs/ui/src/styles/globals.css`, and `docker-template/`; it copies `CLAUDE.md`/`AGENTS.md`
-  verbatim and rewrites `@nextblock-cms/ui/<sub>` imports to the barrel. `docs/prompts/`
-  (internal build prompts) is never copied into the template (`scripts/lib/template-docs.test.js`,
-  run with `npx vitest run apps/create-nextblock/scripts`; CI does not collect it).
+  verbatim and rewrites `@nextblock-cms/ui/<sub>` imports to the barrel (`scripts/lib/ui-imports.js`).
+  That turns a test's mocks of several ui subpaths into mocks of one module, of which vitest keeps
+  only the last, so an app test mocks them through one shared factory
+  (`vi.mock('@nextblock-cms/ui/button', () => ui)`), the rewrite keeps one of the identical lines,
+  and the template check refuses a file that still mocks a module twice. `docs/prompts/`
+  (internal build prompts) is never copied into the template (`scripts/lib/template-docs.test.js`).
+  Run this folder's tests with `npx vitest run apps/create-nextblock/bin apps/create-nextblock/scripts`
+  (the bare folder also collects the template's copy of the app tests); the unit job in
+  `security.yml` does not collect them, `release-rehearsal.yml` does (and then syncs the template
+  from the app before it rehearses, as a release does).
 - `templates/nextblock-template/**` is generated output: committed, shipped, and the update
   source for `apps/nextblock/tools/update.mjs`. Never edit it.
 - `prepack` runs the sync, so `npm pack` / `npm publish` in this folder regenerate the template

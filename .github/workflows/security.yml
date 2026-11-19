@@ -1,14 +1,17 @@
 # Security gates for every push to master and every pull request (Jules and Jarvis PRs included).
 #
 #   unit       the static security checks (service-role boundary, migration grant lint, the
-#              post-apply grant pass lockstep) and the full unit suite, which holds the
-#              regression tests of the 2026-10 red-team fixes.
+#              post-apply grant pass lockstep, the generated migration copies) and the full unit
+#              suite, which holds the regression tests of the 2026-10 red-team fixes.
 #   db-posture replays every migration into a disposable local Supabase database, runs the
 #              post-apply grant pass every deploy runs, then tools/scripts/security-verify.sql.
 #              Grant regressions only show up after that pass (02022's service-role-only
 #              cortex_request_log passed on a plain replay and failed on every deployed
 #              database until 02025), so this job is the only place they are caught before
-#              production.
+#              production. It then runs the product draft publish (02043, 02044) against that
+#              database with several sessions at once (tools/scripts/product-draft-publish.db.test.ts),
+#              and the sandbox reset's replay of every migration after DROP SCHEMA public CASCADE,
+#              rolled back (tools/scripts/migration-replay.db.test.ts).
 #
 # Nothing here touches a real database: the Supabase stack lives inside the runner and the
 # posture runner refuses any non-local host. Rules: docs/04 → "Service-role boundary" and
@@ -64,6 +67,16 @@ jobs:
           -x realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor
       - name: Posture script after the post-apply grant pass
         run: npm run security:db-posture -- --db-url postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      # publish_product_draft (02043, its stock since 02044) with real row locks: two sessions publishing
+      # one draft, a save waiting on the lock, rollback, variant rows, History and the stock rules. Then
+      # the sandbox reset from its second run on: DROP SCHEMA public CASCADE and every migration again,
+      # in one transaction that is rolled back (objects outside public survive the drop, so a file must
+      # stay valid over what a later file left there). The two files wait for each other on an advisory
+      # lock. Their database parts are skipped in the unit job (no database).
+      - name: Product draft publish and migration replay against the database
+        run: npx vitest run tools/scripts/product-draft-publish.db.test.ts tools/scripts/migration-replay.db.test.ts
+        env:
+          NEXTBLOCK_TEST_DB_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
       - name: Stop Supabase
         if: always()
         run: npx supabase stop --workdir libs/db/src --no-backup

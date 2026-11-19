@@ -19,12 +19,22 @@ import {
 } from "@nextblock-cms/ui";
 import MediaImage from "./MediaImage";
 import DeleteMediaButtonClient from "./DeleteMediaButtonClient"; // For single item deletion
-import { deleteMultipleMediaItems, moveSingleMediaItem } from "../actions"; // Server actions for bulk ops
+import MediaUsageList from "./MediaUsageList";
+import { deleteMultipleMediaItems, deleteUnusedMediaItems, getMediaUsage, moveSingleMediaItem } from "../actions"; // Server actions for bulk ops
 import { resolveMediaUrl } from "../../../../lib/media/resolveMediaUrl";
+import { isMediaUnused, type MediaUsage } from "../../../../lib/media/media-usage-format";
+import { ConfirmationModal } from "../../components/ConfirmationModal";
 
 interface MediaGridClientProps {
   initialMediaItems: Media[];
   r2BaseUrl: string;
+  /**
+   * The library's "Unused" view (?usage=unused): the page listed only the items nothing uses
+   * (public.media_usage, 02045); `historyOnlyIds` are named by revisions alone.
+   */
+  unusedView?: { historyOnlyIds: string[] } | null;
+  /** The "Unused" view's lookup failed: nothing is listed, and this says why. */
+  usageError?: string | null;
 }
 
 interface MessageState {
@@ -32,7 +42,16 @@ interface MessageState {
   text: string;
 }
 
-export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaGridClientProps) {
+/** The bulk delete confirmation's usage check (getMediaUsage on the selected items). */
+type BulkUsageState =
+  | { status: "loading" }
+  | { status: "ready"; usage: Record<string, MediaUsage> }
+  | { status: "error"; error: string };
+
+/** "Delete unused" takes at most this many ids a call (the action's own limit). */
+const DELETE_UNUSED_BATCH = 500;
+
+export default function MediaGridClient({ initialMediaItems, r2BaseUrl, unusedView = null, usageError = null }: MediaGridClientProps) {
   const [selectedItems, setSelectedItems] = useState<Array<{ id: string; objectKey: string }>>([]);
   const [mediaItems, setMediaItems] = useState<Media[]>(initialMediaItems);
   const [message, setMessage] = useState<MessageState | null>(null);
@@ -42,10 +61,22 @@ export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaG
   const [isMoving, setIsMoving] = useState(false);
   const [moveProgress, setMoveProgress] = useState(0);
   const [moveError, setMoveError] = useState<string | null>(null);
+  const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
+  const [bulkUsage, setBulkUsage] = useState<BulkUsageState>({ status: "loading" });
+  const [cleanupOpen, setCleanupOpen] = useState(false);
 
   useEffect(() => {
     setMediaItems(initialMediaItems);
   }, [initialMediaItems]);
+
+  const fileName = (id: string) => mediaItems.find((item) => item.id === id)?.file_name ?? id;
+
+  /** Takes the deleted items out of the grid and the selection (the revalidation re-renders it too). */
+  const dropItems = (ids: readonly string[]) => {
+    const gone = new Set(ids.map((id) => id.toLowerCase()));
+    setMediaItems((prev) => prev.filter((item) => !gone.has(item.id.toLowerCase())));
+    setSelectedItems((prev) => prev.filter((item) => !gone.has(item.id.toLowerCase())));
+  };
 
   const handleSelectionChange = (itemId: string, objectKey: string, checked: boolean) => {
     setSelectedItems((prevSelected) => {
@@ -57,6 +88,7 @@ export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaG
     });
   };
 
+  /** Opens the bulk delete confirmation and asks where the selected files are used. */
   const handleBulkDelete = async () => {
     if (selectedItems.length === 0) {
       setMessage({ type: "error", text: "No items selected for deletion." });
@@ -64,21 +96,92 @@ export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaG
     }
 
     setMessage(null);
+    setBulkDialogOpen(true);
+    setBulkUsage({ status: "loading" });
+    try {
+      const result = await getMediaUsage(selectedItems.map((item) => item.id));
+      setBulkUsage(
+        result.error !== undefined ? { status: "error", error: result.error } : { status: "ready", usage: result.usage }
+      );
+    } catch (error) {
+      setBulkUsage({
+        status: "error",
+        error: error instanceof Error && error.message ? error.message : "Where these files are used could not be checked.",
+      });
+    }
+  };
+
+  /** "Delete all": every selected file, used or not (the editor saw where). */
+  const deleteAllSelected = () => {
+    const toDelete = selectedItems;
     startTransition(async () => {
-      const result = await deleteMultipleMediaItems(selectedItems);
+      const result = await deleteMultipleMediaItems(toDelete);
+      setBulkDialogOpen(false);
       if (result.error) {
         setMessage({ type: "error", text: result.error });
       } else if (result.success) {
         setMessage({ type: "success", text: result.success });
-        // The page should revalidate and fetch new mediaItems.
-        // For immediate UI update, we can filter out deleted items:
-        setMediaItems((prevItems) =>
-          prevItems.filter((item) => !selectedItems.find((selected) => selected.id === item.id))
-        );
-        setSelectedItems([]); // Clear selection
+        // The page revalidates too; take the selection out of the grid at once.
+        dropItems(toDelete.map((item) => item.id));
       }
     });
   };
+
+  /** "Delete only the unused": the server checks again and deletes what nothing uses. */
+  const deleteUnusedSelected = () => {
+    const ids = selectedItems.map((item) => item.id);
+    startTransition(async () => {
+      const result = await deleteUnusedMediaItems(ids);
+      setBulkDialogOpen(false);
+      if (result.error !== undefined) {
+        setMessage({ type: "error", text: result.error });
+      } else {
+        setMessage({ type: "success", text: result.success });
+        dropItems(result.deletedIds);
+      }
+    });
+  };
+
+  /** The "Unused" view's "Delete all unused": every listed item, in batches the action accepts. */
+  const deleteAllListedUnused = () => {
+    const ids = mediaItems.map((item) => item.id);
+    startTransition(async () => {
+      const deleted: string[] = [];
+      const notes: string[] = [];
+      let failure: string | null = null;
+      for (let start = 0; start < ids.length; start += DELETE_UNUSED_BATCH) {
+        const result = await deleteUnusedMediaItems(ids.slice(start, start + DELETE_UNUSED_BATCH));
+        if (result.error !== undefined) {
+          failure = result.error;
+          break;
+        }
+        deleted.push(...result.deletedIds);
+        notes.push(result.success);
+      }
+      setCleanupOpen(false);
+      dropItems(deleted);
+      if (failure) {
+        setMessage({ type: "error", text: deleted.length > 0 ? `Deleted ${deleted.length} file(s), then stopped: ${failure}` : failure });
+      } else {
+        setMessage({ type: "success", text: notes.join(" ") || "Nothing to delete." });
+      }
+    });
+  };
+
+  const selectedUsage = bulkUsage.status === "ready" ? bulkUsage.usage : null;
+  const usedSelected = selectedUsage
+    ? selectedItems.filter((item) => {
+        const entry = selectedUsage[item.id.toLowerCase()];
+        return entry !== undefined && !isMediaUnused(entry);
+      })
+    : [];
+  const unusedSelectedCount = selectedUsage
+    ? selectedItems.filter((item) => {
+        const entry = selectedUsage[item.id.toLowerCase()];
+        return entry !== undefined && isMediaUnused(entry);
+      }).length
+    : 0;
+  const historyOnlyCount = unusedView ? unusedView.historyOnlyIds.length : 0;
 
   const beginBulkMove = () => {
     if (selectedItems.length === 0) {
@@ -186,6 +289,103 @@ export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaG
         </DialogContent>
       </Dialog>
 
+      <Dialog open={bulkDialogOpen} onOpenChange={(open) => { if (!isPending) setBulkDialogOpen(open); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {selectedItems.length} file(s)?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-sm" aria-live="polite" data-bulk-delete-usage>
+            <p className="text-muted-foreground">Deleting is permanent: the files are removed from storage too.</p>
+            {bulkUsage.status === "loading" ? (
+              <p className="text-muted-foreground">Checking where the selected files are used…</p>
+            ) : bulkUsage.status === "error" ? (
+              <p className="text-destructive">{bulkUsage.error}</p>
+            ) : (
+              <>
+                {usedSelected.length > 0 ? (
+                  <div className="space-y-3">
+                    <p className="font-medium">
+                      {usedSelected.length} of {selectedItems.length} {usedSelected.length === 1 ? "is" : "are"} used:
+                    </p>
+                    <ul className="max-h-72 space-y-3 overflow-y-auto pe-1">
+                      {usedSelected.map((item) => (
+                        <li key={item.id} className="rounded-md border p-2">
+                          <p className="mb-1 font-medium break-all">{fileName(item.id)}</p>
+                          <MediaUsageList usage={bulkUsage.usage[item.id.toLowerCase()]} maxItems={3} />
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                <p>
+                  {unusedSelectedCount === selectedItems.length
+                    ? "Nothing in this site uses any of them."
+                    : `${unusedSelectedCount} ${unusedSelectedCount === 1 ? "is" : "are"} not used anywhere in this site.`}
+                </p>
+              </>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setBulkDialogOpen(false)} disabled={isPending}>Cancel</Button>
+            <Button
+              variant="secondary"
+              onClick={deleteUnusedSelected}
+              disabled={isPending || bulkUsage.status !== "ready" || unusedSelectedCount === 0}
+            >
+              Delete only the unused ({unusedSelectedCount})
+            </Button>
+            <Button variant="destructive" onClick={deleteAllSelected} disabled={isPending || bulkUsage.status === "loading"}>
+              {isPending ? "Deleting..." : `Delete all ${selectedItems.length}`}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {usageError ? (
+        <div role="alert" className="p-4 rounded-md text-sm bg-red-100 border border-red-200 text-red-700">
+          <div className="flex items-center">
+            <AlertCircle className="h-5 w-5 mr-2 shrink-0" />
+            {usageError} Nothing is listed as unused until the check works again.
+          </div>
+        </div>
+      ) : null}
+
+      {unusedView && mediaItems.length > 0 ? (
+        <div className="flex flex-col gap-3 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-900/20 dark:text-amber-200 sm:flex-row sm:items-center sm:justify-between" data-unused-banner>
+          <p>
+            {mediaItems.length} {mediaItems.length === 1 ? "file is" : "files are"} not used anywhere in this site (pages,
+            posts, products, drafts, settings, logos and partner storefronts).
+            {(() => {
+              const listed = new Set(mediaItems.map((item) => item.id.toLowerCase()));
+              const historyOnly = unusedView.historyOnlyIds.filter((id) => listed.has(id.toLowerCase())).length;
+              return historyOnly > 0
+                ? ` ${historyOnly} of them ${historyOnly === 1 ? "appears" : "appear"} only in revision history.`
+                : null;
+            })()}
+          </p>
+          <Button variant="destructive" onClick={() => setCleanupOpen(true)} disabled={isPending} className="shrink-0">
+            <Trash2 className="mr-2 h-4 w-4" />
+            Delete all {mediaItems.length} unused
+          </Button>
+        </div>
+      ) : null}
+
+      <ConfirmationModal
+        isOpen={cleanupOpen}
+        onClose={() => { if (!isPending) setCleanupOpen(false); }}
+        onConfirm={deleteAllListedUnused}
+        title={`Delete ${mediaItems.length} unused file(s)?`}
+        description="Each file is checked again before it is deleted, and one that is in use by then is kept. Deleting is permanent: the files are removed from storage too."
+        confirmText={isPending ? "Deleting..." : "Delete"}
+        confirmDisabled={isPending}
+      >
+        {historyOnlyCount > 0 ? (
+          <p className="text-sm text-muted-foreground">
+            Restoring a revision that shows one of these files would show a missing image.
+          </p>
+        ) : null}
+      </ConfirmationModal>
+
       {message && (
         <div
           className={`p-4 rounded-md text-sm ${
@@ -204,9 +404,15 @@ export default function MediaGridClient({ initialMediaItems, r2BaseUrl }: MediaG
       {mediaItems.length === 0 && selectedItems.length === 0 ? (
          <div className="text-center py-10 border rounded-lg mt-6">
            <ImageIconLucideHost className="mx-auto h-12 w-12 text-muted-foreground" />
-           <h3 className="mt-2 text-sm font-medium text-foreground">No media found</h3>
+           <h3 className="mt-2 text-sm font-medium text-foreground">
+             {unusedView ? "Nothing to clean up" : usageError ? "Unused files could not be listed" : "No media found"}
+           </h3>
            <p className="mt-1 text-sm text-muted-foreground">
-             Upload some files to get started.
+             {unusedView
+               ? "Every file here is used somewhere in this site."
+               : usageError
+                 ? "Try again in a moment."
+                 : "Upload some files to get started."}
            </p>
          </div>
       ) : (

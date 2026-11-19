@@ -112,6 +112,27 @@ describe('findTemplateProblems', () => {
 
     await expect(check()).resolves.toEqual([]);
   });
+
+  it('reports a test that still mocks one module twice: vitest keeps only the last factory (header-auth through 0.23.5)', async () => {
+    await put(
+      template,
+      'components/header-auth.test.tsx',
+      [
+        "vi.mock('@nextblock-cms/ui', () => ({ DropdownMenu: Pass }));",
+        "vi.mock('@nextblock-cms/ui', () => ({ Avatar: Pass }));",
+        "vi.mock('@nextblock-cms/ui', () => ({ Button: Pass }));",
+        "vi.mock('../app/actions', () => ({}));",
+        "vi.doMock('../app/actions', () => ({}));",
+        '',
+      ].join('\n'),
+    );
+
+    await expect(check()).resolves.toEqual([
+      'components/header-auth.test.tsx mocks @nextblock-cms/ui 3 times, and vitest keeps only the last: give the ui ' +
+        "subpath mocks in apps/nextblock one shared factory (vi.mock('@nextblock-cms/ui/button', () => ui), as in " +
+        'components/header-auth.test.tsx), which the sync reduces to one line',
+    ]);
+  });
 });
 
 describe('sync-template.js wiring', () => {

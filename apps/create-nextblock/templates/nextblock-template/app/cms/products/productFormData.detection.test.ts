@@ -98,7 +98,7 @@ function liveProduct(overrides: Record<string, unknown> = {}) {
     translation_group_id: GROUP_ID,
     updated_at: '2026-09-01T10:00:00+00:00',
     languages: { code: 'en' },
-    product_media: [{ media_id: 'media-1', sort_order: 0, media: { file_path: 'a.webp' } }],
+    product_media: [{ media_id: 'aaaaaaaa-0001-4001-8001-000000000001', sort_order: 0, media: { file_path: 'a.webp' } }],
     product_variants: [liveVariant()],
     ...overrides,
   };
@@ -170,7 +170,7 @@ function cleanOldDraft(overrides: Record<string, unknown> = {}) {
     status: 'active',
     language_id: 1,
     translation_group_id: GROUP_ID,
-    product_media: [{ media_id: 'media-1' }],
+    product_media: [{ media_id: 'aaaaaaaa-0001-4001-8001-000000000001' }],
     category_ids: [],
     variation_attributes: [{ attribute_id: ATTR_COLOR, term_ids: [TERM_RED] }],
     variants: [draftVariant()],
@@ -502,14 +502,14 @@ describe("the variant amounts: against the live variant, else the parent by equa
 describe('the variants group: any value the product RPC writes per variant', () => {
   const liveRow = liveVariant({
     upc: '0123456789029',
-    main_media_id: 'media-1',
+    main_media_id: 'aaaaaaaa-0001-4001-8001-000000000001',
     sale_start_at: '2026-11-21T00:00:00+00:00',
     sale_end_at: '2026-11-30T00:00:00+00:00',
   });
   const live = liveProduct({ product_variants: [liveRow] });
   const sameAsLive = draftVariant({
     upc: '0123456789029',
-    main_media_id: 'media-1',
+    main_media_id: 'aaaaaaaa-0001-4001-8001-000000000001',
     sale_start_at: '2026-11-21T00:00:00+00:00',
     sale_end_at: '2026-11-30T00:00:00+00:00',
   });
@@ -633,7 +633,7 @@ describe('Freemius plan prices: a snapshot whose price a sync moved by any facto
       freemius_plans: plans({ api_monthly_price: 9.99 }),
     });
     // The editor replaced the image: kept, as for any clean autosave.
-    const clean = { ...cleanDigital, price: 999, prices: { JPY: 999 }, product_media: [{ media_id: 'media-2' }] };
+    const clean = { ...cleanDigital, price: 999, prices: { JPY: 999 }, product_media: [{ media_id: 'aaaaaaaa-0002-4002-8002-000000000002' }] };
 
     expect(findPoisonedProductDraftFields(clean, live)).toEqual([]);
   });

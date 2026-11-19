@@ -1,10 +1,34 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { GRANTS_SQL } from './migrate-core.mjs';
+import { applyMigrations, collectMigrations, describeBackend, GRANTS_SQL, loadEnvFiles, readAppliedVersions, runSql } from './migrate-core.mjs';
+
+// applyMigrations reaches Postgres through `await import('postgres')`: this stand-in records each
+// statement instead of connecting (the Management API backend runs on a stubbed fetch below). It
+// answers a history holding 02001, and the two table probes readAppliedVersions makes before it.
+const postgresStatements = vi.hoisted(() => []);
+vi.mock('postgres', () => ({
+  default: () => {
+    const db = (strings) => {
+      const text = strings.join('$');
+      postgresStatements.push(text);
+      if (text.includes('select version from supabase_migrations.schema_migrations')) return Promise.resolve([{ version: '02001' }]);
+      if (text.includes("to_regclass('public.site_settings')")) return Promise.resolve([{ t: 'site_settings' }]);
+      if (text.includes("to_regclass('supabase_migrations.schema_migrations')")) return Promise.resolve([{ t: 'supabase_migrations.schema_migrations' }]);
+      return Promise.resolve([]);
+    };
+    db.unsafe = async (sql) => {
+      postgresStatements.push(sql);
+      return [];
+    };
+    db.end = async () => undefined;
+    return db;
+  },
+}));
 
 // The build-time hook (this directory) and the /setup wizard (lib/setup/schema-apply.ts)
 // both finish an apply with GRANTS_SQL: blanket grants on `public` for the API roles, then
@@ -124,6 +148,9 @@ describe('migrate-core post-apply grant pass', () => {
       'generate_order_invoice_number()',
       'assign_order_invoice_metadata(uuid, timestamp with time zone)',
       'upsert_product_with_variants(jsonb)',
+      // 02043: the atomic product draft publish and the History content it records (anon only).
+      'publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb)',
+      'product_revision_content(uuid)',
       'bump_email_2fa_attempts(uuid)',
       'redeem_coupon_atomically(uuid)',
     ]) {
@@ -321,5 +348,266 @@ describe('migrate-core post-apply grant pass', () => {
     // payout_email_kind, the PayPal payout columns and the PayPal credentials row get no grant to take back
     expect(GRANTS_SQL).not.toContain('paypal_receiver');
     expect(GRANTS_SQL).not.toContain('affiliates_paypal_secret');
+  });
+
+  it('keeps the 02045 media usage lookup service-role only after its blanket grants', () => {
+    // media_usage reads every content table (drafts, revisions, partner pages, site settings) as
+    // the service role: the media library calls it after its own staff check, and no API role may.
+    const fn = 'media_usage(jsonb)';
+    const guard = `if to_regprocedure('public.${fn}') is not null then`;
+    const revoke = `revoke execute on function public.${fn} from public, anon, authenticated;`;
+    expect(GRANTS_SQL).toContain(guard);
+    expect(GRANTS_SQL).toContain(revoke);
+    expect(GRANTS_SQL.indexOf(guard)).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+    expect(GRANTS_SQL.indexOf('grant execute on all functions in schema public')).toBeLessThan(GRANTS_SQL.indexOf(revoke));
+    expect(GRANTS_SQL.match(/media_usage\(/g)).toHaveLength(2);
+  });
+});
+
+describe('applyMigrations with no file to apply', () => {
+  // `npm run update` runs the grant pass alone when nothing is pending by calling applyMigrations([])
+  // (update.mjs reapplyDatabaseGrants), and since 0.23.6 an updater runs its schema step on the engine
+  // of the release it updates to. So every release's applyMigrations runs GRANTS_SQL after its loop on
+  // both backends, an empty list included: skipping the pass when nothing was applied would leave the
+  // grants of an update that applied a release's migrations with the previous engine to the build hook.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    postgresStatements.length = 0;
+  });
+
+  it('runs the grant pass over the Management API', async () => {
+    vi.stubEnv('SUPABASE_ACCESS_TOKEN', 'stub-token');
+    vi.stubEnv('SUPABASE_PROJECT_ID', 'stubref');
+    const queries = [];
+    vi.stubGlobal('fetch', async (_url, init) => {
+      const { query } = JSON.parse(init.body);
+      queries.push(query);
+      const rows = query.startsWith('select version from')
+        ? [{ version: '02001' }]
+        : query.includes("to_regclass('public.site_settings')")
+          ? [{ t: 'site_settings' }]
+          : [];
+      return new Response(JSON.stringify(rows), { status: 200 });
+    });
+
+    expect(await applyMigrations([])).toEqual({ ok: true, applied: 0, backend: 'management-api' });
+    expect(queries.slice(-2)).toEqual([GRANTS_SQL, "notify pgrst, 'reload schema';"]);
+  });
+
+  it('runs the grant pass over a direct Postgres connection', async () => {
+    vi.stubEnv('SUPABASE_ACCESS_TOKEN', '');
+    vi.stubEnv('POSTGRES_URL', 'postgres://nextblock:stub@127.0.0.1:9/nextblock');
+
+    expect(await applyMigrations([])).toEqual({ ok: true, applied: 0, backend: 'postgres' });
+    expect(postgresStatements.slice(-2)).toEqual([GRANTS_SQL, "notify pgrst, 'reload schema';"]);
+  });
+});
+
+/**
+ * Every module a source loads, as written: the specifier of each static import and re-export, each
+ * import(), and each call of require or of a function createRequire made (bound to a name, or called
+ * at once); null where the specifier is not a string literal.
+ */
+function moduleSpecifiersOf(source, fileName) {
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+  const requires = new Set(['require']);
+  const isCreateRequire = (node) => ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'createRequire';
+  const literal = (node) => (node && ts.isStringLiteralLike(node) ? node.text : null);
+  const specifiers = [];
+  const visit = (node) => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) specifiers.push(literal(node.moduleSpecifier));
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && isCreateRequire(node.initializer)) requires.add(node.name.text);
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(callee) && requires.has(callee.text)) || isCreateRequire(callee)) {
+        specifiers.push(literal(node.arguments[0]));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return specifiers;
+}
+
+/** A specifier Node resolves without this file's location: a builtin (`node:`) or a package name. */
+const isBuiltinOrPackage = (specifier) =>
+  typeof specifier === 'string' && (specifier.startsWith('node:') || /^(?:@[\w.-]+\/)?\w[\w.-]*(?:\/[\w.-]+)*$/.test(specifier));
+
+/** Every string in a source that names a path beside it (`./`, `../`) or a file URL, whatever uses it. */
+function relativeLiteralsOf(source, fileName) {
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
+  const found = [];
+  const visit = (node) => {
+    if ((ts.isStringLiteralLike(node) || ts.isTemplateHead(node)) && /^(?:\.\.?\/|file:)/.test(node.text)) found.push(node.text);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return found;
+}
+
+describe('the engine contract an earlier updater relies on', () => {
+  // npm run update imports this file a second time once its code update has replaced it (update.mjs
+  // loadUpdatedMigrationEngine), so every updater runs the NEXT release's engine with the calls, the
+  // arguments and the result reads it was written for (update.test.mjs pins the names it calls). That
+  // import re-reads migrate-core.mjs alone: a module it imports by a relative path resolves to the copy
+  // the first import loaded, the previous release's. GRANTS_SQL moved into a sibling would then run the
+  // old revoke list while the updater says it re-applied the revokes this version lists.
+  const projects = [];
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    postgresStatements.length = 0;
+    for (const root of projects.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A standalone project whose supabase/migrations holds 02001 and 02002. */
+  function makeProject() {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-engine-contract-'));
+    projects.push(root);
+    const dir = path.join(root, 'supabase', 'migrations');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(root, 'package.json'), '{}\n');
+    writeFileSync(path.join(dir, '02001_first.sql'), 'select 1;\n');
+    writeFileSync(path.join(dir, '02002_second.sql'), 'select 2;\n');
+    return { root, dir };
+  }
+
+  /**
+   * Points the engine at `kind`: the Management API on a stubbed fetch (answering `status`), Postgres
+   * on the stand-in above, or no backend. Returns the list of statements that backend receives. fetch
+   * is stubbed in every case, so nothing leaves the machine.
+   */
+  function useBackend(kind, status = 200) {
+    vi.stubEnv('SUPABASE_ACCESS_TOKEN', kind === 'management-api' ? 'stub-token' : '');
+    vi.stubEnv('SUPABASE_PROJECT_ID', kind === 'management-api' ? 'stubref' : '');
+    vi.stubEnv('POSTGRES_URL', kind === 'postgres' ? 'postgres://nextblock:stub@127.0.0.1:9/nextblock' : '');
+    vi.stubEnv('DATABASE_URL', '');
+    const queries = [];
+    vi.stubGlobal('fetch', async (_url, init) => {
+      const { query } = JSON.parse(init.body);
+      queries.push(query);
+      if (status !== 200) return new Response('{"message":"refused by the stub"}', { status });
+      const rows = query.startsWith('select version from') ? [{ version: '02001' }] : query.includes('to_regclass(') ? [{ t: 'present' }] : [];
+      return new Response(JSON.stringify(rows), { status: 200 });
+    });
+    return kind === 'postgres' ? postgresStatements : queries;
+  }
+
+  it('imports no relative module, statically or dynamically, and no module but the ones it lists', () => {
+    const core = read('./migrate-core.mjs');
+    // A package both copies import is served from Node's module cache across the reload, like a sibling:
+    // GRANTS_SQL moved into @nextblock-cms/db would bring the old revoke list back the same way. So the
+    // engine imports exactly these, and a new one is a decision this list records.
+    const ENGINE_MODULES = ['dotenv', 'node:fs', 'node:fs/promises', 'node:module', 'node:path', 'postgres'];
+    /** Why `source` could load a module the reload would serve from the first import's cache. */
+    const reloadProblems = (source) => {
+      const specifiers = moduleSpecifiersOf(source, 'migrate-core.mjs');
+      const problems = specifiers.filter((specifier) => !isBuiltinOrPackage(specifier)).map((specifier) => `loads ${specifier}`);
+      // A string naming a file beside it, whatever loads it: a require bound by assignment or reached
+      // through the module object, which moduleSpecifiersOf does not follow.
+      problems.push(...relativeLiteralsOf(source, 'migrate-core.mjs').map((text) => `names ${text}`));
+      const modules = [...new Set(specifiers.filter((specifier) => typeof specifier === 'string'))].sort();
+      if (modules.join(' ') !== ENGINE_MODULES.join(' ')) problems.push(`imports ${modules.join(', ')}`);
+      return problems;
+    };
+    expect(reloadProblems(core)).toEqual([]);
+    // Each way an edit could bring a sibling or a package in, added to the real file, is caught.
+    for (const [name, line] of Object.entries({
+      'a static import of a sibling': "import { API_ROLE_REVOKE_SQL } from './grants.mjs';",
+      'a re-export from a sibling': "export { GRANTS_SQL } from './grants.mjs';",
+      'a re-export of everything in a sibling': "export * from './grants.mjs';",
+      'a side-effect import from the parent folder': "import '../grants.mjs';",
+      'a dynamic import of a sibling': "const grants = await import('./grants.mjs');",
+      'a dynamic import of a computed path': 'const grants = await import(GRANTS_FILE);',
+      'a dynamic import of a template literal': "const grants = await import(`./${'grants'}.mjs`);",
+      'a file URL': "const grants = await import('file:///srv/nextblock/tools/lib/grants.mjs');",
+      'a dynamic import of a resolved sibling': "const grants = await import(import.meta.resolve('./grants.mjs'));",
+      'a require createRequire made, called at once': "const grants = createRequire(import.meta.url)('./grants.cjs');",
+      'a require createRequire made, under a name': "const load = createRequire(import.meta.url);\nconst grants = load('./grants.cjs');",
+      'a require createRequire made under another import name':
+        "import { createRequire as makeRequire } from 'node:module';\nconst grants = makeRequire(import.meta.url)('./grants.cjs');",
+      'a require createRequire made through the module object':
+        "import nodeModule from 'node:module';\nconst grants = nodeModule.createRequire(import.meta.url)('./grants.cjs');",
+      'a require createRequire made, assigned later': "let load;\nload = createRequire(import.meta.url);\nconst grants = load('./grants.cjs');",
+      'a package import': "import { GRANTS_SQL as SHARED_GRANTS_SQL } from '@nextblock-cms/db/grants';",
+      'a dynamic import of a package': "const shared = await import('@nextblock-cms/db');",
+    })) {
+      expect(reloadProblems(`${core}\n${line}\n`).length, name).toBeGreaterThan(0);
+    }
+  });
+
+  it('loadEnvFiles(root) loads .env.local, then .env, from the root it is given, and keeps a variable already set', async () => {
+    // The updater calls it with the project root, the reload a second time: the second call overrides nothing.
+    const { root } = makeProject();
+    writeFileSync(path.join(root, '.env.local'), 'NB_ENGINE_CONTRACT_A=from .env.local\n');
+    writeFileSync(path.join(root, '.env'), 'NB_ENGINE_CONTRACT_A=from .env\nNB_ENGINE_CONTRACT_B=from .env\nNB_ENGINE_CONTRACT_SET=from .env\n');
+    vi.stubEnv('NB_ENGINE_CONTRACT_A', undefined);
+    vi.stubEnv('NB_ENGINE_CONTRACT_B', undefined);
+    vi.stubEnv('NB_ENGINE_CONTRACT_SET', 'set before the call');
+
+    await loadEnvFiles(root);
+    expect(process.env.NB_ENGINE_CONTRACT_A).toBe('from .env.local');
+    expect(process.env.NB_ENGINE_CONTRACT_B).toBe('from .env');
+    expect(process.env.NB_ENGINE_CONTRACT_SET).toBe('set before the call');
+  });
+
+  it('describeBackend() answers { kind, detail } for each backend', () => {
+    // The updater stops at kind 'none' and prints the detail.
+    useBackend('none');
+    expect(describeBackend()).toMatchObject({ kind: 'none', detail: expect.any(String) });
+    useBackend('postgres');
+    expect(describeBackend()).toMatchObject({ kind: 'postgres', detail: '127.0.0.1:9' });
+    useBackend('management-api');
+    expect(describeBackend()).toMatchObject({ kind: 'management-api', detail: expect.stringContaining('stubref') });
+  });
+
+  it('collectMigrations(root) answers { files: [{ version, name, dir }], sources: [{ label, contributed }] } from the root it is given', () => {
+    // The updater counts and names the files, hands them back to applyMigrations, and prints each
+    // source's contribution.
+    const { root, dir } = makeProject();
+    const { files, sources } = collectMigrations(root);
+    expect(files.filter((file) => file.dir === dir)).toEqual([
+      expect.objectContaining({ version: '02001', name: '02001_first.sql', dir }),
+      expect.objectContaining({ version: '02002', name: '02002_second.sql', dir }),
+    ]);
+    expect(sources).toContainEqual(expect.objectContaining({ label: 'project', dir, contributed: 2 }));
+    for (const source of sources) expect(source).toMatchObject({ label: expect.any(String), contributed: expect.any(Number) });
+  });
+
+  for (const backend of ['management-api', 'postgres']) {
+    it(`readAppliedVersions(), applyMigrations(files, { onApplied }) and runSql(sql) keep their arguments and results on ${backend}`, async () => {
+      const received = useBackend(backend);
+      // The updater reads ok and error, and spreads and probes versions as a Set.
+      const applied = await readAppliedVersions();
+      expect(applied).toMatchObject({ ok: true });
+      expect(applied.versions).toBeInstanceOf(Set);
+      expect([...applied.versions]).toEqual(['02001']);
+
+      // It hands collectMigrations' files in, prints each one onApplied reports, then reads ok, applied and error.
+      const { root, dir } = makeProject();
+      const files = collectMigrations(root).files.filter((file) => file.dir === dir);
+      const reported = [];
+      expect(await applyMigrations(files, { onApplied: (file) => reported.push(file) })).toMatchObject({ ok: true, applied: 1 });
+      expect(reported).toHaveLength(1);
+      expect(reported[0]).toBe(files[1]);
+      expect(received.filter((sql) => sql.includes('select 2;') && sql.includes("values ('02002', '02002_second.sql')"))).toHaveLength(1);
+      expect(received.slice(-2)).toEqual([GRANTS_SQL, "notify pgrst, 'reload schema';"]);
+
+      // The update alert: one statement, and ok.
+      expect(await runSql('select 42;')).toMatchObject({ ok: true });
+      expect(received.at(-1)).toBe('select 42;');
+    });
+  }
+
+  it('answers a call that fails with ok: false and the error the updater prints', async () => {
+    useBackend('management-api', 400);
+    const { root, dir } = makeProject();
+    const files = collectMigrations(root).files.filter((file) => file.dir === dir);
+    const refused = expect.stringContaining('Supabase Management API 400');
+
+    expect(await readAppliedVersions()).toMatchObject({ ok: false, error: refused });
+    expect(await applyMigrations(files, { onApplied: () => expect.unreachable('nothing was applied') })).toMatchObject({ ok: false, applied: 0, error: refused });
+    expect(await runSql('select 42;')).toMatchObject({ ok: false, error: refused });
   });
 });

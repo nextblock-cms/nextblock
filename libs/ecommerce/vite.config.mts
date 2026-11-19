@@ -106,6 +106,9 @@ export default defineConfig({
         'lib/types': './src/lib/types.ts',
         'lib/use-cart': './src/lib/use-cart.ts',
         'lib/variation-utils': './src/lib/variation-utils.ts',
+        // The app's product edit page and draft checks read a draft's gallery through it, by the rule
+        // publish_product_draft applies in SQL (migration 02043).
+        'lib/product-gallery': './src/lib/product-gallery.ts',
         'lib/server-actions/product-actions':
           './src/lib/server-actions/product-actions.ts',
         'lib/components/Cart': './src/lib/components/Cart.tsx',

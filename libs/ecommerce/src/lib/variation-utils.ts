@@ -75,7 +75,12 @@ export function resolveTermValue(term: ProductAttributeTerm, languageCode?: stri
   return resolveTranslatedText(term.value, term.value_translations, languageCode);
 }
 
-function slugifyToken(value: string) {
+/** `value` as a SKU part (lowercased, a-z, 0-9 and single inner hyphens); '' for anything that is not text. */
+function slugifyToken(value: unknown) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
   return value
     .toLowerCase()
     .trim()
@@ -93,14 +98,58 @@ export function buildVariantLabel(options: ProductVariantOption[]) {
   return options.map((option) => option.term_value).join(' / ');
 }
 
-/** A new variant's SKU: the product's SKU plus each option's term slug (its value slugified when it has none). */
+/**
+ * Whether a variant's own option can be used as it is: an object (not a list) with a text attribute id,
+ * attribute name, term id and term value, and a text term slug when it has one, which is the shape
+ * productSchema takes (its uuid checks aside) and the variations editor prints. Every option the form and
+ * the live variants make is one. A product draft's can be anything (any WRITER can PATCH a draft), so the
+ * product form and the app's edit page take a variant's options from its terms when they are not all
+ * readable: a null one threw on mount; one whose term slug was set but not text (an object, a list, a
+ * non-zero number, true), or that had no slug (or a false or 0 one) and a term value that was not text,
+ * threw while filling the empty SKU of a variant whose term the store no longer has ("Cannot read
+ * properties of undefined (reading 'toLowerCase')", "….toUpperCase is not a function"); and every other
+ * one blocked every autosave (productSchema refuses it), one without the ids also opening the variations
+ * editor with none of the variant's terms selected.
+ */
+export function isReadableVariantOption(option: unknown): option is ProductVariantOption {
+  if (option === null || typeof option !== 'object' || Array.isArray(option)) {
+    return false;
+  }
+
+  const { attribute_id, attribute_name, term_id, term_value, term_slug } = option as Record<string, unknown>;
+  return (
+    typeof attribute_id === 'string' &&
+    typeof attribute_name === 'string' &&
+    typeof term_id === 'string' &&
+    typeof term_value === 'string' &&
+    (term_slug === undefined || typeof term_slug === 'string')
+  );
+}
+
+/**
+ * A new variant's SKU: the product's SKU plus each option's term slug (its value slugified when it has
+ * none). Text only: a product SKU, an option, a slug or a value that is not text adds nothing. The product
+ * form fills a loaded variant's empty SKU with this, and a product draft can hold anything (any WRITER can
+ * PATCH one): an option whose term slug was set but not text (an object, a list, a non-zero number,
+ * true), or that had no slug (or a false or 0 one) and a term value that was not text, or a product SKU
+ * that was not text, made ProductForm throw when it mounted in the browser ("Cannot read properties of
+ * undefined (reading 'toLowerCase')", "value.toLowerCase is not a function", "….toUpperCase is not a
+ * function", "baseSku.trim is not a function"; the edit page's client shell renders the form only after
+ * mount, and /cms has no error boundary, so the page was lost for every reader), and the variations editor
+ * threw the same way on a term toggle beside such a product SKU.
+ */
 export function buildVariantSku(baseSku: string, options: ProductVariantOption[]) {
-  const skuSuffix = options
-    .map((option) => (option.term_slug ? option.term_slug : slugifyToken(option.term_value)).toUpperCase())
+  const skuSuffix = (Array.isArray(options) ? (options as unknown[]) : [])
+    .map((option) => {
+      const { term_slug: slug, term_value: value } = (
+        option !== null && typeof option === 'object' ? option : {}
+      ) as Record<string, unknown>;
+      return (typeof slug === 'string' && slug ? slug : slugifyToken(value)).toUpperCase();
+    })
     .filter(Boolean)
     .join('-');
 
-  return [baseSku.trim(), skuSuffix].filter(Boolean).join('-');
+  return [typeof baseSku === 'string' ? baseSku.trim() : '', skuSuffix].filter(Boolean).join('-');
 }
 
 /**

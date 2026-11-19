@@ -203,8 +203,8 @@ for the surrounding AI architecture and credential model.
 ## Verification
 
 ```bash
-# Validate the custom block definition schemas / fixtures
-npx tsx apps/nextblock/scripts/verify-custom-block-definitions.ts
+# Validate the custom block definition schemas / fixtures (monorepo only; --live writes to the database)
+npx tsx tools/scripts/verify-custom-block-definitions.ts
 
 # Exercise the dynamic layout engine
 npx tsx apps/nextblock/scripts/verify-dynamic-layout-engine.tsx

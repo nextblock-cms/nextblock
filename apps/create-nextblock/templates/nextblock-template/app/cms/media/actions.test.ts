@@ -45,6 +45,13 @@ const mocks = vi.hoisted(() => ({
   inUse: [] as string[],
   inUseError: null as { message: string } | null,
   rpcCalls: [] as Array<{ fn: string; args: any }>,
+  // What public.media_usage (02045) answers, and its error.
+  usageAnswer: {} as unknown,
+  usageError: null as { message: string } | null,
+  // The media rows a select reads (the usage actions read id, object_key, variants), and its error.
+  mediaRows: [] as any[],
+  mediaReadError: null as any,
+  mediaSelects: 0,
 }));
 
 const s3Send = vi.fn(async (cmd: any) => {
@@ -83,7 +90,12 @@ function makeSupabaseClient() {
         callLog.push('media.update');
         return { data: mocks.mediaWrite.data, error: mocks.mediaWrite.error };
       }
-      return { data: [], error: null };
+      mocks.mediaSelects += 1;
+      // As PostgREST: an `in` filter on id keeps the rows it names (uuid equality ignores case).
+      const idFilter = state.filters.find((f: any[]) => f[0] === 'in' && f[1] === 'id');
+      const wanted = idFilter ? new Set((idFilter[2] as string[]).map((id) => id.toLowerCase())) : null;
+      const rows = wanted ? mocks.mediaRows.filter((row) => wanted.has(String(row.id).toLowerCase())) : mocks.mediaRows;
+      return { data: mocks.mediaReadError ? null : rows, error: mocks.mediaReadError };
     }
     return { data: [], error: null };
   }
@@ -129,6 +141,9 @@ vi.mock('@nextblock-cms/db/server', () => ({
     rpc: async (fn: string, args: any) => {
       callLog.push(`rpc:${fn}`);
       mocks.rpcCalls.push({ fn, args });
+      if (fn === 'media_usage') {
+        return { data: mocks.usageError ? null : mocks.usageAnswer, error: mocks.usageError };
+      }
       return { data: mocks.inUseError ? null : mocks.inUse, error: mocks.inUseError };
     },
   }),
@@ -177,6 +192,8 @@ import { revalidatePath } from 'next/cache';
 import {
   deleteMediaItem,
   deleteMultipleMediaItems,
+  deleteUnusedMediaItems,
+  getMediaUsage,
   moveMultipleMediaItems,
   moveSingleMediaItem,
 } from './actions';
@@ -196,6 +213,11 @@ beforeEach(() => {
   mocks.inUse = [];
   mocks.inUseError = null;
   mocks.rpcCalls = [];
+  mocks.usageAnswer = {};
+  mocks.usageError = null;
+  mocks.mediaRows = [];
+  mocks.mediaReadError = null;
+  mocks.mediaSelects = 0;
 });
 
 afterEach(() => {
@@ -209,7 +231,7 @@ describe('deleteMediaItem', () => {
   it('neither redirects nor leaves a redirect pending on success: it revalidates the library in place', async () => {
     mocks.mediaWrite = { data: [{ object_key: 'uploads/a.avif', variants: [] }], error: null };
 
-    await expect(deleteMediaItem('media-1', 'uploads/a.avif')).resolves.toBeUndefined();
+    await expect(deleteMediaItem('media-1', 'uploads/a.avif')).resolves.toEqual({ success: 'Media item deleted.' });
     expect(encodedRedirect).not.toHaveBeenCalled();
     // The revalidation is what takes the deleted item out of the grid now.
     expect(revalidatePath).toHaveBeenCalledWith('/cms/media');
@@ -332,16 +354,29 @@ describe('deleteMediaItem', () => {
   it('a non-owner WRITER (zero rows deleted) touches no storage and reports not-permitted', async () => {
     mocks.mediaWrite = { data: [], error: null }; // RLS removed nothing
 
-    await deleteMediaItem('media-1', 'uploads/a.avif');
+    const result = await deleteMediaItem('media-1', 'uploads/a.avif');
 
     expect(callLog).toEqual(['media.delete']); // DB attempted, no storage call
     expect(s3Send).not.toHaveBeenCalled();
     expect(supabaseRemoveObjects).not.toHaveBeenCalled();
-    expect(encodedRedirect).toHaveBeenLastCalledWith(
-      'error',
-      '/cms/media',
-      'Media item not found or you do not have permission to delete it.',
-    );
+    expect(result).toEqual({ error: 'Media item not found or you do not have permission to delete it.' });
+  });
+
+  // /cms/media reads no ?error= or ?success=: through 0.23.4 every refusal redirected to the unfiltered
+  // library (its folder and search lost) and showed nothing. Each answers { error } for the toast.
+  it.each<readonly [string, () => void, string]>([
+    ['no session', () => { mocks.user = null; mocks.role = null; }, 'User not authenticated.'],
+    ['a failed delete', () => { mocks.mediaWrite = { data: null, error: { message: 'deadlock detected' } }; }, 'Failed to delete media record: deadlock detected'],
+    ['no storage bucket', () => { mocks.bucket = ''; }, 'Storage bucket not configured for deletion.'],
+  ])('answers { error } and never redirects: %s', async (_label, arrange, message) => {
+    mocks.mediaWrite = { data: [{ object_key: 'uploads/a.avif', variants: [] }], error: null };
+    arrange();
+
+    const result = await deleteMediaItem('media-1', 'uploads/a.avif');
+
+    expect(result).toEqual({ error: message });
+    expect(encodedRedirect).not.toHaveBeenCalled();
+    expect(s3Send).not.toHaveBeenCalled();
   });
 });
 
@@ -526,14 +561,20 @@ describe('the delete and move actions authorize through getCmsActor(), second fa
   const ownedRow = { id: 'a', object_key: 'uploads/a.avif', file_type: 'image/avif', variants: [{ objectKey: 'uploads/a_small.avif' }] };
   const items = [{ id: 'a', objectKey: 'uploads/a.avif' }];
 
-  /** Every storage-touching action, each answering its refusal message (deleteMediaItem redirects). */
+  const USAGE_ID = 'a1111111-1111-4111-8111-11111111111a';
+
+  /**
+   * Every storage-touching action, and the service-role usage lookup (02045) with "Delete unused",
+   * each answering its refusal message.
+   */
   async function runEveryAction(): Promise<string[]> {
     const messages: string[] = [];
-    await deleteMediaItem('a', 'uploads/a.avif');
-    messages.push(encodedRedirect.mock.lastCall?.[2] ?? '');
+    messages.push(String((await deleteMediaItem('a', 'uploads/a.avif')).error));
     messages.push(String((await deleteMultipleMediaItems(items)).error));
     messages.push(String((await moveMultipleMediaItems(items, 'photos')).error));
     messages.push(String((await moveSingleMediaItem(items[0], 'photos')).error));
+    messages.push(String((await getMediaUsage([USAGE_ID])).error));
+    messages.push(String((await deleteUnusedMediaItems([USAGE_ID])).error));
     return messages;
   }
 
@@ -556,11 +597,13 @@ describe('the delete and move actions authorize through getCmsActor(), second fa
     arrange();
     mocks.backend = 's3';
     mocks.mediaWrite = { data: [ownedRow], error: null };
+    mocks.mediaRows = [{ id: USAGE_ID, object_key: 'uploads/a.avif', variants: [] }];
 
-    expect(await runEveryAction()).toEqual([SECOND_FACTOR, SECOND_FACTOR, SECOND_FACTOR, SECOND_FACTOR]);
-    // No media row deleted or claimed, no service-role in-use read, no storage delete or copy.
+    expect(await runEveryAction()).toEqual(Array(6).fill(SECOND_FACTOR));
+    // No media row read, deleted or claimed, no service-role read (in-use keys, usage), no storage delete or copy.
     expect(callLog).toEqual([]);
     expect(mocks.rpcCalls).toEqual([]);
+    expect(mocks.mediaSelects).toBe(0);
     expect(s3Send).not.toHaveBeenCalled();
     expect(supabaseRemoveObjects).not.toHaveBeenCalled();
   });
@@ -568,9 +611,11 @@ describe('the delete and move actions authorize through getCmsActor(), second fa
   it('refuses a signed-in customer (USER) with the permissions message, touching nothing', async () => {
     mocks.role = 'USER';
     mocks.mediaWrite = { data: [ownedRow], error: null };
+    mocks.mediaRows = [{ id: USAGE_ID, object_key: 'uploads/a.avif', variants: [] }];
 
-    expect(await runEveryAction()).toEqual(Array(4).fill('Forbidden: Insufficient permissions.'));
+    expect(await runEveryAction()).toEqual(Array(6).fill('Forbidden: Insufficient permissions.'));
     expect(callLog).toEqual([]);
+    expect(mocks.mediaSelects).toBe(0);
     expect(s3Send).not.toHaveBeenCalled();
   });
 
@@ -579,8 +624,9 @@ describe('the delete and move actions authorize through getCmsActor(), second fa
     mocks.role = null;
     mocks.mediaWrite = { data: [ownedRow], error: null };
 
-    expect(await runEveryAction()).toEqual(Array(4).fill('User not authenticated.'));
+    expect(await runEveryAction()).toEqual(Array(6).fill('User not authenticated.'));
     expect(callLog).toEqual([]);
+    expect(mocks.mediaSelects).toBe(0);
   });
 
   it('lets an ADMIN whose session passed the enrolled authenticator app (aal2) delete', async () => {
@@ -615,5 +661,172 @@ describe('the delete and move actions authorize through getCmsActor(), second fa
 
     expect(callLog[0]).toBe('media.update');
     expect(res).toEqual({ success: expect.stringContaining('Moved 1 item') });
+  });
+});
+
+describe('where media is used (public.media_usage, 02045) and "Delete unused"', () => {
+  const USED = 'a1111111-1111-4111-8111-11111111111a';
+  const UNUSED = 'b2222222-2222-4222-8222-22222222222b';
+  const HISTORY_ONLY = 'c3333333-3333-4333-8333-33333333333c';
+  const DECOY = 'd4444444-4444-4444-8444-44444444444d';
+
+  /** One item's answer, as the database function writes it. */
+  const answer = (byKind: Record<string, number>, sites: unknown[] = []) => ({
+    total: Object.values(byKind).reduce((sum, n) => sum + n, 0),
+    by_kind: byKind,
+    sites,
+  });
+  const partnerSite = { kind: 'partner_page', record_id: 'e5555555-5555-4555-8555-55555555555e', parent_type: null, parent_id: null, label: 'jane', language: null };
+  const pageSite = { kind: 'block', record_id: '41', parent_type: 'page', parent_id: '7', label: 'Home', language: 'en' };
+
+  beforeEach(() => {
+    mocks.role = 'ADMIN';
+    mocks.mediaRows = [
+      { id: USED, object_key: 'uploads/used.webp', variants: [{ objectKey: 'uploads/used_large.avif' }] },
+      { id: UNUSED, object_key: 'uploads/unused.webp', variants: [] },
+      { id: HISTORY_ONLY, object_key: 'uploads/history.webp', variants: null },
+    ];
+    mocks.usageAnswer = {
+      [USED]: answer({ block: 1, partner_page: 1 }, [pageSite, partnerSite]),
+      [UNUSED]: answer({}),
+      [HISTORY_ONLY]: answer({ page_revision: 2 }),
+    };
+  });
+
+  it("asks with each row's id and the keys its delete would remove: a decoy row's foreign variants are not its own", async () => {
+    mocks.mediaRows = [{ id: DECOY, object_key: 'uploads/decoy.webp', variants: [{ objectKey: 'uploads/victim_large.avif' }, { objectKey: 'uploads/decoy_small.avif' }] }];
+    mocks.usageAnswer = { [DECOY]: answer({}) };
+
+    const result = await getMediaUsage([DECOY.toUpperCase(), DECOY, 'not-a-uuid']);
+
+    expect(mocks.rpcCalls).toEqual([
+      { fn: 'media_usage', args: { p_media: { [DECOY]: ['uploads/decoy.webp', 'uploads/decoy_small.avif'] } } },
+    ]);
+    expect(result).toEqual({ usage: { [DECOY]: { total: 0, byKind: {}, sites: [] } } });
+  });
+
+  it("names a partner storefront to an ADMIN only: a WRITER sees the place without the partner's handle", async () => {
+    const asAdmin = await getMediaUsage([USED]);
+    mocks.role = 'WRITER';
+    const asWriter = await getMediaUsage([USED]);
+
+    expect(asAdmin.usage?.[USED].sites.map((site) => site.label)).toEqual(['Home', 'jane']);
+    expect(asWriter.usage?.[USED].sites.map((site) => site.label)).toEqual(['Home', null]);
+    expect(asWriter.usage?.[USED].byKind).toEqual({ block: 1, partner_page: 1 });
+  });
+
+  it("names to a WRITER no record their RLS hides (a redirect's source path, an ADMIN-tier setting, a partner storefront), not even by id", async () => {
+    const redirectSite = { kind: 'redirect', record_id: 'f6666666-6666-4666-8666-66666666666f', parent_type: null, parent_id: null, label: '/old-launch', language: null };
+    const adminSetting = { kind: 'site_setting', record_id: 'store_contact', parent_type: null, parent_id: null, label: 'store_contact', language: null };
+    const socialImage = { kind: 'site_setting', record_id: 'site_social_image', parent_type: null, parent_id: null, label: 'site_social_image', language: null };
+    mocks.usageAnswer = {
+      [USED]: answer({ block: 1, redirect: 1, site_setting: 2, partner_page: 1 }, [pageSite, redirectSite, adminSetting, socialImage, partnerSite]),
+    };
+    const withheld = { recordId: '', parentType: null, parentId: null, label: null, language: null };
+
+    mocks.role = 'WRITER';
+    const asWriter = await getMediaUsage([USED]);
+    mocks.role = 'ADMIN';
+    const asAdmin = await getMediaUsage([USED]);
+
+    expect(asWriter.usage?.[USED].sites).toEqual([
+      { kind: 'block', recordId: '41', parentType: 'page', parentId: '7', label: 'Home', language: 'en' },
+      { kind: 'redirect', ...withheld },
+      { kind: 'site_setting', ...withheld },
+      { kind: 'site_setting', recordId: 'site_social_image', parentType: null, parentId: null, label: 'site_social_image', language: null },
+      { kind: 'partner_page', ...withheld },
+    ]);
+    expect(asWriter.usage?.[USED].total).toBe(5);
+    expect(asAdmin.usage?.[USED].sites.map((site) => site.label)).toEqual(['Home', '/old-launch', 'store_contact', 'site_social_image', 'jane']);
+  });
+
+  it('never calls a file unused, nor deletes it, when its storage key could not be searched: its keys are not sent', async () => {
+    const CRAFTED = 'e7777777-7777-4777-8777-77777777777e';
+    // A WRITER can insert such a row over PostgREST: its "key" is a search string of their choosing.
+    mocks.mediaRows = [
+      { id: UNUSED, object_key: 'uploads/unused.webp', variants: [] },
+      { id: CRAFTED, object_key: 'uploads/"contactEmail": "owner@shop.md', variants: null },
+    ];
+    mocks.usageAnswer = { [UNUSED]: answer({}), [CRAFTED]: answer({}) };
+    mocks.backend = 'supabase';
+    mocks.mediaWrite = { data: [{ id: UNUSED, object_key: 'uploads/unused.webp', variants: [] }], error: null };
+
+    const listed = await getMediaUsage([UNUSED, CRAFTED]);
+    const result = await deleteUnusedMediaItems([UNUSED, CRAFTED]);
+
+    for (const call of mocks.rpcCalls.filter((entry) => entry.fn === 'media_usage')) {
+      expect(call.args).toEqual({ p_media: { [UNUSED]: ['uploads/unused.webp'], [CRAFTED]: [] } });
+    }
+    expect(listed.usage?.[CRAFTED].byKind).toEqual({ unchecked_key: 1 });
+    expect(result).toEqual({ success: 'Deleted 1 unused file. 1 in use (or gone) was kept.', deletedIds: [UNUSED] });
+    expect(supabaseRemoveObjects).toHaveBeenCalledWith(['uploads/unused.webp']);
+  });
+
+  it.each<readonly [string, () => void]>([
+    ['the lookup fails', () => { mocks.usageError = { message: 'canceling statement due to statement timeout' }; }],
+    ['the lookup leaves an item out', () => { mocks.usageAnswer = { [UNUSED]: answer({}) }; }],
+    ['the lookup answers another shape', () => { mocks.usageAnswer = [{ id: USED }]; }],
+    ['the media rows cannot be read', () => { mocks.mediaReadError = { message: 'permission denied' }; }],
+  ])('answers { error }, never an empty usage, when %s', async (_label, arrange) => {
+    arrange();
+
+    const result = await getMediaUsage([USED, UNUSED]);
+
+    expect(result.usage).toBeUndefined();
+    expect(result.error).toMatch(/could not be checked/);
+  });
+
+  it('deletes only what nothing uses, revision-only items included, through the bulk delete path', async () => {
+    mocks.backend = 'supabase';
+    mocks.mediaWrite = {
+      data: [
+        { id: UNUSED, object_key: 'uploads/unused.webp', variants: [] },
+        { id: HISTORY_ONLY, object_key: 'uploads/history.webp', variants: null },
+      ],
+      error: null,
+    };
+
+    const result = await deleteUnusedMediaItems([USED, UNUSED, HISTORY_ONLY]);
+
+    expect(result).toEqual({ success: 'Deleted 2 unused files. 1 in use (or gone) was kept.', deletedIds: [UNUSED, HISTORY_ONLY] });
+    // The lookup, then the delete of the unused rows only, then their own objects.
+    expect(callLog).toEqual(['rpc:media_usage', 'media.delete', 'rpc:media_storage_keys_in_use', 'supabase.removeObjects']);
+    expect(supabaseRemoveObjects).toHaveBeenCalledWith(['uploads/unused.webp', 'uploads/history.webp']);
+    expect(revalidatePath).toHaveBeenCalledWith('/cms/media');
+  });
+
+  it('deletes nothing when the lookup fails, or when every selected file is in use', async () => {
+    mocks.usageError = { message: 'boom' };
+    const failed = await deleteUnusedMediaItems([UNUSED]);
+    expect(failed).toEqual({ error: expect.stringMatching(/^Nothing was deleted\. Where this media is used could not be checked: boom/) });
+
+    mocks.usageError = null;
+    const allUsed = await deleteUnusedMediaItems([USED]);
+    expect(allUsed).toEqual({ error: 'Nothing was deleted: every selected file is in use, or no longer exists.' });
+
+    expect(callLog).not.toContain('media.delete');
+    expect(s3Send).not.toHaveBeenCalled();
+    expect(supabaseRemoveObjects).not.toHaveBeenCalled();
+  });
+
+  it('says how many it could not delete when RLS keeps a WRITER from deleting another uploader\'s file', async () => {
+    mocks.role = 'WRITER';
+    mocks.mediaWrite = { data: [{ id: UNUSED, object_key: 'uploads/unused.webp', variants: [] }], error: null };
+
+    const result = await deleteUnusedMediaItems([UNUSED, HISTORY_ONLY]);
+
+    expect(result).toEqual({
+      success: 'Deleted 1 unused file. 1 could not be deleted (you do not have permission).',
+      deletedIds: [UNUSED],
+    });
+  });
+
+  it('refuses more than 500 files at a time before reading anything', async () => {
+    const many = Array.from({ length: 501 }, (_, i) => `a1111111-1111-4111-8111-${String(i).padStart(12, '0')}`);
+
+    expect(await getMediaUsage(many)).toEqual({ error: 'Check at most 500 files at a time.' });
+    expect(await deleteUnusedMediaItems(many)).toEqual({ error: 'Delete at most 500 files at a time.' });
+    expect(mocks.mediaSelects).toBe(0);
+    expect(mocks.rpcCalls).toEqual([]);
   });
 });

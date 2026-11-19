@@ -331,3 +331,208 @@ describe('copyProductFromLanguage', () => {
     }
   });
 });
+
+/**
+ * What a draft publish hands public.publish_product_draft (migration 02043): updateProduct()'s RPC
+ * payload in minor units, plus the writes updateProduct() made after the RPC, and nothing that could
+ * change visibility or delete media. The function itself runs against a real database in
+ * tools/scripts/product-draft-publish.db.test.ts.
+ */
+describe('buildProductDraftPublishValues', () => {
+  const formValues: any = {
+    ...baseData,
+    upc: '',
+    price: 49.99,
+    prices: { USD: 49.99, EUR: 45 },
+    sale_price: 39.5,
+    sale_prices: { USD: 39.5, EUR: null },
+    sale_start_at: '2026-12-01T00:00:00.000Z',
+    sale_end_at: null,
+    stock: 4,
+    meta_title: '  Widget | Store  ',
+    meta_description: null,
+    custom_canonical: '',
+    short_description: 'Short',
+    description_json: { type: 'doc', content: [] },
+    translation_group_id: '',
+    product_media: [{ media_id: IMAGE_B }, { media_id: IMAGE_A }, { media_id: 42 }],
+    category_ids: ['55555555-5555-4555-8555-555555555555'],
+    media_id: DELETED_IMAGE,
+    explicitly_removed_media_ids: [IMAGE_C],
+    variants: [
+      {
+        id: '66666666-6666-4666-8666-666666666666',
+        combination_key: 'red',
+        sku: 'SKU-1-RED',
+        upc: null,
+        price: 12.34,
+        prices: { USD: 12.34 },
+        sale_price: null,
+        sale_prices: {},
+        sale_start_at: null,
+        sale_end_at: null,
+        stock_quantity: 3,
+        main_media_id: IMAGE_A,
+        attribute_term_ids: ['77777777-7777-4777-8777-777777777777'],
+        selected_options: [],
+        label: 'Red',
+      },
+    ],
+  };
+
+  it("converts every amount to minor units and keeps each variant with its terms and the draft's copy of its id", async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+    const values = buildProductDraftPublishValues(formValues);
+
+    expect(values).toMatchObject({
+      product_type: 'physical',
+      title: 'Widget',
+      slug: 'widget',
+      sku: 'SKU-1',
+      upc: '',
+      stock: 4,
+      price: 4999,
+      prices: { USD: 4999, EUR: 4500 },
+      sale_price: 3950,
+      // A blank entry is dropped, as updateProduct() always did.
+      sale_prices: { USD: 3950 },
+      sale_start_at: '2026-12-01T00:00:00.000Z',
+      sale_end_at: null,
+      is_taxable: true,
+      language_id: 1,
+      trial_period_days: 0,
+      trial_requires_payment_method: false,
+      short_description: 'Short',
+      description_json: { type: 'doc', content: [] },
+      // Sent as typed: the function trims them, and a blank becomes NULL.
+      meta_title: '  Widget | Store  ',
+      meta_description: null,
+      custom_canonical: '',
+      variants: [
+        {
+          id: '66666666-6666-4666-8666-666666666666',
+          sku: 'SKU-1-RED',
+          upc: null,
+          price: 1234,
+          sale_price: null,
+          prices: { USD: 1234 },
+          sale_prices: {},
+          sale_start_at: null,
+          sale_end_at: null,
+          stock_quantity: 3,
+          main_media_id: IMAGE_A,
+          attribute_term_ids: ['77777777-7777-4777-8777-777777777777'],
+        },
+      ],
+    });
+  });
+
+  it('sends the gallery as the listed media ids in order and the categories as listed, null when the values carry none', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+
+    expect(buildProductDraftPublishValues(formValues)).toMatchObject({
+      gallery_media_ids: [IMAGE_B, IMAGE_A],
+      category_ids: ['55555555-5555-4555-8555-555555555555'],
+    });
+    const bare = buildProductDraftPublishValues({ ...formValues, product_media: undefined, category_ids: undefined });
+    expect(bare.gallery_media_ids).toBeNull();
+    expect(bare.category_ids).toBeNull();
+    expect(buildProductDraftPublishValues({ ...formValues, product_media: [], category_ids: [] })).toMatchObject({
+      gallery_media_ids: [],
+      category_ids: [],
+    });
+  });
+
+  it('never carries visibility, a top-level media_id, a removal list, metadata, the provider or an id', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+    const values = buildProductDraftPublishValues(formValues);
+
+    for (const key of ['status', 'media_id', 'explicitly_removed_media_ids', 'product_media', 'metadata', 'payment_provider', 'id']) {
+      expect(values).not.toHaveProperty(key);
+    }
+    expect(JSON.stringify(values)).not.toContain(DELETED_IMAGE);
+    expect(JSON.stringify(values)).not.toContain(IMAGE_C);
+    // An empty translation group never reaches the function (it keeps the row's).
+    expect(JSON.parse(JSON.stringify(values))).not.toHaveProperty('translation_group_id');
+  });
+
+  it('sends the stock the edit page loaded, keyed as the inventory rows are, with only whole quantities from 0 up', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+
+    const values = buildProductDraftPublishValues({
+      ...formValues,
+      stock_baseline: {
+        'SKU-1-RED': 3,
+        // Spaces around a SKU go, as Postgres btrim() takes them off the inventory key.
+        '  SKU-1-BLUE ': 0,
+        'SKU-1-GREEN': 2.5,
+        'SKU-1-BLACK': -1,
+        'SKU-1-WHITE': 2147483648,
+        'SKU-1-GREY': '4',
+        '   ': 9,
+      },
+    });
+
+    expect(values.stock_baseline).toEqual({ 'SKU-1-RED': 3, 'SKU-1-BLUE': 0 });
+    // The quantities themselves are sent as the draft holds them: the function compares the two.
+    expect(values).toMatchObject({ stock: 4, variants: [expect.objectContaining({ sku: 'SKU-1-RED', stock_quantity: 3 })] });
+  });
+
+  it('sends no baseline for values without one (a draft an earlier version saved, a CMS draft import)', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+
+    expect(buildProductDraftPublishValues(formValues).stock_baseline).toBeNull();
+    expect(buildProductDraftPublishValues({ ...formValues, stock_baseline: null }).stock_baseline).toBeNull();
+    expect(buildProductDraftPublishValues({ ...formValues, stock_baseline: ['SKU-1-RED'] }).stock_baseline).toBeNull();
+  });
+
+  // Review 2026-11-18: a hand-written draft's variant list that was not a list threw here
+  // (`(variants || []).map is not a function`), and a null entry threw on its first field. Neither is
+  // read as no variants, which the function would apply by deleting every live variant: it goes on as
+  // it is, and publish_product_draft refuses it (NBP04). The app's completeProductDraftValues sends the
+  // live variants for a variant list that is not a list, so a publish never gets here with one.
+  it('never throws on variants that are not a list or entries that are not objects, and never reads them as no variants', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+
+    // The payload's own fields are typed loosely (buildProductDraftPublishValues types the fields it adds).
+    const sentVariants = (values: unknown) => (values as { variants: unknown }).variants;
+
+    // false, 0 and '' too: until round 2 `(variants || [])` sent them as no variants, which deleted every
+    // live variant, and a truthiness test (`if (!variants) return []`) would again.
+    for (const variants of [{}, 'x', 42, false, 0, '']) {
+      let values: unknown;
+      expect(() => {
+        values = buildProductDraftPublishValues({ ...formValues, variants });
+      }).not.toThrow();
+      expect(sentVariants(values)).toBe(variants);
+    }
+
+    expect(sentVariants(buildProductDraftPublishValues({ ...formValues, variants: [null, 'x', [], formValues.variants[0]] }))).toEqual([
+      null,
+      'x',
+      [],
+      expect.objectContaining({ sku: 'SKU-1-RED', price: 1234, stock_quantity: 3 }),
+    ]);
+
+    // None at all is still none.
+    expect(sentVariants(buildProductDraftPublishValues({ ...formValues, variants: undefined }))).toEqual([]);
+    expect(sentVariants(buildProductDraftPublishValues({ ...formValues, variants: null }))).toEqual([]);
+  });
+
+  it('keeps the trial only for a digital product sold through Freemius', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+    const trial = { trial_period_days: 14, trial_requires_payment_method: true };
+
+    expect(buildProductDraftPublishValues({ ...formValues, ...trial })).toMatchObject({ trial_period_days: 0, trial_requires_payment_method: false });
+    expect(
+      buildProductDraftPublishValues({ ...formValues, ...trial, product_type: 'digital', payment_provider: 'freemius', freemius_plan_id: '9' })
+    ).toMatchObject({ product_type: 'digital', trial_period_days: 14, trial_requires_payment_method: true, freemius_plan_id: '9' });
+  });
+
+  it('writes nothing itself', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+    buildProductDraftPublishValues(formValues);
+    expect(mocks.writes).toEqual([]);
+    expect(mocks.rpcCalls).toBe(0);
+  });
+});

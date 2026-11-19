@@ -63,7 +63,14 @@ mirrors all but `db/types`).
   `product_drafts.created_at`.
 - Product draft publish runs `requireCmsAdmin()` first, and only an ADMIN may update a `products`
   row (visibility included); the UI's `currentUserCanPublishProductDrafts()` is publish's check,
-  and the server decides. Publish's block swap and its known limits: docs/09 → "Product Drafts".
+  and the server decides. Since 02043 the publish is one transaction, `publish_product_draft`
+  (row locks, variant rows kept by term set, History with prices and variants): docs/09 →
+  "Publishing: one transaction". Since 02044 it writes a SKU's stock only where the draft's
+  quantity differs from both the `stock_baseline` the edit page loaded and the current stock, as a
+  change to the current stock, so a sale made while the page was open stays sold; it first locks
+  the inventory rows a sale could hold against it, in the order a sale takes them, and warns of each
+  SKU left `already_live` or applied to a stock that `moved` (docs/09 → "Stock: only what the editor
+  changed").
 
 ## Auth and data access
 
@@ -101,13 +108,14 @@ mirrors all but `db/types`).
 npx nx serve nextblock              # dev on :4200
 npx nx build nextblock              # prebuild migration hook never fails a build
 npm run lint                        # or npx nx lint <project>
-npm run security:check              # service-role boundary + action actors + sandbox guards + HTML sinks + migration lint + posture runner guard + grant-pass lockstep
+npm run security:check              # service-role boundary + action actors + sandbox guards + HTML sinks + migration lint + posture runner guard + grant-pass lockstep + generated migration copies
 npm run security:db-posture -- --db-url postgresql://postgres:postgres@127.0.0.1:54322/postgres  # local DB only
 npx vitest run <path>               # ALWAYS pass a path (a bare run also collects the template copy); no per-project nx test targets
 npm run db:migrate:check            # ALWAYS first; read-only by construction
 npm run db:migrate && npm run db:types
 npm run generate:migrations-bundle && npm run generate:sandbox   # after any schema/seed change
 npm run sync:create-nextblock       # regenerate the CLI template from apps/nextblock
+node tools/scripts/rehearse-release.js   # after the sync above: pack all 9 (no publish), scaffold from the tarballs, next build + DOCKER_BUILD=true next build (no image) + tsc budget (~20 min; CI: release-rehearsal.yml syncs first)
 ```
 
 ## Conventions
@@ -119,7 +127,10 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   in the same generation; `npm run db:migrate:check` prints it, fails on any other shape, and
   must list the new file as pending (Supabase matches history by version only; a reused
   version is skipped silently). Never use timestamps. Squash runbook: `docs/04` →
-  "Squashing migrations".
+  "Squashing migrations". A file must also replay over a database where every later file ran (the
+  sandbox reset wipes only `public`): a later file that changes a function's return type or
+  parameters drops it first, and the earlier file creates its final shape
+  (`migration-replay.db.test.ts`; docs/04 → "Production migration policy").
 - Seed data-fix migrations scope UPDATEs by content signature + parent (`page_id = v_home AND
   content::text LIKE '%…%'`), never by `blocks.id`; ids drift on every install (035 clobbered
   the home promo that way, 037 repairs it). Verify copy with the SEO engine before writing SQL.
@@ -127,8 +138,10 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   equivalent in the same migration (same `translation_group_id`, same block structure, translated
   text, links to the `-fr` / French slugs). Only `/cms` is English-only. `02008`/`02009` are the
   model: translate text nodes, keep markup, insert missing FR rows guarded by group + language.
-- After schema or seed changes regenerate all three artifacts (`db:types`,
-  `generate:migrations-bundle`, `generate:sandbox`); the generators fail silently by omission.
+- After schema or seed changes, and after editing a pending migration, regenerate all three
+  artifacts (`db:types`, `generate:migrations-bundle`, `generate:sandbox`); the generators fail
+  silently by omission, and `tools/scripts/generated-migration-copies.test.ts` (in
+  `security:check`) fails while the bundle or the sandbox reset differs from the migration files.
 - Server-only modules throw in a browser: Cortex on call, S3 and `server-only` imports on import.
 - UI copy: `t(key)` returns the KEY for an unseeded key, so `t('x') || 'Fallback'` never falls
   back. Use `useLabel()` (app, EN + FR fallbacks), `translateOrFallback` (ecommerce) or
@@ -163,7 +176,11 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   that list in BOTH files (`migrate-core.test.mjs` fails on drift, `migration-grants.test.ts`
   on a missing entry, and on a new table or view granted less than the pass grants), or the
   next deploy hands it back (how the 0028/0029 advisor warnings
-  and 02022's `cortex_request_log` revoke were undone). `tools/scripts/security-verify.sql` is
+  and 02022's `cortex_request_log` revoke were undone). `npm run update` runs the pass too, even
+  with nothing pending, on the migrate-core its code update brought, so an updater runs the next
+  release's copy: keep every call `MIGRATION_ENGINE_CALLS` lists with its shape, `GRANTS_SQL` and
+  `API_ROLE_REVOKE_SQL` in that file, and its imports to those `migrate-core.test.mjs` lists (its
+  header; docs/13 → "Build-time migrations"). `tools/scripts/security-verify.sql` is
   the posture check: run it on a local replay after the post-apply pass (`GRANTS_SQL`), never on
   production.
 
@@ -223,6 +240,12 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   `supabase/` to those three, and check 14 its migrations to valid names equal to those the
   `/setup` bundle embeds (`npm run generate:migrations-bundle`). Never link `dist/` or a folder
   below it into the checkout: vite's `emptyOutDir` empties through the link (libs/db/CLAUDE.md).
+  Check 15 refuses a third-party package a packed file imports that the dist manifest does not
+  declare (in a `.d.ts` one a declared package installs also counts): ui's `.d.ts` imported
+  class-variance-authority, which no scaffold installed (457 TS errors per scaffold through
+  0.23.5). A build declares what it imports with `rootPackageRanges` (lib-build-plugins.mjs: the
+  root package.json's range); `next`/`react` stay optional peers of utils and db, since
+  create-nextblock installs db and npm would install a required peer (all of Next.js).
 - A scaffold override (`postcss`, `qs`, `uuid`, `glob`) lives in three places: root `overrides`,
   `apps/create-nextblock/bin/lib/fallback-overrides.js`, and `MANAGED_OVERRIDES` in
   `apps/nextblock/tools/lib/managed-overrides.mjs` (old value into `previous`, so `npm run
@@ -237,7 +260,12 @@ npm run sync:create-nextblock       # regenerate the CLI template from apps/next
   phases; a version already on npm is skipped, so re-running the same explicit version resumes (a
   `patch`/`minor`/`major` keyword is refused until npm has the stamped version of every package;
   pre-releases are refused). One lib: `npm run build:<lib>`. Never pipe the output (the approval
-  needs the TTY, `EOTP`). docs/06 → "Release commands".
+  needs the TTY, `EOTP`). docs/06 → "Release commands". Before a release, the rehearsal
+  (`npm run sync:create-nextblock`, then `node tools/scripts/rehearse-release.js`; the "Release
+  rehearsal" CI run does both on pushes to master and on PRs, unless they touch only docs/ and
+  Markdown other than a lib README) must pass: it builds a scaffold from packed tarballs with
+  nothing removed and holds its `tsc` to `tools/scripts/release-rehearsal-tsc-budget.json`
+  (docs/06 → "The release rehearsal").
 - The root layout never reads the `affiliates.` translation rows (`getCachedTranslations`
   filters `affiliates.%` in the query; `excludeAffiliateTranslationRows` is a second filter), so
   the global `useTranslations().t('affiliates.…')` returns the key. Affiliates UI reads

@@ -205,7 +205,10 @@ end $nb_trg$;`;
 // the four-argument claim stays listed for a database that has not run 02036 yet), and 02037 the
 // PayPal payout lifecycle (claim_paypal_affiliate_payout, record_paypal_affiliate_payout_batch,
 // note_paypal_affiliate_payout_item, complete_paypal_affiliate_payout, fail_paypal_affiliate_payout,
-// release_paypal_affiliate_payout).
+// release_paypal_affiliate_payout). Migration 02043 keeps anon off publish_product_draft and
+// product_revision_content (the atomic product draft publish), as off upsert_product_with_variants.
+// Migration 02045 adds media_usage (the media library's usage lookup, called with the service role
+// after the app's own staff check).
 // tools/lib/migrate-core.mjs carries the same two blocks for the build-time hook;
 // tools/lib/migrate-core.test.mjs fails when the two copies drift.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
@@ -394,6 +397,12 @@ begin
   if to_regprocedure('public.upsert_product_with_variants(jsonb)') is not null then
     revoke execute on function public.upsert_product_with_variants(jsonb) from public, anon;
   end if;
+  if to_regprocedure('public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb)') is not null then
+    revoke execute on function public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) from public, anon;
+  end if;
+  if to_regprocedure('public.product_revision_content(uuid)') is not null then
+    revoke execute on function public.product_revision_content(uuid) from public, anon;
+  end if;
   if to_regprocedure('public.bump_email_2fa_attempts(uuid)') is not null then
     revoke execute on function public.bump_email_2fa_attempts(uuid) from public, anon, authenticated;
   end if;
@@ -498,6 +507,9 @@ begin
   end if;
   if to_regprocedure('public.release_paypal_affiliate_payout(uuid)') is not null then
     revoke execute on function public.release_paypal_affiliate_payout(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.media_usage(jsonb)') is not null then
+    revoke execute on function public.media_usage(jsonb) from public, anon, authenticated;
   end if;
 end $nb_api$;`;
 

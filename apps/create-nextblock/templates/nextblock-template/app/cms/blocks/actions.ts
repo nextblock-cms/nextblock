@@ -7,8 +7,19 @@ import type { Database } from "@nextblock-cms/db";
 import { getInitialContent, isValidBlockType } from "../../../lib/blocks/blockRegistry";
 import { getOrCreateContentDraft } from "../../../lib/visual-editing/draft-content";
 import { getOrCreateProductDraft } from "../../../lib/visual-editing/product-drafts";
+import { PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR } from "../../../lib/visual-editing/product-draft-meta";
 
 type BlockType = Database['public']['Tables']['blocks']['Row']['block_type'];
+
+/**
+ * Whether a product draft UPDATE ... select("id") matched no row: the draft was published or
+ * discarded after this action read it (publish_product_draft deletes it in the transaction that makes
+ * it live, so a save that waited on its lock finds it gone). Without the select, supabase-js reports
+ * such an UPDATE as a success, and the edit was lost without a word.
+ */
+function isProductDraftGone(rows: unknown) {
+  return !Array.isArray(rows) || rows.length === 0;
+}
 
 // Helper to verify user can edit the parent (page/post)
 async function canEditParent(
@@ -196,14 +207,18 @@ export async function createBlockForProduct(productId: string, languageId: numbe
     const updatedBlocks = [...(draft.blocks || []), newBlock];
     updatedBlocks.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
-    const { error: updateError } = await supabase
+    const { data: savedDrafts, error: updateError } = await supabase
       .from("product_drafts")
       .update({ blocks: updatedBlocks as any })
-      .eq("id", draft.id);
+      .eq("id", draft.id)
+      .select("id");
 
     if (updateError) {
       console.error("Error creating draft block for product:", updateError);
       return { error: `Failed to save draft block: ${updateError.message}` };
+    }
+    if (isProductDraftGone(savedDrafts)) {
+      return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
     }
 
     revalidatePath(`/cms/products/${productId}/edit`);
@@ -243,14 +258,18 @@ export async function updateBlock(
           : b
       );
 
-      const { error: updateError } = await supabase
+      const { data: savedDrafts, error: updateError } = await supabase
         .from("product_drafts")
         .update({ blocks: updatedBlocks as any })
-        .eq("id", draft.id);
+        .eq("id", draft.id)
+        .select("id");
 
       if (updateError) {
         console.error("Error updating draft block content for product:", updateError);
         return { error: `Failed to update draft block: ${updateError.message}` };
+      }
+      if (isProductDraftGone(savedDrafts)) {
+        return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
       }
 
       return { success: true, updatedBlock: { ...existingBlock, content: newContent } as any };
@@ -321,14 +340,18 @@ export async function updateMultipleBlockOrders(
 
         updatedBlocks.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
-        const { error: updateError } = await supabase
+        const { data: savedDrafts, error: updateError } = await supabase
           .from("product_drafts")
           .update({ blocks: updatedBlocks as any })
-          .eq("id", draft.id);
+          .eq("id", draft.id)
+          .select("id");
 
         if (updateError) {
           console.error("Error updating draft blocks order for product:", updateError);
           return { error: `Failed to save blocks order draft: ${updateError.message}` };
+        }
+        if (isProductDraftGone(savedDrafts)) {
+          return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
         }
 
         revalidatePath(`/cms/products/${productId}/edit`);
@@ -394,14 +417,18 @@ export async function deleteBlock(
       const draft = await getOrCreateProductDraft(supabase, productId, user.id);
       const updatedBlocks = (draft.blocks || []).filter(b => b.id !== blockId);
 
-      const { error: updateError } = await supabase
+      const { data: savedDrafts, error: updateError } = await supabase
         .from("product_drafts")
         .update({ blocks: updatedBlocks as any })
-        .eq("id", draft.id);
+        .eq("id", draft.id)
+        .select("id");
 
       if (updateError) {
         console.error("Error deleting draft block for product:", updateError);
         return { error: `Failed to delete block from product draft: ${updateError.message}` };
+      }
+      if (isProductDraftGone(savedDrafts)) {
+        return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
       }
 
       revalidatePath(`/cms/products/${productId}/edit`);
@@ -581,14 +608,18 @@ export async function copyBlocksFromLanguage(
     if (parentType === "product") {
       // 4. Load or create target draft and update blocks
       const targetDraft = await getOrCreateProductDraft(supabase, parentId as string, user.id);
-      const { error: updateError } = await supabase
+      const { data: savedDrafts, error: updateError } = await supabase
         .from("product_drafts")
         .update({ blocks: copiedBlocks as any })
-        .eq("id", targetDraft.id);
+        .eq("id", targetDraft.id)
+        .select("id");
 
       if (updateError) {
         console.error("Error writing copied blocks to target product draft:", updateError);
         return { error: `Failed to copy blocks to draft: ${updateError.message}` };
+      }
+      if (isProductDraftGone(savedDrafts)) {
+        return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
       }
 
       revalidatePath(`/cms/products/${parentId}/edit`);

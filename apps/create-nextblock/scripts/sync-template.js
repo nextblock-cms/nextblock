@@ -10,6 +10,7 @@ import { retryTransientFsErrors } from './lib/fs-retry.js';
 import { findPackProblems } from './lib/pack-check.js';
 import { findTemplateProblems } from './lib/template-check.js';
 import { shouldSyncTemplateDoc } from './lib/template-docs.js';
+import { rewriteUiImports } from './lib/ui-imports.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -354,10 +355,9 @@ async function sanitizeUiImports() {
 
   for (const filePath of filesToProcess) {
     const original = await fs.readFile(filePath, 'utf8');
-    const replaced = original.replace(
-      /@nextblock-cms\/ui\/(?!styles\/)[A-Za-z0-9/_-]+/g,
-      '@nextblock-cms/ui',
-    );
+    // Subpaths to the barrel, and a test's identical shared-factory mocks down to one
+    // (scripts/lib/ui-imports.js; template-check.js refuses a file that still mocks one module twice).
+    const replaced = rewriteUiImports(original);
 
     if (replaced !== original) {
       await fs.writeFile(filePath, replaced);

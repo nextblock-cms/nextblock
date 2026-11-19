@@ -16,7 +16,7 @@ npm run update -- --check   # report what would change; write nothing
 npm run update -- --yes     # never prompt (implied by CI=true)
 npm run update -- --force   # run even when already on the latest version
 npm run update -- --skip-db # code + dependencies only
-npm run update -- --db-only # apply pending migrations only
+npm run update -- --db-only # schema only: pending migrations and the database grants
 ```
 
 > **Windows (PowerShell):** a bare `--` is stripped by the shell, so every flagged form above
@@ -116,8 +116,15 @@ on a human.
 
 **Framework-owned paths** (what the merge covers): `app/`, `components/`, `context/`,
 `hooks/`, `lib/`, `types/`, `tools/`, `scripts/`, `docker/`, `docs/`, `proxy.ts`,
-`index.d.ts`, `next-env.d.ts`, `postcss.config.js`, `eslint.config.mjs`, `Dockerfile`,
-`docker-compose.yml`, `.dockerignore`, `AGENTS.md`, `CLAUDE.md`.
+`instrumentation.ts`, `index.d.ts`, `next-env.d.ts`, `postcss.config.js`, `eslint.config.mjs`,
+`.browserslistrc`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `AGENTS.md`, `CLAUDE.md`.
+`instrumentation.ts` (which registers the CMS second-factor check on a cold server) and
+`.browserslistrc` joined the list in 0.23.6. A project that lacks either (scaffolded before the file
+shipped, and updated since) gets it from the first file sync that a 0.23.6 or later updater runs.
+That is not the update that reaches 0.23.6, which still runs the previous updater, nor a plain
+`npm run update` once on 0.23.6, which finds the code current and syncs nothing: it is
+`npm run update -- --force` after that update, or the update to the next release ("Upgrade notes"
+→ 0.23.6 below).
 
 **Never replaced**: `.env*`, `public/`, `README.md`, `.gitignore`, `.npmrc`, and the four
 files the scaffolder generates per project — `next.config.js`, `tailwind.config.js`,
@@ -417,13 +424,24 @@ logs a warning and continues. That guarantee is why it loads `migrate-core.mjs` 
 *guarded dynamic import*: an unresolvable top-level import is a hard ESM error no `try`
 could contain.
 
-After the pending files, this hook and `/setup` run the same post-apply grant pass
-(`GRANTS_SQL` in `migrate-core.mjs` and `lib/setup/schema-apply.ts`): blanket grants on
+After the pending files, this hook, `npm run update` and `/setup` run the same post-apply grant
+pass (`GRANTS_SQL` in `migrate-core.mjs` and `lib/setup/schema-apply.ts`): blanket grants on
 `public` for the API roles, then the revokes those grants would otherwise undo (EXECUTE on
-every trigger function, and the explicit list of `02021`/`02022`). The two copies must
+every trigger function, and the explicit list in `API_ROLE_REVOKE_SQL`). The two copies must
 stay identical; `tools/lib/migrate-core.test.mjs` fails when they drift. Until 2026-10-20
 the hook had the grants without the revokes, which is how the Security Advisor's
 SECURITY DEFINER warnings came back after every deploy (`02024` repairs that).
+
+The hook runs the pass whenever it runs, even with nothing pending. From 0.23.6's updater on,
+`npm run update` does too (with nothing pending, `npm run update -- --db-only` re-applies the
+grants alone), and it runs its schema step on the `migrate-core.mjs` its code update brought.
+Earlier updaters ran the pass only after applying a migration, and with the copy they had loaded
+before the update: a release's migrations got the previous release's revoke list, and a function
+the new release revokes stayed callable by the API roles until the next build with the hook on
+(see the 0.23.6 note). If the new copy does not load, the update says so, applies what is pending
+with the copy it loaded first (and that copy's grant pass), and with nothing pending runs no grant
+pass. A conflict the update left, in that file or any other, holds the whole schema step before
+the new copy is loaded ("Conflicts hold the schema back" below).
 
 ### Conflicts hold the schema back
 
@@ -435,10 +453,19 @@ finished deciding on, and it stays untouched if they abandon the update entirely
 Resolving is the only extra step; there is no separate resume command. Re-running
 `npm run update` sees the code is already current, skips straight to the schema step, and
 applies the migrations. Before it does, it re-checks with
-`git grep -lE '^<<<<<<< your version$'` and refuses while any marker remains — the label is
-the one `mergeTemplates()` passes to `git merge-file`, so it cannot be confused with a
-conflict from the developer's own git work, and it is anchored to the start of a line so
-source that merely mentions the string does not trip it.
+`git grep -lE '^<<<<<<< your version\r?$'` (the updater passes a real carriage return for `\r`;
+typed into a shell, `\r` reaches git as a plain `r`, so to look yourself run
+`git grep -l "^<<<<<<< your version"`) and refuses while any marker remains — the label is the
+one `mergeTemplates()` passes to `git merge-file`, so it cannot be confused with a conflict from
+the developer's own git work, and it is anchored to the start of a line so source that merely
+mentions the string does not trip it. The optional carriage return is for files with CRLF line
+endings: `git merge-file` writes the marker lines with CRLF when the three files it merges (yours
+and the two published copies) all use CRLF, and about half the template files create-nextblock has
+published do (the updater and the migration engine among them), so a project made with
+`npm create nextblock` has such files on any system. Through 0.23.5 the pattern ended in `$`
+alone, so a conflict in such a file held nothing and the migrations were applied over it. The
+update that reaches 0.23.6 still runs your previous updater and its check, so CRLF files count
+from the run after it.
 
 `git reset --hard HEAD` walks away from the whole thing; the database was never touched.
 
@@ -497,6 +524,153 @@ ship: `verify-lib-dist.js` check 14 compares the file names (not the SQL).
 ## Upgrade notes
 
 Most releases need nothing beyond `npm run update`. These ask for a step of your own.
+
+### 0.23.6 — Supabase Storage on your own domain, two scripts, two missing files, product stock, media usage
+
+The first three are for projects made with `npm create nextblock`; monorepo installs (a fork, a
+1-click deploy, a clone) get them through the merge. The last three concern every install.
+
+- **Images from Supabase Storage on a domain other than `*.supabase.co`.** A project that keeps
+  its media in native Supabase Storage (`STORAGE_PROVIDER=supabase`, or no `STORAGE_PROVIDER` and
+  not both `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`) and sets no `NEXT_PUBLIC_R2_BASE_URL`
+  serves its media from `<Supabase URL>/storage/v1/object/public/<bucket>`, and `next.config.js` let
+  Next's image optimizer fetch from that host only on Supabase Cloud (`**.supabase.co`). On a
+  self-hosted Supabase or a Supabase custom domain, every image served through the optimizer
+  (`/_next/image`) answered 400 `"url" parameter is not allowed`. New projects allow that host, on
+  the bucket's public path only, but `npm run update` never replaces `next.config.js`, so make one
+  of these two changes, then rebuild and restart (`npm run build`, then `npm start`):
+  - In `next.config.js`, find the block under `// Add R2 Custom Domain URL` in
+    `getRemotePatterns()`, `if (process.env.NEXT_PUBLIC_R2_BASE_URL) { … }`, and replace its closing
+    `}` with the branch below, as new projects have it. It calls `computeSupabaseMediaBaseUrl()`,
+    which the same file defines and which returns nothing while both R2 keys are set, even with
+    `STORAGE_PROVIDER=supabase`: the branch then adds no host. With both keys set, or if your file
+    has no such function, use the variable below instead.
+
+    ```js
+      } else {
+        // No explicit base: `env` inlines the native Supabase Storage endpoint as the media base,
+        // so allow its host too, on the public bucket path only.
+        const supabaseMediaBase = computeSupabaseMediaBaseUrl();
+        if (supabaseMediaBase) {
+          try {
+            const parsed = new URL(supabaseMediaBase);
+            patterns.push({
+              protocol: parsed.protocol === 'https:' ? 'https' : 'http',
+              hostname: parsed.hostname,
+              pathname: `${parsed.pathname.replace(/\/+$/, '')}/**`,
+            });
+          } catch {
+            // ignore a malformed Supabase URL
+          }
+        }
+      }
+    ```
+
+  - Or set `NEXT_PUBLIC_R2_BASE_URL` to that address, for example
+    `NEXT_PUBLIC_R2_BASE_URL=https://supabase.example.com/storage/v1/object/public/media` (the
+    bucket is your `STORAGE_BUCKET`, else your `R2_BUCKET_NAME`, else `media`). This is the fix for
+    `STORAGE_PROVIDER=supabase` with both R2 keys set. The block above already allows the host of an
+    explicit base, and the app builds its media URLs on the same address as before. It allows the
+    whole host, though, not only the bucket's public path, so the optimizer will also try any other
+    URL on your Supabase domain it is asked for (it serves only images).
+
+  A project on `*.supabase.co`, one on R2 or other S3 storage, and a Docker project (its setup sets
+  `NEXT_PUBLIC_R2_BASE_URL`) need neither. A Supabase at a loopback or private address stays
+  refused either way: Next's optimizer fetches from no local IP unless
+  `images.dangerouslyAllowLocalIP` is set.
+- **Delete two maintainer scripts.** `scripts/validate-editor-block-schema.ts` and
+  `scripts/verify-custom-block-definitions.ts` are tools for the NextBlock repository, where they
+  now live in `tools/scripts/`. In a project they import `../../../libs/utils/src/lib/editor-blocks`
+  and `../../../schemas/custom-blocks`, paths outside it, so the project's own `tsc` reports a
+  TS2307 (Cannot find module) for each; `next build` never stopped on them, since scaffolds set
+  `typescript.ignoreBuildErrors`. Nothing in a project uses them, and `npm run update` never deletes
+  a file, so delete both.
+- **Projects scaffolded before 0.22.3: add `instrumentation.ts` and `.browserslistrc`.** Until 0.23.6
+  the updater synced neither file, so a project scaffolded before one shipped (`instrumentation.ts`
+  in 0.22.3, `.browserslistrc` in May 2026) has never had it, however often it updated. Without
+  `instrumentation.ts`, the store's server actions (products, inventory, orders, coupons, shipping,
+  payment settings) on a server instance that has not loaded a CMS page yet fall back to a stricter
+  second-factor check, which refuses staff whose second factor is an email code or a remembered
+  device. Without `.browserslistrc`, the build compiles for Next's default browsers (Chrome, Edge
+  and Firefox 111, Safari 16.4) instead of NextBlock's list, which reaches back to Safari and iOS
+  15.4 and Chrome 109. The update that reaches 0.23.6 still runs your previous updater, which skips
+  both, and a plain `npm run update` on 0.23.6 finds the code current and syncs nothing. So, once on
+  0.23.6, commit your work and run `npm run update -- --force` (in PowerShell,
+  `node tools/update.mjs --force`): on a clean tree it merges 0.23.6 again, which adds the missing
+  files and leaves the files you edited alone. Without git, or with uncommitted changes, it instead
+  replaces every framework file that differs from 0.23.6 (it asks first, and keeps copies in
+  `.nextblock-backup/`). Either way it then merges `package.json` again, as every update does: each
+  third-party range the template lists (except a package you pin in `overrides`, which keeps your
+  pin, unless the pin is a value an earlier NextBlock release wrote there, which moves to 0.23.6's)
+  and each framework script (`dev`, `build`, `start`, …) is set to 0.23.6's, so a range or a
+  framework script you changed after reaching 0.23.6 goes back. The log
+  names each range it changes, but not the scripts, and no copy of `package.json` is kept: check
+  `git diff package.json` before you commit, put back what you had changed, and run `npm install`
+  (without git, note those changes before you run it). Or copy both files into the project root from
+  the NextBlock repository's `apps/nextblock/` folder
+  (<https://github.com/nextblock-cms/nextblock/blob/master/apps/nextblock/instrumentation.ts> and
+  `.browserslistrc` beside it), which changes nothing else. The update to the next release adds them
+  as well.
+- **Migrations 02043, 02044 and 02045.** 02043 publishes a product draft in one transaction
+  (`public.publish_product_draft`; variants keep their rows, and History now records prices, stock
+  and variants too), 02044 is the stock rule and 02045 the media usage lookup below. They apply like
+  any other migration ("Build-time migrations" above): `npm run update` applies them when it has a
+  database connection ("Two backends" above), after copying them into `supabase/migrations` in a
+  project made with `npm create nextblock` (a monorepo install gets them through the merge);
+  otherwise the build hook does at the next production build. A Docker project applies them on
+  `npm run docker:up`.
+  - **Outside Docker, rebuild after the update or re-apply the grants.** The update that reaches
+    0.23.6 runs your previous updater, which applies them with the grant pass of the release you came
+    from (it loads that pass before its file sync or merge). That pass leaves `anon` able to call
+    `publish_product_draft` and `product_revision_content`, and `anon` and `authenticated` able to
+    call `media_usage`, until the 0.23.6 pass takes that back. So after `npm run update`, even when it
+    applied them, rebuild or redeploy with the build hook on (`NEXTBLOCK_BUILD_MIGRATE=1` off Vercel),
+    or run `npm run update -- --db-only` once (in PowerShell, `node tools/update.mjs --db-only`, or
+    `node apps/nextblock/tools/update.mjs --db-only` in a monorepo): on 0.23.6 it re-applies the
+    grants even with nothing pending. All three functions run with the caller's own rights, so
+    nothing beyond the caller's own access is exposed, but each `media_usage` call reads every table
+    the caller can see. From 0.23.6's updater on, an update runs a release's migrations with the
+    engine and grant pass that release brings, so later releases need no such step.
+  - **Until they are applied:** without 02043, publishing a product draft is refused with nothing
+    written, Product History cannot compare a version with the product ("Failed to fetch current
+    content."), and a live CMS import, Cortex AI or an MCP client that changes a product records no
+    History for it; without 02045, the media library cannot say where files are used and lists none
+    as unused.
+  - **By hand:** an install that applies migrations itself (the monorepo's `npm run db:migrate`)
+    runs `npm run db:migrate:check` first, confirms 02043 to 02045 are listed as pending, then runs
+    `npm run db:migrate`.
+- **A product publish writes only the stock the editor changed** (02044). Through 0.23.5,
+  publishing a product form draft wrote back the stock its edit page had loaded, so a unit sold
+  while the page was open was put back (and so was any other stock change made meanwhile). Now the
+  draft records the stock the page loaded: a figure left alone stays as the store has it, and an
+  edited one is applied as a change to the stock at publishing, never below 0 (loaded 5, typed 15,
+  one sold meanwhile: 14), with a warning naming each such SKU whose stock had moved; if the
+  editor's figure already counted that (a count made after the sale), correct the stock. A figure the
+  store already shows is left alone, also when the edit was meant to come on top of what moved the
+  stock (loaded 10, 9 typed for a damaged unit, one sold meanwhile: 9 stays, not 8), and the warning
+  names each such SKU too: correct the stock then. The warning names the first five SKUs of each
+  kind, then how many more. Reopening a draft shows the stock its publish would write, and a note
+  above the form names, with the figures, each SKU it shows applied to a stock that moved or already
+  live (the next autosave records the stock it loaded, after which a publish sees neither). A draft
+  saved before the upgrade recorded no loaded stock, so its publish still writes the figures it
+  holds (its edit page shows them), whatever was sold since: compare them with the Inventory screen
+  before you publish one. A publish that changes the stock of hundreds of SKUs at once can still
+  pass the database's 8 s statement timeout, in a large catalog or on a busy database (on local
+  replays five hundred took about 5 s beside 50 other products, up to 9 s on a busy machine, and 9
+  to 13 s beside 2,000); it then fails with nothing written, and the draft is kept.
+- **The media library shows where each file is used** (02045). Deleting a file first shows where
+  it is used (blocks, feature images, galleries, drafts, settings, logos, partner storefronts and
+  more), linked to the screens that edit them, and the button reads "Delete anyway" when something
+  uses it or the check failed. "Delete Selected" names the selected files in use and offers "Delete
+  only the unused" or "Delete all". A new "Unused files" tab lists what nothing uses, with "Delete
+  all N unused": a way to clear out the images that product publishes have only unlinked since
+  0.23.4 (below). The media edit page shows "Where this file is used". Both unused deletes check
+  each file again on the server and delete nothing when that check fails. "Delete all N unused"
+  works in batches of 500 and stops at the first batch that fails, and the files of the batches
+  before it stay deleted (the message says how many, then why it stopped, or only why when none
+  were deleted before it). Drafts count as uses; a file only revisions name counts as unused
+  (restoring such a revision then shows a missing image). The check cannot see a link from another
+  site, a sent email or a cached social preview.
 
 ### 0.23.4 — Standalone builds, product drafts, Freemius keys, license recheck, CSP, uploads
 
@@ -648,7 +822,7 @@ Most releases need nothing beyond `npm run update`. These ask for a step of your
   uses them: that delete removes the image from every gallery, clears any page or post feature
   image, logo or variant image using it, removes its files, and leaves image blocks, section
   backgrounds, text and testimonial blocks and the social image pointing at a missing image. The
-  media library shows no usage.
+  media library showed no usage until 0.23.6 (above).
 - **Check the categories of products you translated.** Since categories arrived (2026-05-26),
   "Create <language> Translation" opened the new product with no categories, and saving it removed
   the categories of every product in the translation group (categories are shared by the group).
@@ -942,10 +1116,10 @@ Most releases need nothing beyond `npm run update`. These ask for a step of your
 | :--- | :--- |
 | To update **any** install | `npm run update` |
 | To see what would change first | `npm run update -- --check` |
-| To know what a release asks of you after updating | "Upgrade notes" above (0.23.4: standalone builds that failed on `vitest`, the check of products published after a description-block or in-page edit (master from 2026-05-22, npm 0.8.11 through 0.23.3), the review of product drafts saved before the upgrade, the Freemius Product ID and webhook listeners, the license recheck, the `media` bucket limits, a second `npm run update` for the `postcss` browser alias, which also names block editors of your own that need a loader line). |
+| To know what a release asks of you after updating | "Upgrade notes" above (0.23.6: Supabase Storage images on a domain other than `*.supabase.co` (a `next.config.js` edit or one `.env` value), two monorepo scripts to delete, `npm run update -- --force` once for projects scaffolded before 0.22.3 (then check `package.json`), a rebuild or `npm run update -- --db-only` after the update that applies migrations 02043 to 02045, and a stock check of product drafts saved before the upgrade; 0.23.4: standalone builds that failed on `vitest`, the check of products published after a description-block or in-page edit (master from 2026-05-22, npm 0.8.11 through 0.23.3), the review of product drafts saved before the upgrade, the Freemius Product ID and webhook listeners, the license recheck, the `media` bucket limits, a second `npm run update` for the `postcss` browser alias, which also names block editors of your own that need a loader line). |
 | Fully hands-off updates | Fork **public**, deploy on Vercel, **enable Actions** once. |
 | To update a **Docker** install | `npm run update` then `npm run docker:up` |
-| To apply only pending migrations | `npm run update -- --db-only` |
+| To apply only pending migrations, or re-apply the database grants | `npm run update -- --db-only` |
 | Conflict banners on a **private** fork | Also set `NEXTBLOCK_GITHUB_TOKEN`. |
 | To force an update check now | Dashboard (admin) → it polls in the background; or `POST /api/cms/check-updates`. |
 | To resolve a sync conflict | Open the linked GitHub issue, merge upstream locally, fix, push, close the issue. |

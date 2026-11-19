@@ -13,6 +13,7 @@ const {
   findSideEffectsProblems,
   findSupabaseFileProblems,
   findSupabaseFolderProblems,
+  findUndeclaredPackageImports,
   findUndeclaredSiblingImports,
   findWorkspaceProtocolDependencies,
   readBundledMigrationNames,
@@ -436,6 +437,179 @@ describe('findUndeclaredSiblingImports (check 11)', () => {
       `${undeclared('lib/tools.es.js', '@nextblock-cms/ecommerce/product-actions', '@nextblock-cms/ecommerce')}; ` +
         'declaring @nextblock-cms/ecom installs it under that name, so declare "@nextblock-cms/ecommerce": ' +
         '"npm:@nextblock-cms/ecom@<range>" instead',
+    ]);
+  });
+});
+
+describe('findUndeclaredPackageImports (check 15)', () => {
+  // What the monorepo installed, as far as these tests need it: the rules for declarations read the
+  // installed manifests, so each test hands in its own node_modules instead of the root's.
+  const installed = (packages: Record<string, Record<string, unknown>>, extraFiles: Record<string, string> = {}) =>
+    dist({
+      ...Object.fromEntries(Object.entries(packages).map(([name, manifest]) => [`${name}/package.json`, { name, ...manifest }])),
+      ...extraFiles,
+    });
+  const NODE_MODULES_NONE = () => installed({});
+  const check = (library: string, dir: string, packed: string[], nodeModulesDir = NODE_MODULES_NONE()) =>
+    findUndeclaredPackageImports(library, dir, new Set(packed), { nodeModulesDir });
+  const undeclaredRuntime = (file: string, specifier: string, name: string) =>
+    `${file} imports "${specifier}" but the package.json the build writes declares ${name} in none of dependencies, ` +
+    'peerDependencies or optionalDependencies, so a project that installs this package can lack it: declare it ' +
+    '(react, react-dom and next as peers, anything the package needs to run as a dependency)';
+  const unresolvedTypes = (file: string, specifier: string, name: string) =>
+    `${file} imports types from "${specifier}", but the package.json the build writes does not declare ${name} and nothing ` +
+    'it declares installs it, so TypeScript reads those types as any in every project that installs this package ' +
+    "(ui's class-variance-authority cost every scaffold 457 errors): declare it as a dependency";
+
+  // ui as 0.23.5 published it: react and react-dom external and undeclared, cva only in the types.
+  const UI_ESM =
+    "'use client';\nimport { jsx } from \"react/jsx-runtime\";\nimport * as React from \"react\";\n" +
+    'import { createPortal } from "react-dom";\nimport { cn } from "@nextblock-cms/utils/utils";\n' +
+    'export const Button = React.forwardRef(() => jsx("button", { className: cn() }));\nexport { createPortal };\n';
+  const BUTTON_DTS =
+    "import { VariantProps } from 'class-variance-authority';\nimport * as React from 'react';\n" +
+    'declare const buttonVariants: (props?: { variant?: "default" | null } | undefined) => string;\n' +
+    'export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement>, VariantProps<typeof buttonVariants> {}\n';
+  const UI_FILES = { 'index.mjs': UI_ESM, 'lib/button.d.ts': BUTTON_DTS };
+  const UI_PACKED = ['package.json', 'index.mjs', 'lib/button.d.ts'];
+
+  it("refuses ui as 0.23.5 published it: react and react-dom undeclared, and button.d.ts's class-variance-authority", () => {
+    const dir = dist({
+      'package.json': { name: '@nextblock-cms/ui', dependencies: { 'react-color': '^2.19.3' }, peerDependencies: { '@nextblock-cms/utils': '^0.23.5' } },
+      ...UI_FILES,
+    });
+    expect(check('ui', dir, UI_PACKED)).toEqual([
+      undeclaredRuntime('index.mjs', 'react/jsx-runtime', 'react'),
+      undeclaredRuntime('index.mjs', 'react-dom', 'react-dom'),
+      unresolvedTypes('lib/button.d.ts', 'class-variance-authority', 'class-variance-authority'),
+      unresolvedTypes('lib/button.d.ts', 'react', 'react'),
+    ]);
+  });
+
+  it('passes the same files once the manifest declares them: react and react-dom as peers, cva as a dependency', () => {
+    const dir = dist({
+      'package.json': {
+        name: '@nextblock-cms/ui',
+        dependencies: { 'class-variance-authority': '^0.7.1' },
+        peerDependencies: { '@nextblock-cms/utils': '^0.23.5', react: '^19.3.1', 'react-dom': '^19.3.1' },
+      },
+      ...UI_FILES,
+    });
+    expect(check('ui', dir, UI_PACKED)).toEqual([]);
+    // optionalDependencies count for the JavaScript too (utils and db declare next as an optional peer).
+    const optional = dist({
+      'package.json': { name: '@nextblock-cms/db', optionalDependencies: { 'server-only': '^0.0.1' } },
+      'lib/a.cjs.js': 'require("server-only");exports.a=1;',
+    });
+    expect(check('db', optional, ['package.json', 'lib/a.cjs.js'])).toEqual([]);
+  });
+
+  it("ignores Node's own modules, relative paths, URLs, comments and strings, the package itself, and siblings in JavaScript (check 11's)", () => {
+    const dir = dist({
+      'package.json': { name: '@nextblock-cms/utils' },
+      'lib/a.es.js':
+        'import fs from "node:fs";\nimport { readFile } from "fs/promises";\nimport path from "path";\n' +
+        'import { b } from "./b.es.js";\nimport { c } from "../c.es.js";\nimport { d } from "@nextblock-cms/utils/server";\n' +
+        'import { e } from "@nextblock-cms/ui";\n// import x from "lodash";\nconst s = "require(\\"left-pad\\")";\n' +
+        'export const a = [fs, readFile, path, b, c, d, e, s];\n',
+      'lib/a.d.ts': '/// <reference types="node" />\nimport type { Stats } from "node:fs";\nexport declare const a: Stats;\n',
+    });
+    expect(check('utils', dir, ['package.json', 'lib/a.es.js', 'lib/a.d.ts'])).toEqual([]);
+  });
+
+  it('reads only the packed files: a stale file outside the "files" whitelist never reaches a consumer', () => {
+    const dir = dist({ 'package.json': { name: '@nextblock-cms/db' }, 'stale.mjs': 'import x from "left-pad";\nexport { x };\n' });
+    expect(check('db', dir, ['package.json'])).toEqual([]);
+  });
+
+  it('lets a declaration name a package that a declared dependency installs (postgrest-js through supabase-js)', () => {
+    const dir = dist({
+      'package.json': { name: '@nextblock-cms/affiliates', dependencies: { '@supabase/supabase-js': '^2.118.0' } },
+      'lib/repository/client.d.ts':
+        'export declare function load(): Promise<import("@supabase/postgrest-js").PostgrestSingleResponse<unknown>>;\n',
+    });
+    const packed = ['package.json', 'lib/repository/client.d.ts'];
+    const withPostgrest = installed({
+      '@supabase/supabase-js': { types: './dist/index.d.ts', dependencies: { '@supabase/postgrest-js': '2.118.0' } },
+      '@supabase/postgrest-js': { types: './dist/index.d.ts' },
+    });
+    expect(check('affiliates', dir, packed, withPostgrest)).toEqual([]);
+    // The same import with nothing that installs it: TypeScript would read the type as any.
+    expect(check('affiliates', dir, packed)).toEqual([
+      unresolvedTypes('lib/repository/client.d.ts', '@supabase/postgrest-js', '@supabase/postgrest-js'),
+    ]);
+  });
+
+  it('follows required peers of what it installs, never optional ones', () => {
+    const dir = dist({
+      'package.json': { name: '@nextblock-cms/editor', dependencies: { '@tiptap/react': '^3.32.0' } },
+      'lib/a.d.ts': "import type { Node } from '@tiptap/pm/model';\nimport type { Y } from 'yjs';\nexport type A = [Node, Y];\n",
+    });
+    const nodeModules = installed({
+      '@tiptap/react': { types: './dist/index.d.ts', peerDependencies: { '@tiptap/pm': '^3.32.0', yjs: '^13' }, peerDependenciesMeta: { yjs: { optional: true } } },
+      '@tiptap/pm': { exports: { './model': { types: './model/index.d.ts', import: './model/index.js' } } },
+    });
+    expect(check('editor', dir, ['package.json', 'lib/a.d.ts'], nodeModules)).toEqual([unresolvedTypes('lib/a.d.ts', 'yjs', 'yjs')]);
+  });
+
+  it('asks for the @types package of a dependency that ships no declarations, but not of a peer (react brings @types/react with the project)', () => {
+    const dts = "import type { ColorResult } from 'react-color';\nimport type { FC } from 'react';\nexport declare const P: FC<{ c: ColorResult }>;\n";
+    const nodeModules = installed({ 'react-color': { main: 'lib/index.js' }, react: { main: 'index.js' } });
+    const manifest = (extra: Record<string, unknown>) => ({
+      name: '@nextblock-cms/ui',
+      dependencies: { 'react-color': '^2.19.3' },
+      peerDependencies: { react: '^19.3.1' },
+      ...extra,
+    });
+    const packed = ['package.json', 'lib/picker.d.ts'];
+    expect(check('ui', dist({ 'package.json': manifest({}), 'lib/picker.d.ts': dts }), packed, nodeModules)).toEqual([
+      "lib/picker.d.ts imports types from \"react-color\", but react-color ships no declarations of its own and the package.json the build writes does not declare @types/react-color, so TypeScript reads those types as any: declare @types/react-color as a dependency",
+    ]);
+    const typed = manifest({ dependencies: { 'react-color': '^2.19.3', '@types/react-color': '^3.0.13' } });
+    expect(check('ui', dist({ 'package.json': typed, 'lib/picker.d.ts': dts }), packed, nodeModules)).toEqual([]);
+    // A package with an index.d.ts of its own needs nothing more.
+    const ownIndex = installed({ 'react-color': { main: 'lib/index.js' }, react: { main: 'index.js' } }, { 'react-color/index.d.ts': 'export {};\n' });
+    expect(check('ui', dist({ 'package.json': manifest({}), 'lib/picker.d.ts': dts }), packed, ownIndex)).toEqual([]);
+    // Undeclared and only installed through a dependency: declaring it as a peer is the usual fix.
+    const viaDependency = dist({ 'package.json': { name: '@nextblock-cms/ui', dependencies: { 'react-color': '^2.19.3' } }, 'lib/picker.d.ts': dts });
+    const reactThroughColor = installed({ 'react-color': { types: './index.d.ts', peerDependencies: { react: '*' } }, react: { main: 'index.js' } });
+    expect(check('ui', viaDependency, packed, reactThroughColor)).toEqual([
+      'lib/picker.d.ts imports types from "react", but react ships no declarations of its own and the package.json the build writes does not declare @types/react, so TypeScript reads those types as any: declare react as a peer (the project then provides its types, as it does @types/react), or @types/react as a dependency',
+    ]);
+  });
+
+  it('counts a declaration file\'s type references and module augmentations, and its sibling imports', () => {
+    const dir = dist({
+      'package.json': { name: '@nextblock-cms/editor', peerDependencies: { '@nextblock-cms/ui': '^0.23.5' } },
+      'lib/env.d.ts': '/// <reference types="vite/client" />\nexport {};\n',
+      'lib/commands.d.ts': "import type { Editor } from '@nextblock-cms/ui';\ndeclare module '@tiptap/core' {\n  interface Commands<R> { x: () => R }\n}\nexport type E = Editor;\n",
+      // An ambient module in a script file declares a module; it needs nothing installed.
+      'lib/shims.d.ts': "declare module 'virtual:nextblock-shim' {\n  const x: string;\n  export default x;\n}\n",
+      'lib/db.d.ts': "import type { Database } from '@nextblock-cms/db/types';\nexport type D = Database;\n",
+    });
+    const packed = ['package.json', 'lib/env.d.ts', 'lib/commands.d.ts', 'lib/shims.d.ts', 'lib/db.d.ts'];
+    expect(check('editor', dir, packed)).toEqual([
+      unresolvedTypes('lib/commands.d.ts', '@tiptap/core', '@tiptap/core'),
+      'lib/db.d.ts imports types from "@nextblock-cms/db/types" but the package.json the build writes does not declare ' +
+        '@nextblock-cms/db, so npm cannot tell which release those types come from: declare it as a dependency or peer',
+      unresolvedTypes('lib/env.d.ts', 'vite/client', 'vite'),
+    ]);
+  });
+
+  it('runs in the release gate (collectDistProblems), with the nodeModulesDir option handed through', () => {
+    const dir = dist({ 'package.json': { name: '@nextblock-cms/ui' }, ...UI_FILES });
+    const problems = collectDistProblems('ui', dir, new Set(UI_PACKED), { nodeModulesDir: NODE_MODULES_NONE() });
+    expect(problems.filter((problem: string) => problem.startsWith('undeclared package: '))).toHaveLength(4);
+    // React installed with a declared dependency: the declaration's react resolves, the runtime import still needs declaring.
+    const withReact = installed({ 'react-color': { types: './index.d.ts', peerDependencies: { react: '*' } }, react: { types: './index.d.ts' } });
+    const declared = dist({ 'package.json': { name: '@nextblock-cms/ui', dependencies: { 'react-color': '^2.19.3', 'class-variance-authority': '^0.7.1' } }, ...UI_FILES });
+    expect(
+      collectDistProblems('ui', declared, new Set(UI_PACKED), { nodeModulesDir: withReact }).filter((problem: string) =>
+        problem.startsWith('undeclared package: ')
+      )
+    ).toEqual([
+      `undeclared package: ${undeclaredRuntime('index.mjs', 'react/jsx-runtime', 'react')}`,
+      `undeclared package: ${undeclaredRuntime('index.mjs', 'react-dom', 'react-dom')}`,
     ]);
   });
 });

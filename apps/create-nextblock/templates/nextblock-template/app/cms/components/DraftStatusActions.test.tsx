@@ -35,6 +35,9 @@ vi.mock('../../actions/visualEditingActions', () => ({
 vi.mock('next/navigation', () => ({ useRouter: () => ({ refresh: mocks.refresh, push: vi.fn(), replace: vi.fn() }) }));
 vi.mock('react-hot-toast', () => ({ toast: mocks.toast }));
 
+// The real dialog, for its overlay's z-index (a static import: an import() of a library makes Nx
+// refuse every static import of it in the app).
+import { Dialog, DialogContent, DialogTitle } from '@nextblock-cms/ui';
 import DraftStatusActions from './DraftStatusActions';
 import {
   NO_CONTENT_DRAFT_ERROR,
@@ -378,5 +381,36 @@ describe('DraftStatusActions after a publish or discard went through', () => {
     });
 
     expect(container.innerHTML).toBe('');
+  });
+});
+
+describe('DraftStatusActions under an open dialog', () => {
+  /** A Tailwind z-index class's value: `z-40` or `z-[1000]`. */
+  function zIndexOf(className: string): number {
+    const match = className.match(/(?:^|\s)z-(?:\[(\d+)\]|(\d+))(?=\s|$)/);
+    if (!match) throw new Error(`no z-index class in "${className}"`);
+    return Number(match[1] ?? match[2]);
+  }
+
+  it("stays under a dialog's overlay: an open block editor covers the bar instead of drawing an unclickable one over it", async () => {
+    // A Radix modal sets pointer-events none on body, so at z-[1000] the bar drew over an open block
+    // editor and nothing could click it.
+    const container = await render(<DraftStatusActions parentId={7} parentType="page" hasDraft />);
+    const bar = container.querySelector<HTMLElement>('[data-nextblock-draft-toolbar]');
+    expect(bar).not.toBeNull();
+
+    await render(
+      <Dialog open>
+        <DialogContent>
+          <DialogTitle>Edit Text</DialogTitle>
+        </DialogContent>
+      </Dialog>
+    );
+    const overlay = [...document.querySelectorAll<HTMLElement>('[data-state="open"]')].find((element) =>
+      element.className.includes('bg-black/80')
+    );
+    expect(overlay).toBeDefined();
+
+    expect(zIndexOf(bar?.className ?? '')).toBeLessThan(zIndexOf(overlay?.className ?? ''));
   });
 });

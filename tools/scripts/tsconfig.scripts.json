@@ -1,0 +1,19 @@
+{
+  // Type-checks the maintainer scripts that run through tsx (which strips types and checks none).
+  // validate-editor-block-schema.ts and verify-custom-block-definitions.ts lived in
+  // apps/nextblock/scripts, inside the app's tsconfig, until the release rehearsal moved them here:
+  // they import monorepo paths, so in the template they broke every scaffold's tsc. No other config
+  // covers tools/scripts. release-rehearsal.test.ts runs `tsc -p` on this file, so the unit job in
+  // security.yml checks them. Named tsconfig.scripts.json, not tsconfig.json: Vite (Oxc) takes its
+  // transform options from the nearest tsconfig.json, and the tests in this folder keep theirs.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "files": ["validate-editor-block-schema.ts", "verify-custom-block-definitions.ts"]
+}

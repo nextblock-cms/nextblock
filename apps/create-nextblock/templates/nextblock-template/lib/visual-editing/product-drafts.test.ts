@@ -22,7 +22,11 @@ import {
   loadProductVisualEditingField,
   saveProductVisualEditingDraftMutation,
 } from "./product-drafts";
-import { classifyProductDraftMeta, planProductDraftOverlayPublish } from "./product-draft-meta";
+import {
+  classifyProductDraftMeta,
+  planProductDraftOverlayPublish,
+  PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR,
+} from "./product-draft-meta";
 import { saveVisualEditingBlockDraftMutation } from "./mutations";
 import type { VisualEditingBlockRequest, VisualEditingProductFieldRequest } from "./types";
 
@@ -52,18 +56,27 @@ const LIVE_PRODUCT_ROW = {
 /**
  * A cookie-client stand-in: `draft` is the product_drafts row (null for none), the products row is
  * LIVE_PRODUCT_ROW (or `live` laid over it), the blocks are [LIVE_BLOCK]. Inserts and updates of
- * product_drafts echo the row and are kept, so a second save reads what the first wrote.
+ * product_drafts echo the row and are kept, so a second save reads what the first wrote; a write
+ * followed by select() answers a list, as supabase-js does. With `publishBeforeFirstUpdate`, the first
+ * product_drafts UPDATE finds the row deleted (a publish committed between the save's read and its
+ * write, or the save waited on the publish's lock) and matches nothing.
  */
-function makeClient(draft: Record<string, unknown> | null, live: Record<string, unknown> = {}) {
+function makeClient(
+  draft: Record<string, unknown> | null,
+  live: Record<string, unknown> = {},
+  options: { publishBeforeFirstUpdate?: boolean } = {}
+) {
   const writes: Array<[string, string, unknown]> = [];
   const productRow: Record<string, unknown> = { ...LIVE_PRODUCT_ROW, ...live };
   let draftRow = draft;
+  let publishPending = Boolean(options.publishBeforeFirstUpdate);
   const client = {
     auth: { getUser: async () => ({ data: { user: { id: "writer-1" } }, error: null }) },
     from: (table: string) => {
       let op = "select";
       let values: Record<string, unknown> = {};
       let columns = "*";
+      let selectedAfterWrite = false;
       const chain: Record<string, unknown> = {};
       const result = () => {
         if (table === "profiles") return { data: { role: "WRITER" }, error: null };
@@ -73,6 +86,11 @@ function makeClient(draft: Record<string, unknown> | null, live: Record<string, 
             return { data: draftRow, error: null };
           }
           if (op === "update") {
+            if (publishPending) {
+              publishPending = false;
+              draftRow = null;
+              return { data: null, error: null };
+            }
             draftRow = { ...(draftRow ?? {}), ...values };
             return { data: draftRow, error: null };
           }
@@ -95,6 +113,7 @@ function makeClient(draft: Record<string, unknown> | null, live: Record<string, 
       };
       chain.select = (selected?: string) => {
         if (op === "select" && typeof selected === "string") columns = selected;
+        if (op !== "select") selectedAfterWrite = true;
         return chain;
       };
       chain.eq = () => chain;
@@ -109,8 +128,14 @@ function makeClient(draft: Record<string, unknown> | null, live: Record<string, 
           return chain;
         };
       }
-      chain.then = (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
-        Promise.resolve(result()).then(resolve, reject);
+      chain.then = (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) => {
+        const settled = result();
+        const listed =
+          op !== "select" && selectedAfterWrite && !Array.isArray(settled.data)
+            ? { ...settled, data: settled.data ? [settled.data] : [] }
+            : settled;
+        return Promise.resolve(listed).then(resolve, reject);
+      };
       return chain;
     },
   };
@@ -173,6 +198,36 @@ describe("a new product draft stages no product row", () => {
     // The overlay carries no slug: the public path comes from the live row.
     expect(mocks.revalidatePath).toHaveBeenCalledWith("/product/pro-plugin");
   });
+
+  it("saves the edit into a new draft when a publish deleted the draft between the save's read and its write", async () => {
+    // The draft the save read held another in-page edit; a publish made it live and deleted the row
+    // (publish_product_draft, migration 02043), so the save's UPDATE matches nothing.
+    const { client, writes } = makeClient(
+      { id: 3, product_id: productId, author_id: "writer-2", meta: { short_description: "Published meanwhile" }, blocks: [LIVE_BLOCK], created_at: "", updated_at: "" },
+      {},
+      { publishBeforeFirstUpdate: true }
+    );
+    mocks.createClient.mockReturnValue(client);
+
+    const result = await saveProductVisualEditingDraftMutation(
+      {
+        parentType: "product",
+        parentId: productId,
+        target: { kind: "product-field", field: "title", input: "plain-text", label: "Product title" },
+      },
+      "Renamed after the publish"
+    );
+
+    expect(result).toEqual({ success: true });
+    // The first UPDATE found no row; the edit went into a new draft (an overlay with this field alone,
+    // the live blocks), not into the published draft's copy.
+    expect(writes.map(([op, table]) => `${op} ${table}`)).toEqual([
+      "update product_drafts",
+      "insert product_drafts",
+      "update product_drafts",
+    ]);
+    expect(writes.at(-1)).toEqual(["update", "product_drafts", { author_id: "writer-1", meta: { title: "Renamed after the publish" } }]);
+  });
 });
 
 describe("saving a description block into a product draft", () => {
@@ -181,6 +236,22 @@ describe("saving a description block into a product draft", () => {
     parentId: productId,
     target: { kind: "top-level", blockId: 5, blockIndex: 0, blockType: "text" },
   };
+
+  it("says the change was not saved when a publish deleted the draft between the save's read and its write", async () => {
+    const { client } = makeClient(
+      { id: 3, product_id: productId, author_id: "writer-2", meta: {}, blocks: [LIVE_BLOCK], created_at: "", updated_at: "" },
+      {},
+      { publishBeforeFirstUpdate: true }
+    );
+    mocks.createClient.mockReturnValue(client);
+
+    // The block ids it names were the published draft's: not replayed into a new draft.
+    await expect(saveVisualEditingBlockDraftMutation(blockRequest, { html_content: "<p>Edited</p>" })).resolves.toEqual({
+      error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR,
+    });
+    expect(PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR).toMatch(/^Not saved: .* published or discarded while you were editing/);
+    expect(mocks.revalidatePath).not.toHaveBeenCalled();
+  });
 
   it("revalidates the live product page: a draft created since 0.23.4 carries no slug", async () => {
     const { client, writes } = makeClient(null);

@@ -104,7 +104,7 @@ Known incomplete or future work:
 | `libs/cortex/src/lib/ai-block-generation.ts` | Inline editor HTML-fragment generation using `generateText`, routing fallback, and lightweight output validation. |
 | `apps/nextblock/app/api/ai/generate-blocks/route.ts` | Compatibility route for inline editor generation. Returns `{ html, credentialSource, modelId }`. |
 | `libs/editor/src/lib/NotionEditor.tsx` | Editor prompt UI and HTML insertion behavior via normal Tiptap parsing. |
-| `apps/nextblock/scripts/validate-editor-block-schema.ts` | Validates editor schema against sample content and emits diagnostics. |
+| `tools/scripts/validate-editor-block-schema.ts` | Validates editor schema against sample content and emits diagnostics (`npm run verify:editor-block-schema`; monorepo only). |
 | `apps/nextblock/scripts/verify-cortex-ai-generate-blocks.ts` | Manual live generation verification script. |
 
 ### Global Agent

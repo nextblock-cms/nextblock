@@ -17,6 +17,7 @@ import {
 } from '@nextblock-cms/ui';
 // Use dependency injection for NotionEditor to avoid SSR/lazy-loading issues
 import { ProductFormValues, productSchema } from '../../../../product-schema';
+import { orderProductGalleryEntries } from '../../../../product-gallery';
 import { useForm } from 'react-hook-form';
 import { ProductMediaManager } from './ProductMediaManager';
 import { SyncFreemiusPricingButton } from './SyncFreemiusPricingButton';
@@ -40,6 +41,7 @@ import {
   buildVariantLabel,
   buildVariantSku,
   extractSelectedTermsByAttribute,
+  isReadableVariantOption,
   resolveAttributeName,
   resolveTermValue,
 } from '../../../../variation-utils';
@@ -168,6 +170,44 @@ function resolveDefaultLanguageId(
 
 type LoadedVariant = NonNullable<ProductFormInitialData['variants']>[number];
 
+/** `value` when it is a list, else an empty one: a hand-written draft can hold anything in a list field. */
+function listOrEmpty<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Loaded variation attributes as the variations editor reads them: the entries that are an object with a
+ * text `attribute_id`, each with its text term ids (none when `term_ids` is not a list). The app's edit page
+ * hands the form such entries only; a hand-written draft can hold anything there, and the editor threw on
+ * mount for a null entry ("Cannot read properties of null (reading 'attribute_id')") or term ids that were
+ * an object or a number (".includes is not a function"), which took the whole edit page down. A term id
+ * that is not text matches no term, and productSchema refuses it, which blocked every autosave. A list the
+ * editor can read as it is loads as it is (the same array and entries).
+ */
+function readVariationAttributes(value: unknown): NonNullable<ProductFormValues['variation_attributes']> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  let changed = false;
+  const readable = (value as unknown[]).flatMap((entry) => {
+    const attribute =
+      entry !== null && typeof entry === 'object' && !Array.isArray(entry) ? (entry as Record<string, unknown>) : null;
+    if (!attribute || typeof attribute.attribute_id !== 'string') {
+      changed = true;
+      return [];
+    }
+    const termIds: unknown[] = Array.isArray(attribute.term_ids) ? attribute.term_ids : [];
+    const textTermIds = termIds.filter((termId): termId is string => typeof termId === 'string');
+    if (termIds === attribute.term_ids && textTermIds.length === termIds.length) {
+      return [attribute];
+    }
+    changed = true;
+    return [{ ...attribute, term_ids: textTermIds }];
+  });
+  return (changed ? readable : value) as NonNullable<ProductFormValues['variation_attributes']>;
+}
+
 /**
  * The options a variant's terms make, as the variations editor builds a combination's: in the
  * attribute list's order, named in the product's language. A term the list lacks makes none.
@@ -202,14 +242,25 @@ function buildOptionsFromAttributes(
  *   their terms) wrote an edit of one into all of them, and 0.23.3 collapsed them on open too;
  * - an empty SKU (the column takes '') gets the one generateVariantDrafts gives a new variant;
  * - missing options, label or key (a CMS draft import's variants) come from the terms and the
- *   attribute list. A term the list lacks stays unnamed, and the autosave shows the refusal.
+ *   attribute list, and so do a label or a key that is not text and a variant's own options unless
+ *   every one is readable (isReadableVariantOption); with no term the list knows, only its own
+ *   readable options stay. A term the list lacks stays unnamed, and the autosave shows the refusal.
+ * A value that is not a list loads no variant: a hand-written draft can hold anything there (the app's
+ * edit page shows the live variants for one, as publish keeps them), and an object or a string threw on
+ * mount, which took the whole edit page down. So did a variant's own options that held null, and, for a
+ * variant whose term the list lacks and whose SKU was empty, an option (an object or a list) whose term
+ * slug was set but not text (an object, a list, a non-zero number, true), or that had no slug (or a false
+ * or 0 one) and a term value that was not text (`{}`, `[]`, `{ term_value: 5 }`, `{ term_slug: 7 }`: the
+ * SKU fill threw when the form mounted in the browser, and with it the edit page, which has no error
+ * boundary); every other option productSchema refuses blocked every autosave, and one without the ids
+ * opened the variations editor with none of the variant's terms selected.
  */
 function repairLoadedVariants(
   variants: LoadedVariant[] | undefined,
   context: { baseSku: string; attributes: ProductAttribute[]; languageCode: string | undefined }
 ): LoadedVariant[] {
   const seenTermSets = new Set<string>();
-  return (variants ?? [])
+  return (Array.isArray(variants) ? variants : [])
     .filter((variant) => Array.isArray(variant?.attribute_term_ids) && variant.attribute_term_ids.length > 0)
     .filter((variant) => {
       const termSet = buildCombinationKey(variant.attribute_term_ids);
@@ -225,19 +276,32 @@ function repairLoadedVariants(
         context.attributes,
         context.languageCode
       );
-      const selectedOptions =
-        Array.isArray(variant.selected_options) && variant.selected_options.length > 0
-          ? variant.selected_options
-          : attributeOptions;
+      // The variant's own options only when every one is readable; otherwise the ones its terms make
+      // (all of them, in the store's names), or its own readable ones when the list knows none of its
+      // terms. Read as its readable options alone, a variant whose option for one attribute was null
+      // would lose that attribute from its options, which the variations editor shows and, when no
+      // variation attribute selects a term, takes its selection from.
+      const ownOptions: unknown[] = Array.isArray(variant.selected_options) ? variant.selected_options : [];
+      const selectedOptions: ProductVariantOption[] =
+        ownOptions.length > 0 && ownOptions.every(isReadableVariantOption)
+          ? ownOptions
+          : attributeOptions.length > 0
+            ? attributeOptions
+            : ownOptions.filter(isReadableVariantOption);
 
+      // A key and a label only as text, as the app's merge reads them: the variations editor prints the
+      // label, and an object there threw ("Objects are not valid as a React child").
       return {
         ...variant,
-        combination_key: variant.combination_key || buildCombinationKey(variant.attribute_term_ids),
+        combination_key:
+          typeof variant.combination_key === 'string' && variant.combination_key
+            ? variant.combination_key
+            : buildCombinationKey(variant.attribute_term_ids),
         sku:
           variant.sku ||
           buildVariantSku(context.baseSku, attributeOptions.length > 0 ? attributeOptions : selectedOptions),
         selected_options: selectedOptions,
-        label: variant.label || buildVariantLabel(selectedOptions),
+        label: typeof variant.label === 'string' && variant.label ? variant.label : buildVariantLabel(selectedOptions),
       };
     });
 }
@@ -318,12 +382,14 @@ function buildProductFormDefaults(
     language_id: languageId,
     translation_group_id:
       initialData?.translation_group_id || translationGroupId || undefined,
-    product_media:
-      initialData?.product_media?.map((productMedia) => ({
-        media_id: productMedia.media_id,
-      })) || [],
-    category_ids: initialData?.category_ids || [],
-    variation_attributes: initialData?.variation_attributes || [],
+    // In the order the gallery manager shows (buildMediaManagerItems): the save writes this list's
+    // order, so a list in another order changed the main image on an edit to any other field.
+    product_media: serializeProductMedia(buildMediaManagerItems(initialData?.product_media)),
+    // Lists only, as for the gallery and the variants: productSchema refuses anything else, which blocked
+    // every autosave with no field to correct it, and the category selector threw on an object. Variation
+    // attributes also only with entries the variations editor can read (readVariationAttributes).
+    category_ids: listOrEmpty(initialData?.category_ids),
+    variation_attributes: readVariationAttributes(initialData?.variation_attributes),
     variants: repairLoadedVariants(initialData?.variants, {
       baseSku: initialData?.sku || '',
       attributes: globalAttributes,
@@ -333,6 +399,10 @@ function buildProductFormDefaults(
       prices: variant.prices || {},
       sale_prices: variant.sale_prices || {},
     })),
+    // The stock the edit page loaded, per SKU: carried unseen to every autosave, so the draft records
+    // what the stock was when this page opened and publishing writes only the quantities changed here.
+    // Only the page knows whether its data is live or a draft's, so the form never computes one.
+    stock_baseline: initialData?.stock_baseline ?? undefined,
   }, currencies);
 
   return {
@@ -342,22 +412,28 @@ function buildProductFormDefaults(
   };
 }
 
+/**
+ * The gallery manager's tiles, in the order it shows them and the form saves them
+ * (orderProductGalleryEntries: by sort_order, the list's order among equals). The tile key is the
+ * media id: a product lists an image once, and a draft entry's own `id` is not a row id. A value that
+ * is not a list draws no tile: a hand-written draft can hold anything there (the app's edit page shows
+ * the live gallery for one, as publish keeps it), and an object or a string threw on mount, which took
+ * the whole edit page down.
+ */
 function buildMediaManagerItems(
   productMedia: ProductFormInitialData['product_media']
 ): ProductMediaManagerItem[] {
-  if (!productMedia) {
+  if (!Array.isArray(productMedia)) {
     return [];
   }
 
-  return productMedia
-    .map((item) => ({
-      id: item.id || item.media_id,
-      media_id: item.media_id,
-      file_path: item.media?.file_path || item.media?.object_key || '',
-      alt: item.media?.alt_text || '',
-      sort_order: item.sort_order ?? 0,
-    }))
-    .sort((left, right) => left.sort_order - right.sort_order);
+  return orderProductGalleryEntries(productMedia).map((item) => ({
+    id: item.media_id,
+    media_id: item.media_id,
+    file_path: item.media?.file_path || item.media?.object_key || '',
+    alt: item.media?.alt_text || '',
+    sort_order: item.sort_order ?? 0,
+  }));
 }
 
 function serializeProductMedia(items: ProductMediaManagerItem[]) {
@@ -604,7 +680,7 @@ export function ProductForm({
   onSeoChange,
 }: ProductFormProps) {
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [showVariations, setShowVariations] = useState(() => Boolean(initialData?.variants?.length));
+  const [showVariations, setShowVariations] = useState(() => listOrEmpty(initialData?.variants).length > 0);
   const currencies = React.useMemo(
     () =>
       currenciesProp
@@ -782,7 +858,7 @@ export function ProductForm({
     // A refused or failed save's message is about values the reset just replaced (a publish, a
     // discard or a description-block save renders the form again): it stayed until the next save.
     setSaveError(null);
-    setShowVariations(Boolean(initialData?.variants?.length));
+    setShowVariations(listOrEmpty(initialData?.variants).length > 0);
     if (hasResetOnceRef.current) {
       setVariationsEditorKey((key) => key + 1);
     }

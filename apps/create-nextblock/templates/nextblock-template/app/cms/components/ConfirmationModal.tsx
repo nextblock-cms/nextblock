@@ -19,6 +19,10 @@ interface ConfirmationModalProps {
   description: string;
   confirmText?: string;
   cancelText?: string;
+  /** More content between the description and the buttons (the media delete's usage list). */
+  children?: React.ReactNode;
+  /** Keeps the confirm button disabled (while the dialog is still loading what it shows). */
+  confirmDisabled?: boolean;
 }
 
 export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
@@ -29,6 +33,8 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
   description,
   confirmText = 'Confirm',
   cancelText = 'Cancel',
+  children,
+  confirmDisabled = false,
 }) => {
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -37,11 +43,12 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
+        {children}
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>
             {cancelText}
           </Button>
-          <Button onClick={onConfirm}>
+          <Button onClick={onConfirm} disabled={confirmDisabled}>
             {confirmText}
           </Button>
         </DialogFooter>

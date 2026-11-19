@@ -35,6 +35,26 @@ class FakeDb {
     return new FakeQuery(this, table);
   }
 
+  /**
+   * public.product_revision_content (migration 02043), which getFullProductContent reads: the meta
+   * columns, the blocks by order, and a commerce section (the price and stock are enough here; the
+   * real shape is pinned by tools/scripts/product-draft-publish.db.test.ts).
+   */
+  async rpc(name: string, args: Row) {
+    if (name !== 'product_revision_content') return { data: null, error: { code: 'PGRST202', message: `no ${name}` } };
+    const product = (this.tables['products'] ?? []).find(row => String(row.id) === String(args['p_product_id']));
+    if (!product) return { data: null, error: null };
+    const meta = Object.fromEntries(
+      ['title', 'slug', 'language_id', 'status', 'meta_title', 'meta_description', 'custom_canonical', 'published_at', 'short_description', 'description_json']
+        .map(column => [column, product[column] ?? null])
+    );
+    const blocks = (this.tables['blocks'] ?? [])
+      .filter(row => String(row.product_id) === String(product.id))
+      .sort((a, b) => a.order - b.order || a.id - b.id)
+      .map(row => ({ language_id: row.language_id, block_type: row.block_type, content: row.content, order: row.order }));
+    return { data: { meta, blocks, commerce: { price: product.price ?? null, stock: product.stock ?? null } }, error: null };
+  }
+
   /** Enforces the real unique constraint so version-collision handling is actually exercised. */
   violatesUnique(table: string, row: Row): boolean {
     const parentColumn = REVISION_UNIQUE_KEYS[table];
@@ -498,6 +518,26 @@ describe("products", () => {
     expect(result).toMatchObject({ success: true });
     expect(db.tables['products'][0]!.title).toBe("Widget");
     expect(db.tables['product_drafts']).toHaveLength(0);
+  });
+
+  it("records the product as it now is after a restore: the restored wording, today's prices and stock", async () => {
+    // Version 1 recorded a price of 4900; the product sells at 5900 now. A restore replays the meta
+    // and the blocks, never the commerce section, so the new snapshot must not claim 4900 came back.
+    db.tables['product_revisions'] = [
+      {
+        id: 1, product_id: productId, version: 1, revision_type: "snapshot", author_id: null,
+        content: { ...productContent, commerce: { price: 4900, stock: 2 } },
+      },
+    ];
+    db.tables['products'][0] = { id: productId, version: 2, ...productMeta, title: "Renamed", price: 5900, stock: 7 };
+
+    await expect(restoreProductToVersion(productId, 1, "user-1")).resolves.toMatchObject({ success: true, version: 3 });
+
+    const recorded = db.tables['product_revisions'].find(r => r.version === 3)!;
+    expect(recorded.revision_type).toBe("snapshot");
+    expect(recorded.content.meta.title).toBe("Widget");
+    expect(recorded.content.commerce).toEqual({ price: 5900, stock: 7 });
+    expect(db.tables['products'][0]!.price).toBe(5900);
   });
 });
 

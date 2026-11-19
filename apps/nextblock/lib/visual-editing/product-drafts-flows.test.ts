@@ -6,6 +6,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  * chains they use, so each flow is one sequence of real calls. These pin what the verify round 6
  * probes found (verify-P6C: D, L1, L2, R1; the integration walk: R1, R2) and the round 7 ones
  * (verify-P7C: VP-B, VP-E, VP-F, VP-J, VP-Q, V8).
+ *
+ * The publish itself is one call to `publish_product_draft` (migration 02043), which this database
+ * answers the way the function behaves: in one step (it holds the products and draft row locks for its
+ * whole transaction, so nothing interleaves with it), refusing a draft that is gone (NBP01), that
+ * changed since the server action read it (NBP02) or whose product changed (NBP03); then the overlay
+ * fields, the blocks replaced, a revision, the draft deleted. What the real function does inside, two
+ * real sessions included, is tools/scripts/product-draft-publish.db.test.ts; this file drives the
+ * server actions around it, step by step.
  */
 
 type Row = Record<string, any>;
@@ -14,21 +22,21 @@ const db = vi.hoisted(() => ({
   tables: { products: [] as Row[], product_drafts: [] as Row[], blocks: [] as Row[], profiles: [] as Row[] },
   nextId: 100,
   userId: 'admin-1',
-  /** getFullProductContent's calls wait on these in turn while `gateEnabled` (the overlap flows). */
-  gates: [] as Array<Promise<void>>,
-  gateCalls: 0,
-  gateEnabled: false,
-  /** Each blocks DELETE in turn waits on its entry, when it has one (the overlap flows). */
-  deleteGates: [] as Array<Promise<void> | undefined>,
-  blocksDeleteCalls: 0,
+  /** Each publish_product_draft call in turn waits on its entry before it runs, when it has one. */
+  rpcGates: [] as Array<Promise<void> | undefined>,
+  rpcCalls: 0,
+  /** Each product_drafts UPDATE in turn waits on its entry, when it has one (a save held at its write). */
+  draftUpdateGates: [] as Array<Promise<void> | undefined>,
+  draftUpdateCalls: 0,
   /** Seconds past 2026-11-14T12:00Z: each product_drafts UPDATE stamps the next one as its updated_at. */
   clock: 0,
+  /** Revisions publish_product_draft recorded: [product id, content after]. */
+  revisions: [] as Array<[string, Row]>,
   /** When set, getProduct() answers this error: the live read failing. */
   getProductError: null as string | null,
   getProduct: vi.fn(),
-  updateProduct: vi.fn(),
+  rpc: vi.fn(),
   syncProductSaleCouponToFreemius: vi.fn(),
-  createProductRevision: vi.fn(),
   revalidatePath: vi.fn(),
 }));
 
@@ -49,9 +57,74 @@ function project(row: Row, columns: string) {
   return picked;
 }
 
+/** The next updated_at, as the database's now() moves on. */
+function tick() {
+  db.clock += 1;
+  return new Date(Date.UTC(2026, 10, 14, 12, 0, db.clock)).toISOString();
+}
+
+/** A PostgREST error answer for a function RAISE with this SQLSTATE. */
+function raised(code: string, message: string) {
+  return { data: null, error: { code, message, details: null, hint: null } };
+}
+
+/**
+ * publish_product_draft (migration 02043) as it behaves, in one synchronous step: no await inside, so
+ * nothing interleaves with it, as nothing interleaves with the real one's transaction.
+ */
+function publishProductDraftFunction(args: Row) {
+  const product = db.tables.products.find((row) => row.id === args.p_product_id);
+  if (!product) return raised('NBP05', 'Product not found.');
+  const draft = db.tables.product_drafts.find((row) => row.product_id === args.p_product_id);
+  if (!draft) return raised('NBP01', 'No draft exists for this product.');
+  if (String(draft.id) !== String(args.p_draft_id) || draft.updated_at !== args.p_draft_updated_at) {
+    return raised('NBP02', 'The draft changed after it was read.');
+  }
+  if ((product.updated_at ?? null) !== (args.p_product_updated_at ?? null)) {
+    return raised('NBP03', 'The product changed after it was read.');
+  }
+
+  if (args.p_values) {
+    // The product values themselves are the database test's; the title is enough to see them land.
+    product.title = args.p_values.title;
+    product.updated_at = tick();
+  } else if (args.p_overlay && Object.keys(args.p_overlay).some((key) => ['title', 'short_description', 'description_json'].includes(key))) {
+    for (const key of ['title', 'short_description', 'description_json']) {
+      if (key in args.p_overlay) product[key] = clone(args.p_overlay[key]);
+    }
+    product.updated_at = tick();
+  }
+
+  db.tables.blocks = db.tables.blocks.filter((row) => row.product_id !== product.id);
+  for (const block of args.p_blocks as Row[]) {
+    db.tables.blocks.push({ id: db.nextId++, page_id: null, post_id: null, product_id: product.id, ...clone(block) });
+  }
+  db.revisions.push([product.id, { title: product.title, blocks: clone(db.tables.blocks.filter((row) => row.product_id === product.id)) }]);
+  db.tables.product_drafts = db.tables.product_drafts.filter((row) => row !== draft);
+
+  return {
+    data: {
+      product_id: product.id,
+      previous_slug: product.slug,
+      slug: product.slug,
+      payment_provider: product.payment_provider ?? 'stripe',
+      wrote_values: Boolean(args.p_values),
+      revision: { recorded: true, version: db.revisions.length + 1 },
+    },
+    error: null,
+  };
+}
+
 function makeClient() {
   return {
     auth: { getUser: async () => ({ data: { user: db.userId ? { id: db.userId } : null }, error: null }) },
+    async rpc(name: string, args: Row) {
+      db.rpc(name, clone(args));
+      const gate = db.rpcGates[db.rpcCalls++];
+      if (gate) await gate;
+      if (name !== 'publish_product_draft') return raised('PGRST202', `Could not find the function public.${name}`);
+      return publishProductDraftFunction(args);
+    },
     from(table: keyof typeof db.tables) {
       let op: 'select' | 'insert' | 'update' | 'delete' = 'select';
       let values: any = null;
@@ -88,10 +161,7 @@ function makeClient() {
           for (const row of found) {
             Object.assign(row, clone(values));
             // on_product_drafts_update (02003): BEFORE UPDATE sets updated_at to now(), whatever the write says.
-            if (table === 'product_drafts') {
-              db.clock += 1;
-              row.updated_at = new Date(Date.UTC(2026, 10, 14, 12, 0, db.clock)).toISOString();
-            }
+            if (table === 'product_drafts') row.updated_at = tick();
           }
           return { data: returning ? found.map((row) => project(row, columns)) : null, error: null };
         }
@@ -147,7 +217,8 @@ function makeClient() {
           return { data: (Array.isArray(data) ? data : [])[0] ?? null, error: null };
         },
         then(resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) {
-          const gate = table === 'blocks' && op === 'delete' ? db.deleteGates[db.blocksDeleteCalls++] : undefined;
+          const gate =
+            table === 'product_drafts' && op === 'update' ? db.draftUpdateGates[db.draftUpdateCalls++] : undefined;
           return Promise.resolve(gate)
             .then(() => run())
             .then(resolve, reject);
@@ -167,17 +238,14 @@ vi.mock('@nextblock-cms/db/server', () => ({
   getServiceRoleSupabaseClient: () => client,
   getSsgSupabaseClient: () => client,
 }));
-vi.mock('@nextblock-cms/ecommerce/product-actions', () => ({
+vi.mock('@nextblock-cms/ecommerce/product-actions', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@nextblock-cms/ecommerce/product-actions')>()),
   // The products row with its joins, as getProduct() reads it.
   getProduct: async (_client: unknown, productId: string) => {
     db.getProduct(productId);
     if (db.getProductError) return { data: null, error: { message: db.getProductError } };
     const row = db.tables.products.find((product) => product.id === productId);
     return row ? { data: clone(row), error: null } : { data: null, error: { message: 'not found' } };
-  },
-  updateProduct: async (...args: unknown[]) => {
-    db.updateProduct(...args);
-    return args[1];
   },
 }));
 vi.mock('@nextblock-cms/ecommerce/freemius-coupons', () => ({
@@ -186,27 +254,11 @@ vi.mock('@nextblock-cms/ecommerce/freemius-coupons', () => ({
 vi.mock('../auth/twoFactor', () => ({
   evaluateTwoFactor: async () => ({ status: 'satisfied', userId: db.userId, mfaType: null }),
 }));
-vi.mock('../../app/cms/revisions/utils', () => ({
-  getFullProductContent: async (productId: string) => {
-    if (db.gateEnabled) {
-      const gate = db.gates[db.gateCalls++];
-      if (gate) await gate;
-    }
-    const product = db.tables.products.find((row) => row.id === productId);
-    return { meta: { title: product?.title }, blocks: db.tables.blocks.filter((row) => row.product_id === productId) };
-  },
-}));
-vi.mock('../../app/cms/revisions/service', () => ({
-  createProductRevision: async (...args: unknown[]) => {
-    db.createProductRevision(...args);
-    return { success: true, version: 2, recorded: true };
-  },
-}));
 
 import {
-  PRODUCT_DESCRIPTION_BLOCKS_CHANGED_WARNING,
+  PRODUCT_CHANGED_DURING_PUBLISH_ERROR,
+  PRODUCT_DRAFT_CHANGED_DURING_PUBLISH_ERROR,
   PRODUCT_DRAFT_IN_PAGE_EMPTIED_DESCRIPTION_ERROR,
-  PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR,
   applyProductDraftToProductRecord,
   buildPoisonedProductDraftInPageSaveError,
   getProductDraft,
@@ -214,7 +266,7 @@ import {
   publishProductVisualEditingDraft,
   saveProductVisualEditingDraftMutation,
 } from './product-drafts';
-import { describeSkippedProductDraftOverlay } from './product-draft-meta';
+import { NO_PRODUCT_DRAFT_ERROR, describeSkippedProductDraftOverlay } from './product-draft-meta';
 import {
   buildPoisonedProductDraftPublishError,
   findPoisonedProductDraftFields,
@@ -286,22 +338,22 @@ beforeEach(() => {
   vi.clearAllMocks();
   db.nextId = 100;
   db.userId = 'admin-1';
-  db.gates = [];
-  db.gateCalls = 0;
-  db.gateEnabled = false;
-  db.deleteGates = [];
-  db.blocksDeleteCalls = 0;
+  db.rpcGates = [];
+  db.rpcCalls = 0;
+  db.draftUpdateGates = [];
+  db.draftUpdateCalls = 0;
   db.clock = 0;
+  db.revisions = [];
   db.getProductError = null;
 });
 
-/** Lets the publishes in flight run until `condition` holds (or fails the test). */
+/** Lets the flows in flight run until `condition` holds (or fails the test). */
 async function until(condition: () => boolean) {
   for (let i = 0; i < 200 && !condition(); i += 1) await new Promise((resolve) => setTimeout(resolve, 2));
   expect(condition()).toBe(true);
 }
 
-/** A gate a flow opens when it chooses (db.gates, db.deleteGates). */
+/** A gate a flow opens when it chooses (db.rpcGates, db.draftUpdateGates). */
 function gate() {
   let open: () => void = () => undefined;
   const closed = new Promise<void>((resolve) => {
@@ -423,170 +475,119 @@ function seedOverlap(liveBlockIds: number[], draftTexts = ['Draft A', 'Draft B']
 }
 
 /**
- * Two publishes of one draft. Each claims the draft (an UPDATE that matches only the row as it read
- * it; 02003's trigger moves updated_at) after its checks and before its first write: round 7 instead
- * took a publish's rows back out after a short delete, which could remove the only set (VP-F, V8).
+ * Two publishes of one draft, and a publish against a save. 0.23.4 claimed the draft (an UPDATE on its
+ * id and updated_at) and then sent each write as its own request: a publish that read the draft after
+ * another's claim still swapped the blocks (the description twice, V8), and a save that landed after the
+ * claim was reported saved and deleted with the draft. Since migration 02043 the claim, the writes and
+ * the draft delete are one call under the draft's row lock.
  */
-describe('two publishes of the same draft that overlap', () => {
-  it('R1: both read the draft before either writes: the first publishes, the second finds the draft claimed and writes nothing', async () => {
-    seedOverlap([5, 6]);
+describe('two publishes of the same draft, and a publish against a save', () => {
+  it.each([
+    ['with live description blocks', [5, 6]],
+    ['with no live description blocks (VP-E)', [] as number[]],
+  ])('R1/VP-B/VP-F/V8 %s: both read the draft first, the first publishes, the second finds it gone and writes nothing', async (_label, liveBlockIds) => {
+    seedOverlap(liveBlockIds);
     const first = gate();
     const second = gate();
-    db.gates = [first.closed, second.closed];
-    db.gateEnabled = true;
+    db.rpcGates = [first.closed, second.closed];
 
-    // Both read the draft and the live ids [5, 6], then wait before writing anything.
+    // Both read the draft and the live row, then wait before their call.
     const firstPublish = publishProductVisualEditingDraft(P1);
     const secondPublish = publishProductVisualEditingDraft(P1);
-    await until(() => db.gateCalls === 2);
+    await until(() => db.rpcCalls === 2);
     first.open();
-    const firstResult = await firstPublish;
-    second.open();
-    const secondResult = await secondPublish;
-
-    expect(firstResult).toEqual({ success: true });
-    expect(secondResult).toEqual({ success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR });
-    expect(PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR).toBe(
-      'Another publish of this draft started first, or the draft changed since it was read: nothing was published.'
-    );
-    // The first publish's rows only: the second inserted none.
-    expect(liveBlocks().map((row) => [row.id, row.content.html_content])).toEqual([
-      [100, '<p>Draft A</p>'],
-      [101, '<p>Draft B</p>'],
-    ]);
-    expect(live().title).toBe('Pro plugin X');
-    expect(db.createProductRevision).toHaveBeenCalledTimes(1);
-    expect(db.tables.product_drafts).toEqual([]);
-  });
-
-  it("VP-B: the first waits at its delete while the second runs: the second still writes nothing, and History holds the first's blocks only", async () => {
-    seedOverlap([5, 6]);
-    const first = gate();
-    const second = gate();
-    const firstDelete = gate();
-    db.gates = [first.closed, second.closed];
-    db.gateEnabled = true;
-    db.deleteGates = [firstDelete.closed];
-
-    const firstPublish = publishProductVisualEditingDraft(P1);
-    const secondPublish = publishProductVisualEditingDraft(P1);
-    await until(() => db.gateCalls === 2);
-    first.open();
-    // The first claims the draft, renames the product, inserts its rows and waits before deleting [5, 6].
-    await until(() => db.blocksDeleteCalls === 1);
-    second.open();
-    const secondResult = await secondPublish;
-    firstDelete.open();
-    const firstResult = await firstPublish;
-
-    expect(secondResult).toEqual({ success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR });
-    expect(firstResult).toEqual({ success: true });
-    expect(liveBlocks().map((row) => row.content.html_content)).toEqual(['<p>Draft A</p>', '<p>Draft B</p>']);
-    // Round 7 recorded the other publish's rows too: an after-state of four blocks for a page of two.
-    expect(db.createProductRevision).toHaveBeenCalledTimes(1);
-    const after = db.createProductRevision.mock.calls[0][3] as { blocks: Row[] };
-    expect(after.blocks.map((row) => row.id)).toEqual([100, 101]);
-  });
-
-  it('VP-E: a product with no live description blocks gets one set, not two', async () => {
-    seedOverlap([], ['Draft A']);
-    const first = gate();
-    const second = gate();
-    db.gates = [first.closed, second.closed];
-    db.gateEnabled = true;
-
-    const firstPublish = publishProductVisualEditingDraft(P1);
-    const secondPublish = publishProductVisualEditingDraft(P1);
-    await until(() => db.gateCalls === 2);
-    first.open();
-    const firstResult = await firstPublish;
-    second.open();
-    const secondResult = await secondPublish;
-
-    expect(firstResult).toEqual({ success: true });
-    expect(secondResult).toEqual({ success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR });
-    expect(liveBlocks().map((row) => row.content.html_content)).toEqual(['<p>Draft A</p>']);
-  });
-
-  it('VP-F: a publish that reads the draft while the first waits between its insert and its delete finds it gone by its claim: one set', async () => {
-    seedOverlap([5, 6]);
-    const secondRead = gate();
-    const firstDelete = gate();
-    // The first publish's content read passes at once; the second's waits.
-    db.gates = [Promise.resolve(), secondRead.closed];
-    db.gateEnabled = true;
-    db.deleteGates = [firstDelete.closed];
-
-    const firstPublish = publishProductVisualEditingDraft(P1);
-    // The first claimed the draft, inserted 100 and 101 and waits before deleting [5, 6].
-    await until(() => db.blocksDeleteCalls === 1);
-    const secondPublish = publishProductVisualEditingDraft(P1);
-    // The second read the claimed draft and the live ids [5, 6, 100, 101], and waits before its claim.
-    await until(() => db.gateCalls === 2);
-    firstDelete.open();
     const firstResult = await firstPublish;
     const revalidationsByFirst = db.revalidatePath.mock.calls.length;
-    secondRead.open();
+    second.open();
     const secondResult = await secondPublish;
 
     expect(firstResult).toEqual({ success: true });
-    expect(secondResult).toEqual({ success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR });
-    // Round 7's take-back left no description blocks and no draft here.
-    expect(liveBlocks().map((row) => [row.id, row.content.html_content])).toEqual([
-      [100, '<p>Draft A</p>'],
-      [101, '<p>Draft B</p>'],
-    ]);
+    // The draft bar reads this as "already published elsewhere": it hides and reloads.
+    expect(secondResult).toEqual({ success: false, error: NO_PRODUCT_DRAFT_ERROR });
+    // One set of description blocks, whatever the live ones were: 0.23.4 could leave two.
+    expect(liveBlocks().map((row) => row.content.html_content)).toEqual(['<p>Draft A</p>', '<p>Draft B</p>']);
+    expect(live().title).toBe('Pro plugin X');
+    expect(db.revisions).toHaveLength(1);
     expect(db.tables.product_drafts).toEqual([]);
+    // The refused one refreshed nothing.
     expect(db.revalidatePath.mock.calls.length).toBe(revalidationsByFirst);
-    expect(db.createProductRevision).toHaveBeenCalledTimes(1);
   });
 
-  it("V8: a publish that reads the draft after the first claimed it is not stopped; its delete removes the first one's row, and it keeps its own, with a warning", async () => {
-    seedOverlap([5], ['Draft']);
-    const firstDelete = gate();
-    const secondDelete = gate();
-    db.deleteGates = [firstDelete.closed, secondDelete.closed];
+  it('a publish that reads the draft after another one committed finds no draft at all', async () => {
+    seedOverlap([5]);
+    await expect(publishProductVisualEditingDraft(P1)).resolves.toEqual({ success: true });
 
-    const firstPublish = publishProductVisualEditingDraft(P1);
-    // The first claimed the draft, inserted 100 and waits before deleting [5].
-    await until(() => db.blocksDeleteCalls === 1);
-    const secondPublish = publishProductVisualEditingDraft(P1);
-    // The second read the claimed draft and the live ids [5, 100], claimed it in turn, inserted 101 and waits.
-    await until(() => db.blocksDeleteCalls === 2);
-    firstDelete.open();
-    const firstResult = await firstPublish;
-    secondDelete.open();
-    const secondResult = await secondPublish;
-
-    expect(firstResult).toEqual({ success: true });
-    // Its delete of [5, 100] removed only 100: round 7 then took 101 back out and left no blocks.
-    expect(secondResult).toEqual({ success: true, warning: PRODUCT_DESCRIPTION_BLOCKS_CHANGED_WARNING });
-    expect(liveBlocks().map((row) => [row.id, row.content.html_content])).toEqual([[101, '<p>Draft</p>']]);
-    expect(db.tables.product_drafts).toEqual([]);
+    await expect(publishProductVisualEditingDraft(P1)).resolves.toEqual({ success: false, error: NO_PRODUCT_DRAFT_ERROR });
+    expect(db.rpc).toHaveBeenCalledTimes(1);
+    expect(liveBlocks()).toHaveLength(2);
   });
 
   it('an in-page save made while a publish was reading is kept: the publish finds the draft changed and writes nothing', async () => {
     seedOverlap([5], ['Draft']);
-    const read = gate();
-    db.gates = [read.closed];
-    db.gateEnabled = true;
+    const call = gate();
+    db.rpcGates = [call.closed];
 
     const publishing = publishProductVisualEditingDraft(P1);
-    // The publish read the draft and the live ids, and waits before its claim.
-    await until(() => db.gateCalls === 1);
+    // The publish read the draft and the live row, and waits before its call.
+    await until(() => db.rpcCalls === 1);
     db.userId = 'writer-1';
     await expect(saveProductVisualEditingDraftMutation(fieldRequest('short_description'), 'Saved meanwhile')).resolves.toEqual({
       success: true,
     });
     db.userId = 'admin-1';
-    read.open();
+    call.open();
 
-    await expect(publishing).resolves.toEqual({ success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR });
-    // Without the claim the publish went on and removed the draft with the edit in it.
+    await expect(publishing).resolves.toEqual({ success: false, error: PRODUCT_DRAFT_CHANGED_DURING_PUBLISH_ERROR });
     expect(draftMeta()).toEqual({ title: 'Pro plugin X', short_description: 'Saved meanwhile' });
     expect(live().title).toBe('Pro plugin');
     expect(liveBlocks().map((row) => row.id)).toEqual([5]);
-    expect(db.createProductRevision).not.toHaveBeenCalled();
+    expect(db.revisions).toEqual([]);
+  });
+
+  it('an in-page save that lands after the publish committed goes into a new draft: it is never reported saved and deleted', async () => {
+    seedOverlap([5], ['Draft']);
+    const write = gate();
+    db.draftUpdateGates = [write.closed];
+
+    // The save read the draft and waits at its UPDATE (as one waits on the publish's row lock).
+    db.userId = 'writer-1';
+    const saving = saveProductVisualEditingDraftMutation(fieldRequest('short_description'), 'Typed during the publish');
+    await until(() => db.draftUpdateCalls === 1);
+
+    // The publish runs to the end: the draft (title "Pro plugin X") is live and deleted.
+    db.userId = 'admin-1';
+    await expect(publishProductVisualEditingDraft(P1)).resolves.toEqual({ success: true });
+    expect(live().title).toBe('Pro plugin X');
+    expect(db.tables.product_drafts).toEqual([]);
+
+    // Its UPDATE matches no row now; the save puts the edit into a new draft instead.
+    db.userId = 'writer-1';
+    write.open();
+    await expect(saving).resolves.toEqual({ success: true });
+    expect(db.tables.product_drafts).toHaveLength(1);
+    expect(draftMeta()).toEqual({ short_description: 'Typed during the publish' });
+    // The new draft starts from the published blocks, and the next publish makes the edit live.
+    expect(db.tables.product_drafts[0].blocks.map((block: Row) => block.content.html_content)).toEqual(['<p>Draft</p>']);
+    db.userId = 'admin-1';
+    await expect(publishProductVisualEditingDraft(P1)).resolves.toEqual({ success: true });
+    expect(live()).toMatchObject({ title: 'Pro plugin X', short_description: 'Typed during the publish' });
+  });
+
+  it('a product written between the read and the call is refused, the draft kept, nothing written', async () => {
+    seedOverlap([5], ['Draft']);
+    const call = gate();
+    db.rpcGates = [call.closed];
+
+    const publishing = publishProductVisualEditingDraft(P1);
+    await until(() => db.rpcCalls === 1);
+    // A Cortex field update (which stamps updated_at) lands meanwhile.
+    Object.assign(live(), { short_description: 'Written by Cortex', updated_at: '2026-11-14T12:30:00.000Z' });
+    call.open();
+
+    await expect(publishing).resolves.toEqual({ success: false, error: PRODUCT_CHANGED_DURING_PUBLISH_ERROR });
+    expect(live()).toMatchObject({ title: 'Pro plugin', short_description: 'Written by Cortex' });
+    expect(draftMeta()).toEqual({ title: 'Pro plugin X' });
+    expect(liveBlocks().map((row) => row.id)).toEqual([5]);
   });
 });
 
@@ -722,7 +723,7 @@ describe('an old draft publish refuses (an earlier version autosaved it over a r
       success: false,
       error: buildPoisonedProductDraftPublishError(fields),
     });
-    expect(db.updateProduct).not.toHaveBeenCalled();
+    expect(db.rpc).not.toHaveBeenCalled();
     expect(db.syncProductSaleCouponToFreemius).not.toHaveBeenCalled();
     expect(live().price).toBe(30000);
   });
@@ -787,10 +788,12 @@ describe('an old draft publish refuses (an earlier version autosaved it over a r
 
     db.userId = 'admin-1';
     await expect(publishProductVisualEditingDraft(P1)).resolves.toEqual({ success: true });
-    expect(db.updateProduct).toHaveBeenCalledWith(
-      client,
-      P1,
-      expect.objectContaining({ price: 349, prices: { USD: 349 }, description_json: IN_PAGE })
+    expect(db.rpc).toHaveBeenCalledWith(
+      'publish_product_draft',
+      expect.objectContaining({
+        // Minor units: the function receives what buildProductDraftPublishValues makes of the $349.
+        p_values: expect.objectContaining({ price: 34900, prices: { USD: 34900 }, description_json: IN_PAGE }),
+      })
     );
   });
 
@@ -845,7 +848,7 @@ describe('an old draft publish refuses (an earlier version autosaved it over a r
     const published = (await publishProductVisualEditingDraft(P1)) as { success: boolean; error: string };
     expect(published).toEqual({ success: false, error: buildPoisonedProductDraftPublishError(fields, { meta: original }) });
     expect(published.error).toMatch(/^Not published\. This draft was saved by a CMS import in an earlier version of NextBlock/);
-    expect(db.updateProduct).not.toHaveBeenCalled();
+    expect(db.rpc).not.toHaveBeenCalled();
   });
 
   it('refuses an in-page save into an unmarked product-values draft when the live product cannot be read, and the description load fails too', async () => {

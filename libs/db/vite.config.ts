@@ -2,6 +2,8 @@ import { defineConfig } from 'vite';
 import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
+// eslint-disable-next-line @nx/enforce-module-boundaries -- a build-time helper every lib config shares, not a library dependency
+import { rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
 const packageJsonPath = path.resolve(__dirname, 'package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
@@ -15,6 +17,19 @@ const utilsVersion = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../util
 if (typeof utilsVersion !== 'string' || !/^\d+\.\d+\.\d+/.test(utilsVersion)) {
   throw new Error("libs/utils/package.json has no version for db's peerDependencies");
 }
+// Every bare import stays external (rolldownOptions.external below), and through 0.23.5 the
+// manifest declared none of the third-party ones, so they resolved only because the app installs
+// them: the Supabase clients (@supabase/supabase-js, @supabase/ssr) and the `server-only` guard
+// as dependencies, and next (next/headers, next/cache, next/server) as an optional peer. Optional,
+// because create-nextblock depends on this package for its supabase/ folder alone, and npm installs
+// a required peer: Next.js on every `npm create nextblock`. tools/scripts/verify-lib-dist.js check
+// 15 refuses an undeclared import.
+const dependencies = rootPackageRanges(['@supabase/ssr', '@supabase/supabase-js', 'server-only']);
+const peerDependencies = {
+  '@nextblock-cms/utils': `^${utilsVersion}`,
+  ...rootPackageRanges(['next']),
+};
+const peerDependenciesMeta = { next: { optional: true } };
 
 export default defineConfig({
   root: __dirname,
@@ -43,7 +58,8 @@ export default defineConfig({
       // here, never shipped): without this exclude its declaration landed in
       // dist/libs/db/supabase/functions/, which verify-lib-dist.js check 13 refuses. The copy step
       // (tools/scripts/copy-db-supabase.cjs) also empties dist/libs/db/supabase before it copies.
-      exclude: ['vite.config.ts', 'src/supabase/**'],
+      // The tests are left out too: through 0.23.5 four `*.test.d.ts` files shipped.
+      exclude: ['vite.config.ts', 'src/supabase/**', 'src/**/*.test.ts', 'src/**/*.spec.ts'],
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/db',
@@ -53,7 +69,9 @@ export default defineConfig({
           main: 'index.cjs.js',
           module: 'index.es.js',
           types: 'index.d.ts',
-          peerDependencies: { '@nextblock-cms/utils': `^${utilsVersion}` },
+          dependencies,
+          peerDependencies,
+          peerDependenciesMeta,
           // Enables tree-shaking so a client importing the browser `createClient` from
           // '@nextblock-cms/db' does NOT drag in the server module (next/headers + the
           // typeof-window guard). db uses a runtime guard, not a 'use client'/'use server'

@@ -9,7 +9,8 @@
  * - `product-values`: the product form's autosave (`updateProductAction` → `saveProductDraftMeta`
  *   in libs/ecommerce) or a CMS import in draft mode (`lib/cms-transfer/server.ts`).
  *   `ProductFormValues` in MAJOR units (49.00, `prices: { USD: 49 }`, variant prices likewise),
- *   which `updateProduct()` multiplies by 100. Both writers always store a `variants` array
+ *   which publish multiplies by 100 (`buildProductDraftPublishValues`, as `updateProduct()` does).
+ *   Both writers always store a `variants` array
  *   (`sanitizeProductFormValuesForStoreManagedCurrencies` returns one; the import sets it in
  *   draft mode) and never an `id` (`productSchema` has none, and zod drops unknown keys).
  * - `legacy-row-snapshot`: a draft created before 0.23.4 by a block edit or an in-page edit.
@@ -26,9 +27,9 @@
  *   rewritten from a legacy snapshot also carries PRODUCT_DRAFT_LEGACY_FIELDS_KEY and
  *   PRODUCT_DRAFT_LEGACY_CREATED_AT_KEY, which no classification reads and no products write takes.
  *
- * Publishing any of them needs an ADMIN past the second factor (`requireCmsAdmin()`).
- * `product-values` goes through `updateProduct()`; the other two write the overlay fields only,
- * never a price, a variant or the schedule.
+ * Publishing any of them needs an ADMIN past the second factor (`requireCmsAdmin()`), and is one
+ * call to `publish_product_draft` (migration 02043). `product-values` are its `p_values`; the other
+ * two send the overlay fields only, never a price, a variant or the schedule.
  *
  * Product values written since 0.23.4 carry PRODUCT_DRAFT_FORM_MARKER_KEY. Before that the edit page
  * showed a legacy row snapshot as form values (cents as dollars, no variants, gallery or
@@ -43,7 +44,7 @@ export type ProductDraftMetaKind = 'product-values' | 'legacy-row-snapshot' | 'o
  * autosave (`saveProductDraftMeta` in libs/ecommerce, which keeps its own copy of the literal because
  * a 'use server' module exports only async functions) and a CMS import in draft mode
  * (lib/cms-transfer/server.ts). A product-values meta without it was written by an earlier version.
- * It never reaches updateProduct() or the products row (`withoutProductDraftFormMarker`).
+ * It never reaches the publish or the products row (`withoutProductDraftFormMarker`).
  * product-draft-marker.test.ts pins the lib's literal to this one.
  */
 export const PRODUCT_DRAFT_FORM_MARKER_KEY = 'form_version';
@@ -64,7 +65,7 @@ export function withProductDraftFormMarker<T extends Record<string, unknown>>(me
   return { ...meta, [PRODUCT_DRAFT_FORM_MARKER_KEY]: PRODUCT_DRAFT_FORM_MARKER_VALUE };
 }
 
-/** `values` without the marker, for updateProduct() and the form. */
+/** `values` without the marker, for the publish and the form. */
 export function withoutProductDraftFormMarker<T extends Record<string, unknown>>(values: T): T {
   if (!hasOwn(values, PRODUCT_DRAFT_FORM_MARKER_KEY)) {
     return values;
@@ -215,8 +216,9 @@ function parseTimestamp(value: unknown): number | null {
  * Whether the products row is unchanged since the draft was created: `products.updated_at` at or
  * before `product_drafts.created_at`. No trigger maintains products.updated_at. The app writes that
  * change a product's title, short description or description set it: the product RPC and
- * updateProduct's follow-up writes, Cortex's field update, a live CMS import, the data migrations
- * 02019 / 02020 / 02032, an overlay publish, and since 0.23.4 the Freemius sync's upsert (which
+ * updateProduct's follow-up writes, a draft publish (publish_product_draft, 02043, with the product
+ * values or the overlay fields), Cortex's field update, a live CMS import, the data migrations
+ * 02019 / 02020 / 02032, and since 0.23.4 the Freemius sync's upsert (which
  * rewrites a synced product's title and short description), a revision restore, Copy from language
  * and Cortex's raw database tools (execute_database_mutation and execute_database_action_plan, on
  * every products update or upsert, whatever `updated_at` the call carries). A live CMS import, a
@@ -478,6 +480,17 @@ export const PRODUCT_PUBLISH_ADMIN_ONLY_NOTE = 'An administrator publishes produ
  */
 export const NO_PRODUCT_DRAFT_ERROR = 'No draft exists for this product.';
 export const NO_CONTENT_DRAFT_ERROR = 'No draft exists for this content.';
+
+/**
+ * What a CMS or storefront block edit of a product answers when its draft row was deleted between its
+ * read and its write: by a publish (publish_product_draft, migration 02043, deletes the draft in the
+ * transaction that makes it live, so a save that waited on its lock finds the row gone) or a discard,
+ * in another tab or by another user. The block ids the edit names belonged to that draft, so it is
+ * not replayed into a new one: nothing was saved. (The in-page field editor and the product form's
+ * autosave save into a new draft instead.)
+ */
+export const PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR =
+  "Not saved: this product's draft was published or discarded while you were editing (in another tab or by another user). Reload the page and make the change again.";
 
 /**
  * The warning a publish that skipped a legacy snapshot's overlay fields (or the snapshot fields an

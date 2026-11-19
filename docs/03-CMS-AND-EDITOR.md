@@ -227,6 +227,140 @@ bundled image goes into `BUNDLED_PUBLIC_MEDIA_KEYS`;
 behind it, and on a bundled key that a forward migration or the sandbox reset writes
 without listing it.
 
+## Deleting media
+
+Media is deleted only from the media library (`app/cms/media/actions.ts`), never by a
+save: a product save or publish only unlinks an image dropped from the gallery
+(docs/09 → "Product Drafts"). The single delete (`deleteMediaItem`) and the bulk delete
+(`deleteMultipleMediaItems`) check the staff actor and its second factor
+(`getCmsActor()`), delete the media row as the caller (RLS: an ADMIN any row, a WRITER
+their own), then remove only the storage objects that row owns (`ownedMediaStorageKeys`)
+and no other row still lists (`media_storage_keys_in_use`, 02028).
+
+Both answer `{ error }` or `{ success }`: the single delete shows it in a toast, the bulk
+delete in a banner, and the library re-renders in place with its folder and search. Until
+the 0.23.4 follow-up a refused single delete redirected to `/cms/media?error=…`, which
+nothing on the page reads, so the library lost its folder and search and showed nothing.
+
+### Where an image is used
+
+Before anyone deletes, the library says where each file is used: `public.media_usage`
+(migration 02045, service role only; docs/04) looks for the media id and every storage key the
+row owns (`ownedMediaStorageKeys`) in:
+
+- foreign keys: product galleries, variant images, page and post feature images, logos;
+- documents: blocks (nested sections and their backgrounds, text block HTML, testimonial and
+  custom block fields), page, post and product drafts, product descriptions, site settings (the
+  social image, branding and CSS rows; never the secret rows, which 02038 keeps for the service
+  role and the function skips by the same rule), custom block definitions, navigation links,
+  redirect destinations, category descriptions, themes, profile pictures, partner storefronts, and
+  revisions.
+
+The app reads it through `findMediaUsage` (`lib/media/media-usage.ts`) and describes it with
+`lib/media/media-usage-format.ts`:
+
+- The single delete's confirmation lists the places, each linked to the screen that edits it,
+  keeps its button disabled until the answer comes, and reads "Delete anyway" when the file is
+  used or the check failed.
+- "Delete Selected" no longer deletes at once: its dialog shows which selected files are used
+  and offers "Delete only the unused" or "Delete all".
+- The "Unused files" view (`/cms/media?usage=unused`, kept through folder and search changes)
+  lists the files nothing uses, with "Delete all N unused".
+- The media edit page shows "Where this file is used".
+
+A revision counts as history, not as a use: a file only revisions name is listed as unused, with a
+note that restoring such a revision would show a missing image. Drafts count as uses.
+
+"Delete only the unused" and "Delete all unused" call `deleteUnusedMediaItems`, which checks the
+usage again on the server, whatever the page showed, and deletes only what is still unused,
+through the bulk delete's own path (500 files a call; the view sends larger lists in batches). A
+failed or partial lookup deletes nothing and lists nothing as unused: an image is never called
+unused on an answer that did not come. The function answers with the service role, so a WRITER is
+shown no name, record id or link for a place their own session cannot read
+(`withoutAdminOnlyLabels`): a partner storefront, a redirect (an inactive one is ADMIN-only, and the
+answer does not say which) and an ADMIN-tier setting (any key outside
+`WRITER_READABLE_SITE_SETTING_KEYS`, the WRITER branches of `site_settings_read_policy`, which
+`media-usage-format.test.ts` holds to the latest migration). The counts stay whole.
+
+A row's keys are search strings its author chose: any staff member can insert a media row of their
+own over the Data API with whatever `object_key` and `variants` they like. So `findMediaUsage` sends
+only keys the upload routes could mint (`isAcceptableClientObjectKey` with the media extension:
+`[A-Za-z0-9._/-]` only, at most 512 characters), no two spellings of one key (equal ignoring case)
+and at most 17 a row (a real upload has 6 to 8), and the function matches a key only as a whole
+token, never as a substring (a substring search let the author probe documents they cannot read, and
+one row listing thousands of spellings made every lookup that included it time out). A row that
+breaks any of those rules is asked about by id alone and answered with one more use, "Its storage
+key could not be searched; check where it is used before deleting" (kind `unchecked_key`, summary
+"Could not be fully checked"): it is never listed as unused, "Delete unused" never deletes it, and
+the rest of the batch is answered as usual. To remove one, check where it is used by hand, then use
+"Delete anyway".
+
+Limits. It is a lookup, not a proof: a link from another site, an email already sent or a social
+network's cached preview cannot be seen, and the dialogs say so. A key glued into a longer word
+(`uploads/a.png.bak`, `xuploads/a.png`) is not found, and a key at the bucket root matches that file
+name under any URL (counted as a use, the safe direction). An image placed between the check and the
+delete is deleted anyway. The lookup reads every content table each time, so the library runs it on
+demand: in a dialog, the "Unused files" view and the edit page, never on the plain library.
+
+The function reads each document as JSON text: a jsonb column's text, and a plain text column
+(a navigation link, a redirect, a profile picture URL, a product's short description, a category
+description, a theme's CSS) through `to_json`. There a line break or another control character in a
+string is an escape (`\n`, `\t`, or `\u` and four hex digits), and a backslash is written twice.
+Before cutting runs the function turns each such escape, and each escaped backslash, into a space,
+reading from the left so that an escaped backslash stays one character. Without that pass (found in
+the review before 02045 shipped) the escape's letter glued to the key after it: a key on its own line
+in a text field was not found, so its file was listed as unused and "Delete unused" deleted it. Ids
+need no such pass: their pattern has no word boundaries, so an escape's letter before one is skipped,
+even `b` or `f`, which are hex digits.
+
+A backslash right before a slash is the one exception: a stored `\/` reads as `/`. JSON that escapes
+its slashes, such as JSON-LD pasted into a text block the way PHP's `json_encode` writes it
+(`https:\/\/cdn.example.com\/uploads\/a.png`), puts a backslash before every slash, and the pass
+above cut the run at each one, so `uploads/a.png` was never found there and "Delete unused" deleted
+its file (found by the review of that pass). Text with escaped slashes now names a key exactly where
+the same text without those backslashes does. That is not only more matches: a key directly followed
+by `\/` and more key characters is part of a longer run and is not found, as `uploads/a.png/x`
+already is not. Any other backslash still separates: in a stored `\\/` the first one does. In the
+JSON text a stored `\/` is two backslashes and a slash, and one plain `replace()` turns those three
+characters into `/` before the escape pass. jsonb and `to_json` never write `\/`, so the backslashes
+before a slash there always come in pairs, and the replace takes only the last pair.
+
+`security-verify.sql` section 45 plants a key after a newline, a carriage return, a tab, a backspace,
+a form feed and U+0001, an id after a backspace and a form feed, a key after a backslash and a
+newline, a key starting with `n` right after a backslash in a text block and in a navigation link, a
+key written with escaped slashes in JSON-LD in a text block and in a redirect target, and keys right
+before two and three stored backslashes and a slash, and requires each one found.
+
+Its cost grows with the length of the documents. A run of key characters is cut only into the
+suffixes that could equal a key sent: none longer than the longest key (at most 512 characters) or
+deeper than the deepest one, each run split once, and no run at all when no key was sent. Building
+every suffix cost the square of a run's length, and people outside the staff write documents it
+reads: one profile picture URL of 20,000 slashes, which anyone who signs up can set, made every
+lookup take tens of seconds (36 to 85 s on local replays), far past the Data API's 8 s statement
+timeout, so the "Unused files" view listed nothing and "Delete unused" deleted nothing.
+`security-verify.sql` section 45 now plants that document and requires an answer within a 4 s
+statement timeout (it takes milliseconds). Measured on a local replay: about 30 ms for the seeded
+site, and about 4 to 5 s for a 57 MB site whose 7,000 documents name 1,000 files 140,000 times
+(14 s before the suffix bound; less where documents name fewer files), of which the escape pass
+takes about 0.3 s and the escaped-slash replace about 0.1 s.
+
+What stays, all linear in the length of the documents: a site like that 57 MB one leaves less than
+twice the headroom under 8 s, and one very large document can still time the lookup out (dense short
+runs of key characters cost about 0.85 µs a byte, a document of control characters up to about
+1.3 µs a stored byte, each one a six-character escape in the JSON text the function reads); the
+lookup then fails, so nothing is listed as unused and nothing is deleted. Any staff member can
+insert a media row of their own with a minted-looking key of 512 characters and 254 segments, which
+raises the work of every lookup that row is in: about 4 to 4.5 µs a byte of documents made of runs
+of 300 segments.
+
+A key right after an escape whose letter is a key character (a `\b`, `\f`, `\n`, `\r`, `\t` or `\u`
+escape) inside a JSON string stored as text is still not found. JSON-LD pasted into a text block
+writes a line break inside its own strings as a backslash and an `n`, and that `n` glues to a key
+right after it (`\nuploads/a.png` gives the run `nuploads/a.png`); a slash written there as a `\u`
+escape cuts a key the same way. After an escaped quote, backslash or slash the key is found. Reading
+a stored backslash and a letter as a separator would lose keys that are found today: in text like
+`C:\nature.png`, the file `nature.png`.
+
 ## Feature images and the social preview image
 
 Two different images decide what a page shows at the top and what a shared link

@@ -6,7 +6,7 @@
 //   npm run update -- --yes        don't prompt (implied by CI=true)
 //   npm run update -- --force      run even when already on the latest version
 //   npm run update -- --skip-db    code + dependencies only
-//   npm run update -- --db-only    pending migrations only
+//   npm run update -- --db-only    schema only: pending migrations and the database grants
 //
 // It detects which of the four supported installs it is running inside and picks the
 // right code channel for it:
@@ -27,7 +27,9 @@
 //
 // Schema always moves last, after dependencies are installed, so the newest migrations
 // are on disk before they are applied. Migrations are forward-only and each one is
-// applied and recorded inside a single transaction — see ./lib/migrate-core.mjs.
+// applied and recorded inside a single transaction — see ./lib/migrate-core.mjs. The
+// schema step runs on the engine the code update brought (loadUpdatedMigrationEngine), and
+// re-applies the database grants even when nothing is pending (reapplyDatabaseGrants).
 
 import { spawnSync } from 'node:child_process';
 import {
@@ -87,6 +89,17 @@ const TEMPLATE_SUBPATH = path.join('templates', 'nextblock-template');
  * conflict there and hold the migrations, over a test nothing in a standalone project builds or
  * runs. A root file added here later has the same problem when earlier releases shipped different
  * copies of it.
+ *
+ * instrumentation.ts and .browserslistrc were left off until 0.23.6, so a project scaffolded before
+ * them never received them: without instrumentation.ts the CMS second-factor gate is not registered
+ * on a cold server, and without .browserslistrc Next compiles for its own default browsers (Safari
+ * 16.4 and up, among others) instead of NextBlock's list (Safari 15.4 and up). Neither carries
+ * the proxy.test.ts risk today: a project that lacks one gets it copied in, instrumentation.ts has
+ * had one version since it first shipped (2026-10-21), and .browserslistrc has not changed since
+ * 2026-06-08, so the merge either copies it (a project still on the release it was scaffolded with)
+ * or leaves the project's copy alone (upstream unchanged since the project's recorded release).
+ * The update that brings 0.23.6 still runs the previous updater, so they arrive with
+ * `npm run update -- --force` after it or with the next release's update (docs/13 → 0.23.6).
  */
 const FRAMEWORK_PATHS = [
   'app',
@@ -100,10 +113,12 @@ const FRAMEWORK_PATHS = [
   'docker',
   'docs',
   'proxy.ts',
+  'instrumentation.ts',
   'index.d.ts',
   'next-env.d.ts',
   'postcss.config.js',
   'eslint.config.mjs',
+  '.browserslistrc',
   'Dockerfile',
   'docker-compose.yml',
   '.dockerignore',
@@ -943,7 +958,9 @@ const EDITOR_NAME_RE = /^(?:[\w$-]+(?:\.[\w$-]+)*\/)*[\w$-]+(?:\.[\w$-]+)*$/;
 const NOT_AN_EDITOR_RE = /\.(?:test|spec|story|stories|d)$/i;
 /**
  * A line git merge-file writes to open or close a conflict hunk (`<<<<<<< your version`,
- * `>>>>>>> NextBlock 0.23.5`).
+ * `>>>>>>> NextBlock 0.23.5`). In JavaScript a multiline `$` matches before a CR as well as an LF,
+ * so this and CONFLICT_SEPARATOR_RE find a CRLF file's markers too; git grep's `$` does not
+ * (UNRESOLVED_CONFLICT_PATTERN).
  */
 const CONFLICT_MARKER_RE = /^(?:<{7}|>{7})(?: |$)/m;
 /**
@@ -1511,7 +1528,21 @@ async function updateCodeViaNpm(install, flags) {
 /* -------------------------------------------------------------- schema --- */
 
 /**
- * Unresolved merge conflicts left in the project by a previous `npm run update`.
+ * The line `git merge-file` writes to open a hunk under mergeTemplates()' first label, as the
+ * pattern unresolvedConflicts() hands `git grep -E`. merge-file writes it with CRLF when the three
+ * files it merges (the project's and the two published copies) use CRLF, and git grep keeps the CR in
+ * the line, which `$` alone never matched: through 0.23.5 an update that left a conflict in a CRLF
+ * file held nothing and applied the migrations over it. About half the template files
+ * create-nextblock has published are CRLF (this file and tools/lib/migrate-core.mjs among them), so
+ * in a standalone project that was a conflict in any of those, on any system. The hold also keeps the
+ * reload from importing a tools/lib/migrate-core.mjs the merge left conflicted (updateSchema). `\r` is
+ * a JavaScript escape, so git receives a literal CR; capture() starts git with no shell in between.
+ */
+const UNRESOLVED_CONFLICT_PATTERN = '^<<<<<<< your version\r?$';
+
+/**
+ * Unresolved merge conflicts left in the project by a previous `npm run update`: the tracked files
+ * holding UNRESOLVED_CONFLICT_PATTERN, whatever their line endings.
  *
  * The marker label is the one mergeTemplates() passes to `git merge-file`, so this cannot
  * be confused with a conflict from the developer's own git work. Used to refuse the schema
@@ -1521,7 +1552,7 @@ function unresolvedConflicts(projectRoot) {
   // Anchored to the start of a line: that is where git merge-file writes the marker, and
   // anchoring stops the match from firing on source that merely *mentions* the string —
   // this file being the first example.
-  const res = capture('git', ['grep', '-lE', '^<<<<<<< your version$', '--', '.'], {
+  const res = capture('git', ['grep', '-lE', UNRESOLVED_CONFLICT_PATTERN, '--', '.'], {
     cwd: projectRoot,
   });
   // exit 1 with no output is git grep's "no matches"; anything else (not a repo, etc.) is
@@ -1530,7 +1561,89 @@ function unresolvedConflicts(projectRoot) {
   return res.stdout.split('\n').filter(Boolean);
 }
 
-async function updateSchema(install, core, flags) {
+/**
+ * The calls the schema step and main() make on the migration engine. The update to a release runs
+ * its schema step on that release's tools/lib/migrate-core.mjs (loadUpdatedMigrationEngine), so an
+ * updater calls the engine of the release after it: every release's engine keeps each name an
+ * earlier updater lists here (update.test.mjs pins them), and one that lacks a name is not used.
+ */
+const MIGRATION_ENGINE_CALLS = ['loadEnvFiles', 'describeBackend', 'collectMigrations', 'readAppliedVersions', 'applyMigrations', 'runSql'];
+
+/** The migration engine's path in this install, for messages. */
+const migrationEngineFile = (install) =>
+  install.layout === 'monorepo' ? 'apps/nextblock/tools/lib/migrate-core.mjs' : 'tools/lib/migrate-core.mjs';
+
+/** An error on one line: its message, after its name when that says more than "Error" (a SyntaxError). */
+const errorLine = (err) =>
+  err instanceof Error ? (err.name && err.name !== 'Error' ? `${err.name}: ${err.message}` : err.message) : String(err);
+
+/**
+ * The migration engine for the schema step of a run that updated the code.
+ *
+ * main() imports tools/lib/migrate-core.mjs before the code update, which replaces it (the template
+ * sync in a standalone project, the git merge in the monorepo), and Node keeps a module once loaded.
+ * Through 0.23.5 the update that brought a release therefore applied that release's migrations with
+ * the previous release's engine and post-apply grant pass: GRANTS_SQL grants EXECUTE on every public
+ * function to the API roles and then revokes only what its API_ROLE_REVOKE_SQL lists, so a function
+ * the new release revokes stayed callable until the next build hook run (after the update to 0.23.6,
+ * anon could call publish_product_draft). The query gives the file a module URL of its own, so Node
+ * reads it from disk again; it stays one string literal, like every import() here. The new engine
+ * reads process.env, which the first engine's loadEnvFiles filled, and its own loadEnvFiles
+ * overrides nothing.
+ *
+ * A file that does not load, or lacks a call in MIGRATION_ENGINE_CALLS, leaves the engine loaded
+ * first, marked not current: the schema step then applies pending migrations with it, as earlier
+ * updaters did, and never runs a grant pass of its own with it.
+ */
+async function loadUpdatedMigrationEngine(loaded, install) {
+  const file = migrationEngineFile(install);
+  try {
+    const engine = await import('./lib/migrate-core.mjs?after-update');
+    const missing = MIGRATION_ENGINE_CALLS.filter((name) => typeof engine[name] !== 'function');
+    if (missing.length > 0) throw new Error(`it exports no ${missing.join(', ')}`);
+    await engine.loadEnvFiles(install.root);
+    info(C.dim(`Using the migration engine as this update left it (${file}).`));
+    return { core: engine, current: true };
+  } catch (err) {
+    warn(`Could not load ${file} as this update left it: ${errorLine(err)}`);
+    info(
+      'This run keeps the copy loaded before the update, with the database grants of the version you updated from. ' +
+        `Run ${C.cyan('npm run update')} again to apply this version's grants (if that file fails to load again, fix it first).`,
+    );
+    return { core: loaded, current: false };
+  }
+}
+
+/**
+ * The post-apply grant pass with nothing to apply: GRANTS_SQL grants the API roles their blanket
+ * privileges on public, then takes back what the trigger-function revoke and API_ROLE_REVOKE_SQL
+ * list, as the build hook does on every production build. Through 0.23.5 an update ran it only
+ * after applying a migration, so the grants of an update that applied a release's migrations with
+ * the previous engine (above) waited for the build hook; now running `npm run update` again closes
+ * that gap. Not under --check, which writes nothing, and not with an engine the code update
+ * replaced: its pass is the previous version's, and would hand back what a newer pass took away.
+ */
+async function reapplyDatabaseGrants(core, current, flags) {
+  if (flags.check) {
+    info(C.dim('Would re-apply the database grants.'));
+    return { ok: true, applied: 0 };
+  }
+  if (!current) {
+    warn('The database grants were not re-applied: the migration engine this update brought did not load (above).');
+    return { ok: true, applied: 0 };
+  }
+  // Given no file, applyMigrations applies nothing and then runs the grant pass, as it does after
+  // every apply on both backends (and has PostgREST reload its schema).
+  const result = await core.applyMigrations([]);
+  if (!result.ok) {
+    fail(`Could not re-apply the database grants: ${result.error}`);
+    return { ok: false, applied: 0 };
+  }
+  good('Re-applied the database grants: the blanket grants to the API roles, then the revokes this version lists.');
+  return { ok: true, applied: 0 };
+}
+
+async function updateSchema(install, core, flags, { codeChanged = false } = {}) {
   step('Database schema');
 
   // Never migrate over an unresolved merge. The developer has not yet decided what their
@@ -1560,6 +1673,19 @@ async function updateSchema(install, core, flags) {
     return { ok: true, applied: 0 };
   }
 
+  // After the hold, which finds an engine file the merge left conflicted whatever its line endings,
+  // so the reload never imports one, and outside Docker, whose stack runs its own migrations and no
+  // blanket grant (docker/migrate/run-migrations.sh). update.test.mjs fails if the reload moves above
+  // either. The result names the engine used, which main() keeps for the update alert.
+  const engine = codeChanged ? await loadUpdatedMigrationEngine(core, install) : { core, current: true };
+  return { ...(await applyPendingMigrations(install, engine, flags)), core: engine.core };
+}
+
+/**
+ * Apply what is pending on `core`, which then runs the grant pass; with nothing pending, run the
+ * grant pass alone (reapplyDatabaseGrants). `current` is false for an engine the code update replaced.
+ */
+async function applyPendingMigrations(install, { core, current }, flags) {
   const backend = core.describeBackend();
   if (backend.kind === 'none') {
     warn(`No database connection is configured (${backend.detail}).`);
@@ -1611,7 +1737,7 @@ async function updateSchema(install, core, flags) {
 
   if (pending.length === 0) {
     good(`Schema is up to date (${files.length} migration(s) recorded).`);
-    return { ok: true, applied: 0 };
+    return reapplyDatabaseGrants(core, current, flags);
   }
 
   info(`${C.bold(String(pending.length))} pending migration(s):`);
@@ -1631,7 +1757,11 @@ async function updateSchema(install, core, flags) {
     info('The failed migration rolled back; re-run once the cause is fixed.');
     return { ok: false, applied: result.applied };
   }
-  good(`Applied ${result.applied} migration(s).`);
+  good(
+    current
+      ? `Applied ${result.applied} migration(s) and re-applied the database grants.`
+      : `Applied ${result.applied} migration(s), with the database grants of the version you updated from (above).`,
+  );
   return { ok: true, applied: result.applied };
 }
 
@@ -1680,7 +1810,7 @@ ${C.bold('npm run update')} — bring this NextBlock install up to date.
   ${C.cyan('npm run update -- --yes')}        never prompt
   ${C.cyan('npm run update -- --force')}      run even when already on the latest version
   ${C.cyan('npm run update -- --skip-db')}    code + dependencies only
-  ${C.cyan('npm run update -- --db-only')}    apply pending migrations only
+  ${C.cyan('npm run update -- --db-only')}    schema only: pending migrations and the database grants
 
   On Windows PowerShell the bare ${C.cyan('--')} is stripped and the flag never arrives;
   call this script directly instead, e.g. ${C.cyan('node apps/nextblock/tools/update.mjs --db-only')}.
@@ -1696,6 +1826,11 @@ async function main() {
   info(describeInstall(install));
   info(C.dim(install.root));
 
+  // Loaded here for loadEnvFiles, --check and a run that changes no code. The code update below may
+  // replace tools/lib/migrate-core.mjs, so a run that updates the code loads it again for the schema
+  // step (loadUpdatedMigrationEngine): a release's migrations then run with that release's engine and
+  // post-apply grant pass, API_ROLE_REVOKE_SQL included. The schema step hands back the engine it
+  // used, for the update alert below.
   let core;
   try {
     core = await import('./lib/migrate-core.mjs');
@@ -1793,9 +1928,10 @@ async function main() {
   let schemaOk = true;
   let schemaDeferred = false;
   if (!flags.skipDb) {
-    const res = await updateSchema(install, core, flags);
+    const res = await updateSchema(install, core, flags, { codeChanged: codeChanged && !flags.check });
     schemaOk = res.ok;
     schemaDeferred = res.deferred === true;
+    if (res.core) core = res.core;
   }
 
   // Only after an update that fully landed. A no-op run must not clear a banner advertising

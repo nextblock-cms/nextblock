@@ -4,30 +4,35 @@ import type { Json } from "@nextblock-cms/db";
 import { createClient } from "@nextblock-cms/db/server";
 // Deep subpaths: the product page imports this module, and the '/server' barrel would make
 // every CMS commerce page's client components part of that route.
-import { getProduct, updateProduct } from "@nextblock-cms/ecommerce/product-actions";
+import {
+  buildProductDraftPublishValues,
+  getProduct,
+  type ProductDraftPublishValues,
+} from "@nextblock-cms/ecommerce/product-actions";
 import { syncProductSaleCouponToFreemius } from "@nextblock-cms/ecommerce/freemius-coupons";
 import { getCmsActor, requireCmsAdmin } from "../auth/cms-actor";
 import { getCurrentUserCanEdit, normalizeDraftBlocks } from "./draft-content";
 import {
   classifyProductDraftMeta,
-  describeProductDraftOverlayFields,
   describeSkippedProductDraftOverlay,
   hasProductDraftFormMarker,
   legacyProductDraftMetaAsOverlay,
   NO_PRODUCT_DRAFT_ERROR,
   planProductDraftOverlayPublish,
+  PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR,
   PRODUCT_DRAFT_OVERLAY_FIELDS,
   resolveProductDraftOverlayDisplay,
   withoutRecordedLegacySnapshotField,
   type ProductDraftOverlayField,
   type ProductDraftOverlayPublishPlan,
 } from "./product-draft-meta";
-import { getFullProductContent } from "../../app/cms/revisions/utils";
-import { createProductRevision } from "../../app/cms/revisions/service";
 import {
   buildPoisonedProductDraftPublishError,
+  buildUnreadableProductDraftPublishError,
   completeProductDraftValues,
   findPoisonedProductDraftFields,
+  findUnreadableProductDraftValues,
+  listProductStockEntries,
   type PoisonedProductDraftField,
 } from "../../app/cms/products/productFormData";
 import {
@@ -43,6 +48,9 @@ import type {
 } from "./types";
 
 type SupabaseAny = ReturnType<typeof createClient>;
+
+/** The form values buildProductDraftPublishValues takes (libs/ecommerce ProductFormValues). */
+type ProductFormValues = Parameters<typeof buildProductDraftPublishValues>[0];
 
 export interface ProductDraftRow {
   id: number;
@@ -235,183 +243,123 @@ async function readLiveProductOverlayRow(
   return data as LiveProductOverlayRow;
 }
 
-/** PostgREST answers at most max_rows (1000) rows a request and drops the rest without an error. */
-const LIVE_BLOCK_ID_PAGE_SIZE = 1000;
-
 /**
- * The ids of the product's live description blocks: the rows a publish replaces, captured before
- * anything is written, a page at a time.
+ * A description block as publish_product_draft (migration 02043) writes it: the draft's row without
+ * its ids and timestamps, which the database gives the new row.
  */
-async function readLiveProductBlockIds(supabase: SupabaseAny, productId: string): Promise<number[]> {
-  const ids: number[] = [];
-
-  for (let from = 0; ; from += LIVE_BLOCK_ID_PAGE_SIZE) {
-    const { data, error } = await (supabase as any)
-      .from("blocks")
-      .select("id")
-      .eq("product_id", productId)
-      .order("id", { ascending: true })
-      .range(from, from + LIVE_BLOCK_ID_PAGE_SIZE - 1);
-
-    if (error) {
-      throw new Error(
-        `Failed to read the product's description blocks: ${error.message}. Nothing was published; the draft is kept.`
-      );
-    }
-
-    const rows: unknown[] = Array.isArray(data) ? data : [];
-    for (const row of rows) {
-      const id = isRecord(row) ? Number(row.id) : Number.NaN;
-      if (Number.isFinite(id)) {
-        ids.push(id);
-      }
-    }
-
-    if (rows.length < LIVE_BLOCK_ID_PAGE_SIZE) {
-      return ids;
-    }
-  }
-}
-
-type ProductBlockInsert = {
-  page_id: null;
-  post_id: null;
-  product_id: string;
+type ProductBlockPayload = {
   language_id: number;
   block_type: string;
   content: Json;
   order: number;
 };
 
-/** The numeric ids of the rows a write returned (`.select("id")`). */
-function readReturnedRowIds(data: unknown): number[] {
-  return (Array.isArray(data) ? data : [])
-    .map((row: unknown) => (isRecord(row) ? Number(row.id) : Number.NaN))
-    .filter((id: number) => Number.isFinite(id));
-}
-
-/** Takes the rows a publish just inserted back out (best effort): the error message, or null. */
-async function deleteInsertedProductBlocks(
-  supabase: SupabaseAny,
-  productId: string,
-  insertedIds: readonly number[]
-): Promise<string | null> {
-  const { error } = await (supabase as any)
-    .from("blocks")
-    .delete()
-    .eq("product_id", productId)
-    .in("id", [...insertedIds]);
-
-  return error ? String(error.message) : null;
+/** `updated_at` as a products row read returned it (null when the column is NULL or absent). */
+function readUpdatedAt(row: unknown): string | null {
+  return isRecord(row) && typeof row.updated_at === "string" ? row.updated_at : null;
 }
 
 /**
- * What replaceProductBlocks reports: `error` when the swap stopped part way (publish keeps the draft
- * for another try), `warning` when it finished but some of the captured rows were already gone, or
- * null.
+ * A SKU whose stock publish_product_draft (migration 02044) did not set to the draft's quantity as a
+ * change from its baseline, in its answer's `stock_adjusted`: `loaded` the draft's baseline (the stock its
+ * change started from), `entered` the draft's quantity, `current` the SKU's quantity just before the
+ * publish (null when unknown), `published` now live. The draft's figures may be another editor's autosave
+ * or a hand-written draft's.
+ * - `moved`: the change was applied to a quantity that had moved since it started, so `published` is not
+ *   `entered` (loaded 5, typed 15, one sold meanwhile: 14).
+ * - `already_live`: the quantity already was `entered`, so the SKU was left as it was (`published` =
+ *   `current` = `entered`): right for a change already published (a draft started again after its
+ *   publish), wrong for one meant to come on top of what moved the stock (loaded 10, 9 typed for a
+ *   damaged unit, one sold meanwhile: 9 stays where 8 was meant). The rule stays on purpose, and the
+ *   warning names every SKU it decides (review 2026-11-18).
  */
-type ProductBlockSwapOutcome = { error: string } | { warning: string } | null;
-
-/** A publish's warning when its blocks DELETE removed fewer rows than it captured (replaceProductBlocks). */
-export const PRODUCT_DESCRIPTION_BLOCKS_CHANGED_WARNING =
-  "Published, but some of the description blocks this publish replaced had already been removed while it ran (by another publish, a revision restore, Copy from language, a live CMS import or a direct database write). Check the product's description blocks: the page may show some twice.";
-
-/**
- * Replaces the product's live description blocks (`liveBlockIds`, read before any write) with the
- * draft's rows. supabase-js sends each statement as its own request, with no transaction around
- * them, so the order keeps the product whole: the draft's rows are inserted first, then only the
- * captured ids are deleted. A failed insert deletes nothing (the live blocks stay). A failed delete
- * removed nothing, so the rows just inserted are taken back out (best effort) and the page does not
- * show both. The delete returns the rows it removed: fewer than it was given means another writer
- * removed some of them while this publish ran (a revision restore, Copy from language, a live CMS
- * import, a direct database write such as Cortex's raw database tools, or a publish of the same draft
- * that read it after this one claimed it: publishProductVisualEditingDraft). In-page and CMS block
- * edits only ever write the draft, and Cortex's block tools only update or insert rows.
- * The rows just inserted stay then, and publish succeeds with a warning to check the blocks: taking
- * them back out could leave none, when that other writer was a publish of the same draft whose new
- * rows this one captured and removed, and keeping them can at worst show the description twice. An
- * empty draft list just deletes the captured ids.
- */
-async function replaceProductBlocks(
-  supabase: SupabaseAny,
-  productId: string,
-  liveBlockIds: readonly number[],
-  blocks: readonly ProductBlockInsert[]
-): Promise<ProductBlockSwapOutcome> {
-  let insertedIds: number[] = [];
-
-  if (blocks.length > 0) {
-    const { data, error } = await (supabase as any).from("blocks").insert(blocks as any).select("id");
-
-    if (error) {
-      return {
-        error: `The draft's description blocks could not be published (${error.message}); the live ones are unchanged.`,
-      };
-    }
-
-    insertedIds = readReturnedRowIds(data);
-  }
-
-  if (liveBlockIds.length === 0) {
-    return null;
-  }
-
-  const { data: removedRows, error: deleteError } = await (supabase as any)
-    .from("blocks")
-    .delete()
-    .eq("product_id", productId)
-    .in("id", [...liveBlockIds])
-    .select("id");
-
-  if (deleteError) {
-    if (blocks.length === 0) {
-      return {
-        error: `The live description blocks could not be removed (${deleteError.message}); they are unchanged.`,
-      };
-    }
-
-    if (insertedIds.length < blocks.length) {
-      return {
-        error: `The live description blocks could not be removed (${deleteError.message}), and the draft's new rows could not be identified to take them back: the product page shows both until you publish again.`,
-      };
-    }
-
-    const cleanupError = await deleteInsertedProductBlocks(supabase, productId, insertedIds);
-    if (cleanupError) {
-      return {
-        error: `The live description blocks could not be removed (${deleteError.message}), and neither could the draft's new rows (${cleanupError}): the product page shows both until you publish again.`,
-      };
-    }
-
-    return {
-      error: `The live description blocks could not be removed (${deleteError.message}); the draft's new rows were taken back out, so the live ones are unchanged.`,
-    };
-  }
-
-  if (readReturnedRowIds(removedRows).length < liveBlockIds.length) {
-    return { warning: PRODUCT_DESCRIPTION_BLOCKS_CHANGED_WARNING };
-  }
-
-  return null;
+export interface AdjustedProductStock {
+  sku: string;
+  reason: "moved" | "already_live";
+  entered: number;
+  loaded: number;
+  current: number | null;
+  published: number;
 }
 
-/** What a publish had already made live when its block step failed (the error says it). */
-function describeLiveBeforeProductBlocks(
-  wroteProductValues: boolean,
-  overlayUpdate: ProductDraftOverlayPublishPlan["update"]
-) {
-  if (wroteProductValues) {
-    return "The draft's product values (prices, variants and details) are already live.";
-  }
-
-  const fields = PRODUCT_DRAFT_OVERLAY_FIELDS.filter((field) =>
-    hasOwn(overlayUpdate as Record<string, unknown>, field)
+/** `stock_adjusted` as the function answers it; `reason` "already_live" is that kind, anything else (none included) moved. */
+function readAdjustedProductStock(value: unknown): AdjustedProductStock[] {
+  const isCount = (count: unknown): count is number => typeof count === "number" && Number.isFinite(count);
+  return (Array.isArray(value) ? value : []).flatMap((entry) =>
+    isRecord(entry) && typeof entry.sku === "string" && isCount(entry.entered) && isCount(entry.loaded) && isCount(entry.published)
+      ? [
+          {
+            sku: entry.sku,
+            reason: entry.reason === "already_live" ? ("already_live" as const) : ("moved" as const),
+            entered: entry.entered,
+            loaded: entry.loaded,
+            current: isCount(entry.current) ? entry.current : null,
+            published: entry.published,
+          },
+        ]
+      : []
   );
-  if (fields.length > 0) {
-    return `The product's ${describeProductDraftOverlayFields(fields)} ${fields.length > 1 ? "are" : "is"} already live.`;
+}
+
+/** What publish_product_draft answers once everything is live (null fields when it did not say). */
+function readPublishResult(data: unknown) {
+  const result = isRecord(data) ? data : {};
+  return {
+    slug: typeof result.slug === "string" ? result.slug : null,
+    paymentProvider: typeof result.payment_provider === "string" ? result.payment_provider : null,
+    stockAdjusted: readAdjustedProductStock(result.stock_adjusted),
+  };
+}
+
+/**
+ * The warning for the SKUs publish did not set to the draft's figure as a change from its baseline
+ * (AdjustedProductStock), one part per kind, each naming the first five SKUs, then how many more
+ * (listProductStockEntries, as the edit page's notes do):
+ * - moved: the change was applied to the stock at publishing, which a sale, the Inventory screen, an
+ *   import or a translation's publish had moved since the change started, instead of replacing it, so
+ *   nothing sold meanwhile came back;
+ * - already live: the stock already held the draft's figure, so the change was not applied on top of it.
+ * Each says when to correct the stock. It names the draft, never the publisher: the figures may be another
+ * editor's autosave, or a hand-written draft's that nobody typed (any WRITER can write a draft's
+ * quantities and its `stock_baseline` over PostgREST). The draft bar shows it in a toast that stays until
+ * it is dismissed.
+ */
+export function describeAdjustedProductStock(adjusted: readonly AdjustedProductStock[]) {
+  const parts: string[] = [];
+
+  const moved = adjusted.filter((entry) => entry.reason !== "already_live");
+  if (moved.length > 0) {
+    const one = moved.length === 1;
+    const list = listProductStockEntries(
+      moved.map((entry) => {
+        const meanwhile = entry.current === null ? "" : `, and it was ${entry.current} at publishing`;
+        return `${entry.sku} is now ${entry.published} (the draft changed ${entry.loaded} to ${entry.entered}${meanwhile})`;
+      })
+    );
+    parts.push(
+      one
+        ? `The stock at publishing differed from the figure this draft's stock change started from (after a sale or another stock update, for example), so the change was applied to the stock at publishing instead of replacing it: ${list}. If the draft's figure already counted that change, correct the stock.`
+        : `The stock at publishing differed from the figures this draft's stock changes started from (after a sale or another stock update, for example), so the changes were applied to the stock at publishing instead of replacing it: ${list}. If the draft's figures already counted those changes, correct the stock.`
+    );
   }
 
-  return "Nothing else was published.";
+  const alreadyLive = adjusted.filter((entry) => entry.reason === "already_live");
+  if (alreadyLive.length > 0) {
+    const one = alreadyLive.length === 1;
+    const list = listProductStockEntries(
+      alreadyLive.map((entry) => {
+        const atPublishing = entry.current === null ? "" : `, and it was already ${entry.current} at publishing`;
+        return `${entry.sku} stays at ${entry.published} (the draft changed ${entry.loaded} to ${entry.entered}${atPublishing})`;
+      })
+    );
+    parts.push(
+      one
+        ? `The stock already showed this draft's figure at publishing, so the change was not applied on top of it: ${list}. If the change was meant to come on top of what moved the stock (a damaged unit taken out after a sale, for example), correct the stock.`
+        : `The stock already showed this draft's figures at publishing, so the changes were not applied on top of them: ${list}. If a change was meant to come on top of what moved the stock (a damaged unit taken out after a sale, for example), correct the stock.`
+    );
+  }
+
+  return `Published. ${parts.join(" ")}`;
 }
 
 /** `text` ending in a full stop (PostgREST's messages carry none), so a warning can follow it. */
@@ -624,69 +572,82 @@ export async function saveProductVisualEditingDraftMutation(
   try {
     assertValidProductFieldRequest(request);
     const auth = await requireVisualEditingEditableUser();
-    const draft = await getOrCreateProductDraft(auth.supabase, request.parentId, auth.user.id);
     const field = request.target.field;
     const value = normalizeProductFieldContent(field, content);
 
-    // A draft publish refuses as an earlier version's autosave over a row snapshot stays refused
-    // until the CMS editor repairs it: written into here, it could lose the only sign the check reads
-    // (its emptied description) while its x100 prices and old stock stayed in, ready to publish.
-    const liveProductForCheck = await readLiveProductForDraftCheck(auth.supabase, request.parentId, draft.meta);
-    const poisonedFields = liveProductForCheck ? findPoisonedProductDraftFields(draft.meta, liveProductForCheck) : [];
-    if (poisonedFields.length > 0) {
-      return { error: buildPoisonedProductDraftInPageSaveError(poisonedFields, draft.meta) };
+    // Twice at most: an UPDATE that returns no row found the draft deleted after it was read (a
+    // publish, which deletes it in the transaction that makes it live, so a save that waited on its
+    // lock lands here, or a discard, from another tab or user). The edit then goes into a new draft,
+    // as if it was made just after.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const draft = await getOrCreateProductDraft(auth.supabase, request.parentId, auth.user.id);
+
+      // A draft publish refuses as an earlier version's autosave over a row snapshot stays refused
+      // until the CMS editor repairs it: written into here, it could lose the only sign the check reads
+      // (its emptied description) while its x100 prices and old stock stayed in, ready to publish.
+      const liveProductForCheck = await readLiveProductForDraftCheck(auth.supabase, request.parentId, draft.meta);
+      const poisonedFields = liveProductForCheck ? findPoisonedProductDraftFields(draft.meta, liveProductForCheck) : [];
+      if (poisonedFields.length > 0) {
+        return { error: buildPoisonedProductDraftInPageSaveError(poisonedFields, draft.meta) };
+      }
+
+      // A pre-0.23.4 row snapshot is rewritten as the overlay publishing it would write now (the
+      // snapshot fields it keeps recorded, so they keep the rule), plus this edit. Kept as a snapshot,
+      // it stayed one, and once the live row changed publish skipped this edit with the rest, however
+      // often it was made (lib/visual-editing/product-draft-meta.ts).
+      const baseMeta =
+        classifyProductDraftMeta(draft.meta) === "legacy-row-snapshot"
+          ? legacyProductDraftMetaAsOverlay(
+              draft.meta,
+              await readLiveProductOverlayRow(auth.supabase, request.parentId),
+              draft.created_at,
+              field
+            )
+          : draft.meta;
+      // The field is an in-page edit now, whatever the snapshot held for it.
+      const nextMeta = withoutRecordedLegacySnapshotField({ ...baseMeta, [field]: value }, field);
+
+      // Nor does an in-page save newly flag a draft (none is flagged by now). Of the fields it edits,
+      // the check reads only the description: emptying it in a clean unmarked draft would make publish
+      // refuse the draft as an old copy and lock this editor out of it (the CMS editor would then show
+      // the live prices over the draft's).
+      if (liveProductForCheck && findPoisonedProductDraftFields(nextMeta, liveProductForCheck).length > 0) {
+        return { error: PRODUCT_DRAFT_IN_PAGE_EMPTIED_DESCRIPTION_ERROR };
+      }
+
+      const { data, error } = await (auth.supabase as any)
+        .from("product_drafts")
+        .update({
+          author_id: auth.user.id,
+          meta: nextMeta,
+        })
+        .eq("id", draft.id)
+        .select("*");
+
+      if (error) {
+        return {
+          error: formatVisualEditingError(
+            new Error(`Failed to save product draft: ${error.message}`),
+            "Failed to save product draft."
+          ),
+        };
+      }
+
+      const savedRow: unknown = Array.isArray(data) ? data[0] : null;
+      if (!isRecord(savedRow)) {
+        continue;
+      }
+
+      const savedDraft = normalizeProductDraftRow(savedRow);
+      revalidateProductPublicPaths([
+        await readLiveProductSlug(auth.supabase, request.parentId),
+        savedDraft.meta.slug,
+      ]);
+
+      return { success: true };
     }
 
-    // A pre-0.23.4 row snapshot is rewritten as the overlay publishing it would write now (the
-    // snapshot fields it keeps recorded, so they keep the rule), plus this edit. Kept as a snapshot,
-    // it stayed one, and once the live row changed publish skipped this edit with the rest, however
-    // often it was made (lib/visual-editing/product-draft-meta.ts).
-    const baseMeta =
-      classifyProductDraftMeta(draft.meta) === "legacy-row-snapshot"
-        ? legacyProductDraftMetaAsOverlay(
-            draft.meta,
-            await readLiveProductOverlayRow(auth.supabase, request.parentId),
-            draft.created_at,
-            field
-          )
-        : draft.meta;
-    // The field is an in-page edit now, whatever the snapshot held for it.
-    const nextMeta = withoutRecordedLegacySnapshotField({ ...baseMeta, [field]: value }, field);
-
-    // Nor does an in-page save newly flag a draft (none is flagged by now). Of the fields it edits,
-    // the check reads only the description: emptying it in a clean unmarked draft would make publish
-    // refuse the draft as an old copy and lock this editor out of it (the CMS editor would then show
-    // the live prices over the draft's).
-    if (liveProductForCheck && findPoisonedProductDraftFields(nextMeta, liveProductForCheck).length > 0) {
-      return { error: PRODUCT_DRAFT_IN_PAGE_EMPTIED_DESCRIPTION_ERROR };
-    }
-
-    const { data, error } = await (auth.supabase as any)
-      .from("product_drafts")
-      .update({
-        author_id: auth.user.id,
-        meta: nextMeta,
-      })
-      .eq("id", draft.id)
-      .select("*")
-      .single();
-
-    if (error || !data) {
-      return {
-        error: formatVisualEditingError(
-          new Error(`Failed to save product draft: ${error?.message ?? "unknown error"}`),
-          "Failed to save product draft."
-        ),
-      };
-    }
-
-    const savedDraft = normalizeProductDraftRow(data);
-    revalidateProductPublicPaths([
-      await readLiveProductSlug(auth.supabase, request.parentId),
-      savedDraft.meta.slug,
-    ]);
-
-    return { success: true };
+    return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
   } catch (error) {
     return {
       error: formatVisualEditingError(error, "Failed to save product draft."),
@@ -697,9 +658,64 @@ export async function saveProductVisualEditingDraftMutation(
 /** What anyone but an ADMIN past the second factor gets from publish. */
 export const PRODUCT_PUBLISH_ADMIN_ONLY_ERROR = "Only an administrator can publish products.";
 
-/** What a publish whose claim on the draft matched no row returns (publishProductVisualEditingDraft). */
-export const PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR =
-  "Another publish of this draft started first, or the draft changed since it was read: nothing was published.";
+/**
+ * publish_product_draft refused the draft because it changed after this publish read it (NBP02): an
+ * in-page edit, a block edit, a form autosave or a Cortex edit saved into it in between. That change
+ * stays in the draft.
+ */
+export const PRODUCT_DRAFT_CHANGED_DURING_PUBLISH_ERROR =
+  "The draft changed after this publish read it (an edit was saved into it meanwhile): nothing was published, and the draft keeps that edit. Publish again.";
+
+/**
+ * publish_product_draft refused because the product row changed after this publish read it (NBP03): a
+ * Cortex field update, a Freemius sync, a sale's stock update or another write landed in between, and
+ * the values publish completed from that read could have reverted it.
+ */
+export const PRODUCT_CHANGED_DURING_PUBLISH_ERROR =
+  "The product changed after this publish read it (another save, a sync or a sale wrote it meanwhile): nothing was published; the draft is kept. Publish again.";
+
+/** A deadlock or lock conflict with a write to this product or to a translation sharing its SKU. */
+export const PRODUCT_PUBLISH_CONFLICT_ERROR =
+  "Another change to this product, or to a translation sharing its SKU, was being saved at the same moment: nothing was published; the draft is kept. Publish again.";
+
+/**
+ * The database has no publish_product_draft: migration 02043 has not been applied there. The route to
+ * apply it depends on the install (docs/13, the 0.23.6 entry): a project made with create-nextblock has no
+ * `db:migrate` script, and applies pending migrations with `npm run update -- --db-only` or on its next
+ * production build (the build hook migrates); the NextBlock repository runs `npm run db:migrate`.
+ */
+export const PRODUCT_PUBLISH_NEEDS_MIGRATION_ERROR =
+  "Publishing products needs database migration 02043, which this database has not applied yet. Nothing was published; the draft is kept. Apply the pending migrations (in a project made with create-nextblock: npm run update -- --db-only, or redeploy; in the NextBlock repository: npm run db:migrate), then publish again.";
+
+/**
+ * The message for a publish call that got no answer from the database: supabase-js reports a failed
+ * request (the network, a timeout) as an error without a code, and the call may have committed before
+ * its answer was lost. So it never says nothing was published.
+ */
+function describeUnconfirmedProductPublish(message: string) {
+  const reason = message ? ` (${asSentence(message).slice(0, -1)})` : "";
+  return `The publish could not be confirmed${reason}. Reload the page: if the draft is gone, it was published; if it is still there, nothing was, and you can publish again.`;
+}
+
+/**
+ * The message for a publish_product_draft error. Every error the database answered (a SQLSTATE, or
+ * PostgREST's own code) rolled the whole publish back, so nothing is live and the draft stays.
+ */
+function describeProductPublishFailure(error: { code?: unknown; message?: unknown } | null | undefined) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  const message = typeof error?.message === "string" ? error.message.trim() : "";
+
+  if (!code) return describeUnconfirmedProductPublish(message);
+  if (code === "NBP01") return NO_PRODUCT_DRAFT_ERROR;
+  if (code === "NBP02") return PRODUCT_DRAFT_CHANGED_DURING_PUBLISH_ERROR;
+  if (code === "NBP03") return PRODUCT_CHANGED_DURING_PUBLISH_ERROR;
+  if (code === "42501" && message === PRODUCT_PUBLISH_ADMIN_ONLY_ERROR) return PRODUCT_PUBLISH_ADMIN_ONLY_ERROR;
+  if (code === "40P01" || code === "40001" || code === "55P03") return PRODUCT_PUBLISH_CONFLICT_ERROR;
+  // PostgREST's answer for a function its schema cache does not have, and Postgres' own.
+  if (code === "PGRST202" || code === "42883") return PRODUCT_PUBLISH_NEEDS_MIGRATION_ERROR;
+
+  return `Publishing failed: ${asSentence(message || "unknown error")} Nothing was published; the draft is kept.`;
+}
 
 /**
  * requireCmsAdmin() throws `Forbidden` for a signed-in non-ADMIN, and `Unauthorized` without a session
@@ -718,13 +734,12 @@ export async function publishProductVisualEditingDraft(
   productId: string
 ): Promise<VisualEditingMutationResult> {
   // Every product publish needs an ADMIN past the second factor, checked before anything is read:
-  // product values go through `upsert_product_with_variants` (is_admin(): the role only, which a
-  // password alone satisfies) and a Freemius product's sale coupon is pushed with the service role
-  // through the developer key pair; product_revisions accepts only ADMIN inserts (02003
-  // product_revisions_insert_policy), so a WRITER's publish would go live with no History; and
-  // before 0.23.4 no WRITER could complete one anyway (every draft carried product values, and the
-  // RPC refused). WRITERs keep editing drafts. A server action never meets the CMS layout's 2FA
-  // redirect, so the second factor is checked here too.
+  // publish_product_draft (migration 02043) refuses anyone but an ADMIN by role only (is_admin(), as
+  // every products write policy does, which a password alone satisfies), and a Freemius product's
+  // sale coupon is pushed with the service role through the developer key pair; product_revisions
+  // accepts only ADMIN inserts (02003 product_revisions_insert_policy), and the function records
+  // History in the same transaction. WRITERs keep editing drafts. A server action never meets the
+  // CMS layout's 2FA redirect, so the second factor is checked here too.
   //
   // Awaited bare in a try whose catch returns, not `requireCmsAdmin().catch(...)`: the coupon-push
   // scan in tools/scripts/server-action-actors.test.ts cannot prove what a .catch() handler does.
@@ -736,8 +751,9 @@ export async function publishProductVisualEditingDraft(
   }
 
   try {
-    // Reads and writes run as the caller (RLS: products and product_revisions take ADMIN writes);
-    // the service-role client only pushes the Freemius sale coupon.
+    // Reads and the publish itself run as the caller (RLS: products, variants, the gallery,
+    // categories, inventory and product_revisions take ADMIN writes); the service-role client only
+    // pushes the Freemius sale coupon.
     const supabase = createClient();
     const { data, error } = await (supabase as any)
       .from("product_drafts")
@@ -763,20 +779,22 @@ export async function publishProductVisualEditingDraft(
 
     // Only a draft the product form (or a CMS draft import) wrote carries product values. A draft
     // a block edit or the in-page editor created stages the overlay fields at most, and one
-    // created before 0.23.4 holds the raw products row in minor units: neither may reach
-    // updateProduct(), which would read its cents as dollars (lib/visual-editing/product-draft-meta.ts).
+    // created before 0.23.4 holds the raw products row in minor units: neither may be published as
+    // product values, which would read its cents as dollars (lib/visual-editing/product-draft-meta.ts).
     const metaKind = classifyProductDraftMeta(draft.meta);
     // The public path to revalidate: the live slug as it was before this publish.
     let liveSlug: string | null = null;
-    let productValues: (ReturnType<typeof completeProductDraftValues> & { status?: unknown }) | null = null;
+    // The products row's updated_at as read here: publish_product_draft refuses when the row changed
+    // since, because the values below were completed (or planned) from this read.
+    let liveUpdatedAt: string | null = null;
+    let values: ProductDraftPublishValues | null = null;
     let overlayPlan: ProductDraftOverlayPublishPlan = { update: {}, skipped: [] };
 
     if (metaKind === "product-values") {
-      // The live product, read the way the edit page reads it. upsert_product_with_variants
-      // replaces every column it takes and every variant, and updateProduct() clears the SEO
-      // fields and the sale schedule it is not given, so a field the draft lacks (a CMS draft
-      // import carries no sale schedule) is taken from here instead of being cleared, zeroed or
-      // deleted.
+      // The live product, read the way the edit page reads it. The publish replaces every column the
+      // values carry and every variant, and clears the SEO fields and the sale schedule they lack, so
+      // a field the draft lacks (a CMS draft import carries no sale schedule) is taken from here
+      // instead of being cleared, zeroed or deleted.
       const { data: liveProduct, error: liveProductError } = await getProduct(supabase as any, productId);
 
       if (liveProductError || !liveProduct) {
@@ -784,6 +802,7 @@ export async function publishProductVisualEditingDraft(
       }
 
       liveSlug = typeof (liveProduct as any).slug === "string" ? (liveProduct as any).slug : null;
+      liveUpdatedAt = readUpdatedAt(liveProduct);
 
       // An unmarked draft an earlier version wrote is refused before any write
       // (findPoisonedProductDraftFields has the rules). A form autosave over a row snapshot shows
@@ -800,15 +819,28 @@ export async function publishProductVisualEditingDraft(
         return { success: false, error: buildPoisonedProductDraftPublishError(poisonedFields, { meta: draft.meta }) };
       }
 
-      productValues = {
-        ...completeProductDraftValues(draft.meta as Record<string, unknown>, liveProduct),
-        // Visibility belongs to the row, not the draft: `upsert_product_with_variants`
-        // takes `status` as a required field, so publishing a draft that still carries
-        // an old status would move the product in or out of the storefront behind the
-        // editor's back. Pin it to whatever is live right now. (`published_at` is not
-        // part of the RPC payload, so the schedule survives untouched.)
-        status: (liveProduct as any).status ?? (draft.meta as any)?.status,
-      };
+      // A stock or a SKU publish cannot read (findUnreadableProductDraftValues: a stock that is not a
+      // number or numeric text, a SKU that is not text; only a hand-written draft holds one) is refused
+      // before any write, marked or not. Sent as it was, it reached the function in a form the edit page
+      // never showed (until 2026-11-18 "NaN" went live as the largest stock, and a number SKU's change
+      // applies to a baseline entry the page cannot key) or failed the publish midway. The edit page names
+      // them and shows the live stock in place of a stock it cannot read, so its next autosave repairs the
+      // draft.
+      const unreadableValues = findUnreadableProductDraftValues(draft.meta, liveProduct);
+      if (unreadableValues.length > 0) {
+        return { success: false, error: buildUnreadableProductDraftPublishError(unreadableValues) };
+      }
+
+      // Never the draft's `status` (visibility belongs to the row: the values sent carry none, and the
+      // function writes none), its `media_id` or `explicitly_removed_media_ids`
+      // (completeProductDraftValues drops both: a publish never deletes media, it only unlinks an
+      // image the gallery drops). Its `stock_baseline` (the stock the edit page loaded) goes along, for
+      // the SKUs the live product stocks: the function writes a SKU's stock only where the draft's
+      // quantity differs from it and from the current stock, as a change to the stock as it is at
+      // publishing (migration 02044), so a sale since the page load stays.
+      values = buildProductDraftPublishValues(
+        completeProductDraftValues(draft.meta as Record<string, unknown>, liveProduct) as unknown as ProductFormValues
+      );
     } else {
       // An overlay, or a pre-0.23.4 row snapshot: the overlay fields only, and only those that
       // differ from the live row; a legacy snapshot's, and the snapshot fields an overlay recorded
@@ -817,137 +849,76 @@ export async function publishProductVisualEditingDraft(
       // stay as they are.
       const liveProduct = await readLiveProductOverlayRow(supabase, productId);
       liveSlug = typeof liveProduct.slug === "string" ? liveProduct.slug : null;
+      liveUpdatedAt = readUpdatedAt(liveProduct);
       overlayPlan = planProductDraftOverlayPublish(draft.meta, liveProduct, draft.created_at);
     }
 
-    // The live description blocks this publish replaces, captured before any write: the draft's
-    // rows are inserted first and only these ids deleted after them (replaceProductBlocks).
-    const liveBlockIds = await readLiveProductBlockIds(supabase, productId);
-
-    // Captured before any write, so the revision records the real before/after pair.
-    const previousContent = await getFullProductContent(productId, undefined, supabase as any);
-
-    // Claim the draft: the last step before the first write, after every check that can refuse. The
-    // UPDATE matches only the row as this publish read it, and on_product_drafts_update (02003,
-    // BEFORE UPDATE) moves updated_at, so of two publishes that read the same row only the first gets
-    // it back. The other, or a publish that read the draft before an edit or an autosave saved into
-    // it, stops here with nothing written. A publish that reads the draft after this claim is not
-    // stopped: whichever of the two block swaps finds captured rows already gone keeps its own rows
-    // and warns (replaceProductBlocks), and for a product with no live description blocks neither
-    // captured any, so neither can tell.
-    const { data: claimedRows, error: claimError } = await (supabase as any)
-      .from("product_drafts")
-      .update({ author_id: admin.userId })
-      .eq("id", draft.id)
-      .eq("updated_at", draft.updated_at)
-      .select("id");
-
-    if (claimError) {
-      return {
-        success: false,
-        error: `Failed to start publishing the draft: ${claimError.message}. Nothing was published; the draft is kept.`,
-      };
-    }
-
-    if (!Array.isArray(claimedRows) || claimedRows.length === 0) {
-      return { success: false, error: PRODUCT_DRAFT_PUBLISH_CLAIM_REFUSED_ERROR };
-    }
-
-    // A Freemius sale coupon that could not be pushed: the storefront then shows a sale that Freemius'
-    // checkout does not apply, so it is said with the publish's other warnings.
-    let couponWarning: string | null = null;
-    if (productValues) {
-      // Only unlinks an image dropped from the gallery: a product save never deletes media
-      // (updateProduct in libs/ecommerce product-actions.ts says why).
-      await updateProduct(supabase as any, productId, productValues as any);
-      if (productValues.payment_provider === "freemius") {
-        try {
-          const couponResult = await syncProductSaleCouponToFreemius({
-            productId,
-            client: admin.supabase as any,
-          });
-          if (couponResult && couponResult.success === false) {
-            console.error("Failed to sync Freemius sale coupon on publish:", couponResult.error);
-            couponWarning = describeFreemiusSaleCouponFailure(couponResult.error);
-          }
-        } catch (couponError) {
-          console.error("Failed to sync Freemius sale coupon on publish:", couponError);
-          couponWarning = describeFreemiusSaleCouponFailure(
-            couponError instanceof Error ? couponError.message : String(couponError)
-          );
-        }
-      }
-    } else if (Object.keys(overlayPlan.update).length > 0) {
-      const { data: updatedRows, error: updateError } = await (supabase as any)
-        .from("products")
-        // updated_at too, like every other write to the row (the sitemap's lastModified reads it).
-        .update({ ...overlayPlan.update, updated_at: new Date().toISOString() })
-        .eq("id", productId)
-        .select("id");
-
-      if (updateError) {
-        throw new Error(`Failed to update product: ${updateError.message}`);
-      }
-
-      // RLS filters an UPDATE it refuses down to zero rows, without an error (supabase-js returns
-      // rows only with .select()). Stop before the blocks so nothing is half-published and the
-      // draft stays.
-      if (!Array.isArray(updatedRows) || updatedRows.length === 0) {
-        throw new Error(
-          "The product's title or description was not saved: your account cannot update this product. Nothing was published; the draft is kept."
-        );
-      }
-    }
-
-    // Publish blocks: the draft's rows in, then the captured live ids out. The product row may be
-    // live already, so a failure here says what is, keeps the draft for another try and still
-    // refreshes the storefront, which must show the row as it now is. ("order" carries no unique
-    // constraint, so old and new rows may coexist between the two statements. Captured ids that
-    // another writer removed first leave this publish's rows live, with a warning:
-    // replaceProductBlocks.)
-    const blocksToInsert: ProductBlockInsert[] = draft.blocks.map((block, index) => ({
-      page_id: null,
-      post_id: null,
-      product_id: productId,
+    // The draft's description blocks replace the live ones ([] deletes them).
+    const blocks: ProductBlockPayload[] = draft.blocks.map((block, index) => ({
       language_id: block.language_id,
       block_type: block.block_type,
       content: block.content,
       order: Number.isFinite(block.order) ? block.order : index,
     }));
 
-    const blocksOutcome = await replaceProductBlocks(supabase, productId, liveBlockIds, blocksToInsert);
-    if (blocksOutcome && "error" in blocksOutcome) {
-      const wroteProductRow = Boolean(productValues) || Object.keys(overlayPlan.update).length > 0;
-      if (wroteProductRow) {
+    // One transaction (migration 02043): the products row and then the draft row locked, refused with
+    // nothing written when the draft is gone (another publish or a discard came first), when it changed
+    // since the read above (a save landed in between: it stays in the draft) or when the products row
+    // did; then the product values or the overlay fields, the blocks, History (a revision whenever the
+    // content changed, prices, variants, stock, the sale window and the gallery included) and the draft
+    // delete. Any failure rolls all of it back, so nothing is ever half-published.
+    let answer: { data: unknown; error: { code?: unknown; message?: unknown } | null };
+    try {
+      answer = await (supabase as any).rpc("publish_product_draft", {
+        p_product_id: productId,
+        p_draft_id: draft.id,
+        p_draft_updated_at: draft.updated_at,
+        p_product_updated_at: liveUpdatedAt,
+        p_values: values,
+        p_overlay: values ? null : overlayPlan.update,
+        p_blocks: blocks,
+      });
+    } catch (requestError) {
+      answer = { data: null, error: { message: requestError instanceof Error ? requestError.message : String(requestError) } };
+    }
+    const { data: published, error: publishError } = answer;
+
+    if (publishError) {
+      const code = typeof publishError.code === "string" ? publishError.code : "";
+      if (!["NBP01", "NBP02", "NBP03"].includes(code)) {
+        console.error("Product draft publish failed:", publishError);
+      }
+      // No answer: it may have committed, so the pages are refreshed in case it did.
+      if (!code) {
         revalidateProductPublicPaths([liveSlug, draft.meta.slug]);
         revalidateVisualEditingPath(`/cms/products/${productId}/edit`);
       }
-
-      return {
-        success: false,
-        error: `${blocksOutcome.error} ${describeLiveBeforeProductBlocks(Boolean(productValues), overlayPlan.update)} The draft is kept: publish again to finish.`,
-      };
+      return { success: false, error: describeProductPublishFailure(publishError) };
     }
 
-    // The product row and its blocks are already live at this point, so a failed revision
-    // is reported as a warning rather than aborting: returning early here would leave the
-    // draft row undeleted and the storefront un-revalidated. Recorded through the same ADMIN
-    // session (product_revisions_insert_policy: is_admin()).
-    let revisionWarning: string | null = null;
-    const nextContent = await getFullProductContent(productId, undefined, supabase as any);
-    if (previousContent && nextContent) {
-      const revision = await createProductRevision(
-        productId,
-        admin.userId,
-        previousContent,
-        nextContent,
-        supabase
-      );
-      if ("error" in revision) {
-        revisionWarning = revision.error;
+    // Everything is live from here on.
+    const result = readPublishResult(published);
+
+    // A Freemius sale coupon that could not be pushed: the storefront then shows a sale that Freemius'
+    // checkout does not apply, so it is said with the publish's other warnings. Pushed after the
+    // commit, from the values now live (Freemius is outside the transaction).
+    let couponWarning: string | null = null;
+    if (values && result.paymentProvider === "freemius") {
+      try {
+        const couponResult = await syncProductSaleCouponToFreemius({
+          productId,
+          client: admin.supabase as any,
+        });
+        if (couponResult && couponResult.success === false) {
+          console.error("Failed to sync Freemius sale coupon on publish:", couponResult.error);
+          couponWarning = describeFreemiusSaleCouponFailure(couponResult.error);
+        }
+      } catch (couponError) {
+        console.error("Failed to sync Freemius sale coupon on publish:", couponError);
+        couponWarning = describeFreemiusSaleCouponFailure(
+          couponError instanceof Error ? couponError.message : String(couponError)
+        );
       }
-    } else {
-      revisionWarning = "the product content could not be read back";
     }
 
     const warnings = [
@@ -957,30 +928,17 @@ export async function publishProductVisualEditingDraft(
             PRODUCT_DRAFT_OVERLAY_FIELDS.filter((field) => hasOwn(overlayPlan.update as Record<string, unknown>, field))
           )
         : null,
-      blocksOutcome && "warning" in blocksOutcome ? blocksOutcome.warning : null,
-      revisionWarning ? `Published, but history was not recorded: ${revisionWarning}` : null,
+      // A stock change applied to a quantity that moved while the draft was open, or not applied because
+      // the stock already held the draft's figure (migration 02044): live at another figure than a change
+      // from the draft's baseline gives, so the editor is told which and why.
+      result.stockAdjusted.length > 0 ? describeAdjustedProductStock(result.stockAdjusted) : null,
       couponWarning,
     ].filter((warning): warning is string => Boolean(warning));
 
-    // The product row and its blocks are live, whatever the draft delete below does: refresh the slug
-    // the product had (and the form draft's when it renamed the product) and the edit page first.
-    revalidateProductPublicPaths([liveSlug, draft.meta.slug]);
+    // The slug the product had, the one it has now (a product-values draft may rename it) and the
+    // edit page, whose re-render in this action's response resets the form to the published values.
+    revalidateProductPublicPaths([liveSlug, result.slug, draft.meta.slug]);
     revalidateVisualEditingPath(`/cms/products/${productId}/edit`);
-
-    const { error: deleteError } = await (supabase as any)
-      .from("product_drafts")
-      .delete()
-      .eq("id", draft.id);
-
-    if (deleteError) {
-      // The edits are live and only the draft row stayed: the draft bar and the visibility dialog show
-      // an error starting "Published, but" as a success with that text, so it carries every warning
-      // of the publish too (skipped fields, description blocks that may show twice, no history).
-      return {
-        success: false,
-        error: [asSentence(`Published, but failed to remove product draft: ${deleteError.message}`), ...warnings].join(" "),
-      };
-    }
 
     if (warnings.length > 0) {
       return { success: true, warning: warnings.join(" ") };

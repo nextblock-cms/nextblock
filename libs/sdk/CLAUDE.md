@@ -15,7 +15,9 @@ CMS registry and the only consumer live in `apps/nextblock` (`lib/blocks/blockRe
 
 ## Gotchas
 - The published `package.json` is written by `vite.config.ts` afterBuild; `dependencies` and
-  `license` in the source manifest never ship.
+  `license` in the source manifest never ship. It declares `zod` and `lucide-react` as peers (the
+  types name them; ranges from the root `package.json`), which `verify-lib-dist.js` check 15
+  requires.
 - `sdk.ts` uses `React.ComponentType` without importing React; consumers need `@types/react`.
 - `BlockConfig` field names are load-bearing for `blockRegistry.ts`.
 - `npm run build:sdk` publishes to npm; use `npx nx build sdk` for a local build.

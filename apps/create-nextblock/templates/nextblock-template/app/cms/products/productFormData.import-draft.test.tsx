@@ -316,7 +316,7 @@ describe('a pre-0.23.4 CMS draft import keeps its prices and stock', () => {
   });
 
   it('is not flagged for a gallery the file replaced: only an emptied one counts', () => {
-    const draft = oldImportDraft({ product_media: [{ media_id: 'media-from-the-file' }], description_json: RICH });
+    const draft = oldImportDraft({ product_media: [{ media_id: 'aaaaaaaa-00f1-40f1-80f1-0000000000f1' }], description_json: RICH });
 
     expect(findPoisonedProductDraftFields(draft, liveSimple)).toEqual([]);
   });

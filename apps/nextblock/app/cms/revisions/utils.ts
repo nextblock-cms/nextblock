@@ -8,7 +8,8 @@ type BlockRow = Database['public']['Tables']['blocks']['Row'];
  * The columns a revision snapshot captures, in one place.
  *
  * These lists are the contract between four things that must agree exactly:
- *   - the SELECTs in this file (what a snapshot records),
+ *   - the SELECTs in this file (what a snapshot records; for products, the `meta` object of
+ *     public.product_revision_content in migration 02043, which getFullProductContent reads),
  *   - the UPDATEs in service.ts (what a restore replays),
  *   - the jsonb_build_object() calls in migration 00000000000016 (the stored baseline),
  *   - RESTORE_EXCLUDED_META_COLUMNS below (what a restore must never replay).
@@ -108,9 +109,66 @@ export interface FullPostContent {
   blocks: SimpleBlockContent[];
 }
 
+/** A variant in a product's History content, by SKU and attribute terms (variant ids are left out). */
+export interface ProductVariantCommerceContent {
+  sku: string;
+  upc: string | null;
+  price: number;
+  prices: Json;
+  sale_price: number | null;
+  sale_prices: Json | null;
+  sale_start_at: string | null;
+  sale_end_at: string | null;
+  scheduled_price: number | null;
+  scheduled_prices: Json | null;
+  scheduled_price_at: string | null;
+  stock_quantity: number;
+  main_media_id: string | null;
+  attribute_term_ids: string[];
+}
+
+/**
+ * The commerce side of a product's History content: what a product-values publish can change beside
+ * the meta columns and the blocks. Amounts are minor units, as stored. A restore never replays it
+ * (RESTORE_EXCLUDED_META_COLUMNS covers visibility the same way): restoring the wording of a version
+ * must not move prices, variants or stock behind a shopper's back.
+ */
+export interface ProductCommerceContent {
+  sku: string;
+  upc: string | null;
+  product_type: string;
+  payment_provider: string;
+  price: number;
+  prices: Json;
+  sale_price: number | null;
+  sale_prices: Json | null;
+  sale_start_at: string | null;
+  sale_end_at: string | null;
+  scheduled_price: number | null;
+  scheduled_prices: Json | null;
+  scheduled_price_at: string | null;
+  stock: number | null;
+  is_taxable: boolean;
+  freemius_product_id: string | null;
+  freemius_plan_id: string | null;
+  trial_period_days: number;
+  trial_requires_payment_method: boolean;
+  /** media ids in gallery order */
+  gallery: string[];
+  category_ids: string[];
+  /** ordered by SKU */
+  variants: ProductVariantCommerceContent[];
+}
+
 export interface FullProductContent {
   meta: ProductMetaContent;
   blocks: SimpleBlockContent[];
+  /**
+   * Absent from revisions recorded before migration 02043, which held the meta columns and the
+   * blocks only, so a publish that changed prices, variants, stock, the sale window or the gallery
+   * and nothing else recorded nothing.
+   */
+  commerce?: ProductCommerceContent;
 }
 
 export type AnyFullContent = FullPageContent | FullPostContent | FullProductContent;
@@ -245,44 +303,38 @@ export async function getFullPostContent(
   };
 }
 
+/**
+ * A product's History content, read from `public.product_revision_content` (migration 02043): the
+ * same function `publish_product_draft` records a publish's revision with, in the transaction that
+ * publishes, so the content History compares and the content it stored can never be shaped
+ * differently. `meta` holds PRODUCT_META_COLUMNS (timestamps as normalizeTimestamp writes them),
+ * `blocks` the blocks ordered by `order` then id, and `commerce` the prices, variants, stock, sale
+ * window, gallery and the rest (ProductCommerceContent). Runs with the caller's rights, as the table
+ * reads it replaced did. Null when the product cannot be read, or when the database has not applied
+ * 02043 yet (PostgREST then knows no such function). Products take no block overrides
+ * (BlockCaptureOptions): nothing captures a product's blocks with one.
+ */
 export async function getFullProductContent(
   productId: string,
-  opts?: BlockCaptureOptions,
+  opts?: undefined,
   client?: AnySupabaseClient
 ): Promise<FullProductContent | null> {
+  void opts;
   const supabase = (client ?? createClient()) as AnySupabaseClient;
-  const { data: product, error: productError } = await supabase
-    .from('products')
-    .select(`id, ${PRODUCT_META_COLUMNS.join(', ')}`)
-    .eq('id', productId)
-    .single();
-  if (productError || !product) return null;
+  let data: unknown;
+  try {
+    const answer = await supabase.rpc('product_revision_content', { p_product_id: productId });
+    if (answer.error) return null;
+    data = answer.data;
+  } catch {
+    return null;
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
 
-  const { data: blocks, error: blocksError } = await supabase
-    .from('blocks')
-    .select(BLOCK_SELECT)
-    .eq('product_id', productId)
-    .order('order', { ascending: true })
-    .order('id', { ascending: true });
-  if (blocksError) return null;
+  const content = data as Record<string, unknown>;
+  if (!content['meta'] || typeof content['meta'] !== 'object' || !Array.isArray(content['blocks'])) return null;
 
-  const row = product as Record<string, any>;
-
-  return {
-    meta: {
-      title: row['title'],
-      slug: row['slug'],
-      language_id: row['language_id'],
-      status: row['status'],
-      meta_title: row['meta_title'] ?? null,
-      meta_description: row['meta_description'] ?? null,
-      custom_canonical: row['custom_canonical'] ?? null,
-      published_at: normalizeTimestamp(row['published_at']),
-      short_description: row['short_description'] ?? null,
-      description_json: (row['description_json'] ?? null) as Json | null,
-    },
-    blocks: toSimpleBlocks(blocks as any, opts),
-  };
+  return content as unknown as FullProductContent;
 }
 
 /**

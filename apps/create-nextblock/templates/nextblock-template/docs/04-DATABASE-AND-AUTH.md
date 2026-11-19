@@ -336,7 +336,7 @@ change):
   forward migration revokes them. Both apply paths end with a blanket
   `grant execute on all functions in schema public` to the API roles, so each path must
   take it back in the same pass: `TRIGGER_FUNCTION_REVOKE_SQL` (every `RETURNS trigger`
-  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02028`/`02030`/`02035`–`02037`) in
+  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02028`/`02030`/`02035`–`02037`/`02043`/`02045`) in
   `lib/setup/schema-apply.ts` (`/setup`) and `tools/lib/migrate-core.mjs` (the build-time
   hook). The hook lacked both until 2026-10-20, so every production deploy re-granted the
   triggers and the advisor flagged them again; `02024` repairs the databases that were
@@ -866,8 +866,9 @@ API-reachable table with RLS off exposes every row to the public key
 (`tools/scripts/lib/migration-grants.js`: `findUngrantedObjects` + `findTablesWithoutRls`). Two places still apply blanket grants afterwards:
 the sandbox reset (`ALTER DEFAULT PRIVILEGES ... GRANT ALL` in `generate-sandbox-reset.ts`) and
 the post-apply pass of both apply paths (`lib/setup/schema-apply.ts` for `/setup`,
-`tools/lib/migrate-core.mjs` for the build hook on every deploy), which then re-applies the
-revokes in `API_ROLE_REVOKE_SQL` so a deployed or wizard-installed database matches a
+`tools/lib/migrate-core.mjs` for the build hook on every deploy and for `npm run update`, on the
+copy its code update brought and even with nothing pending since 0.23.6's updater), which then
+re-applies the revokes in `API_ROLE_REVOKE_SQL` so a deployed or wizard-installed database matches a
 CLI-migrated one.
 
 `02025` (2026-10-21, grant-level hardening after review of `02021`–`02024`) removes three places
@@ -1128,7 +1129,8 @@ is [15-AFFILIATES-AND-STOREFRONTS.md](./15-AFFILIATES-AND-STOREFRONTS.md)):
   and send stored keys literally (the S3 SDK encodes a key and the move its `CopySource`; on
   Supabase the delete puts keys in the request body and the move refuses), so the decoy-row trick
   `02028` closed for media cannot reach a partner's files either. A product save deletes no media
-  since 0.23.4: `updateProduct()` only unlinks an image dropped from the gallery. Until then it
+  since 0.23.4: `updateProduct()` only unlinks an image dropped from the gallery, and so does the
+  draft publish's `publish_product_draft` (02043), which deletes no media row. Until then it
   deleted the row of every dropped image no product, post, logo or variant used and, on R2, every
   key that row listed, and took more ids from the draft's `explicitly_removed_media_ids`, so a
   WRITER's draft or decoy row could make an ADMIN's publish delete other uploaders' files and
@@ -1354,6 +1356,77 @@ reads it with the service role. Reads are unchanged, and no grant changes.
 `anon` still reading the flag and the service role still writing it. Before `02041`, five of
 its lines fail. Section 3's no-factor ADMIN probe moved to `store_contact`.
 
+`02043` and `02044` (2026-11-18) make a product draft publish one call,
+`public.publish_product_draft` (docs/09 → "Publishing: one transaction" and "Stock: only what the
+editor changed"). It and `public.product_revision_content` are `SECURITY INVOKER` with
+`search_path ''` and executable by `authenticated` and the service role only (both copies of
+`API_ROLE_REVOKE_SQL` take `anon` back after the blanket grant); their three helpers live in
+`private`, which the grant pass never touches. The publish refuses anyone but an ADMIN
+(`is_admin()`), runs with the admin's RLS and deletes no media. 02044 also replaces two 02001
+functions, statement for statement but one change each: `sync_inventory_cache_for_sku` holds a
+product's total at 2147483647, and `apply_order_inventory_deduction` takes an order's SKUs in SKU
+order, the order the publish locks inventory rows in. It adds `idx_product_variants_sku` and
+`idx_products_sku`: every inventory write runs `sync_inventory_cache_for_sku` (its trigger), which
+updates the variants and products carrying the SKU, and the inventory read policy checks each row
+it reads against them, so without an index each of those lookups scanned the whole table, or the
+whole `(product_id, sku)` key, under the caller's row policies, once per SKU a publish writes.
+Measured on local replays, five hundred changed SKUs beside 50 other products take 10 s or more
+without them and about 5 s with them on an idle machine (up to 9 s on a busy one, past the Data
+API's 8 s statement timeout); beside 2,000 other products they still take 9 to 13 s, and a publish
+past the timeout fails with nothing written. Both are a plain `CREATE INDEX IF NOT EXISTS` (a migration
+runs in a transaction, where `CONCURRENTLY` cannot), which holds writes to its table until the
+file's transaction commits, right after it.
+`security-verify.sql` section 44 (10 assertions) checks the privileges and the behaviour, and
+`tools/scripts/product-draft-publish.db.test.ts` runs the functions with several sessions at once
+(CI db-posture job).
+
+`02045` (2026-11-18) adds `public.media_usage(p_media jsonb) RETURNS jsonb`, the media library's
+usage lookup (docs/03 → "Deleting media"). It is `SECURITY INVOKER` with `search_path ''`, and only
+the service role executes it: the migration revokes it from `PUBLIC, anon, authenticated`, and both
+copies of `API_ROLE_REVOKE_SQL` revoke it again after the blanket grant (`migrate-core.test.mjs`).
+It reads every content table, drafts, revisions, partner pages and site settings included (never the
+secret rows, which it skips by 02038's own rule: the seven named keys, and any key with a
+secret-like suffix whatever its case), and returns their titles, so an answer limited to what RLS
+lets a caller see would call a used image unused. The app calls it through `findMediaUsage`
+(`lib/media/media-usage.ts`, `server-only`) after `getCmsActor()` has found staff past their second
+factor (the media actions and pages), and shows a WRITER no label or record id for a place their own
+session cannot read (`withoutAdminOnlyLabels`: partner storefronts, redirects, ADMIN-tier settings).
+Given each media id and the keys its row owns (`ownedMediaStorageKeys`), it reports every foreign
+key (gallery, variant image, feature image, logo) and every document that names the id or a key. It
+reads each document as JSON text (a jsonb column's text, a plain text column through `to_json`): one
+regex pass per document for uuids and, when a key was sent, one for runs of storage-key characters.
+Before that pass a stored `\/` is read as `/` (two backslashes and a slash in the JSON text, which
+one plain `replace()` turns into `/`), so JSON that escapes its slashes, as PHP's `json_encode`
+writes it, names a key exactly where the same text unescaped would (a key directly followed by `\/`
+and more key characters is part of a longer run, as `uploads/a.png/x` is); then every JSON escape
+whose letter is a key character (a control character in a string: `\n`, `\t`, or `\u` and four hex
+digits) and every escaped backslash becomes a space, read from the left so that an escaped backslash
+stays one character (without these a key on its own line in a text field, or one written with
+escaped slashes, was never found, so "Delete unused" deleted its file), and `%2F` is read as `/`;
+each run is then split once into the suffixes after a `/` that could equal a key sent (none longer
+than the longest key or with more segments than the deepest), a key matching such a token exactly.
+Building every suffix cost the square of a run's length, and documents it reads are written outside
+the staff too: one profile picture URL of 20,000 slashes (anyone who signs up sets one) made every
+lookup take tens of seconds (36 to 85 s on local replays), far past the Data API's 8 s statement
+timeout. Staff can write a media row's keys, so they are search strings chosen by the row's author:
+the function ignores a key with a character outside `[A-Za-z0-9._/-]` or longer than 512 characters
+(`MAX_OBJECT_KEY_LENGTH`, which `media-usage.test.ts` holds equal) and never searches for a
+substring, and the app sends only keys an upload route could mint, no two spellings of one key and
+at most 17 a row (a row breaking any of these is asked about by id alone and answered with one more
+use, `unchecked_key`, never unused; a row that owns no key, a partner upload or a key over 512
+characters, is asked about by id alone without `unchecked_key`: its delete removes no object). The
+answer is one jsonb value, so PostgREST's `max_rows` never truncates it. Measured on a local replay:
+about 30 ms for the seeded site, and about 4 to 5 s for a 57 MB site whose 5,000 blocks and 2,000
+revisions name 1,000 media 140,000 times (14 s before the suffix bound; the escape pass about 0.3 s
+and the escaped-slash replace about 0.1 s of it), less than twice the headroom under 8 s.
+`security-verify.sql` section 45 (14 assertions, 287 in the file) checks the privileges, each kind
+of use, the secret rows skipped, that a key with a space is not found where a document holds it
+verbatim, that a key right after a JSON escape is found (after six control characters, and after an
+escaped backslash in a text block and in a navigation link), that a key written with escaped slashes
+is found (JSON-LD in a text block, where the backslashes before an escaped slash still end a key,
+and a redirect target), and that a profile picture URL of 20,000 slashes answers within a 4 s
+statement timeout with the key at its end still found; without the function all fourteen fail.
+
 ## Migration Structure
 
 ### Current reality: squash generations (`GGNNN`)
@@ -1445,7 +1518,9 @@ What each kind of database needs:
   - marker unset, catch-up already recorded → an earlier auto-detect repair recorded it without
     running it. It refuses and prints the `:revert` command to un-record it.
 - **The sandbox:** its reset payload wipes `public`, replays the folder from empty
-  (seed runs, marker set, catch-up skipped) and re-records the generation's versions.
+  (seed runs, marker set, catch-up skipped) and re-records the generation's versions. Only
+  `public` is wiped: `private` keeps what the last run left, so every file must replay over it
+  ("Production migration policy").
 - **Downstream installs (Vercel, `npm create nextblock`, Docker):** nothing to do. The
   `/setup` wizard, the build hook, `npm run update` and the Docker runner all apply pending
   files in order and cross the squash automatically.
@@ -1465,6 +1540,28 @@ production or shared database change.
   `libs/db/src/supabase/migrations` for each new schema/data change.
 - Keep migrations non-destructive by default. Avoid dropping or rewriting data
   that may include orders, users, payments, or customer records.
+- **Every file must replay over a database that already ran it and every later file.** The
+  sandbox reset (every 15 minutes) and `/setup`'s local reset (local development only; it also
+  drops `supabase_migrations`) drop `public` and run the folder again, and the stale-history
+  self-heal of `/setup` and of the build hook runs it all again once `public` was dropped some
+  other way. Objects outside `public` survive with a later file's definition (`private`: 02021's
+  role helpers, 02043's publish helpers). `CREATE OR REPLACE` cannot change a function's return
+  type, parameter names or defaults, so a later file that changes one drops the function first,
+  and the earlier file creates it in its final shape (dropping it first too when a database may
+  hold an older shape). Until 2026-11-18 (before release) 02043 created
+  `private.apply_product_draft_values` returning `void` and 02044 re-created it returning `jsonb`,
+  so from its second run on the sandbox reset would have stopped at 02043 (42P13) and rolled back:
+  02043 now creates it returning `jsonb` and drops it first, for a developer database that ran the
+  earlier 02043. `tools/scripts/migration-replay.db.test.ts` (CI db-posture job) runs that replay
+  on the migrated database in one rolled-back transaction and checks it ends with the first run's
+  definitions.
+- **The generated copies follow every migration change.** `/setup` applies
+  `apps/nextblock/lib/setup/migrations-bundle.ts` where the migration folder is not on disk (a
+  serverless host), and the sandbox reset replays
+  `apps/nextblock/app/api/cron/reset-sandbox/sandboxResetSql.ts`: run
+  `npm run generate:migrations-bundle && npm run generate:sandbox` after adding or editing a file.
+  `tools/scripts/generated-migration-copies.test.ts` (in `security:check`) fails while either
+  differs from the files, naming the stale file and the command.
 - Run `npm run db:migrate:check` before `npm run db:migrate`. **Read its pending
   list** — do not just look for a success line. If you added a migration and the
   check reports `Pending: 0`, that file will never run (see below).

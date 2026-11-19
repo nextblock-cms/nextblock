@@ -4,7 +4,7 @@ import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
-import { copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
+import { copyIntoDist, rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageJsonPath = path.resolve(__dirname, 'package.json');
@@ -12,6 +12,13 @@ const packageJsonPath = path.resolve(__dirname, 'package.json');
 // and through 0.20 every package this hook writes shipped without either.
 const { version, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 const OUT_DIR = path.resolve(__dirname, '../../dist/libs/utils');
+// react (translations-context) and next (server-utils) stay external and were never declared, so
+// only the app's own copies made them resolve. Optional peers: every project that renders those
+// modules has both, while create-nextblock installs utils through @nextblock-cms/db and reads no
+// code from it, and npm would install a required peer there (Next.js alone is over 100 MB).
+// tools/scripts/verify-lib-dist.js check 15 refuses an undeclared import.
+const peerDependencies = rootPackageRanges(['next', 'react']);
+const peerDependenciesMeta = { next: { optional: true }, react: { optional: true } };
 
 export default defineConfig({
   root: __dirname,
@@ -37,6 +44,10 @@ export default defineConfig({
       // of monorepo-relative source paths that do not exist in the published package.
       aliasesExclude: [new RegExp('^@nextblock-cms/')],
       outDirs: '../../dist/libs/utils',
+      // The plugin declares every file tsconfig.lib.json includes, tests too: through 0.23.5 the
+      // package shipped sixteen `*.test.d.ts` files. tsconfig.lib.json keeps including the tests,
+      // because the typecheck target is what type-checks them.
+      exclude: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'src/**/*.spec.ts', 'src/**/*.spec.tsx'],
       afterBuild: () => {
         const packageJson = {
           name: '@nextblock-cms/utils',
@@ -98,6 +109,8 @@ export default defineConfig({
             // tests/published-dependencies.test.ts fails when the two differ.
             'sanitize-html': '^2.18.2',
           },
+          peerDependencies,
+          peerDependenciesMeta,
         };
 
         const outputDir = path.resolve(__dirname, '../../dist/libs/utils');

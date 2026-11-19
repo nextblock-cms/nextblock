@@ -543,6 +543,82 @@ what its consumers read, in the shape they read it, and a fourteenth holds the f
 | Supabase folder | The first fix was a denylist (`.temp/`, `.branches/`, `.env*` but `*.example`), and the Supabase CLI also keeps local state in `supabase/` that is not a dot path, which check 12 cannot see: local Studio's saved SQL snippets (`snippets/`) and `supabase gen signing-key`'s `signing_keys.json`. Consumers read only `config.toml`, `migrations/` and `templates/` from the package (create-nextblock's `ensureSupabaseAssets`, `npm run update`, the build hook's `migrate-core`); `functions/` holds the maintainer-only migration-ingest edge function, deployed from `libs/db/src`. The copy now takes exactly those three (`SUPABASE_PACKAGE_ENTRIES`), fails the build when one is missing, and owns `dist/libs/db/supabase`: it empties the folder before copying, and refuses any other destination, a link, and a destination whose real path is, holds or sits inside the source. Its first allowlist version merged instead, and vite-plugin-dts, which declares every file `tsconfig.lib.json` includes, had already written `supabase/functions/nextblock-migration-ingest/index.d.ts` there, so check 13 (the tarball's `supabase/` holds exactly the three entries) refused every fresh `db` build; `libs/db/vite.config.ts` now also excludes `src/supabase/**` from the declarations. Check 13 counts each entry only in the shape consumers read (`config.toml` as a file, `migrations/` and `templates/` as folders with a file in them), so a regular file named `supabase/migrations` is refused, not counted. The emptying copy first checked its destination as written, so a link above it (`dist/libs/db` as a junction into `libs/db/src`) let a run of the copy empty `libs/db/src/supabase`; it now compares real paths first (the OS realpath, which also expands Windows 8.3 short names). That guards the copy step only: `nx build db` runs `vite build` before it, and Vite's `emptyOutDir` empties `../../dist/libs/db` through such a link (all of `libs/db/src` in that example) before the copy can refuse. The release build (`buildLibArtifact`) deletes `dist/libs/db` (`fs.rmSync`, which unlinks a link there and keeps its target) before it builds, so a release is not exposed to a link at `dist/libs/db` itself; never link `dist/` or anything below it into the checkout. `copy-db-supabase.test.ts` fails when a consumer reads an entry the list leaves out, when a stale file survives the copy, and when a wrong destination, a link or a junction into, around or inside the source is not refused (a source spelled with 8.3 short names too, where the temp folder has one). |
 | Supabase files | Check 13 passes any file inside an allowed folder. Every install applies what ships in `supabase/migrations` (`migrate-core` and `npm run update` take any `<digits>_*.sql`), so a file the Supabase CLI writes with a timestamped name (`migration new`, `db diff -f`, `db pull`) left in `libs/db/src/supabase/migrations` would sort after every `GGNNN` version and run on every downstream database, and the release never runs `npm run db:migrate:check`. Check 14 holds the packed migrations to `validateMigrationNames` (`GGNNN_<snake_name>.sql`, one generation, contiguous from `000`), refuses any other file or a subfolder there (a `seed.sql` too, which no applier runs and `db:migrate:check` never lists), and allows only `*.html` in `supabase/templates` (the Auth email templates new projects upload). A correctly named migration can still be a work in progress, so check 14 also compares the packed file names with the ones `apps/nextblock/lib/setup/migrations-bundle.ts` embeds (what `/setup` applies on a serverless host, read with the TypeScript parser): a migration the bundle lacks, or a bundled one the tarball lacks, stops the release (take a file not meant for it out of the folder, otherwise run `npm run generate:migrations-bundle`), and a `migrations/` folder that holds no top-level `<digits>_*.sql` file (only stray files, a subfolder or dot paths) is one problem for the whole bundle. That also keeps a serverless `/setup` and `npm run update` from applying different sets of migrations; it compares names, not SQL, so a migration edited after the bundle was generated still passes. A work in progress that was bundled too still ships, so the releasing checkout must hold only the migrations meant for that release. |
 
+A fifteenth check covers the third-party packages the tarball imports:
+
+| Check | What went wrong |
+| :-- | :-- |
+| Undeclared packages | `ui`'s `button.d.ts` and `badge.d.ts` import `class-variance-authority` (`VariantProps<typeof buttonVariants>`), which the bundle inlines and nothing in a scaffold installed, so TypeScript found no `variant` or `size` on `Button` and `Badge`: 457 errors in every scaffold through 0.23.5, hidden by the scaffold's `typescript.ignoreBuildErrors`. The radix packages behind `ui`'s dialogs, menus and selects and the Tiptap packages behind the editor's types resolved nowhere either, so their props were silently `any`, and `utils`, `ui`, `editor` and `db` imported `react`, `react-dom`, `next`, `server-only` or `@supabase/*` at run time without declaring them (only the app's own copies made those resolve). Check 15 parses every packed file. In JavaScript every bare import must be declared (`dependencies`, `peerDependencies` or `optionalDependencies`; Node's own modules need nothing, and `@nextblock-cms/*` is check 11's). In a declaration file a package that a declared one installs also counts (TypeScript writes `import("@supabase/postgrest-js")` for a type inferred through `@supabase/supabase-js`; the check follows the installed manifests under the root `node_modules`), `/// <reference types>` and module augmentations count as imports, a sibling must be declared directly, and a dependency that ships no types of its own needs its `@types/*` package declared too (a peer does not: the project that provides `react` provides `@types/react`). The lib builds now declare what they import, each range read from the root `package.json` by `rootPackageRanges` (`tools/vite/lib-build-plugins.mjs`), so a published range is always the one the monorepo builds against: `ui` the radix packages and `class-variance-authority` as dependencies (the JavaScript keeps its inlined copies) and `react`/`react-dom` as peers; `editor` the Tiptap packages its declarations name, and the same peers; `sdk` `zod` and `lucide-react` as peers; `db` `@supabase/supabase-js`, `@supabase/ssr` and `server-only` as dependencies; `utils` and `db` `next` (and `utils` `react`) as **optional** peers, because `create-nextblock` depends on `db` for its `supabase/` folder alone and npm installs a required peer: Next.js on every `npm create nextblock`. |
+
+### The release rehearsal
+
+The pre-publish check judges one package at a time from inside the monorepo, where every
+devDependency is installed at the root. It never sees a scaffold: every scaffold from 0.23.0 to
+0.23.3 failed `next build` with `Can't resolve 'vitest'` (a template-literal `import()` bundled a
+test file), and every one through 0.23.5 had the 457 type errors above. `tools/scripts/rehearse-release.js`
+builds the scaffold a user gets, from what a release would publish, and publishes nothing:
+
+```bash
+npm run sync:create-nextblock                     # first: the CLI is packed from the template on disk
+node tools/scripts/rehearse-release.js            # work folder in the OS temp folder
+node tools/scripts/rehearse-release.js --workdir <folder outside the repository>
+```
+
+1. **Libraries.** `release-lib.js <lib> <version> --dry-run` for the eight libs in publish order
+   (the real Nx build, the pre-publish checks, `npm publish --dry-run`), then `npm pack` of each
+   `dist/libs/<lib>`. npm runs with an empty user config, so it holds no credentials, and with
+   `npm_config_force` so the dry-run publish accepts a version npm already serves. The version is
+   `create-nextblock`'s (`--version x.y.z` picks another); every stamp `release-lib.js` writes is
+   restored byte for byte afterwards.
+2. **CLI.** `npm pack --ignore-scripts` in `apps/create-nextblock`, so the template **as it is on
+   disk** ships: sync it first (`npm run sync:create-nextblock`), as a release does (the CI job
+   below does). The tarball is extracted into the work folder's `cli/`, emptied first on every run
+   (tar only adds and overwrites, so an earlier run's extraction would bring files deleted from the
+   template since into the scaffold), its own `@nextblock-cms/db` is pointed at the packed `db` (the
+   CLI copies `supabase/` from the copy it installed), and it runs from the extraction with
+   `--non-interactive --mode cloud --skip-install --no-trial`, which sends nothing to the license
+   service.
+3. **Scaffold.** Every `@nextblock-cms/*` dependency and override (the libs' own sibling edges, the
+   `@nextblock-cms/ecommerce` alias included) is pointed at the tarballs, `npm install` runs from the
+   public registry with install scripts off, and the lockfile must resolve every `@nextblock-cms/*`
+   package to a tarball: one taken from npm would rehearse a mix.
+4. **Checks**, with nothing removed from the scaffold (`app/cms/blocks/editors/SectionBlockEditor.test.tsx`
+   must still be there): `next build`; a scan of `.next` for bundled vitest, chai or test files;
+   `DOCKER_BUILD=true next build` (the standalone output the Dockerfile copies; no image is built),
+   which must write `.next/standalone/server.js` and trace no test tooling, then a boot of that
+   server laid out as the Dockerfile does (`/api/setup/status` must
+   answer with its readiness JSON, 503 until a first admin exists and so always here, and `/` below
+   500; `--no-boot` skips it); and `tsc --noEmit` against the budget pinned in
+   `tools/scripts/release-rehearsal-tsc-budget.json` (`total` and a count per error code). The
+   type-check leaves the test files out (a rehearsal-only `tsconfig.rehearsal.json` extends the
+   scaffold's own): they import vitest, which no scaffold installs, so each new app test would add
+   errors. A count
+   above its budget fails, an error code the budget does not list included; fewer errors print the
+   budget to pin instead. After fixing scaffold type errors, lower the budget (rerun with
+   `--write-budget` to write the measured counts) so the next regression has no slack to hide in.
+
+The scaffold builds with no Supabase settings, like a fresh `npm create nextblock` before `/setup`,
+and `next build` runs directly, never `npm run build` (its `prebuild` hook migrates). The work folder
+must lie outside the repository: Node resolves packages up the folder tree, so a scaffold inside it
+would find the monorepo's `node_modules` (vitest included) and hide exactly what this looks for.
+It keeps `logs/` (one file per step) and `rehearsal-report.json`; `--skip-pack` reuses its
+tarballs (the CLI is still packed again, so a re-run sees the template as it is now) and
+`--skip-scaffold` its installed scaffold, for a second look at the checks.
+
+`.github/workflows/release-rehearsal.yml` runs on pushes to master and on pull requests that change
+anything outside `docs/` and Markdown, a lib's `README.md` included (it is the lib's npm page, and
+the rehearsal's dry runs are the only place check 8 reads it before a release). It runs the CLI's
+own tests (`npx vitest run apps/create-nextblock/bin apps/create-nextblock/scripts`), which the
+unit job in `security.yml` does not collect, then syncs the template from the app
+(`npm run sync:create-nextblock`), as a release does, then the rehearsal. Pull requests change the
+app and leave the generated template alone (automated ones must), so without the sync it would
+rehearse the last committed template rather than the change under review; the synced copy stays in
+the runner's checkout and nothing commits it. It keeps the logs as an artifact, and runs only in the
+upstream repository: forks and 1-click copies inherit the file. Its filter is a `paths` list with
+`!` patterns (GitHub documents `!` for `paths` only; patterns apply in order and the last match
+decides, which is how the READMEs come back after `!**/*.md`), and `release-rehearsal.test.ts` pins
+it and the sync's place. A local run takes about 20 minutes; the runtime checks with a database and
+a browser in `.claude/local-preview/verify-tools` (git-excluded) remain a separate, manual pass.
+
 ### How the libraries build
 
 `npx nx build <lib>` runs the `vite build` target that `@nx/vite/plugin` infers from the lib's

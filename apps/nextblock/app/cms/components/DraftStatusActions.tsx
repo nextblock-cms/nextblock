@@ -91,9 +91,10 @@ export default function DraftStatusActions(props: DraftStatusActionsProps) {
   /**
    * A publish that went live with a warning keeps it on screen until the editor reloads the page from
    * the toast: the automatic reload 800 ms later cut the toast short, and the warning (fields a
-   * pre-0.23.4 draft could not publish, description blocks that may show twice, history not recorded,
-   * a draft row left behind) is often the only sign of what the publish skipped. As in the visibility
-   * dialog, which keeps the same warning until it is closed.
+   * pre-0.23.4 draft could not publish, a Freemius sale coupon not pushed; for a page or post, history
+   * not recorded or a draft row left behind) is often the only sign of what the publish skipped. As in
+   * the visibility dialog, which keeps the same warning until it is closed. A product publish is one
+   * transaction since migration 02043, so it never leaves a draft row behind or History unrecorded.
    */
   const showWarningUntilReload = (warning: string, toastId: string) => {
     if (parentType !== "product") {
@@ -214,9 +215,12 @@ export default function DraftStatusActions(props: DraftStatusActionsProps) {
   };
 
   return (
+    // z-40: under a dialog's overlay (z-50, libs/ui dialog.tsx), menus and popovers. At z-[1000] the
+    // bar drew over an open block editor, where nothing could click it (a Radix modal sets
+    // pointer-events none on body). DraftStatusActions.test.tsx holds it under the overlay.
     <div
       data-nextblock-draft-toolbar
-      className="fixed bottom-6 left-1/2 z-[1000] flex -translate-x-1/2 items-center gap-3.5 rounded-full border border-amber-500/30 bg-background/95 px-4 py-2 text-sm shadow-xl backdrop-blur-md transition-all duration-300 ease-in-out animate-in fade-in slide-in-from-bottom-5"
+      className="fixed bottom-6 left-1/2 z-40 flex -translate-x-1/2 items-center gap-3.5 rounded-full border border-amber-500/30 bg-background/95 px-4 py-2 text-sm shadow-xl backdrop-blur-md transition-all duration-300 ease-in-out animate-in fade-in slide-in-from-bottom-5"
     >
       <div className="flex items-center gap-2 px-1">
         <div className="relative flex h-2.5 w-2.5">

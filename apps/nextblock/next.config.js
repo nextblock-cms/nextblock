@@ -247,6 +247,26 @@ function getRemotePatterns() {
     } catch {
       // ignore malformed value
     }
+  } else {
+    // No explicit base: `env` above inlines the native Supabase Storage endpoint as the media
+    // base (computeSupabaseMediaBaseUrl), so its host has to be allowed too. `**.supabase.co`
+    // covers Supabase Cloud only; a self-hosted Supabase on its own domain answered every
+    // thumbnail with 400 "url parameter is not allowed". Limited to the public bucket path, not
+    // the whole host. (A loopback or private address stays refused: Next's optimizer blocks
+    // local IPs unless images.dangerouslyAllowLocalIP is set.)
+    const supabaseMediaBase = computeSupabaseMediaBaseUrl();
+    if (supabaseMediaBase) {
+      try {
+        const parsed = new URL(supabaseMediaBase);
+        patterns.push({
+          protocol: parsed.protocol === 'https:' ? 'https' : 'http',
+          hostname: parsed.hostname,
+          pathname: `${parsed.pathname.replace(/\/+$/, '')}/**`,
+        });
+      } catch {
+        // ignore a malformed Supabase URL
+      }
+    }
   }
 
   // Add General Public URL

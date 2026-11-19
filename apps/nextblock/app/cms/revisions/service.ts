@@ -447,6 +447,15 @@ async function restoreInternal(
 
   await deleteDraftFor(supabase, spec, parentId);
 
+  // A restore replays a product's meta columns and blocks, never its commerce section (prices,
+  // variants, stock, the sale window, the gallery: utils.ts ProductCommerceContent), and a version
+  // recorded before migration 02043 has none. So a product's new snapshot is the product as it now
+  // is, read back, and not the reconstructed version, which would claim its old prices were restored.
+  const recordedContent: AnyFullContent =
+    spec.parentTable === 'products'
+      ? ((await getFullProductContent(String(parentId), undefined, supabase)) ?? content)
+      : content;
+
   // Record the restored state as a new snapshot so history stays append-only: restoring is
   // itself an edit, and the version you restored from remains reachable.
   const currentVersion = (await readParentVersion(supabase, spec, parentId)) ?? 1;
@@ -458,7 +467,7 @@ async function restoreInternal(
       author_id: authorId,
       version,
       revision_type: 'snapshot',
-      content: content as unknown as Json,
+      content: recordedContent as unknown as Json,
     });
 
   let { error: revError } = await insertRestoreSnapshot(newVersion);

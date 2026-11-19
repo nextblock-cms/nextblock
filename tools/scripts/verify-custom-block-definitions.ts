@@ -8,7 +8,7 @@ import {
   customBlockDefinitionCreateSchema,
   customBlockDefinitionRowSchema,
   type CustomBlockDefinition,
-} from '../../../schemas/custom-blocks';
+} from '../../schemas/custom-blocks';
 
 dotenv.config({ path: '.env.local' });
 

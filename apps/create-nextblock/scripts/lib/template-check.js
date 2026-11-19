@@ -1,5 +1,6 @@
 import { relative, resolve, sep } from 'node:path';
 import fs from 'fs-extra';
+import { findRepeatedMocks, UI_SUBPATH_IMPORT } from './ui-imports.js';
 
 // What the template sync promises about the finished template, checked from disk. `npm publish`
 // runs the sync in `prepack`, so a template that falls short stops the publish before anything
@@ -11,8 +12,6 @@ const MUST_BE_ABSENT = ['project.json', 'tsconfig.tsbuildinfo'];
 const DOCKER_SCRIPTS = ['docker:setup', 'docker:up', 'docker:down', 'docker:logs'];
 const SOURCE_DIRS = ['app', 'components', 'context', 'lib'];
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx']);
-/** The same pattern sanitizeUiImports rewrites to the `@nextblock-cms/ui` barrel. */
-const UI_SUBPATH_IMPORT = /@nextblock-cms\/ui\/(?!styles\/)[A-Za-z0-9/_-]+/;
 
 export const toPosix = (path) => path.split(sep).join('/');
 
@@ -86,8 +85,19 @@ export async function findTemplateProblems(
     const absoluteDir = resolve(templateDir, dir);
     if (!(await fs.pathExists(absoluteDir))) continue;
     for (const file of await listFiles(absoluteDir, hasSourceExtension)) {
-      const match = (await fs.readFile(file, 'utf8')).match(UI_SUBPATH_IMPORT);
-      if (match) problems.push(`${toPosix(relative(templateDir, file))} still imports ${match[0]}`);
+      const text = await fs.readFile(file, 'utf8');
+      const rel = toPosix(relative(templateDir, file));
+      const match = text.match(UI_SUBPATH_IMPORT);
+      if (match) problems.push(`${rel} still imports ${match[0]}`);
+      // vitest keeps only the last factory for a module, so the other mocks silently stop applying
+      // (the rewritten header-auth.test.tsx mocked the ui barrel three times through 0.23.5).
+      for (const { specifier, count } of findRepeatedMocks(text)) {
+        problems.push(
+          `${rel} mocks ${specifier} ${count} times, and vitest keeps only the last: give the ui subpath mocks in ` +
+            `apps/nextblock one shared factory (vi.mock('@nextblock-cms/ui/button', () => ui), as in ` +
+            'components/header-auth.test.tsx), which the sync reduces to one line',
+        );
+      }
     }
   }
 

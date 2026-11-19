@@ -24047,6 +24047,2005 @@ VALUES
 ON CONFLICT (key) DO NOTHING;
 
 
+-- >>> FROM: 02043_atomic_product_draft_publish.sql <<<
+-- 02043: a product draft publishes in one transaction, under a row lock.
+-- Append-only, forward-only: five functions (CREATE OR REPLACE, the values helper dropped first), no
+-- table, policy or data change. The file also replays over a database where it and 02044 already ran:
+-- the sandbox reset and the stale-history self-heal drop only \`public\`, so the three \`private\` helpers
+-- stay, the values helper as 02044 left it. CREATE OR REPLACE cannot change a return type, so that
+-- helper returns jsonb here too and is dropped before it is created (section 3);
+-- tools/scripts/migration-replay.db.test.ts replays every file that way. Every function is SECURITY
+-- INVOKER: it runs with the caller's rights and RLS, so it can do nothing the caller could not already
+-- do over PostgREST, only all of it at once or none of it.
+--
+-- Until now publishProductVisualEditingDraft (apps/nextblock/lib/visual-editing/product-drafts.ts) sent
+-- a dozen PostgREST requests with no transaction around them: a claim on the draft (an UPDATE on its id
+-- and updated_at), upsert_product_with_variants, the gallery upsert and unlink, taxability, SEO, the
+-- sale schedule across the SKU group, the shared inventory (with the service role), the categories, a
+-- block insert, a block delete, a revision and the draft delete. The limits 0.23.4 accepted for that:
+--   * two publishes (two tabs or two admins) could leave the description blocks twice;
+--   * a save that landed after the claim reported success and was deleted with the draft;
+--   * a failure after the RPC (the gallery, the inventory, the blocks...) was reported as a failed
+--     publish while prices and variants were already live, and nothing was revalidated;
+--   * every product-values publish deleted and re-created the variants: new ids, so past order items
+--     lost their variant link (order_items.variant_id ON DELETE SET NULL) and a cart line added before
+--     the publish was refused at checkout as unavailable;
+--   * pending scheduled variant prices (scheduled_price, scheduled_prices, scheduled_price_at, written
+--     by the promotions import) were dropped by every product-values publish;
+--   * History recorded nothing for a publish that only changed prices, variants, stock, the sale window
+--     or the gallery: the revision content held the product columns and the blocks only.
+--
+-- public.publish_product_draft() replaces all of it with one call, made by the app after
+-- requireCmsAdmin() (an ADMIN past the second factor). It refuses anyone but an ADMIN (is_admin(), as
+-- every products write policy does: a remembered device is an aal1 session, so is_admin_mfa() would
+-- refuse admins the app lets in), locks the products row and then the draft row (FOR UPDATE, always in
+-- that order), and refuses with nothing written when:
+--   * the draft is gone (NBP01): another publish or a discard deleted it first; a second publish that
+--     waited on the lock lands here, so the description is replaced once;
+--   * the draft changed since the app read it (NBP02: another id, or another updated_at, which
+--     on_product_drafts_update moves on every UPDATE): a save that landed before the lock is kept in
+--     the draft, and one that waits on the lock finds the row deleted (the app's save paths check the
+--     rows their UPDATE returned and say so, or start a new draft);
+--   * the product changed since the app read it (NBP03: another updated_at), because the values the
+--     app completed from that read (completeProductDraftValues, planProductDraftOverlayPublish's
+--     updated_at rule for a pre-0.23.4 snapshot) would revert the change.
+-- Then it writes the product values (or the overlay fields), replaces the description blocks with the
+-- draft's, records History when the content changed, and deletes the draft. Any error rolls all of it
+-- back: nothing is half-published, and the draft stays for another try.
+--
+-- Product values (private.apply_product_draft_values) do what updateProduct() did, in the same order,
+-- with these differences:
+--   * variants are matched to the live ones by their set of attribute terms (the draft's own variant
+--     id breaks a tie between live variants with the same set): a match is updated in place, keeping
+--     its id, its order item links and its pending scheduled prices; only a live variant the draft no
+--     longer has is deleted, and only a draft variant with a new term set is inserted;
+--   * a variant image or gallery image that no longer has a media row is left out (the gallery already
+--     was since 0.23.4), and so is a category that no longer exists, instead of failing the publish;
+--   * products.status (visibility belongs to the row) and products.metadata are never written;
+--   * the shared inventory is written through the caller's ADMIN session (inventory_items has ADMIN
+--     write policies) instead of the service role.
+-- A save path still never deletes media: the gallery is one upsert of the listed images and one unlink
+-- of the rest; no media row is ever deleted here.
+--
+-- public.product_revision_content() is the History content of a product, in one place: the app's
+-- getFullProductContent() (apps/nextblock/app/cms/revisions/utils.ts) reads it too. It keeps the
+-- \`meta\` and \`blocks\` of earlier revisions and adds \`commerce\`: SKU, UPC, type and provider, prices,
+-- sale prices and the sale window, pending scheduled prices, stock, taxability, the Freemius ids and
+-- trial, the gallery's media ids, the category ids, and each variant's values and terms (by SKU,
+-- without ids). A restore still replays only the title, descriptions, SEO fields and blocks.
+--
+-- Grants: EXECUTE for authenticated and service_role only. The post-apply grant pass grants EXECUTE on
+-- every function in \`public\` to anon, so both public functions are also in API_ROLE_REVOKE_SQL
+-- (apps/nextblock/tools/lib/migrate-core.mjs and apps/nextblock/lib/setup/schema-apply.ts). The three
+-- helpers live in \`private\` (not exposed by PostgREST; the pass never touches it); the invoker needs
+-- EXECUTE on them. tools/scripts/security-verify.sql section 44 checks the privileges and the behaviour,
+-- and tools/scripts/product-draft-publish.db.test.ts runs two sessions against each other.
+
+CREATE SCHEMA IF NOT EXISTS private;
+
+-- ---------------------------------------------------------------------------
+-- 1. The History content of a product
+-- ---------------------------------------------------------------------------
+-- Timestamps are written as Date#toISOString() writes them (millisecond precision, \`Z\`), as the app's
+-- snapshots always were, so a value that round-trips through the database is never a phantom change.
+CREATE OR REPLACE FUNCTION public.product_revision_content(p_product_id uuid)
+    RETURNS jsonb
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+  SELECT jsonb_build_object(
+    'meta', jsonb_build_object(
+      'title', p.title,
+      'slug', p.slug,
+      'language_id', p.language_id,
+      'status', p.status,
+      'meta_title', p.meta_title,
+      'meta_description', p.meta_description,
+      'custom_canonical', p.custom_canonical,
+      'published_at', to_char(p.published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'short_description', p.short_description,
+      'description_json', p.description_json
+    ),
+    -- Ordered by "order" then id: revision blocks carry no id, so their position is their identity.
+    'blocks', COALESCE((
+      SELECT jsonb_agg(
+               jsonb_build_object(
+                 'language_id', b.language_id,
+                 'block_type', b.block_type,
+                 'content', b.content,
+                 'order', b."order"
+               )
+               ORDER BY b."order", b.id
+             )
+        FROM public.blocks b
+       WHERE b.product_id = p.id
+    ), '[]'::jsonb),
+    'commerce', jsonb_build_object(
+      'sku', p.sku,
+      'upc', p.upc,
+      'product_type', p.product_type,
+      'payment_provider', p.payment_provider,
+      'price', p.price,
+      'prices', p.prices,
+      'sale_price', p.sale_price,
+      'sale_prices', p.sale_prices,
+      'sale_start_at', to_char(p.sale_start_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'sale_end_at', to_char(p.sale_end_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'scheduled_price', p.scheduled_price,
+      'scheduled_prices', p.scheduled_prices,
+      'scheduled_price_at', to_char(p.scheduled_price_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+      'stock', p.stock,
+      'is_taxable', p.is_taxable,
+      'freemius_product_id', p.freemius_product_id,
+      'freemius_plan_id', p.freemius_plan_id,
+      'trial_period_days', p.trial_period_days,
+      'trial_requires_payment_method', p.trial_requires_payment_method,
+      'gallery', COALESCE((
+        SELECT jsonb_agg(pm.media_id ORDER BY pm.sort_order NULLS LAST, pm.media_id)
+          FROM public.product_media pm
+         WHERE pm.product_id = p.id
+      ), '[]'::jsonb),
+      'category_ids', COALESCE((
+        SELECT jsonb_agg(pc.category_id ORDER BY pc.category_id)
+          FROM public.product_categories pc
+         WHERE pc.product_id = p.id
+      ), '[]'::jsonb),
+      'variants', COALESCE((
+        SELECT jsonb_agg(
+                 jsonb_build_object(
+                   'sku', v.sku,
+                   'upc', v.upc,
+                   'price', v.price,
+                   'prices', v.prices,
+                   'sale_price', v.sale_price,
+                   'sale_prices', v.sale_prices,
+                   'sale_start_at', to_char(v.sale_start_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                   'sale_end_at', to_char(v.sale_end_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                   'scheduled_price', v.scheduled_price,
+                   'scheduled_prices', v.scheduled_prices,
+                   'scheduled_price_at', to_char(v.scheduled_price_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                   'stock_quantity', v.stock_quantity,
+                   'main_media_id', v.main_media_id,
+                   'attribute_term_ids', COALESCE((
+                     SELECT jsonb_agg(m.attribute_term_id ORDER BY m.attribute_term_id)
+                       FROM public.variant_attribute_mapping m
+                      WHERE m.variant_id = v.id
+                   ), '[]'::jsonb)
+                 )
+                 ORDER BY v.sku, v.id
+               )
+          FROM public.product_variants v
+         WHERE v.product_id = p.id
+      ), '[]'::jsonb)
+    )
+  )
+  FROM public.products p
+  WHERE p.id = p_product_id;
+$$;
+
+REVOKE ALL ON FUNCTION public.product_revision_content(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.product_revision_content(uuid) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 2. Variants, matched to the live ones by their attribute terms
+-- ---------------------------------------------------------------------------
+-- Called only by private.apply_product_draft_values(). \`p_variants\` is the draft's list in minor units
+-- (serializeVariantsForRpc in libs/ecommerce product-actions.ts). A draft variant takes the first live
+-- variant not yet taken whose set of attribute terms equals its own, preferring the live variant with
+-- the draft variant's own id; that row is updated in place (same id, so order items keep their link,
+-- carts keep their line, and scheduled prices stay pending). Live variants left over are deleted (their
+-- mappings cascade), and draft variants left over are inserted with their mappings. A kept variant
+-- whose SKU changes first takes a temporary SKU, because product_variants_product_id_sku_key is
+-- checked row by row and two kept variants may swap SKUs.
+CREATE OR REPLACE FUNCTION private.sync_product_draft_variants(p_product_id uuid, p_variants jsonb)
+    RETURNS void
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_uuid_pattern constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_live_ids uuid[];
+  v_live_keys text[];
+  v_taken boolean[];
+  v_live_count integer;
+  v_variant jsonb;
+  v_key text;
+  v_draft_id uuid;
+  v_match integer;
+  v_i integer;
+  v_matched_ids uuid[] := '{}';
+  v_matched_variants jsonb[] := '{}';
+  v_new_variants jsonb[] := '{}';
+  v_delete_ids uuid[];
+  v_variant_id uuid;
+BEGIN
+  IF p_variants IS NULL OR jsonb_typeof(p_variants) <> 'array' THEN
+    RAISE EXCEPTION 'The draft''s variants are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  -- The live variants and their term sets, oldest first.
+  SELECT COALESCE(array_agg(v.id ORDER BY v.created_at, v.id), '{}'),
+         COALESCE(array_agg(COALESCE(k.term_key, '') ORDER BY v.created_at, v.id), '{}')
+    INTO v_live_ids, v_live_keys
+    FROM public.product_variants v
+    LEFT JOIN LATERAL (
+      SELECT string_agg(m.attribute_term_id::text, ',' ORDER BY m.attribute_term_id) AS term_key
+        FROM public.variant_attribute_mapping m
+       WHERE m.variant_id = v.id
+    ) k ON true
+   WHERE v.product_id = p_product_id;
+
+  v_live_count := COALESCE(array_length(v_live_ids, 1), 0);
+  v_taken := array_fill(false, ARRAY[v_live_count]);
+
+  FOR v_variant IN SELECT value FROM jsonb_array_elements(p_variants) LOOP
+    IF jsonb_typeof(v_variant) <> 'object' THEN
+      RAISE EXCEPTION 'A draft variant is not an object.' USING ERRCODE = 'NBP04';
+    END IF;
+
+    v_key := COALESCE((
+      SELECT string_agg(t.term_id::text, ',' ORDER BY t.term_id)
+        FROM (
+          SELECT DISTINCT value::uuid AS term_id
+            FROM jsonb_array_elements_text(COALESCE(v_variant->'attribute_term_ids', '[]'::jsonb))
+        ) t
+    ), '');
+
+    v_draft_id := CASE
+      WHEN lower(COALESCE(v_variant->>'id', '')) ~ v_uuid_pattern THEN (v_variant->>'id')::uuid
+    END;
+
+    v_match := NULL;
+    IF v_draft_id IS NOT NULL THEN
+      v_i := array_position(v_live_ids, v_draft_id);
+      IF v_i IS NOT NULL AND NOT v_taken[v_i] AND v_live_keys[v_i] = v_key THEN
+        v_match := v_i;
+      END IF;
+    END IF;
+    IF v_match IS NULL THEN
+      FOR v_i IN 1 .. v_live_count LOOP
+        IF NOT v_taken[v_i] AND v_live_keys[v_i] = v_key THEN
+          v_match := v_i;
+          EXIT;
+        END IF;
+      END LOOP;
+    END IF;
+
+    IF v_match IS NULL THEN
+      v_new_variants := array_append(v_new_variants, v_variant);
+    ELSE
+      v_taken[v_match] := true;
+      v_matched_ids := array_append(v_matched_ids, v_live_ids[v_match]);
+      v_matched_variants := array_append(v_matched_variants, v_variant);
+    END IF;
+  END LOOP;
+
+  -- 1. Live variants the draft no longer has. Their order items keep the line and lose the link
+  --    (order_items_variant_id_fkey is ON DELETE SET NULL), as before.
+  SELECT COALESCE(array_agg(l.id), '{}')
+    INTO v_delete_ids
+    FROM unnest(v_live_ids) WITH ORDINALITY AS l(id, n)
+   WHERE NOT v_taken[l.n::integer];
+
+  IF COALESCE(array_length(v_delete_ids, 1), 0) > 0 THEN
+    DELETE FROM public.product_variants
+     WHERE product_id = p_product_id
+       AND id = ANY (v_delete_ids);
+  END IF;
+
+  -- 2. A kept variant whose SKU changes gives its old SKU up first.
+  FOR v_i IN 1 .. COALESCE(array_length(v_matched_ids, 1), 0) LOOP
+    UPDATE public.product_variants
+       SET sku = '__nextblock_publish_' || id::text
+     WHERE id = v_matched_ids[v_i]
+       AND sku IS DISTINCT FROM (v_matched_variants[v_i]->>'sku');
+  END LOOP;
+
+  -- 3. Kept variants take the draft's values on the same row; scheduled prices stay as they are.
+  FOR v_i IN 1 .. COALESCE(array_length(v_matched_ids, 1), 0) LOOP
+    v_variant := v_matched_variants[v_i];
+    UPDATE public.product_variants
+       SET sku = v_variant->>'sku',
+           upc = NULLIF(v_variant->>'upc', ''),
+           price = COALESCE((v_variant->>'price')::integer, 0),
+           prices = COALESCE(v_variant->'prices', '{}'::jsonb),
+           sale_price = CASE
+             WHEN v_variant ? 'sale_price' AND v_variant->>'sale_price' <> '' THEN (v_variant->>'sale_price')::integer
+           END,
+           sale_prices = CASE
+             WHEN v_variant ? 'sale_prices' THEN COALESCE(v_variant->'sale_prices', '{}'::jsonb)
+           END,
+           sale_start_at = CASE
+             WHEN v_variant ? 'sale_start_at' AND v_variant->>'sale_start_at' <> '' THEN (v_variant->>'sale_start_at')::timestamptz
+           END,
+           sale_end_at = CASE
+             WHEN v_variant ? 'sale_end_at' AND v_variant->>'sale_end_at' <> '' THEN (v_variant->>'sale_end_at')::timestamptz
+           END,
+           stock_quantity = COALESCE((v_variant->>'stock_quantity')::integer, 0),
+           main_media_id = (
+             SELECT m.id
+               FROM public.media m
+              WHERE m.id = CASE
+                WHEN lower(COALESCE(v_variant->>'main_media_id', '')) ~ v_uuid_pattern THEN lower(v_variant->>'main_media_id')::uuid
+              END
+           ),
+           updated_at = now()
+     WHERE id = v_matched_ids[v_i];
+  END LOOP;
+
+  -- 4. Draft variants with a term set no live variant has.
+  FOREACH v_variant IN ARRAY v_new_variants LOOP
+    INSERT INTO public.product_variants (
+      product_id,
+      sku,
+      upc,
+      price,
+      prices,
+      sale_price,
+      sale_prices,
+      sale_start_at,
+      sale_end_at,
+      stock_quantity,
+      main_media_id
+    )
+    VALUES (
+      p_product_id,
+      v_variant->>'sku',
+      NULLIF(v_variant->>'upc', ''),
+      COALESCE((v_variant->>'price')::integer, 0),
+      COALESCE(v_variant->'prices', '{}'::jsonb),
+      CASE WHEN v_variant ? 'sale_price' AND v_variant->>'sale_price' <> '' THEN (v_variant->>'sale_price')::integer END,
+      CASE WHEN v_variant ? 'sale_prices' THEN COALESCE(v_variant->'sale_prices', '{}'::jsonb) END,
+      CASE WHEN v_variant ? 'sale_start_at' AND v_variant->>'sale_start_at' <> '' THEN (v_variant->>'sale_start_at')::timestamptz END,
+      CASE WHEN v_variant ? 'sale_end_at' AND v_variant->>'sale_end_at' <> '' THEN (v_variant->>'sale_end_at')::timestamptz END,
+      COALESCE((v_variant->>'stock_quantity')::integer, 0),
+      (
+        SELECT m.id
+          FROM public.media m
+         WHERE m.id = CASE
+           WHEN lower(COALESCE(v_variant->>'main_media_id', '')) ~ v_uuid_pattern THEN lower(v_variant->>'main_media_id')::uuid
+         END
+      )
+    )
+    RETURNING id INTO v_variant_id;
+
+    INSERT INTO public.variant_attribute_mapping (variant_id, attribute_term_id)
+    SELECT DISTINCT v_variant_id, value::uuid
+      FROM jsonb_array_elements_text(COALESCE(v_variant->'attribute_term_ids', '[]'::jsonb));
+  END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.sync_product_draft_variants(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.sync_product_draft_variants(uuid, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. Product values: what updateProduct() wrote, in one statement list
+-- ---------------------------------------------------------------------------
+-- Called only by public.publish_product_draft(). \`p_values\` is built by buildProductDraftPublishValues
+-- (libs/ecommerce product-actions.ts): the RPC payload of updateProduct() (minor units) without \`id\`,
+-- \`status\`, \`metadata\` and \`payment_provider\`, plus the SEO fields, \`gallery_media_ids\` (null: leave the
+-- gallery as it is) and \`category_ids\` (null: leave the categories as they are). The product row takes
+-- the columns upsert_product_with_variants took (\`payment_provider\` follows \`product_type\`, the stock
+-- of a product with variants is their sum), taxability and the SEO fields (blank becomes NULL).
+-- It answers { stock_adjusted: [] }, which the publish below ignores: 02044 re-creates this helper to
+-- answer the stock it adjusted, and a replay runs this file over that version (see the header). The
+-- helper is dropped first all the same: a developer's database that ran this file before 2026-11-18,
+-- and not yet 02044, holds a version returning void (no shared database ran it), and CREATE OR REPLACE
+-- fails over another return type (42P13), which rolls a whole replay back. Nothing depends on the
+-- helper (a plpgsql body is not tracked: the publish below calls it by name), so the drop takes
+-- nothing else with it, and the grants after it are set again on the new one.
+DROP FUNCTION IF EXISTS private.apply_product_draft_values(uuid, jsonb);
+
+CREATE OR REPLACE FUNCTION private.apply_product_draft_values(p_product_id uuid, p_values jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_uuid_pattern constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  v_variants jsonb := COALESCE(p_values->'variants', '[]'::jsonb);
+  v_has_variants boolean;
+  v_total_variant_stock integer := 0;
+  v_product_type text;
+  v_translation_group_id uuid;
+  v_saved record;
+  v_sku_group uuid[];
+  v_siblings uuid[];
+  v_gallery uuid[];
+  v_inventory_sku text;
+BEGIN
+  IF p_values IS NULL OR jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The draft''s product values are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF jsonb_typeof(v_variants) <> 'array' THEN
+    RAISE EXCEPTION 'The draft''s variants are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  v_has_variants := jsonb_array_length(v_variants) > 0;
+  v_translation_group_id := CASE
+    WHEN lower(COALESCE(p_values->>'translation_group_id', '')) ~ v_uuid_pattern THEN (p_values->>'translation_group_id')::uuid
+  END;
+  v_product_type := CASE
+    WHEN p_values->>'product_type' IN ('physical', 'digital') THEN p_values->>'product_type'
+    WHEN NULLIF(p_values->>'freemius_product_id', '') IS NOT NULL
+      OR NULLIF(p_values->>'freemius_plan_id', '') IS NOT NULL THEN 'digital'
+    ELSE 'physical'
+  END;
+
+  IF v_has_variants THEN
+    SELECT COALESCE(SUM(COALESCE((value->>'stock_quantity')::integer, 0)), 0)
+      INTO v_total_variant_stock
+      FROM jsonb_array_elements(v_variants);
+  END IF;
+
+  -- The product row.
+  UPDATE public.products
+     SET title = p_values->>'title',
+         slug = p_values->>'slug',
+         sku = p_values->>'sku',
+         product_type = v_product_type,
+         payment_provider = CASE WHEN v_product_type = 'digital' THEN 'freemius' ELSE 'stripe' END,
+         upc = NULLIF(p_values->>'upc', ''),
+         stock = CASE
+           WHEN v_has_variants THEN v_total_variant_stock
+           ELSE COALESCE((p_values->>'stock')::integer, 0)
+         END,
+         short_description = NULLIF(p_values->>'short_description', ''),
+         description_json = NULLIF(p_values->'description_json', 'null'::jsonb),
+         price = COALESCE((p_values->>'price')::integer, 0),
+         prices = COALESCE(p_values->'prices', '{}'::jsonb),
+         sale_price = CASE
+           WHEN p_values ? 'sale_price' AND p_values->>'sale_price' <> '' THEN (p_values->>'sale_price')::integer
+         END,
+         sale_prices = CASE
+           WHEN p_values ? 'sale_prices' THEN COALESCE(p_values->'sale_prices', '{}'::jsonb)
+         END,
+         sale_start_at = CASE
+           WHEN p_values ? 'sale_start_at' AND p_values->>'sale_start_at' <> '' THEN (p_values->>'sale_start_at')::timestamptz
+         END,
+         sale_end_at = CASE
+           WHEN p_values ? 'sale_end_at' AND p_values->>'sale_end_at' <> '' THEN (p_values->>'sale_end_at')::timestamptz
+         END,
+         freemius_plan_id = NULLIF(p_values->>'freemius_plan_id', ''),
+         freemius_product_id = NULLIF(p_values->>'freemius_product_id', ''),
+         trial_period_days = COALESCE((p_values->>'trial_period_days')::integer, 0),
+         trial_requires_payment_method = COALESCE((p_values->>'trial_requires_payment_method')::boolean, false),
+         is_taxable = COALESCE((p_values->>'is_taxable')::boolean, is_taxable),
+         meta_title = NULLIF(btrim(p_values->>'meta_title'), ''),
+         meta_description = NULLIF(btrim(p_values->>'meta_description'), ''),
+         custom_canonical = NULLIF(btrim(p_values->>'custom_canonical'), ''),
+         language_id = COALESCE((p_values->>'language_id')::bigint, language_id),
+         translation_group_id = COALESCE(v_translation_group_id, translation_group_id),
+         updated_at = now()
+   WHERE id = p_product_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  -- The variants (section 2).
+  PERFORM private.sync_product_draft_variants(p_product_id, v_variants);
+
+  -- The gallery: the listed images that still have a media row, each once, in their order, then the
+  -- images it no longer lists unlinked. A dropped image keeps its media row and its files.
+  IF jsonb_typeof(p_values->'gallery_media_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(listed.media_id ORDER BY listed.position), '{}')
+      INTO v_gallery
+      FROM (
+        SELECT candidate.media_id, min(candidate.ordinality) AS position
+          FROM (
+            SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS media_id,
+                   item.ordinality
+              FROM jsonb_array_elements_text(p_values->'gallery_media_ids') WITH ORDINALITY AS item(value, ordinality)
+          ) candidate
+         WHERE candidate.media_id IS NOT NULL
+         GROUP BY candidate.media_id
+      ) listed
+     WHERE EXISTS (SELECT 1 FROM public.media m WHERE m.id = listed.media_id);
+
+    INSERT INTO public.product_media (product_id, media_id, sort_order)
+    SELECT p_product_id, g.media_id, (g.n - 1)::integer
+      FROM unnest(v_gallery) WITH ORDINALITY AS g(media_id, n)
+        ON CONFLICT (product_id, media_id) DO UPDATE SET sort_order = EXCLUDED.sort_order;
+
+    DELETE FROM public.product_media
+     WHERE product_id = p_product_id
+       AND NOT (media_id = ANY (v_gallery));
+  END IF;
+
+  -- The sale schedule belongs to the SKU: the saved row's canonical sale amounts (the currency trigger
+  -- has normalised them) and its window go to every product sharing the SKU (its translations), and
+  -- each variant's to the variants with its SKU in those products.
+  SELECT p.sku, p.sale_price, p.sale_prices, p.sale_start_at, p.sale_end_at, p.translation_group_id
+    INTO v_saved
+    FROM public.products p
+   WHERE p.id = p_product_id;
+
+  SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+    INTO v_sku_group
+    FROM public.products p
+   WHERE p.sku = v_saved.sku;
+
+  UPDATE public.products
+     SET sale_price = v_saved.sale_price,
+         sale_prices = v_saved.sale_prices,
+         sale_start_at = v_saved.sale_start_at,
+         sale_end_at = v_saved.sale_end_at,
+         updated_at = now()
+   WHERE id = ANY (v_sku_group);
+
+  IF v_has_variants THEN
+    UPDATE public.product_variants AS target
+       SET sale_price = source.sale_price,
+           sale_prices = source.sale_prices,
+           sale_start_at = source.sale_start_at,
+           sale_end_at = source.sale_end_at,
+           updated_at = now()
+      FROM public.product_variants AS source
+     WHERE source.product_id = p_product_id
+       AND target.sku = source.sku
+       AND target.product_id = ANY (v_sku_group);
+  END IF;
+
+  -- The shared inventory: one row per SKU (a later variant with the same SKU wins). Its trigger writes
+  -- the quantity back to every variant and product with that SKU.
+  IF v_has_variants THEN
+    INSERT INTO public.inventory_items (sku, quantity)
+    SELECT DISTINCT ON (stock.sku) stock.sku, stock.quantity
+      FROM (
+        SELECT btrim(item.value->>'sku') AS sku,
+               GREATEST(0, trunc(COALESCE((item.value->>'stock_quantity')::numeric, 0)))::integer AS quantity,
+               item.ordinality
+          FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+      ) stock
+     WHERE stock.sku <> ''
+     ORDER BY stock.sku, stock.ordinality DESC
+        ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+  ELSE
+    v_inventory_sku := btrim(p_values->>'sku');
+    IF v_inventory_sku <> '' THEN
+      INSERT INTO public.inventory_items (sku, quantity)
+      VALUES (v_inventory_sku, GREATEST(0, trunc(COALESCE((p_values->>'stock')::numeric, 0)))::integer)
+          ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+    END IF;
+  END IF;
+
+  -- Categories belong to the translation group: every product in it gets the listed categories that
+  -- still exist.
+  IF jsonb_typeof(p_values->'category_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+      INTO v_siblings
+      FROM public.products p
+     WHERE p.translation_group_id = v_saved.translation_group_id;
+
+    DELETE FROM public.product_categories WHERE product_id = ANY (v_siblings);
+
+    INSERT INTO public.product_categories (product_id, category_id)
+    SELECT sibling.id, category.id
+      FROM unnest(v_siblings) AS sibling(id)
+     CROSS JOIN (
+       SELECT DISTINCT c.id
+         FROM (
+           SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS category_id
+             FROM jsonb_array_elements_text(p_values->'category_ids') AS item(value)
+         ) requested
+         JOIN public.categories c ON c.id = requested.category_id
+     ) category;
+  END IF;
+
+  RETURN jsonb_build_object('stock_adjusted', '[]'::jsonb);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.apply_product_draft_values(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.apply_product_draft_values(uuid, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. History: one snapshot per publish that changed the content
+-- ---------------------------------------------------------------------------
+-- Called only by public.publish_product_draft(), with the content before and after its writes. A
+-- revision chain needs a base: when no snapshot sits at or below the current version, the content
+-- before is recorded first at that version (createRevisionInternal's ensureBaseSnapshot). The new
+-- revision is always a full snapshot (the app's reader replays either kind), at the next free
+-- version, and products.version moves to it. Another writer taking that version first (the app's
+-- revision engine does not lock the product row) only moves this one to the next.
+CREATE OR REPLACE FUNCTION private.record_product_revision(p_product_id uuid, p_before jsonb, p_after jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_current integer;
+  v_next integer;
+  v_attempts integer := 0;
+BEGIN
+  SELECT COALESCE(p.version, 1) INTO v_current FROM public.products p WHERE p.id = p_product_id;
+
+  IF p_after IS NULL OR p_before IS NOT DISTINCT FROM p_after THEN
+    RETURN jsonb_build_object('recorded', false, 'version', v_current);
+  END IF;
+
+  IF p_before IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+      FROM public.product_revisions r
+     WHERE r.product_id = p_product_id
+       AND r.version <= v_current
+       AND r.revision_type = 'snapshot'
+  ) THEN
+    INSERT INTO public.product_revisions (product_id, author_id, version, revision_type, content)
+    VALUES (p_product_id, auth.uid(), v_current, 'snapshot', p_before)
+        ON CONFLICT (product_id, version) DO NOTHING;
+  END IF;
+
+  LOOP
+    SELECT GREATEST(v_current, COALESCE(max(r.version), 0)) + 1
+      INTO v_next
+      FROM public.product_revisions r
+     WHERE r.product_id = p_product_id;
+
+    BEGIN
+      INSERT INTO public.product_revisions (product_id, author_id, version, revision_type, content)
+      VALUES (p_product_id, auth.uid(), v_next, 'snapshot', p_after);
+      EXIT;
+    EXCEPTION WHEN unique_violation THEN
+      v_attempts := v_attempts + 1;
+      IF v_attempts >= 5 THEN
+        RAISE;
+      END IF;
+    END;
+  END LOOP;
+
+  UPDATE public.products SET version = v_next WHERE id = p_product_id;
+
+  RETURN jsonb_build_object('recorded', true, 'version', v_next);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.record_product_revision(uuid, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.record_product_revision(uuid, jsonb, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. The publish
+-- ---------------------------------------------------------------------------
+-- p_draft_id / p_draft_updated_at: the draft row as the app read it. p_product_updated_at: the products
+-- row's updated_at as the app read it (NULL when the column is NULL). p_values: the product values
+-- (section 3), or NULL for a draft that holds none. p_overlay: { title?, short_description?,
+-- description_json? } for an overlay or a pre-0.23.4 snapshot (planProductDraftOverlayPublish: only
+-- the fields to write; nothing else in it is read), or NULL. p_blocks: the draft's description blocks
+-- as [{ language_id, block_type, content, order }], which replace the live ones ([] deletes them).
+CREATE OR REPLACE FUNCTION public.publish_product_draft(
+    p_product_id uuid,
+    p_draft_id bigint,
+    p_draft_updated_at timestamp with time zone,
+    p_product_updated_at timestamp with time zone,
+    p_values jsonb,
+    p_overlay jsonb,
+    p_blocks jsonb
+)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_product public.products%ROWTYPE;
+  v_draft public.product_drafts%ROWTYPE;
+  v_before jsonb;
+  v_after jsonb;
+  v_revision jsonb;
+  v_slug text;
+  v_payment_provider text;
+BEGIN
+  IF NOT COALESCE(public.is_admin(), false) THEN
+    RAISE EXCEPTION 'Only an administrator can publish products.' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_values IS NOT NULL AND jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The product values to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_overlay IS NOT NULL AND jsonb_typeof(p_overlay) <> 'object' THEN
+    RAISE EXCEPTION 'The fields to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_values IS NOT NULL AND p_overlay IS NOT NULL AND p_overlay <> '{}'::jsonb THEN
+    RAISE EXCEPTION 'A publish writes product values or overlay fields, not both.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_blocks IS NULL OR jsonb_typeof(p_blocks) <> 'array' THEN
+    RAISE EXCEPTION 'The description blocks to publish are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  -- The products row first, then the draft row, in every publish: two publishes queue here, and the
+  -- second finds the draft gone.
+  SELECT * INTO v_product FROM public.products WHERE id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  SELECT * INTO v_draft FROM public.product_drafts WHERE product_id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No draft exists for this product.' USING ERRCODE = 'NBP01';
+  END IF;
+  IF v_draft.id IS DISTINCT FROM p_draft_id OR v_draft.updated_at IS DISTINCT FROM p_draft_updated_at THEN
+    RAISE EXCEPTION 'The draft changed after it was read.' USING ERRCODE = 'NBP02';
+  END IF;
+  IF v_product.updated_at IS DISTINCT FROM p_product_updated_at THEN
+    RAISE EXCEPTION 'The product changed after it was read.' USING ERRCODE = 'NBP03';
+  END IF;
+
+  v_before := public.product_revision_content(p_product_id);
+
+  IF p_values IS NOT NULL THEN
+    PERFORM private.apply_product_draft_values(p_product_id, p_values);
+  ELSIF p_overlay IS NOT NULL AND (p_overlay ? 'title' OR p_overlay ? 'short_description' OR p_overlay ? 'description_json') THEN
+    UPDATE public.products
+       SET title = CASE WHEN p_overlay ? 'title' THEN p_overlay->>'title' ELSE title END,
+           short_description = CASE WHEN p_overlay ? 'short_description' THEN p_overlay->>'short_description' ELSE short_description END,
+           description_json = CASE
+             WHEN p_overlay ? 'description_json' THEN NULLIF(p_overlay->'description_json', 'null'::jsonb)
+             ELSE description_json
+           END,
+           updated_at = now()
+     WHERE id = p_product_id;
+  END IF;
+
+  DELETE FROM public.blocks WHERE product_id = p_product_id;
+
+  INSERT INTO public.blocks (page_id, post_id, product_id, language_id, block_type, content, "order")
+  SELECT NULL,
+         NULL,
+         p_product_id,
+         (b.value->>'language_id')::bigint,
+         b.value->>'block_type',
+         NULLIF(b.value->'content', 'null'::jsonb),
+         COALESCE((b.value->>'order')::integer, (b.ordinality - 1)::integer)
+    FROM jsonb_array_elements(p_blocks) WITH ORDINALITY AS b(value, ordinality)
+   ORDER BY b.ordinality;
+
+  v_after := public.product_revision_content(p_product_id);
+  v_revision := private.record_product_revision(p_product_id, v_before, v_after);
+
+  DELETE FROM public.product_drafts WHERE id = v_draft.id;
+
+  SELECT p.slug, p.payment_provider INTO v_slug, v_payment_provider FROM public.products p WHERE p.id = p_product_id;
+
+  RETURN jsonb_build_object(
+    'product_id', p_product_id,
+    'previous_slug', v_product.slug,
+    'slug', v_slug,
+    'payment_provider', v_payment_provider,
+    'wrote_values', p_values IS NOT NULL,
+    'revision', v_revision
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) TO authenticated, service_role;
+
+
+-- >>> FROM: 02044_product_draft_publish_stock_baseline.sql <<<
+-- 02044: a product-values publish writes a SKU's stock only when the editor changed it.
+-- Append-only, forward-only, re-runnable: four functions replaced (the helper dropped and created
+-- again, see below) and two indexes added (section 5), no table, policy or data change.
+--
+-- Until now private.apply_product_draft_values (02043) wrote the stock the product form had loaded back
+-- into inventory_items for every SKU of the draft (each variant's stock_quantity, or the product's stock
+-- without variants), as updateProduct() and syncSharedInventoryForSavedProduct did through 0.23.5. The
+-- form loads the stock when the edit page opens and its autosave stores it in the draft, so a unit sold
+-- between the page load and Publish (apply_order_inventory_deduction lowers inventory_items, whose
+-- trigger writes the quantity back to the variants and the product) was put back by the publish, and so
+-- was a change made meanwhile on the Inventory screen, by an import or by the publish of a translation
+-- sharing the SKU. NBP03 could not catch it: it refuses a write after the read the server action makes
+-- when Publish is pressed, while the draft's stock dates from the page load, and the draft's values win.
+--
+-- The draft now records the stock the form loaded, per SKU: \`stock_baseline\` in the product values,
+-- { "<sku>": <quantity> } (the edit page builds it, ProductForm carries it, the autosave stores it and
+-- buildProductDraftPublishValues sends it). The publish compares each SKU's quantity in the draft with
+-- it:
+--   * the same (the editor did not change it): inventory_items is left as it is, and the variant rows
+--     and the product row take the SKU's current quantity (its inventory row, or without one the live
+--     variant's or product's stock, as apply_order_inventory_deduction reads it), never the draft's
+--     copy. A SKU without an inventory row gets one holding that quantity;
+--   * changed, to the SKU's current quantity: left alone the same way, because the change is already
+--     live. A draft started again after its publish (an autosave that ran after the commit, another
+--     tab) still carries the baseline from before it: loaded 5, typed 10 and published, the same values
+--     again would publish 15 by the next rule, and they publish 10. A baseline written by hand does
+--     nothing here either. But the values cannot tell a change already published from a quantity that
+--     sales or another stock update (the Inventory screen, an import, a translation's publish) reached
+--     meanwhile, and that one is left alone too: loaded 10, 9 typed for a damaged unit, one sold
+--     meanwhile: 9 stays, where 8 was meant. So the answer names every SKU this rule decides
+--     (\`already_live\`), and the app warns;
+--   * changed otherwise: the change (the draft's quantity minus the loaded one) is applied to the SKU's
+--     current quantity, never below 0, so a sale made meanwhile keeps its deduction and the editor's
+--     change still lands (loaded 5, typed 15, one sold meanwhile: 14). With nothing in between, that is
+--     the typed quantity; otherwise the answer names the SKU (\`moved\`), and the app warns;
+--   * not in the baseline (a variant the editor added, a SKU the editor renamed), or values without
+--     one (a draft saved before this migration, a CMS draft import, whose stock is the file's): the
+--     draft's quantity, as before.
+-- The answer's \`stock_adjusted\` lists { sku, reason, entered, loaded, current, published } in code-point
+-- SKU order (COLLATE "C" compares the UTF-8 bytes, which is code-point order, as the edit page sorts its
+-- notes; the page and the warning then name the same first SKUs): reason \`already_live\` for each SKU the
+-- second rule decided (published = current = entered), \`moved\` for each change published at another
+-- quantity than the one typed (published = current + entered - loaded, held between 0 and 2147483647).
+-- A SKU left as loaded and a SKU written as typed are not listed. What the rules cannot see, since
+-- nothing records which publish a baseline was loaded against: a draft started again after its
+-- publish whose stock moved again before its own publish (published 10, one sold, then the same values
+-- publish 14, \`moved\`), and a figure typed again on a form loaded before that publish (published 10,
+-- then 12 typed there: 17).
+-- A baseline entry that is not a whole number from 0 to 2147483647 counts as missing. A baseline changes
+-- only what the publish writes for the stock, which any product_drafts writer (a WRITER over PostgREST
+-- included) could already set to anything, and only an ADMIN publishes; beside a quantity equal to the
+-- live stock it changes nothing, and the answer says so.
+--
+-- Lock order. A sale (apply_order_inventory_deduction; the app's SQL fallback runs the same steps)
+-- locks each SKU's inventory row, and the row's trigger (sync_inventory_cache_for_sku) then writes the
+-- variant and product rows carrying that SKU: a sale holds a product's rows only through the inventory
+-- row of one of the product's SKUs. Until 2026-11-18 the publish locked the products row first and wrote
+-- the inventory rows last, so a sale made while it ran could deadlock with it, and PostgreSQL aborted
+-- one of the two (40P01): the publish failed, or the sale's deduction fell back to the app's SQL path
+-- (caught before release). Now, before the products row, public.publish_product_draft locks in SKU
+-- order the inventory rows of every SKU of every product whose rows it can write: this product (a
+-- variant the draft drops or renames included), the products with the values' product SKU (the sale
+-- schedule writes them: its translations, a SKU only a translation carries included) and the products
+-- carrying one of the values' SKUs (the inventory trigger writes them), each SKU as stored (the row a
+-- sale locks), plus the values' SKUs trimmed (the rows the helper writes). And a sale takes an order's
+-- SKUs in SKU order too (section 4), so neither ever holds an inventory row the other needs before one
+-- it already has. A sale that holds one of those rows is waited for before the publish locks anything
+-- else; its trigger moves the updated_at of the products carrying the SKU, so a publish of one of them
+-- then refuses with nothing written (NBP03), and the next publish applies the editor's change to what
+-- the sale left. A sale that comes later waits for the publish and deducts from what it wrote. Two
+-- publishes sharing SKUs (translations) take them in the same order: the second waits, then refuses
+-- (NBP03) when the first wrote its row (always when they share the product SKU: the sale schedule).
+-- The plan below reads the locked rows, so each SKU is written as it was read (no second read at write
+-- time). Not covered: a SKU with no inventory row when the publish starts (a product from before shared
+-- inventory that nothing has sold or published since; a publish by this file gives every SKU in its
+-- values a row), whose first sale may still deadlock with the publish; a SKU another session adds to one
+-- of those products between the publish's read of them and its locks; a writer that takes several of
+-- those inventory rows in one statement in another order (upsertInventoryRows in libs/ecommerce, which
+-- createProduct() runs with a new product's variant SKUs in form order, as when a translation created
+-- on the CMS's new-product page carries its source's SKUs, and Cortex's execute_database_mutation,
+-- which can upsert or update several inventory rows at once); and cycles through other sessions. Two
+-- sales of one product's variants can deadlock with each other, as with 02001's deduction: one holds
+-- the product row through its trigger and waits for an inventory row the other holds, whose trigger
+-- waits for that product row. Either way the database aborts one transaction of the cycle, which writes
+-- nothing (when that is createProduct()'s upsert, the product it saved first stays, and the CMS reports
+-- the create as failed).
+--
+-- Every stock quantity in the values (each variant's, and the product's without variants) is read like
+-- the edit page's reader (readDraftStockQuantity in apps/nextblock/app/cms/products/productFormData.ts)
+-- reads one: a JSON number, or text matching the same pattern (DECIMAL_TEXT_PATTERN there,
+-- v_quantity_pattern here: a plain decimal number, with surrounding spaces, a sign, a fraction, an
+-- exponent; tools/scripts/stock-quantity-pattern.test.ts holds the two to the same strings), cut to its
+-- whole part and held between 0 and 2147483647; null or none reads as 0. Anything else is refused with
+-- nothing written (NBP04, naming the SKU). Until 2026-11-18 the plan cast the text to numeric, which also
+-- reads 'NaN' (it sorts above every number, so the clamp wrote 2147483647), 'Infinity' and 'inf' (the
+-- same) and, since PostgreSQL 16, '0x10' and '1_000': text the edit page cannot read either (it shows the
+-- live stock in its place, and publish refuses such a draft before calling this function:
+-- findUnreadableProductDraftValues), which any product_drafts writer can store. The two readers part
+-- only at edges the app never sends here, since it sends every quantity as a whole number
+-- (completeProductDraftValues) and refuses a draft holding one it cannot read: a JSON number or text
+-- from about 1.8e308 (where JavaScript reads Infinity) up to numeric's limit (below 1e131072) reads
+-- 2147483647 here, which the page refuses; text numeric cannot hold (131072 digits before the point at
+-- most, 16383 after it) is refused here, and the page refuses it too when it is too large ('1e200000')
+-- but reads a number when the extra digits are after the point ('1e-20000' as 0); and text with more
+-- digits than a double carries ('4.99999999999999999') is cut exactly here (4), where the page rounds
+-- it first (5). A product's stock beside variants is their total, held at 2147483647 (it raised 22003
+-- above it), and so is the total the inventory trigger writes (section 3).
+--
+-- private.apply_product_draft_values now answers the stock it adjusted (02043's answers an empty list)
+-- and public.publish_product_draft returns it as \`stock_adjusted\`. The helper is dropped and created
+-- again, not replaced: a database whose 02043 ran before 2026-11-18 holds a version returning void, and
+-- CREATE OR REPLACE cannot change a return type. Everything else in both functions is 02043's,
+-- statement for statement, but the stock and the inventory locks. Sections 3 and 4 replace two 02001
+-- functions, statement for statement but one change each: the inventory trigger's product total held,
+-- and the sale's SKU order.
+--
+-- Not addressed: a publish that changes many SKUs at once still runs the inventory trigger once per SKU,
+-- and each run sums the product's variants again under the ADMIN's row policies, so its cost grows with
+-- the square of the SKUs it changes, and with the catalog. With the SKU indexes (section 5) five hundred
+-- changed SKUs beside 50 other products take about 5 s on an idle machine, under the Data API's 8 s
+-- statement timeout for \`authenticated\` but not by much, and up to 9 s on a busy one, past it (10 s or
+-- more without them); beside 2,000 other products they take 9 to 13 s. Past it the publish fails
+-- (57014: nothing written, the draft stays).
+--
+-- Grants: as 02043. The re-created private function starts with PostgreSQL's default EXECUTE for PUBLIC,
+-- so it is revoked from PUBLIC and anon and granted to authenticated and service_role (the publish runs
+-- it as its caller). public.publish_product_draft keeps its grants (CREATE OR REPLACE) and its entry in
+-- API_ROLE_REVOKE_SQL; public.sync_inventory_cache_for_sku and public.apply_order_inventory_deduction
+-- keep theirs too.
+-- tools/scripts/product-draft-publish.db.test.ts runs these functions: a sale between the page load and
+-- the publish, an edited stock, both at once, a draft started again after its publish, a crafted
+-- baseline, what the answer names (\`already_live\`, \`moved\`, both in one publish, in code-point order),
+-- the quantities it reads and refuses, two variants of 2147483647, which inventory rows a publish locks
+-- (a product without variants, an overlay, a variant the draft drops, the product SKU, a SKU only a
+-- translation carries, another SKU of a product sharing one of the values, a padded SKU as stored and
+-- trimmed), a sale or a translation's publish running against a publish (each could deadlock until
+-- 2026-11-18: a sale holding the row, a sale part way, two translations, a variant the draft drops or
+-- renames, a SKU only a translation carries, a product sharing a SKU), and the sale's deduction by the
+-- function and by the app's SQL fallback (every SKU of an order once, in SKU order, two sales in
+-- opposite orders), and section 5's indexes; without a database, it holds sections 3 and 4 to 02001's
+-- text but their one change each, and section 5 to a plain CREATE INDEX IF NOT EXISTS.
+-- tools/scripts/migration-replay.db.test.ts upgrades a void helper with this file and replays every
+-- file over a migrated database.
+
+CREATE SCHEMA IF NOT EXISTS private;
+
+DROP FUNCTION IF EXISTS private.apply_product_draft_values(uuid, jsonb);
+
+-- ---------------------------------------------------------------------------
+-- 1. Product values: 02043's, with the stock written only where the editor changed it
+-- ---------------------------------------------------------------------------
+-- Called only by public.publish_product_draft(), once it has locked the inventory rows of the values'
+-- SKUs (and the others a sale could hold against it: see the header). \`p_values\` is built by
+-- buildProductDraftPublishValues (libs/ecommerce product-actions.ts): the RPC payload of updateProduct()
+-- (minor units) without \`id\`, \`status\`, \`metadata\` and \`payment_provider\`, plus the SEO fields,
+-- \`gallery_media_ids\` (null: leave the gallery as it is), \`category_ids\` (null: leave the categories as
+-- they are) and \`stock_baseline\` (null: none). Returns
+-- { stock_adjusted: [{ sku, reason, entered, loaded, current, published }] } (see the header).
+CREATE FUNCTION private.apply_product_draft_values(p_product_id uuid, p_values jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_uuid_pattern constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  -- DECIMAL_TEXT_PATTERN of productFormData.ts, with ASCII digits spelled out
+  -- (tools/scripts/stock-quantity-pattern.test.ts compares the two).
+  v_quantity_pattern constant text := '^[ \\t\\n\\v\\f\\r]*[+-]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \\t\\n\\v\\f\\r]*$';
+  v_max_quantity constant numeric := 2147483647;
+  v_variants jsonb := COALESCE(p_values->'variants', '[]'::jsonb);
+  v_baseline jsonb;
+  v_has_variants boolean;
+  v_total_variant_stock integer := 0;
+  v_product_stock integer;
+  v_product_entered integer := 0;
+  v_read integer[] := '{}';
+  v_item record;
+  v_number numeric;
+  v_product_type text;
+  v_translation_group_id uuid;
+  v_saved record;
+  v_sku_group uuid[];
+  v_siblings uuid[];
+  v_gallery uuid[];
+  v_slot record;
+  v_entered integer;
+  v_loaded integer;
+  v_live integer;
+  v_mode text;
+  v_quantity integer;
+  v_steps integer := 0;
+  v_plan_skus text[] := '{}';
+  v_plan_modes text[] := '{}';
+  v_plan_quantities integer[] := '{}';
+  v_adjusted_count integer := 0;
+  v_adjusted jsonb[] := '{}';
+BEGIN
+  IF p_values IS NULL OR jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The draft''s product values are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF jsonb_typeof(v_variants) <> 'array' THEN
+    RAISE EXCEPTION 'The draft''s variants are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+  -- private.sync_product_draft_variants refuses one too; the stock plan below reads them first.
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_variants) AS item(value) WHERE jsonb_typeof(item.value) <> 'object') THEN
+    RAISE EXCEPTION 'A draft variant is not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  v_has_variants := jsonb_array_length(v_variants) > 0;
+  v_baseline := CASE WHEN jsonb_typeof(p_values->'stock_baseline') = 'object' THEN p_values->'stock_baseline' END;
+  v_translation_group_id := CASE
+    WHEN lower(COALESCE(p_values->>'translation_group_id', '')) ~ v_uuid_pattern THEN (p_values->>'translation_group_id')::uuid
+  END;
+  v_product_type := CASE
+    WHEN p_values->>'product_type' IN ('physical', 'digital') THEN p_values->>'product_type'
+    WHEN NULLIF(p_values->>'freemius_product_id', '') IS NOT NULL
+      OR NULLIF(p_values->>'freemius_plan_id', '') IS NOT NULL THEN 'digital'
+    ELSE 'physical'
+  END;
+
+  -- Every stock quantity the values carry (each variant's, or the product's without variants): a JSON
+  -- number, or text matching v_quantity_pattern (the edit page's DECIMAL_TEXT_PATTERN; where the two
+  -- readers still part, see the header), cut to its whole part and held between 0 and 2147483647; null
+  -- or none is 0; anything else is refused before anything is written. Each quantity read is kept by its
+  -- variant's position (v_read), and the variants are rebuilt once below with it or the planned one, so
+  -- everything after the plan (the stock total, the variant rows) reads whole numbers.
+  FOR v_item IN
+    SELECT item.ordinality AS position, btrim(item.value->>'sku') AS sku, item.value->'stock_quantity' AS quantity
+      FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+    UNION ALL
+    SELECT 0, btrim(p_values->>'sku'), p_values->'stock'
+     WHERE NOT v_has_variants
+  LOOP
+    v_number := CASE
+      WHEN v_item.quantity IS NULL OR jsonb_typeof(v_item.quantity) = 'null' THEN 0
+      WHEN jsonb_typeof(v_item.quantity) = 'number' THEN v_item.quantity::numeric
+    END;
+    IF jsonb_typeof(v_item.quantity) = 'string' AND (v_item.quantity #>> '{}') ~ v_quantity_pattern THEN
+      BEGIN
+        v_number := (v_item.quantity #>> '{}')::numeric;
+      EXCEPTION WHEN numeric_value_out_of_range THEN
+        -- More digits than numeric holds ('1e200000'): refused below like any other unreadable text.
+        v_number := NULL;
+      END;
+    END IF;
+    IF v_number IS NULL THEN
+      RAISE EXCEPTION 'The draft''s stock for % is not a number: %.',
+        CASE
+          WHEN COALESCE(v_item.sku, '') <> '' THEN 'SKU ' || v_item.sku
+          WHEN v_item.position = 0 THEN 'the product'
+          ELSE 'variant ' || v_item.position || ' (no SKU)'
+        END,
+        left(v_item.quantity::text, 40)
+        USING ERRCODE = 'NBP04';
+    END IF;
+    v_quantity := GREATEST(0, LEAST(v_max_quantity, trunc(v_number)))::integer;
+    IF v_item.position = 0 THEN
+      v_product_entered := v_quantity;
+    ELSE
+      -- In place (an expanded array): a jsonb_set on the whole list here copied it once per variant.
+      v_read[v_item.position] := v_quantity;
+    END IF;
+  END LOOP;
+
+  -- The stock, planned before anything is written: one entry per SKU the values carry (each variant's,
+  -- or the product's without variants; a later variant with the same SKU wins, as there is one
+  -- inventory row per SKU), in code-point SKU order (the order of the answer's entries), with the SKU's
+  -- current quantity read in the same query: its inventory row (publish_product_draft locked it before
+  -- the products row, so it is written below as it is read here), or without one the stock the live
+  -- rows show (a product saved before shared inventory), as apply_order_inventory_deduction reads it;
+  -- NULL when nothing live carries the SKU. One query, not one per SKU: the inventory row policy's
+  -- checks cost a scan of the variants per statement.
+  FOR v_slot IN
+    SELECT slot.sku, slot.entered, COALESCE(i.quantity, live.quantity) AS live
+      FROM (
+        SELECT DISTINCT ON (s.sku) s.sku, s.entered
+          FROM (
+            SELECT btrim(item.value->>'sku') AS sku, v_read[item.ordinality] AS entered, item.ordinality
+              FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+             WHERE v_has_variants
+            UNION ALL
+            SELECT btrim(p_values->>'sku'), v_product_entered, 1
+             WHERE NOT v_has_variants
+          ) s
+         WHERE COALESCE(s.sku, '') <> ''
+         ORDER BY s.sku, s.ordinality DESC
+      ) slot
+      LEFT JOIN public.inventory_items i ON i.sku = slot.sku
+      LEFT JOIN (
+        (SELECT DISTINCT ON (btrim(v.sku)) btrim(v.sku) AS sku, GREATEST(COALESCE(v.stock_quantity, 0), 0) AS quantity
+           FROM public.product_variants v
+          WHERE v_has_variants
+            AND v.product_id = p_product_id
+          ORDER BY btrim(v.sku), v.created_at, v.id)
+        UNION ALL
+        SELECT btrim(p.sku), GREATEST(COALESCE(p.stock, 0), 0)
+          FROM public.products p
+         WHERE NOT v_has_variants
+           AND p.id = p_product_id
+           AND NOT EXISTS (SELECT 1 FROM public.product_variants v WHERE v.product_id = p.id)
+      ) live ON live.sku = slot.sku
+     ORDER BY slot.sku COLLATE "C"
+  LOOP
+    v_entered := v_slot.entered;
+    v_live := v_slot.live;
+    v_loaded := CASE WHEN jsonb_typeof(v_baseline->v_slot.sku) = 'number' THEN
+      CASE
+        WHEN (v_baseline->>v_slot.sku)::numeric BETWEEN 0 AND v_max_quantity
+         AND (v_baseline->>v_slot.sku)::numeric = trunc((v_baseline->>v_slot.sku)::numeric)
+        THEN (v_baseline->>v_slot.sku)::integer
+      END
+    END;
+
+    IF v_loaded IS NOT NULL AND v_entered = v_loaded THEN
+      -- Not changed by the editor: the current quantity, whatever sold or changed since the page load.
+      v_mode := 'keep';
+      v_quantity := COALESCE(v_live, v_entered);
+    ELSIF v_loaded IS NOT NULL AND v_entered = v_live THEN
+      -- Changed to the current quantity: already live (a draft started again after its publish keeps
+      -- the baseline from before it), so applying the change again would count it twice. A sale that
+      -- reached the same quantity looks the same, so the answer names the SKU.
+      v_mode := 'keep';
+      v_quantity := v_live;
+      v_adjusted_count := v_adjusted_count + 1;
+      v_adjusted[v_adjusted_count] := jsonb_build_object(
+        'sku', v_slot.sku,
+        'reason', 'already_live',
+        'entered', v_entered,
+        'loaded', v_loaded,
+        'current', v_live,
+        'published', v_live
+      );
+    ELSIF v_loaded IS NOT NULL AND v_live IS NOT NULL THEN
+      -- Changed: the editor's change, applied to the current quantity.
+      v_mode := 'change';
+      v_quantity := GREATEST(0, LEAST(v_max_quantity, v_live::numeric + v_entered - v_loaded))::integer;
+      IF v_quantity <> v_entered THEN
+        v_adjusted_count := v_adjusted_count + 1;
+        v_adjusted[v_adjusted_count] := jsonb_build_object(
+          'sku', v_slot.sku,
+          'reason', 'moved',
+          'entered', v_entered,
+          'loaded', v_loaded,
+          'current', v_live,
+          'published', v_quantity
+        );
+      END IF;
+    ELSE
+      -- No loaded quantity (a new SKU, values without a baseline) or nothing live: the draft's.
+      v_mode := 'set';
+      v_quantity := v_entered;
+    END IF;
+
+    v_steps := v_steps + 1;
+    v_plan_skus[v_steps] := v_slot.sku;
+    v_plan_modes[v_steps] := v_mode;
+    v_plan_quantities[v_steps] := v_quantity;
+  END LOOP;
+
+  -- The variants and the product row carry the planned quantities (a variant without a SKU keeps the
+  -- one read above); the trigger on inventory_items writes the same ones back for every SKU written
+  -- below. The product's stock beside variants is their total, held at 2147483647 (an integer column).
+  IF v_has_variants THEN
+    SELECT jsonb_agg(jsonb_set(item.value, '{stock_quantity}', to_jsonb(COALESCE(planned.quantity, v_read[item.ordinality])))
+                     ORDER BY item.ordinality),
+           LEAST(COALESCE(SUM(COALESCE(planned.quantity, v_read[item.ordinality])), 0), v_max_quantity)::integer
+      INTO v_variants, v_total_variant_stock
+      FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+      LEFT JOIN unnest(v_plan_skus, v_plan_quantities) AS planned(sku, quantity) ON planned.sku = btrim(item.value->>'sku');
+  ELSE
+    v_product_stock := COALESCE(v_plan_quantities[array_position(v_plan_skus, btrim(COALESCE(p_values->>'sku', '')))], v_product_entered);
+  END IF;
+
+  -- The product row.
+  UPDATE public.products
+     SET title = p_values->>'title',
+         slug = p_values->>'slug',
+         sku = p_values->>'sku',
+         product_type = v_product_type,
+         payment_provider = CASE WHEN v_product_type = 'digital' THEN 'freemius' ELSE 'stripe' END,
+         upc = NULLIF(p_values->>'upc', ''),
+         stock = CASE
+           WHEN v_has_variants THEN v_total_variant_stock
+           ELSE v_product_stock
+         END,
+         short_description = NULLIF(p_values->>'short_description', ''),
+         description_json = NULLIF(p_values->'description_json', 'null'::jsonb),
+         price = COALESCE((p_values->>'price')::integer, 0),
+         prices = COALESCE(p_values->'prices', '{}'::jsonb),
+         sale_price = CASE
+           WHEN p_values ? 'sale_price' AND p_values->>'sale_price' <> '' THEN (p_values->>'sale_price')::integer
+         END,
+         sale_prices = CASE
+           WHEN p_values ? 'sale_prices' THEN COALESCE(p_values->'sale_prices', '{}'::jsonb)
+         END,
+         sale_start_at = CASE
+           WHEN p_values ? 'sale_start_at' AND p_values->>'sale_start_at' <> '' THEN (p_values->>'sale_start_at')::timestamptz
+         END,
+         sale_end_at = CASE
+           WHEN p_values ? 'sale_end_at' AND p_values->>'sale_end_at' <> '' THEN (p_values->>'sale_end_at')::timestamptz
+         END,
+         freemius_plan_id = NULLIF(p_values->>'freemius_plan_id', ''),
+         freemius_product_id = NULLIF(p_values->>'freemius_product_id', ''),
+         trial_period_days = COALESCE((p_values->>'trial_period_days')::integer, 0),
+         trial_requires_payment_method = COALESCE((p_values->>'trial_requires_payment_method')::boolean, false),
+         is_taxable = COALESCE((p_values->>'is_taxable')::boolean, is_taxable),
+         meta_title = NULLIF(btrim(p_values->>'meta_title'), ''),
+         meta_description = NULLIF(btrim(p_values->>'meta_description'), ''),
+         custom_canonical = NULLIF(btrim(p_values->>'custom_canonical'), ''),
+         language_id = COALESCE((p_values->>'language_id')::bigint, language_id),
+         translation_group_id = COALESCE(v_translation_group_id, translation_group_id),
+         updated_at = now()
+   WHERE id = p_product_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  -- The variants (02043 section 2), with the planned quantities.
+  PERFORM private.sync_product_draft_variants(p_product_id, v_variants);
+
+  -- The gallery: the listed images that still have a media row, each once, in their order, then the
+  -- images it no longer lists unlinked. A dropped image keeps its media row and its files.
+  IF jsonb_typeof(p_values->'gallery_media_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(listed.media_id ORDER BY listed.position), '{}')
+      INTO v_gallery
+      FROM (
+        SELECT candidate.media_id, min(candidate.ordinality) AS position
+          FROM (
+            SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS media_id,
+                   item.ordinality
+              FROM jsonb_array_elements_text(p_values->'gallery_media_ids') WITH ORDINALITY AS item(value, ordinality)
+          ) candidate
+         WHERE candidate.media_id IS NOT NULL
+         GROUP BY candidate.media_id
+      ) listed
+     WHERE EXISTS (SELECT 1 FROM public.media m WHERE m.id = listed.media_id);
+
+    INSERT INTO public.product_media (product_id, media_id, sort_order)
+    SELECT p_product_id, g.media_id, (g.n - 1)::integer
+      FROM unnest(v_gallery) WITH ORDINALITY AS g(media_id, n)
+        ON CONFLICT (product_id, media_id) DO UPDATE SET sort_order = EXCLUDED.sort_order;
+
+    DELETE FROM public.product_media
+     WHERE product_id = p_product_id
+       AND NOT (media_id = ANY (v_gallery));
+  END IF;
+
+  -- The sale schedule belongs to the SKU: the saved row's canonical sale amounts (the currency trigger
+  -- has normalised them) and its window go to every product sharing the SKU (its translations), and
+  -- each variant's to the variants with its SKU in those products.
+  SELECT p.sku, p.sale_price, p.sale_prices, p.sale_start_at, p.sale_end_at, p.translation_group_id
+    INTO v_saved
+    FROM public.products p
+   WHERE p.id = p_product_id;
+
+  SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+    INTO v_sku_group
+    FROM public.products p
+   WHERE p.sku = v_saved.sku;
+
+  UPDATE public.products
+     SET sale_price = v_saved.sale_price,
+         sale_prices = v_saved.sale_prices,
+         sale_start_at = v_saved.sale_start_at,
+         sale_end_at = v_saved.sale_end_at,
+         updated_at = now()
+   WHERE id = ANY (v_sku_group);
+
+  IF v_has_variants THEN
+    UPDATE public.product_variants AS target
+       SET sale_price = source.sale_price,
+           sale_prices = source.sale_prices,
+           sale_start_at = source.sale_start_at,
+           sale_end_at = source.sale_end_at,
+           updated_at = now()
+      FROM public.product_variants AS source
+     WHERE source.product_id = p_product_id
+       AND target.sku = source.sku
+       AND target.product_id = ANY (v_sku_group);
+  END IF;
+
+  -- The shared inventory, by the plan above, in two statements. A kept SKU is never written; one
+  -- without a row gets one holding its current quantity (NOT EXISTS reads committed rows, so a row
+  -- another session created and committed since the publish took its locks is left as it is; one it is
+  -- still inserting is waited for: the header's SKU with no inventory row). Every other SKU takes its
+  -- planned quantity: the rows were locked before the plan read them, so there is nothing to read
+  -- again. The trigger writes each quantity it sets back to every variant and product with that SKU
+  -- (translations included).
+  INSERT INTO public.inventory_items (sku, quantity)
+  SELECT step.sku, step.quantity
+    FROM unnest(v_plan_skus, v_plan_modes, v_plan_quantities) AS step(sku, mode, quantity)
+   WHERE step.mode = 'keep'
+     AND NOT EXISTS (SELECT 1 FROM public.inventory_items i WHERE i.sku = step.sku)
+   ORDER BY step.sku
+      ON CONFLICT (sku) DO NOTHING;
+
+  INSERT INTO public.inventory_items (sku, quantity)
+  SELECT step.sku, step.quantity
+    FROM unnest(v_plan_skus, v_plan_modes, v_plan_quantities) AS step(sku, mode, quantity)
+   WHERE step.mode <> 'keep'
+   ORDER BY step.sku
+      ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+
+  -- Categories belong to the translation group: every product in it gets the listed categories that
+  -- still exist.
+  IF jsonb_typeof(p_values->'category_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+      INTO v_siblings
+      FROM public.products p
+     WHERE p.translation_group_id = v_saved.translation_group_id;
+
+    DELETE FROM public.product_categories WHERE product_id = ANY (v_siblings);
+
+    INSERT INTO public.product_categories (product_id, category_id)
+    SELECT sibling.id, category.id
+      FROM unnest(v_siblings) AS sibling(id)
+     CROSS JOIN (
+       SELECT DISTINCT c.id
+         FROM (
+           SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS category_id
+             FROM jsonb_array_elements_text(p_values->'category_ids') AS item(value)
+         ) requested
+         JOIN public.categories c ON c.id = requested.category_id
+     ) category;
+  END IF;
+
+  RETURN jsonb_build_object('stock_adjusted', to_jsonb(v_adjusted));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.apply_product_draft_values(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.apply_product_draft_values(uuid, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 2. The publish: 02043's, locking the inventory rows first and answering the stock it adjusted
+-- ---------------------------------------------------------------------------
+-- As in 02043 (section 5), plus the inventory row locks (see the header) and \`stock_adjusted\` in the
+-- answer: [] for an overlay publish.
+CREATE OR REPLACE FUNCTION public.publish_product_draft(
+    p_product_id uuid,
+    p_draft_id bigint,
+    p_draft_updated_at timestamp with time zone,
+    p_product_updated_at timestamp with time zone,
+    p_values jsonb,
+    p_overlay jsonb,
+    p_blocks jsonb
+)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_product public.products%ROWTYPE;
+  v_draft public.product_drafts%ROWTYPE;
+  v_before jsonb;
+  v_after jsonb;
+  v_revision jsonb;
+  v_values_result jsonb;
+  v_slug text;
+  v_payment_provider text;
+  v_value_variants jsonb;
+  v_stock_skus text[];
+  v_stock_products uuid[];
+BEGIN
+  IF NOT COALESCE(public.is_admin(), false) THEN
+    RAISE EXCEPTION 'Only an administrator can publish products.' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_values IS NOT NULL AND jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The product values to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_overlay IS NOT NULL AND jsonb_typeof(p_overlay) <> 'object' THEN
+    RAISE EXCEPTION 'The fields to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_values IS NOT NULL AND p_overlay IS NOT NULL AND p_overlay <> '{}'::jsonb THEN
+    RAISE EXCEPTION 'A publish writes product values or overlay fields, not both.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_blocks IS NULL OR jsonb_typeof(p_blocks) <> 'array' THEN
+    RAISE EXCEPTION 'The description blocks to publish are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  -- Inventory rows, before the products row and in SKU order (see the header). A sale locks a SKU's
+  -- inventory row, then its trigger writes the variant and product rows carrying that SKU, so it holds a
+  -- product's rows only through the row of one of that product's SKUs. Every product or variant row this
+  -- publish writes belongs to this product (a variant the draft drops or renames included), to a product
+  -- with the values' product SKU (the sale schedule) or to a product carrying one of the values' SKUs
+  -- (the inventory trigger; one without variants carries only its own SKU, one of the values'). So it
+  -- locks the row of every SKU those products carry, as stored (the row a sale locks), and of every SKU
+  -- the values carry, trimmed (the rows private.apply_product_draft_values writes: each variant's, or
+  -- the product's without variants). A SKU without a row has nothing to lock, and an overlay publish,
+  -- which writes no stock and no other product's row, locks none. Values whose variants are not a list
+  -- are refused by the helper.
+  IF p_values IS NOT NULL THEN
+    v_value_variants := COALESCE(p_values->'variants', '[]'::jsonb);
+    IF jsonb_typeof(v_value_variants) = 'array' THEN
+      v_stock_skus := ARRAY(
+        SELECT value_sku.sku
+          FROM (
+            SELECT btrim(item.value->>'sku') FROM jsonb_array_elements(v_value_variants) AS item(value)
+            UNION
+            SELECT btrim(p_values->>'sku') WHERE jsonb_array_length(v_value_variants) = 0
+          ) AS value_sku(sku)
+         WHERE value_sku.sku <> ''
+      );
+      v_stock_products := ARRAY(
+        SELECT p_product_id
+        UNION
+        SELECT p.id FROM public.products p WHERE p.sku = p_values->>'sku'
+        UNION
+        SELECT v.product_id FROM public.product_variants v WHERE v.sku = ANY (v_stock_skus)
+      );
+      v_stock_skus := v_stock_skus || ARRAY(
+        SELECT p.sku FROM public.products p WHERE p.id = ANY (v_stock_products) AND btrim(p.sku) <> ''
+        UNION
+        SELECT v.sku FROM public.product_variants v WHERE v.product_id = ANY (v_stock_products) AND btrim(v.sku) <> ''
+      );
+      PERFORM 1
+         FROM public.inventory_items i
+        WHERE i.sku = ANY (v_stock_skus)
+        ORDER BY i.sku
+          FOR UPDATE;
+    END IF;
+  END IF;
+
+  -- The products row first, then the draft row, in every publish: two publishes queue here, and the
+  -- second finds the draft gone.
+  SELECT * INTO v_product FROM public.products WHERE id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  SELECT * INTO v_draft FROM public.product_drafts WHERE product_id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No draft exists for this product.' USING ERRCODE = 'NBP01';
+  END IF;
+  IF v_draft.id IS DISTINCT FROM p_draft_id OR v_draft.updated_at IS DISTINCT FROM p_draft_updated_at THEN
+    RAISE EXCEPTION 'The draft changed after it was read.' USING ERRCODE = 'NBP02';
+  END IF;
+  IF v_product.updated_at IS DISTINCT FROM p_product_updated_at THEN
+    RAISE EXCEPTION 'The product changed after it was read.' USING ERRCODE = 'NBP03';
+  END IF;
+
+  v_before := public.product_revision_content(p_product_id);
+
+  IF p_values IS NOT NULL THEN
+    v_values_result := private.apply_product_draft_values(p_product_id, p_values);
+  ELSIF p_overlay IS NOT NULL AND (p_overlay ? 'title' OR p_overlay ? 'short_description' OR p_overlay ? 'description_json') THEN
+    UPDATE public.products
+       SET title = CASE WHEN p_overlay ? 'title' THEN p_overlay->>'title' ELSE title END,
+           short_description = CASE WHEN p_overlay ? 'short_description' THEN p_overlay->>'short_description' ELSE short_description END,
+           description_json = CASE
+             WHEN p_overlay ? 'description_json' THEN NULLIF(p_overlay->'description_json', 'null'::jsonb)
+             ELSE description_json
+           END,
+           updated_at = now()
+     WHERE id = p_product_id;
+  END IF;
+
+  DELETE FROM public.blocks WHERE product_id = p_product_id;
+
+  INSERT INTO public.blocks (page_id, post_id, product_id, language_id, block_type, content, "order")
+  SELECT NULL,
+         NULL,
+         p_product_id,
+         (b.value->>'language_id')::bigint,
+         b.value->>'block_type',
+         NULLIF(b.value->'content', 'null'::jsonb),
+         COALESCE((b.value->>'order')::integer, (b.ordinality - 1)::integer)
+    FROM jsonb_array_elements(p_blocks) WITH ORDINALITY AS b(value, ordinality)
+   ORDER BY b.ordinality;
+
+  v_after := public.product_revision_content(p_product_id);
+  v_revision := private.record_product_revision(p_product_id, v_before, v_after);
+
+  DELETE FROM public.product_drafts WHERE id = v_draft.id;
+
+  SELECT p.slug, p.payment_provider INTO v_slug, v_payment_provider FROM public.products p WHERE p.id = p_product_id;
+
+  RETURN jsonb_build_object(
+    'product_id', p_product_id,
+    'previous_slug', v_product.slug,
+    'slug', v_slug,
+    'payment_provider', v_payment_provider,
+    'wrote_values', p_values IS NOT NULL,
+    'stock_adjusted', COALESCE(v_values_result->'stock_adjusted', '[]'::jsonb),
+    'revision', v_revision
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. The inventory trigger's product total, held at 2147483647
+-- ---------------------------------------------------------------------------
+-- 02001's public.sync_inventory_cache_for_sku, which on_inventory_item_change runs for every
+-- inventory row written (a sale, the Inventory screen, an import, a publish), statement for statement,
+-- but the stock of a product with variants: the total of their inventory rows, an integer column,
+-- now held at 2147483647. Above it the sum raised 22003 and failed the write that fired it, so a
+-- publish of two variants of 2147483647 failed here once the helper's own total was held. Replaced,
+-- not dropped: the trigger and the grants stay.
+CREATE OR REPLACE FUNCTION public.sync_inventory_cache_for_sku(p_sku text) RETURNS void
+    LANGUAGE plpgsql
+    SET search_path TO 'public'
+    AS $$
+DECLARE
+  v_quantity integer := 0;
+BEGIN
+  IF NULLIF(trim(p_sku), '') IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT quantity
+    INTO v_quantity
+  FROM public.inventory_items
+  WHERE sku = p_sku
+  LIMIT 1;
+
+  v_quantity := COALESCE(v_quantity, 0);
+
+  UPDATE public.product_variants
+  SET
+    stock_quantity = v_quantity,
+    updated_at = now()
+  WHERE sku = p_sku;
+
+  UPDATE public.products AS products
+  SET
+    stock = v_quantity,
+    updated_at = now()
+  WHERE products.sku = p_sku
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.product_variants
+      WHERE product_id = products.id
+    );
+
+  UPDATE public.products AS products
+  SET
+    stock = LEAST(COALESCE((
+      SELECT SUM(COALESCE(inventory.quantity, 0))
+      FROM public.product_variants AS variants
+      LEFT JOIN public.inventory_items AS inventory
+        ON inventory.sku = variants.sku
+      WHERE variants.product_id = products.id
+    ), 0), 2147483647),
+    updated_at = now()
+  WHERE EXISTS (
+    SELECT 1
+    FROM public.product_variants AS variants
+    WHERE variants.product_id = products.id
+      AND variants.sku = p_sku
+  );
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4. The sale's deduction, taking an order's SKUs in SKU order
+-- ---------------------------------------------------------------------------
+-- 02001's public.apply_order_inventory_deduction (what checkout's order syncs call for a paid order),
+-- statement for statement, but its loop takes the order's lines in the order of the SKU each one locks
+-- (the variant's when variant_id is set, else the product's): the order publish_product_draft locks
+-- inventory rows in (both sort by the sku columns' own collation). In GROUP BY order, a sale part way
+-- through its SKUs when a publish started deadlocked with it whenever it held a later SKU of the
+-- publish's but not an earlier one, and two sales taking the same two SKUs in opposite orders could
+-- deadlock too. The app's SQL fallback (applyOrderInventoryDeductionViaSql in libs/ecommerce
+-- order-inventory.ts) orders its lines the same way. A padded SKU (' X ') is matched here as stored and
+-- trimmed by the publish, as before this file: a sale of the variant ' X ' lowers the row ' X ', and a
+-- publish writes the row 'X' (its lock set holds both). Replaced, not dropped: the signature, the
+-- attributes (invoker, search_path) and the grants stay; the track-quantities switch and the
+-- inventory_deducted_at guard are 02001's.
+CREATE OR REPLACE FUNCTION public.apply_order_inventory_deduction(p_order_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    SET search_path TO 'public'
+    AS $$
+DECLARE
+  v_track_quantities boolean := public.get_ecommerce_track_quantities();
+  v_item record;
+  v_inventory_deducted_at timestamptz;
+  v_sku text;
+  v_current_quantity integer;
+BEGIN
+  SELECT inventory_deducted_at
+    INTO v_inventory_deducted_at
+  FROM public.orders
+  WHERE id = p_order_id
+  FOR UPDATE;
+
+  IF NOT FOUND OR v_inventory_deducted_at IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  IF NOT v_track_quantities THEN
+    UPDATE public.orders
+    SET inventory_deducted_at = now()
+    WHERE id = p_order_id;
+
+    RETURN;
+  END IF;
+
+  FOR v_item IN
+    SELECT
+      product_id,
+      variant_id,
+      SUM(quantity)::integer AS quantity
+    FROM public.order_items
+    WHERE order_id = p_order_id
+    GROUP BY product_id, variant_id
+    ORDER BY CASE
+               WHEN order_items.variant_id IS NOT NULL
+                 THEN (SELECT v.sku FROM public.product_variants v WHERE v.id = order_items.variant_id)
+               ELSE (SELECT p.sku FROM public.products p WHERE p.id = order_items.product_id)
+             END,
+             product_id,
+             variant_id
+  LOOP
+    v_sku := NULL;
+    v_current_quantity := 0;
+
+    IF v_item.variant_id IS NOT NULL THEN
+      SELECT
+        sku,
+        GREATEST(COALESCE(stock_quantity, 0), 0)
+        INTO v_sku,
+             v_current_quantity
+      FROM public.product_variants
+      WHERE id = v_item.variant_id
+      LIMIT 1;
+    ELSIF v_item.product_id IS NOT NULL THEN
+      SELECT
+        sku,
+        GREATEST(COALESCE(stock, 0), 0)
+        INTO v_sku,
+             v_current_quantity
+      FROM public.products
+      WHERE id = v_item.product_id
+      LIMIT 1;
+    END IF;
+
+    IF NULLIF(trim(v_sku), '') IS NULL THEN
+      CONTINUE;
+    END IF;
+
+    INSERT INTO public.inventory_items (sku, quantity)
+    VALUES (v_sku, v_current_quantity)
+    ON CONFLICT (sku) DO NOTHING;
+
+    UPDATE public.inventory_items
+    SET
+      quantity = GREATEST(COALESCE(quantity, 0) - v_item.quantity, 0),
+      updated_at = now()
+    WHERE sku = v_sku;
+  END LOOP;
+
+  UPDATE public.orders
+  SET inventory_deducted_at = now()
+  WHERE id = p_order_id;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 5. Indexes on the SKU columns the inventory trigger and the row policies look up
+-- ---------------------------------------------------------------------------
+-- Every inventory write runs sync_inventory_cache_for_sku, which updates the variants and the product
+-- carrying the SKU (WHERE sku = ...), and the inventory read policy checks each row it reads against the
+-- products and the variants carrying its SKU. Neither column had an index of its own (the unique keys
+-- start with product_id and language_id), so each of those lookups scanned the whole table, or the whole
+-- (product_id, sku) key, under the caller's row policies, once per SKU a publish writes. Measured
+-- 2026-11-18 on local replays, as the ADMIN through \`authenticated\`: five hundred changed SKUs beside 50
+-- other products took 10 s or more without them and about 5 s with both on an idle machine, up to 9 s on
+-- a busy one (the variants one alone: 5 to 9 s), fifty changed SKUs beside 2,000 other products 0.8 to
+-- 2.1 s, then 0.2 to 0.3 s. A plain CREATE INDEX (a migration runs in a transaction, where CONCURRENTLY
+-- cannot): it holds writes to each table until this file's transaction commits, right after it, a
+-- moment for a store's catalog.
+CREATE INDEX IF NOT EXISTS idx_product_variants_sku ON public.product_variants USING btree (sku);
+CREATE INDEX IF NOT EXISTS idx_products_sku ON public.products USING btree (sku);
+
+
+-- >>> FROM: 02045_media_usage_lookup.sql <<<
+-- 02045: public.media_usage(p_media jsonb), where each media item is used, for the media library.
+-- Append-only, forward-only, idempotent (CREATE OR REPLACE). One read-only function: no table,
+-- policy or data change. EXECUTE belongs to the service role alone: revoked here from PUBLIC, anon
+-- and authenticated, and again after every deploy's blanket grant (API_ROLE_REVOKE_SQL in
+-- apps/nextblock/tools/lib/migrate-core.mjs and apps/nextblock/lib/setup/schema-apply.ts), the
+-- shape 02028 gave media_storage_keys_in_use. The app calls it after its own staff and
+-- second-factor check (apps/nextblock/lib/media/media-usage.ts).
+--
+-- Why (the 0.23.4 follow-up). Since 0.23.4 a product save never deletes media: an image dropped from
+-- a gallery is only unlinked, because nothing told whether a page block, a section background, a
+-- text block or the social image still showed it (they keep their own copy of the key, and no
+-- foreign key tracks them). Media is deleted only from the media library, where someone chooses it.
+-- This function tells that person where an item is used before they choose: the delete dialogs list
+-- it, the library's "Unused" view lists the items nothing here names, and "Delete unused" checks
+-- again at delete time. It is a lookup, not a proof: a reference outside the database (another site,
+-- a sent email, a social network's cached preview) is invisible to it.
+--
+-- Input: { "<media id>": ["<storage key>", ...] }: each media row's id and the keys the app's delete
+-- would remove (ownedMediaStorageKeys in apps/nextblock/lib/storage/media-object-keys.ts: the row's
+-- object_key and the variants of the same upload). The app computes the keys, so this function keeps
+-- no copy of that rule. An entry whose name is not a uuid is ignored, and so is a key that is not a
+-- string, holds a character outside [A-Za-z0-9._/-] (the characters the upload routes mint) or is
+-- longer than 512 characters (MAX_OBJECT_KEY_LENGTH in apps/nextblock/lib/storage/upload-policy.ts:
+-- isSafeObjectKey refuses a longer key, so no upload route mints one, and the app never sends one).
+-- Staff can write a media row's keys (a WRITER inserts their own row over PostgREST), so the keys are
+-- search strings chosen by the row's author: the app sends only minted keys, at most 17 a row (a row
+-- holding any other is asked about by id alone and reported as not checked, never unused:
+-- findMediaUsage in apps/nextblock/lib/media/media-usage.ts), and this function matches keys only as
+-- whole tokens. It never searches a document for a substring: that would let a row's author probe
+-- documents they cannot read (ADMIN-tier settings, partner drafts, inactive redirects), and it costs a
+-- full scan of every document per key, so one crafted row could make every lookup that included it
+-- time out.
+--
+-- An item is used where:
+--   * a foreign key names its id: product galleries (product_media), variant images
+--     (product_variants.main_media_id), page and post feature images, logos;
+--   * a document names its id or one of its keys anywhere in its text: blocks (nested sections and
+--     their backgrounds, text block HTML, testimonial and custom block fields), content and product
+--     drafts (meta and blocks), products (description_json, metadata, short_description),
+--     site_settings (site_social_image, the branding and CSS rows), custom block definitions,
+--     navigation item URLs, redirect destinations, category descriptions, theme tokens and CSS,
+--     profile pictures, partner storefront pages (draft, published and the published profile), and
+--     page, post and product revisions, which the app shows as history, not as a use.
+-- The secret rows of site_settings are never read: the rows 02038 keeps for the service role alone,
+-- by its own rule (the seven named keys, cortex_ai_mcp_settings among them, and any key ending like a
+-- secret, in any case). They hold envelopes and settings, never media, and a match there would name
+-- a secret row to the caller.
+-- Each document is read once, as JSON text: a jsonb column's ::text, and a plain text column
+-- through to_json, so a backslash in any document starts an escape. Its uuids are read in any case.
+-- When a key was sent, every run of storage-key characters ([A-Za-z0-9._/-]) holding a dot and an
+-- extension is also cut into the suffixes that start after a '/' (or at the run's start), with
+-- '%2F' read as '/' first (Next's image optimizer URLs): a key sits at the end of its URL's path,
+-- after the media base. Before that, every JSON escape whose letter is a storage-key character
+-- becomes a space, and so does every escaped backslash, read left to right so that one stays a
+-- single character. A control character in a string is written as such an escape (\\n, \\t, \\r, \\b,
+-- \\f, or \\u and four hex digits), and its letter used to glue to the key after it: a key on its own
+-- line in a text field was never found, so its file was listed as unused and "Delete unused"
+-- deleted it. An escaped quote needs nothing (a quote is no key character), and neither do uuids:
+-- their pattern has no boundaries, so an escape's letter before one (b and f are hex) never hides
+-- it. Before even that, a stored \\/ (a backslash right before a slash) is read as '/': JSON pasted
+-- into a text field may escape every slash (JSON-LD as PHP's json_encode writes it,
+-- https:\\/\\/cdn.example.com\\/uploads\\/a.png), and the escaped backslash before each slash cut the
+-- run there, so uploads/a.png was never found and "Delete unused" deleted its file. Text with
+-- escaped slashes now names a key exactly where the same text without those backslashes would. That
+-- is not only more matches: a key directly followed by \\/ and more key characters is part of a
+-- longer run and not found, as uploads/a.png/x already is not. Any other backslash still separates
+-- (in a stored \\\\/ the first one does). A key matches one of those tokens exactly, so only a suffix
+-- that could equal a key sent is built: none longer than the longest key (at most 512 characters,
+-- above) and none with more '/'-separated segments than the deepest key has, and each run is split
+-- once. Building every suffix cost the square of a run's length, and non-staff write documents read
+-- here (a profile picture URL, which anyone who signs up sets; a partner's storefront draft): one
+-- avatar_url of 20,000 slashes made every lookup take tens of seconds (36 to 85 s on local
+-- replays), far past the Data API's 8 s statement timeout, so the Unused view listed nothing and
+-- "Delete unused" deleted nothing. Now a lookup grows with the length of the documents.
+-- Limits: a key glued into a longer run (uploads/a.png.bak) is not found, and a key at the bucket
+-- root matches that file name under any URL (counted as a use: the safe direction). A key right
+-- after an escape whose letter is a key character (a \\b, \\f, \\n, \\r, \\t or \\u escape) inside a JSON
+-- string stored as text (a JSON-LD \\n right before it: a backslash, an n, then the key) is not found
+-- either, since that letter glues to the key: reading a stored backslash and a letter as a separator
+-- would lose nature.png in the text C:\\nature.png, where it is found. After an escaped quote,
+-- backslash or slash the key is found.
+--
+-- Output: { "<media id>": { "total": n, "by_kind": { "<kind>": n }, "sites": [ up to 50 of
+-- { kind, record_id, parent_type, parent_id, label, language } ] } }, one entry per uuid in the input
+-- (lowercased; total 0 when nothing names it). Live uses come first, then drafts, then revisions.
+-- One jsonb value, so PostgREST's max_rows (1000 rows a response) never truncates the answer.
+--
+-- tools/scripts/security-verify.sql section 45 checks the privileges, each kind of use, the secret
+-- rows skipped, a key with another character never searched, a key right after a JSON escape found
+-- (the pass reads every \\b, \\f, \\n, \\r, \\t and \\uXXXX escape as a separator; the section plants six
+-- control characters, a newline, a carriage return, a tab, a backspace, a form feed and U+0001, and
+-- an escaped backslash read as one character, in a text block and in a plain text column), a key
+-- written with escaped slashes found (JSON-LD in a text block, where a backslash before an escaped
+-- slash still separates, and a redirect target), and a profile picture URL of 20,000 slashes
+-- answered within a 4 s statement timeout.
+
+CREATE OR REPLACE FUNCTION public.media_usage(p_media jsonb)
+    RETURNS jsonb
+    LANGUAGE sql STABLE SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+WITH input AS (
+  SELECT lower(e.key) AS media_id, e.value AS keys
+    FROM jsonb_each(CASE WHEN jsonb_typeof(p_media) = 'object' THEN p_media ELSE '{}'::jsonb END) AS e
+   WHERE e.key ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+),
+targets AS (
+  SELECT DISTINCT i.media_id FROM input i
+),
+key_needles AS (
+  SELECT i.media_id, k.value #>> '{}' AS needle
+    FROM input i
+   CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(i.keys) = 'array' THEN i.keys ELSE '[]'::jsonb END) AS k(value)
+   WHERE jsonb_typeof(k.value) = 'string'
+     AND k.value #>> '{}' ~ '^[A-Za-z0-9._/-]+$'
+     -- MAX_OBJECT_KEY_LENGTH (apps/nextblock/lib/storage/upload-policy.ts): the key tokens below are
+     -- never longer than the longest key, so this caps what one run can cost.
+     AND length(k.value #>> '{}') <= 512
+),
+needles AS (
+  SELECT t.media_id, t.media_id AS needle
+    FROM targets t
+  UNION
+  SELECT k.media_id, k.needle
+    FROM key_needles k
+),
+key_limits AS (
+  -- A token longer than the longest key sent, or with more '/'-separated segments than the deepest
+  -- one has, equals no key: the key tokens stop there.
+  SELECT max(length(k.needle)) AS max_length,
+         max(cardinality(string_to_array(k.needle, '/'))) AS max_segments
+    FROM key_needles k
+),
+docs AS (
+  -- Every body is JSON text: a jsonb column's ::text, a plain text column through to_json (its
+  -- backslashes escaped too), so a backslash in a body always starts an escape (the key tokens below).
+  SELECT 'block'::text AS kind, b.id::text AS record_id,
+         CASE WHEN b.page_id IS NOT NULL THEN 'page'
+              WHEN b.post_id IS NOT NULL THEN 'post'
+              WHEN b.product_id IS NOT NULL THEN 'product' END AS parent_type,
+         coalesce(b.page_id::text, b.post_id::text, b.product_id::text) AS parent_id,
+         b.content::text AS body
+    FROM public.blocks b
+   WHERE b.content IS NOT NULL
+  UNION ALL
+  SELECT 'content_draft', d.id::text, d.parent_type, d.parent_id::text, concat_ws(' ', d.meta::text, d.blocks::text)
+    FROM public.content_drafts d
+  UNION ALL
+  SELECT 'product_draft', d.id::text, 'product', d.product_id::text, concat_ws(' ', d.meta::text, d.blocks::text)
+    FROM public.product_drafts d
+  UNION ALL
+  SELECT 'product', p.id::text, 'product', p.id::text,
+         concat_ws(' ', p.description_json::text, p.metadata::text, to_json(p.short_description)::text)
+    FROM public.products p
+  UNION ALL
+  SELECT 'site_setting', s.key, NULL, NULL, s.value::text
+    FROM public.site_settings s
+   WHERE s.value IS NOT NULL
+     -- 02038's secret rows, by site_settings_read_policy's own rule: keep the two in step.
+     AND s.key <> ALL (ARRAY['email_secret','payment_secret','bot_protection_secret','cortex_ai_openrouter_api_key','cortex_ai_pexels_api_key','cortex_ai_unsplash_access_key','cortex_ai_mcp_settings']::text[])
+     AND s.key !~* '(_secret|_secret_key|_api_key|_access_key|_private_key|_token|_password|_credentials?)$'
+  UNION ALL
+  SELECT 'custom_block', c.id::text, NULL, NULL, concat_ws(' ', c.fields::text, c.layout_schema::text)
+    FROM public.custom_block_definitions c
+  UNION ALL
+  SELECT 'navigation_item', n.id::text, NULL, NULL, to_json(n.url)::text
+    FROM public.navigation_items n
+  UNION ALL
+  SELECT 'redirect', r.id::text, NULL, NULL, to_json(r.destination_path)::text
+    FROM public.cms_redirects r
+  UNION ALL
+  SELECT 'category', c.id::text, NULL, NULL, concat_ws(' ', to_json(c.description)::text, c.description_translations::text)
+    FROM public.categories c
+  UNION ALL
+  SELECT 'site_theme', t.id::text, NULL, NULL, concat_ws(' ', t.tokens::text, to_json(t.extra_css)::text)
+    FROM public.site_themes t
+  UNION ALL
+  SELECT 'profile', pr.id::text, NULL, NULL, to_json(pr.avatar_url)::text
+    FROM public.profiles pr
+   WHERE pr.avatar_url IS NOT NULL
+  UNION ALL
+  SELECT 'partner_page', ap.id::text, NULL, NULL,
+         concat_ws(' ', ap.draft_content::text, ap.published_content::text, ap.published_profile::text)
+    FROM public.affiliate_pages ap
+  UNION ALL
+  SELECT 'page_revision', r.id::text, 'page', r.page_id::text, r.content::text
+    FROM public.page_revisions r
+  UNION ALL
+  SELECT 'post_revision', r.id::text, 'post', r.post_id::text, r.content::text
+    FROM public.post_revisions r
+  UNION ALL
+  SELECT 'product_revision', r.id::text, 'product', r.product_id::text, r.content::text
+    FROM public.product_revisions r
+),
+tokens AS (
+  SELECT d.kind, d.record_id, d.parent_type, d.parent_id, lower(m.found[1]) AS token
+    FROM docs d
+   CROSS JOIN LATERAL regexp_matches(
+           d.body, '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}', 'g') AS m(found)
+  -- UNION ALL: sites below removes the duplicates, among far fewer rows (only the tokens that equal an
+  -- id or a key), so the tokens of every document are not sorted first (on a large site, a sort that
+  -- spilled to disk).
+  UNION ALL
+  -- The suffixes of a run that could equal a key: its last max_length + 1 characters hold them all (a
+  -- key and the '/' before it), the suffix from their first part counts only when the run is no
+  -- longer than max_length (it is then the whole run), and a suffix has at most max_segments parts.
+  -- rtrim and string_to_array are function calls in FROM, so each runs once per run: as subquery
+  -- columns they were inlined and evaluated again for every suffix, re-reading the whole run each time.
+  -- Before the runs are cut, an escaped slash becomes a slash, then each JSON escape whose letter is a
+  -- key character (\\n, \\t, \\r, \\b, \\f, \\u and four hex digits) and each escaped backslash becomes a
+  -- space, matched left to right, so an escaped backslash is consumed whole: the text C:\\\\nb/a.png (a
+  -- backslash, then nb/a.png) gives the run nb/a.png, and \\nb/a.png (a newline, then b/a.png) gives
+  -- b/a.png. Without it the escape's letter glued to the key after it. An escaped quote stays: neither
+  -- of its characters belongs to a run.
+  -- The escaped slash: a stored \\/ is \\\\/ in the JSON text, an escaped backslash and the slash, and
+  -- replace() turns those three characters into '/'. That keeps the left-to-right pairing: jsonb and
+  -- to_json never write \\/, so the run of backslashes before a '/' in the JSON text is always even (two
+  -- for each stored backslash), and replace(), scanning left to right, takes its last pair, which is
+  -- one whole escaped backslash; the pairs before it stay for the escape pass, as before (\\\\\\\\/, a
+  -- stored \\\\/, gives ' /': the first stored backslash still separates). A plain replace() costs less
+  -- than one more regex.
+  SELECT d.kind, d.record_id, d.parent_type, d.parent_id, array_to_string(w.parts[i.n:], '/')
+    FROM docs d
+   CROSS JOIN key_limits kl
+   CROSS JOIN LATERAL regexp_matches(
+           replace(replace(regexp_replace(replace(d.body, '\\\\/', '/'), '\\\\([\\\\bfnrt]|u[0-9A-Fa-f]{4})', ' ', 'g'), '%2F', '/'), '%2f', '/'),
+           '[A-Za-z0-9._/-]*\\.[A-Za-z0-9][A-Za-z0-9._/-]*', 'g') AS m(found)
+   CROSS JOIN LATERAL rtrim(m.found[1], '._/-') AS r(run)
+   CROSS JOIN LATERAL string_to_array(right(r.run, kl.max_length + 1), '/') AS w(parts)
+   CROSS JOIN LATERAL generate_series(
+           greatest(CASE WHEN length(r.run) > kl.max_length THEN 2 ELSE 1 END,
+                    cardinality(w.parts) - kl.max_segments + 1),
+           cardinality(w.parts)) AS i(n)
+   -- No key sent (an id-only lookup): no document is cut into runs.
+   WHERE EXISTS (SELECT 1 FROM key_needles)
+),
+sites AS (
+  SELECT n.media_id, t.kind, t.record_id, t.parent_type, t.parent_id
+    FROM tokens t
+    JOIN needles n ON n.needle = t.token
+  UNION
+  SELECT t.media_id, 'product_gallery', pm.product_id::text, 'product', pm.product_id::text
+    FROM targets t
+    JOIN public.product_media pm ON pm.media_id = t.media_id::uuid
+  UNION
+  SELECT t.media_id, 'product_variant', v.id::text, 'product', v.product_id::text
+    FROM targets t
+    JOIN public.product_variants v ON v.main_media_id = t.media_id::uuid
+  UNION
+  SELECT t.media_id, 'page_feature_image', p.id::text, 'page', p.id::text
+    FROM targets t
+    JOIN public.pages p ON p.feature_image_id = t.media_id::uuid
+  UNION
+  SELECT t.media_id, 'post_feature_image', p.id::text, 'post', p.id::text
+    FROM targets t
+    JOIN public.posts p ON p.feature_image_id = t.media_id::uuid
+  UNION
+  SELECT t.media_id, 'logo', l.id::text, NULL, NULL
+    FROM targets t
+    JOIN public.logos l ON l.media_id = t.media_id::uuid
+),
+labeled AS (
+  SELECT s.media_id, s.kind, s.record_id, s.parent_type, s.parent_id,
+         CASE s.parent_type
+           WHEN 'page' THEN (SELECT pg.title FROM public.pages pg WHERE pg.id = s.parent_id::bigint)
+           WHEN 'post' THEN (SELECT po.title FROM public.posts po WHERE po.id = s.parent_id::bigint)
+           WHEN 'product' THEN (SELECT pr.title FROM public.products pr WHERE pr.id = s.parent_id::uuid)
+           ELSE CASE s.kind
+             WHEN 'logo' THEN (SELECT l.name FROM public.logos l WHERE l.id = s.record_id::uuid)
+             WHEN 'custom_block' THEN (SELECT c.name FROM public.custom_block_definitions c WHERE c.id = s.record_id::uuid)
+             WHEN 'navigation_item' THEN (SELECT n.label FROM public.navigation_items n WHERE n.id = s.record_id::bigint)
+             WHEN 'redirect' THEN (SELECT r.source_path FROM public.cms_redirects r WHERE r.id = s.record_id::uuid)
+             WHEN 'category' THEN (SELECT c.name FROM public.categories c WHERE c.id = s.record_id::uuid)
+             WHEN 'site_theme' THEN (SELECT th.name FROM public.site_themes th WHERE th.id = s.record_id::uuid)
+             WHEN 'site_setting' THEN s.record_id
+             WHEN 'partner_page' THEN (
+               SELECT af.handle FROM public.affiliate_pages ap
+                 JOIN public.affiliate_profiles af ON af.id = ap.affiliate_id
+                WHERE ap.id = s.record_id::uuid)
+           END
+         END AS label,
+         CASE s.parent_type
+           WHEN 'page' THEN (SELECT lg.code FROM public.pages pg JOIN public.languages lg ON lg.id = pg.language_id WHERE pg.id = s.parent_id::bigint)
+           WHEN 'post' THEN (SELECT lg.code FROM public.posts po JOIN public.languages lg ON lg.id = po.language_id WHERE po.id = s.parent_id::bigint)
+           WHEN 'product' THEN (SELECT lg.code FROM public.products pr JOIN public.languages lg ON lg.id = pr.language_id WHERE pr.id = s.parent_id::uuid)
+         END AS language,
+         CASE
+           WHEN s.kind IN ('page_revision', 'post_revision', 'product_revision') THEN 3
+           WHEN s.kind IN ('content_draft', 'product_draft') THEN 2
+           ELSE 1
+         END AS tier
+    FROM sites s
+),
+ranked AS (
+  SELECT l.*,
+         row_number() OVER (PARTITION BY l.media_id ORDER BY l.tier, l.kind, l.label NULLS LAST, l.record_id) AS rn
+    FROM labeled l
+),
+per_kind AS (
+  SELECT c.media_id, jsonb_object_agg(c.kind, c.n) AS by_kind, sum(c.n)::integer AS total
+    FROM (SELECT r.media_id, r.kind, count(*)::integer AS n FROM ranked r GROUP BY r.media_id, r.kind) c
+   GROUP BY c.media_id
+),
+per_site AS (
+  SELECT r.media_id,
+         jsonb_agg(jsonb_build_object(
+           'kind', r.kind,
+           'record_id', r.record_id,
+           'parent_type', r.parent_type,
+           'parent_id', r.parent_id,
+           'label', r.label,
+           'language', r.language) ORDER BY r.rn) AS sites
+    FROM ranked r
+   WHERE r.rn <= 50
+   GROUP BY r.media_id
+)
+SELECT coalesce(
+         jsonb_object_agg(
+           t.media_id,
+           jsonb_build_object(
+             'total', coalesce(k.total, 0),
+             'by_kind', coalesce(k.by_kind, '{}'::jsonb),
+             'sites', coalesce(s.sites, '[]'::jsonb))),
+         '{}'::jsonb)
+  FROM targets t
+  LEFT JOIN per_kind k ON k.media_id = t.media_id
+  LEFT JOIN per_site s ON s.media_id = t.media_id;
+$$;
+
+COMMENT ON FUNCTION public.media_usage(jsonb) IS
+  'Where each media item is used: { "<id>": ["<owned key>", ...] } in, { "<id>": { total, by_kind, sites } } out. Service role only (02045).';
+
+REVOKE ALL ON FUNCTION public.media_usage(jsonb) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.media_usage(jsonb) TO service_role;
+
+
   -- Step C2: Take the API roles' EXECUTE back off every trigger function. Step B's
   -- DEFAULT PRIVILEGES hand anon/authenticated EXECUTE on each function the migrations
   -- create; trigger functions never need it (EXECUTE is only checked at CREATE TRIGGER
@@ -24110,7 +26109,10 @@ ON CONFLICT (key) DO NOTHING;
     ('02039', 'home_hero_heading_fit'),
     ('02040', 'home_partner_section_after_ecosystem'),
     ('02041', 'site_settings_admin_created_flag_service_role_only'),
-    ('02042', 'consent_cookie_settings_copy')
+    ('02042', 'consent_cookie_settings_copy'),
+    ('02043', 'atomic_product_draft_publish'),
+    ('02044', 'product_draft_publish_stock_baseline'),
+    ('02045', 'media_usage_lookup')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles: the users Step A kept (the two ids and the demo admin's

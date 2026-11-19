@@ -30,7 +30,8 @@ const serviceClient = { from: vi.fn() };
 
 /**
  * A query that answers every chained call: reads resolve to an empty list (maybeSingle() to the
- * product's draft row when one exists), writes are recorded and succeed.
+ * product's draft row when one exists), writes are recorded and succeed; an UPDATE of the draft
+ * answers the row it wrote (the autosave selects it back to tell a vanished draft from a saved one).
  */
 function emptyQuery(table: string) {
   const query: Record<string, unknown> = {};
@@ -48,7 +49,13 @@ function emptyQuery(table: string) {
     error: null,
   });
   query.then = (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
-    Promise.resolve(op === 'select' ? { data: [], error: null } : { error: null }).then(resolve, reject);
+    Promise.resolve(
+      op === 'select'
+        ? { data: [], error: null }
+        : op === 'update' && table === 'product_drafts'
+          ? { data: mocks.draftExists ? [{ id: 7 }] : [], error: null }
+          : { error: null }
+    ).then(resolve, reject);
   return query;
 }
 
@@ -233,5 +240,54 @@ describe('the product form autosave stamps its draft as written by 0.23.4', () =
 
     await expect(updateProductAction('product-1', formValues)).resolves.toEqual({ success: true });
     expect(draftWrite('update')?.meta).toEqual(expect.objectContaining({ form_version: 2 }));
+  });
+
+  // Migration 02044: the stock the edit page loaded, per SKU, rides every autosave into the draft, so
+  // publishing writes only the quantities changed in the form and a sale made meanwhile stays.
+  it('stores the stock the edit page loaded beside the stock values, in an existing draft and a new one', async () => {
+    const withBaseline = { ...formValues, stock: 7, stock_baseline: { PRO: 7 } } as typeof formValues;
+
+    mocks.draftExists = true;
+    await expect(updateProductAction('product-1', withBaseline)).resolves.toEqual({ success: true });
+    expect(draftWrite('update')?.meta).toEqual(expect.objectContaining({ stock: 7, stock_baseline: { PRO: 7 } }));
+
+    mocks.cookieWrites.mockClear();
+    mocks.draftExists = false;
+    await expect(updateProductAction('product-1', withBaseline)).resolves.toEqual({ success: true });
+    expect(draftWrite('insert')?.meta).toEqual(expect.objectContaining({ stock: 7, stock_baseline: { PRO: 7 } }));
+  });
+
+  // The edit page used to draw a draft's tiles from an entry's embedded `media` object and order them
+  // by its `sort_order`, neither of which publish reads (security review 2026-11-15, the 0.23.4
+  // follow-up). The autosave stores the gallery as publish reads it (toProductGalleryDraftEntries).
+  it.each([
+    ['an existing draft', true, 'update'],
+    ['a draft the autosave creates', false, 'insert'],
+  ] as const)('stores the gallery of %s as bare { media_id } entries, in the order publish writes', async (_name, exists, op) => {
+    mocks.draftExists = exists;
+    const productMedia = [
+      { media_id: 'B2222222-2222-4222-8222-22222222222B', sort_order: 0, media: { file_path: 'uploads/live-main.webp' } },
+      { media_id: 'a1111111-1111-4111-8111-11111111111a', sort_order: 5, id: 'row-1' },
+      { media_id: 'not-a-uuid', media: { file_path: 'uploads/live-main.webp' } },
+      { media_id: 'b2222222-2222-4222-8222-22222222222b' },
+      null,
+    ];
+
+    await expect(
+      updateProductAction('product-1', { ...formValues, product_media: productMedia } as unknown as Parameters<typeof updateProductAction>[1])
+    ).resolves.toEqual({ success: true });
+
+    expect(draftWrite(op)?.meta.product_media).toEqual([
+      { media_id: 'b2222222-2222-4222-8222-22222222222b' },
+      { media_id: 'a1111111-1111-4111-8111-11111111111a' },
+    ]);
+  });
+
+  it('leaves a values object without a gallery list as it is (publish then keeps the live gallery)', async () => {
+    mocks.draftExists = true;
+
+    await updateProductAction('product-1', formValues);
+
+    expect(draftWrite('update')?.meta).not.toHaveProperty('product_media');
   });
 });

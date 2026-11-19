@@ -15,6 +15,8 @@ const PRODUCT_ID = '123e4567-e89b-12d3-a456-426614174000';
 
 const mocks = vi.hoisted(() => ({
   draftExists: true,
+  /** The draft read finds a row, but a publish deletes it before the autosave's UPDATE. */
+  publishedBeforeUpdate: false,
   writes: [] as Array<[string, string, any]>,
 }));
 
@@ -36,8 +38,15 @@ function makeCookieClient() {
         data: table === 'product_drafts' && mocks.draftExists ? { id: 7 } : null,
         error: null,
       });
+      // An UPDATE ... select('id') answers the rows it wrote: none once the draft is gone.
       query.then = (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
-        Promise.resolve(op === 'select' ? { data: [], error: null } : { error: null }).then(resolve, reject);
+        Promise.resolve(
+          op === 'select'
+            ? { data: [], error: null }
+            : op === 'update'
+              ? { data: mocks.draftExists && !mocks.publishedBeforeUpdate ? [{ id: 7 }] : [], error: null }
+              : { error: null }
+        ).then(resolve, reject);
       return query;
     },
   };
@@ -108,6 +117,22 @@ function storedMeta() {
 beforeEach(() => {
   mocks.writes = [];
   mocks.draftExists = true;
+  mocks.publishedBeforeUpdate = false;
+});
+
+describe("the lib's autosave never reports a write that matched no draft as saved", () => {
+  it('starts a new draft, stamped, when a publish deleted the one it read before its UPDATE landed', async () => {
+    mocks.publishedBeforeUpdate = true;
+
+    await expect(updateProductAction(PRODUCT_ID, FORM_VALUES as any)).resolves.toEqual({ success: true });
+
+    // Until migration 02043's follow-up the UPDATE that matched nothing was the end of it: the edit
+    // was reported saved and was gone.
+    expect(mocks.writes.filter(([, table]) => table === 'product_drafts').map(([op]) => op)).toEqual(['update', 'insert']);
+    const inserted = mocks.writes.find(([op, table]) => op === 'insert' && table === 'product_drafts')?.[2];
+    expect(inserted).toMatchObject({ product_id: PRODUCT_ID, author_id: 'writer-1', blocks: [] });
+    expect(hasProductDraftFormMarker(inserted.meta)).toBe(true);
+  });
 });
 
 describe("the lib's autosave stamps the marker the app reads", () => {

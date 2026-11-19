@@ -46,6 +46,11 @@ const REVISIONS_PER_PAGE = 10;
  * `status`/`published_at` are here because visibility is owned by the top bar and never
  * replayed on restore (see RESTORE_EXCLUDED_META_COLUMNS); attributing a publish toggle to
  * whoever saved next would be wrong.
+ *
+ * `/commerce` whole (never a path below it): a product revision recorded before migration
+ * 02043 has no commerce section, so comparing it with today's content adds or removes the
+ * entire object. That is a change of what History records, not of the product; a real price,
+ * variant or gallery change shows up as an op below /commerce.
  */
 const IGNORED_DIFF_PATHS = new Set<string>([
   '/meta/updated_at',
@@ -53,6 +58,7 @@ const IGNORED_DIFF_PATHS = new Set<string>([
   '/meta/version',
   '/meta/id',
   '/meta/author_id',
+  '/commerce',
   ...RESTORE_EXCLUDED_META_COLUMNS.map(column => `/meta/${column}`),
 ]);
 
@@ -350,5 +356,12 @@ export async function compareProductVersion(productId: string, targetVersion: nu
   if (!current) return { error: 'Failed to fetch current content.' } as const;
   const reconstructed = await reconstructProductVersionContent(productId, targetVersion);
   if ('error' in reconstructed) return { error: reconstructed.error } as const;
+  // A version recorded before migration 02043 holds no commerce section: compared as it is, the
+  // view would list today's whole commerce object as a difference.
+  if (!reconstructed.content.commerce) {
+    const { commerce: _recordedSince02043, ...withoutCommerce } = current;
+    void _recordedSince02043;
+    return { success: true as const, current: withoutCommerce, target: reconstructed.content };
+  }
   return { success: true as const, current, target: reconstructed.content };
 }

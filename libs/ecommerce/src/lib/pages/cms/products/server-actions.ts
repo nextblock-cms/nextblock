@@ -5,6 +5,7 @@ import 'server-only';
 import { createClient } from '@nextblock-cms/db/server';
 import { requireEcomAdmin, requireEcomStaff } from '../../../server-actions/require-ecom-role';
 import { ProductFormValues } from '../../../product-schema';
+import { toProductGalleryDraftEntries } from '../../../product-gallery';
 import {
   createProduct as createProductLib,
   deleteProduct as deleteProductLib,
@@ -69,7 +70,7 @@ export async function createProductAction(data: ProductFormValues) {
  * 'use server' module exports only async functions, so the app keeps its own copy of the literal
  * (PRODUCT_DRAFT_FORM_MARKER_KEY / _VALUE in apps/nextblock/lib/visual-editing/product-draft-meta.ts);
  * product-draft-marker.test.ts there runs this action and fails when the two drift. It never
- * reaches updateProduct() or the products row.
+ * reaches the publish (publish_product_draft) or the products row.
  */
 const PRODUCT_DRAFT_FORM_MARKER = { form_version: 2 } as const;
 
@@ -84,6 +85,30 @@ const PRODUCT_DRAFT_FORM_MARKER = { form_version: 2 } as const;
  * vanish from the editor the first time the form autosaved — and deleted them
  * for good on the next publish. Seed the snapshot from the live blocks when the
  * draft is created, and only ever touch `meta` afterwards.
+ *
+ * The update returns the rows it wrote: none means the draft was deleted after
+ * it was read (a publish, which deletes it in the transaction that makes it
+ * live, so an autosave that waited on its lock lands here, or a discard in
+ * another tab). The values then start a new draft; without the check
+ * supabase-js reported the write that matched nothing as saved, and the edit
+ * was lost. Their `stock_baseline` is still the one the page loaded before
+ * that publish (nothing records which publish a baseline was loaded against)
+ * until a save from a page loaded after the publish records the live stock of
+ * every SKU the product stocks (the edit page records one for each, a SKU
+ * that baseline lacks included). Until then a quantity the publish made live
+ * equals the current stock, so the edit page shows it as it is and the next
+ * publish leaves it, until the stock moves: after a sale the change is
+ * applied again (loaded 5, published 10, one sold: the page shows 14 and the
+ * next publish writes it); and a stock typed while the publish ran reads as a
+ * change from the older baseline, which the edit page shows applied to the
+ * new stock, as the next publish writes it. The edit page names each SKU it
+ * shows already live, or applied to a stock that moved at another figure
+ * than the draft's, and a publish of the draft as it stands warns of both. A
+ * variant added before that publish is in no baseline, so a publish writes
+ * its figure as the draft holds it, a sale since included; the edit page
+ * shows that figure with no note, and a save from it stores it as a change
+ * from the stock it loaded, so a sale made between that publish and that
+ * page load stays undone (later ones stay sold).
  */
 async function saveProductDraftMeta(
   supabase: ReturnType<typeof createClient>,
@@ -91,20 +116,32 @@ async function saveProductDraftMeta(
   authorId: string,
   meta: ProductFormValues
 ) {
+  // The gallery as publish will read it: bare `{ media_id }` entries in order, lowercased, each once,
+  // uuids only (toProductGalleryDraftEntries). An entry's own `sort_order` or embedded `media`
+  // object is never stored: publish ignores both, and the edit page used to show them.
+  const productMedia = toProductGalleryDraftEntries(meta.product_media);
   const metaUpdate = {
     author_id: authorId,
-    meta: { ...meta, ...PRODUCT_DRAFT_FORM_MARKER } as any,
+    meta: {
+      ...meta,
+      ...(productMedia ? { product_media: productMedia } : {}),
+      ...PRODUCT_DRAFT_FORM_MARKER,
+    } as any,
     updated_at: new Date().toISOString(),
   };
-  const updateExistingDraft = async () => {
-    const { error } = await supabase
+  /** Whether the draft row was there to update. */
+  const updateExistingDraft = async (): Promise<boolean> => {
+    const { data, error } = await supabase
       .from('product_drafts')
       .update(metaUpdate)
-      .eq('product_id', productId);
+      .eq('product_id', productId)
+      .select('id');
 
     if (error) {
       throw new Error(`Failed to save product draft: ${error.message}`);
     }
+
+    return Array.isArray(data) && data.length > 0;
   };
 
   const { data: existingDraft, error: readError } = await supabase
@@ -117,8 +154,7 @@ async function saveProductDraftMeta(
     throw new Error(`Failed to read product draft: ${readError.message}`);
   }
 
-  if (existingDraft) {
-    await updateExistingDraft();
+  if (existingDraft && (await updateExistingDraft())) {
     return;
   }
 
@@ -144,8 +180,12 @@ async function saveProductDraftMeta(
     // 23505: a concurrent autosave created the draft first. Its snapshot is
     // already seeded, so fall back to a meta-only update rather than failing.
     if (insertError.code === '23505') {
-      await updateExistingDraft();
-      return;
+      if (await updateExistingDraft()) {
+        return;
+      }
+      throw new Error(
+        'Failed to save product draft: it was published or discarded while this save ran. Edit the form again to save.'
+      );
     }
 
     throw new Error(`Failed to save product draft: ${insertError.message}`);

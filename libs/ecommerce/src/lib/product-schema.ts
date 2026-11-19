@@ -140,6 +140,12 @@ export const productSchema = z.object({
   explicitly_removed_media_ids: z.array(z.string()).optional(),
   variation_attributes: z.array(variationAttributeSchema).optional(),
   variants: z.array(variantDraftSchema).optional(),
+  // The stock the edit page loaded, per SKU ({ sku: quantity }: each variant's, or the product's when it
+  // has none). The form never shows it; the autosave stores it in the draft, and publishing writes a
+  // SKU's stock only when the draft's quantity differs from it (publish_product_draft, migration 02044),
+  // so a sale made while the page was open keeps its deduction. Lenient on purpose: a hidden field that
+  // refused a value would block every autosave, and the publish ignores an entry it cannot read.
+  stock_baseline: z.record(z.string(), z.number()).nullable().optional(),
 }).refine(
   (product) =>
     product.sale_price === null ||

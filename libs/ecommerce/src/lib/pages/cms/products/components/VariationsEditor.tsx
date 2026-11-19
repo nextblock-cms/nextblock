@@ -57,6 +57,12 @@ interface VariationsEditorProps {
   }) => void;
 }
 
+/**
+ * The largest quantity an inventory row holds (`inventory_items.quantity` and `products.stock` are
+ * integers), as product-actions.ts and the app's productFormData.ts hold a stock.
+ */
+const MAX_STOCK_QUANTITY = 2147483647;
+
 function formatCurrency(value: number, currencyCode = 'USD') {
   return new Intl.NumberFormat('en-US', {
     style: 'currency',
@@ -110,11 +116,27 @@ export function VariationsEditor({
   onChange,
 }: VariationsEditorProps) {
   const [selectedTermsByAttribute, setSelectedTermsByAttribute] = useState<Record<string, string[]>>(() => {
-    if (initialVariationAttributes && initialVariationAttributes.length > 0) {
-      return initialVariationAttributes.reduce<Record<string, string[]>>((accumulator, attribute) => {
-        accumulator[attribute.attribute_id] = attribute.term_ids;
-        return accumulator;
-      }, {});
+    // Only entries it can read that select a term: an object with a text attribute id, and its text term
+    // ids. ProductForm hands it readable entries only; given a draft's null entry, or term ids that were an
+    // object or a number, this threw on mount, which took the whole product edit page down. With no entry
+    // selecting a term, the selection comes from the variants' own options, as the form's change check
+    // assumes (variationAttributesMatchFormValues in ProductForm): taken as a selection of nothing, the
+    // variants showed with none of their terms selected, the panel's next mount emitted a change no one
+    // made, and toggling another term regenerated the list without them.
+    const attributes = (Array.isArray(initialVariationAttributes) ? initialVariationAttributes : [])
+      .filter((attribute) => attribute !== null && typeof attribute === 'object' && typeof attribute.attribute_id === 'string')
+      .map((attribute) => {
+        const termIds: unknown[] = Array.isArray(attribute.term_ids) ? attribute.term_ids : [];
+        return [
+          attribute.attribute_id,
+          termIds.every((termId) => typeof termId === 'string')
+            ? (termIds as string[])
+            : termIds.filter((termId): termId is string => typeof termId === 'string'),
+        ] as const;
+      })
+      .filter(([, termIds]) => termIds.length > 0);
+    if (attributes.length > 0) {
+      return Object.fromEntries(attributes);
     }
 
     return extractSelectedTermsByAttribute(initialVariants || []);
@@ -210,8 +232,11 @@ export function VariationsEditor({
     });
   }, [onChange, selectedTermsByAttribute, variantDrafts]);
 
+  // Held at the largest stock a row holds, as the app's edit page holds the read-only total beside the
+  // variants and the publish holds the product's stock it writes from them: unheld, two variants of
+  // 2147483647 showed "Stock: 4294967294", a stock nothing can hold.
   const totalVariantStock = variantDrafts.reduce(
-    (accumulator, variant) => accumulator + (variant.stock_quantity || 0),
+    (accumulator, variant) => Math.min(MAX_STOCK_QUANTITY, accumulator + (variant.stock_quantity || 0)),
     0
   );
   const defaultCurrency = currencies.find((currency) => currency.is_default) ?? currencies[0];

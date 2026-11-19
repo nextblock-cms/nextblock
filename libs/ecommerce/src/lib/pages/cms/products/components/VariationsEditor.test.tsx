@@ -67,7 +67,7 @@ function colorVariant(termId: string, value: string, price: number) {
   };
 }
 
-type Emission = { variants: unknown[] };
+type Emission = { variants: unknown[]; variationAttributes?: unknown[] };
 
 let mounted: { root: Root; container: HTMLElement } | null = null;
 
@@ -87,6 +87,8 @@ afterEach(() => {
 async function openEditor(options: {
   globalAttributes: ProductAttribute[];
   variants: ReturnType<typeof colorVariant>[];
+  /** The selected terms the editor opens with (none by default: it takes them from the variants). */
+  variationAttributes?: unknown[];
 }) {
   const onChange = vi.fn<(payload: Emission) => void>();
   const container = document.createElement('div');
@@ -105,7 +107,7 @@ async function openEditor(options: {
         baseSalePrice={null}
         baseSalePrices={{}}
         currencies={props.currencies}
-        initialVariationAttributes={[]}
+        initialVariationAttributes={(options.variationAttributes ?? []) as never}
         initialVariants={options.variants as never}
         onChange={onChange as never}
       />
@@ -156,5 +158,105 @@ describe('the variations editor keeps a list whose terms resolve to nothing', ()
     });
 
     expect(emittedCounts(onChange).at(-1)).toBe(0);
+  });
+});
+
+/**
+ * Review 2026-11-18: a product draft's variation attributes can hold anything (any WRITER can PATCH a
+ * draft), and the editor threw on mount for a null entry ("Cannot read properties of null (reading
+ * 'attribute_id')") or term ids that were an object or a number (".includes is not a function"), in the
+ * browser (the edit page's client shell renders the form only after mount, and /cms has no error boundary),
+ * so the product edit page failed for every reader. ProductForm loads readable
+ * entries only; the editor reads only those itself, and with no entry selecting a term it takes the
+ * selection from the variants' options, as the form's change check assumes.
+ */
+describe('the variations editor opens on the variation attributes it can read', () => {
+  const termButton = (container: HTMLElement, label: string) =>
+    [...container.querySelectorAll('button')].find((button) => button.textContent === label);
+
+  it.each([
+    ['a null entry', [null]],
+    ['an entry whose term ids are an object', [{ attribute_id: ATTR_COLOR, term_ids: {} }]],
+    ['an entry whose term ids are a number', [{ attribute_id: ATTR_COLOR, term_ids: 5 }]],
+    ['an entry that selects no term', [{ attribute_id: ATTR_COLOR, term_ids: [] }]],
+    [
+      'entries that are not objects with a text attribute id, or select no text term',
+      [42, 'x', { attribute_id: 7, term_ids: [TERM_RED] }, { attribute_id: ATTR_COLOR, term_ids: [null, 5] }],
+    ],
+  ])('%s: the selection its variants make', async (_label, variationAttributes) => {
+    const { container, onChange } = await openEditor({
+      globalAttributes: [COLOR],
+      variants: [colorVariant(TERM_RED, 'Red', 49)],
+      variationAttributes,
+    });
+
+    expect(container.querySelector(`#variant-stock-${TERM_RED}`)).not.toBeNull();
+    expect(termButton(container, 'Red')?.className).toContain('bg-primary/10');
+    expect(termButton(container, 'Blue')?.className).not.toContain('bg-primary/10');
+    expect(onChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      variants: [expect.objectContaining({ sku: 'PRO-RED' })],
+      variationAttributes: [{ attribute_id: ATTR_COLOR, term_ids: [TERM_RED] }],
+    });
+  });
+
+  it('a list with readable entries: those entries, with their text term ids', async () => {
+    const { container, onChange } = await openEditor({
+      globalAttributes: [COLOR],
+      variants: [colorVariant(TERM_RED, 'Red', 49), colorVariant(TERM_BLUE, 'Blue', 54)],
+      variationAttributes: [null, { attribute_id: ATTR_COLOR, term_ids: [TERM_BLUE, 5] }],
+    });
+
+    expect(termButton(container, 'Blue')?.className).toContain('bg-primary/10');
+    expect(termButton(container, 'Red')?.className).not.toContain('bg-primary/10');
+    expect(onChange.mock.calls.at(-1)?.[0]).toMatchObject({
+      variationAttributes: [{ attribute_id: ATTR_COLOR, term_ids: [TERM_BLUE] }],
+    });
+    // Opening regenerates nothing: both variants stay.
+    expect(emittedCounts(onChange).at(-1)).toBe(2);
+  });
+});
+
+describe('the variations editor beside values a product draft can hold', () => {
+  // Review 2026-11-18 (round 4): the badge summed the variants' stock unheld, so two variants of 2147483647
+  // showed "Stock: 4294967294", while the app's edit page holds the read-only total beside the variants at
+  // 2147483647, as the publish holds the product's stock it writes from them.
+  it('holds the stock badge at the largest stock a row holds', async () => {
+    const MAX = 2147483647;
+    const badge = (container: HTMLElement) =>
+      [...container.querySelectorAll('span, div')].find((element) => element.textContent?.startsWith('Stock: '))?.textContent;
+
+    const { container } = await openEditor({ globalAttributes: [COLOR], variants: [colorVariant(TERM_RED, 'Red', 49), colorVariant(TERM_BLUE, 'Blue', 54)] });
+    expect(badge(container)).toBe('Stock: 4');
+
+    act(() => mounted?.root.unmount());
+    mounted?.container.remove();
+    mounted = null;
+
+    const { container: full } = await openEditor({
+      globalAttributes: [COLOR],
+      variants: [
+        { ...colorVariant(TERM_RED, 'Red', 49), stock_quantity: MAX },
+        { ...colorVariant(TERM_BLUE, 'Blue', 54), stock_quantity: MAX },
+      ],
+    });
+    expect(badge(full)).toBe(`Stock: ${MAX}`);
+  });
+
+  // buildVariantSku read the product SKU with `.trim()`, so a term toggle beside a product SKU that is not
+  // text (a hand-written draft's, which the form shows as loaded) threw while regenerating the variants.
+  it('adds a variant from a term toggle beside a product SKU that is not text, its SKU from the term alone', async () => {
+    const { container, onChange, rerender } = await openEditor({ globalAttributes: [COLOR], variants: [colorVariant(TERM_RED, 'Red', 49)] });
+    await rerender({ currencies: [USD], baseSku: 5 as unknown as string });
+
+    const blue = [...container.querySelectorAll('button')].find((button) => button.textContent === 'Blue');
+    await act(async () => {
+      blue?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(container.querySelector(`#variant-stock-${TERM_BLUE}`)).not.toBeNull();
+    expect(onChange.mock.calls.at(-1)?.[0].variants).toEqual([
+      expect.objectContaining({ combination_key: TERM_RED, sku: 'PRO-RED' }),
+      expect.objectContaining({ combination_key: TERM_BLUE, sku: 'BLUE' }),
+    ]);
   });
 });

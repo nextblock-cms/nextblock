@@ -6,7 +6,7 @@ import {
   editorBlockDocumentSchema,
   editorGeneratedBlockDocumentSchema,
   getEditorBlocksJsonSchema,
-} from '../../../libs/utils/src/lib/editor-blocks';
+} from '../../libs/utils/src/lib/editor-blocks';
 
 dotenv.config({ path: '.env.local' });
 

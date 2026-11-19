@@ -3,12 +3,20 @@ import { defineConfig } from 'vite';
 import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
+// eslint-disable-next-line @nx/enforce-module-boundaries -- a build-time helper every lib config shares, not a library dependency
+import { rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
 const packageJsonPath = path.resolve(__dirname, 'package.json');
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
 const { version, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
 const OUT_DIR = path.resolve(__dirname, '../../dist/libs/sdk');
+// The contract's declarations name zod (field schemas) and lucide-react (block icons), and the
+// manifest this hook writes declared neither through 0.23.5 (package.json's `dependencies` never
+// reach it). Peers: a block's schema and icon must be the project's own zod and lucide-react, or
+// their types do not line up. tools/scripts/verify-lib-dist.js check 15 refuses a declaration
+// import nothing declares.
+const peerDependencies = rootPackageRanges(['lucide-react', 'zod']);
 
 export default defineConfig(() => ({
   root: __dirname,
@@ -27,6 +35,7 @@ export default defineConfig(() => ({
           main: 'index.js',
           module: 'index.js',
           types: 'index.d.ts',
+          peerDependencies,
           exports: {
             '.': {
               types: './index.d.ts',

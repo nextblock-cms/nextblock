@@ -9,6 +9,7 @@ import {
   normalizeContentDraftRow,
   updateDraftBlockContent,
 } from "./draft-content";
+import { PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR } from "./product-draft-meta";
 import type {
   NextblockDocumentType,
   NextblockVisualDocumentType,
@@ -132,16 +133,21 @@ export async function saveVisualEditingBlockDraftMutation(
           blocks: nextSnapshot.blocks,
         })
         .eq("id", draft.id)
-        .select("*")
-        .single();
+        .select("id");
 
-      if (error || !data) {
+      if (error) {
         return {
           error: formatVisualEditingError(
-            new Error(`Failed to save product draft: ${error?.message ?? "unknown error"}`),
+            new Error(`Failed to save product draft: ${error.message}`),
             "Failed to save product draft."
           ),
         };
+      }
+
+      // No row: the draft was published or discarded after it was read (a save that waited on a
+      // publish's lock finds it deleted). The block ids this edit names were that draft's.
+      if (!Array.isArray(data) || data.length === 0) {
+        return { error: PRODUCT_DRAFT_GONE_DURING_SAVE_ERROR };
       }
 
       // The live product's page: a draft created since 0.23.4 carries no slug (its meta starts as {}),

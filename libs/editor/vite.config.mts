@@ -4,7 +4,7 @@ import dts from 'vite-plugin-dts';
 import * as path from 'path';
 import * as fs from 'fs';
 import { fileURLToPath } from 'url';
-import { clientDirectiveOnEntries, copyIntoDist } from '../../tools/vite/lib-build-plugins.mjs';
+import { clientDirectiveOnEntries, copyIntoDist, rootPackageRanges } from '../../tools/vite/lib-build-plugins.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const resolveFrom = (...segments: string[]) => path.resolve(__dirname, ...segments);
@@ -14,7 +14,35 @@ const packageJsonPath = resolveFrom('package.json');
 // (see rolldownOptions.external below). Copied into the published manifest by afterBuild.
 // license and repository go into the published manifest too: npm shows them on the package page,
 // and through 0.20 every package this hook writes shipped without either.
-const { version, dependencies, license, repository } = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+const { version, dependencies: externalDependencies, license, repository } = JSON.parse(
+  fs.readFileSync(packageJsonPath, 'utf8')
+);
+// The bundle inlines Tiptap, but the declarations import it by name (NotionEditor's `Editor`,
+// `Extension`, the node types). Through 0.23.5 the manifest declared none of it, so those types
+// resolved only where the app or another package happened to install the same Tiptap package, and
+// were `any` elsewhere. @tiptap/extension-list and @tiptap/extension-paragraph come in with
+// @tiptap/starter-kit, not from the root package.json; they release in lockstep with @tiptap/core.
+// The JavaScript still uses its inlined copies. tools/scripts/verify-lib-dist.js check 15 refuses a
+// declaration import nothing declares.
+const dependencies = {
+  ...externalDependencies,
+  ...rootPackageRanges(
+    [
+      '@tiptap/core',
+      '@tiptap/extension-blockquote',
+      '@tiptap/extension-code-block-lowlight',
+      '@tiptap/extension-heading',
+      '@tiptap/extension-image',
+      '@tiptap/extension-list',
+      '@tiptap/extension-paragraph',
+      '@tiptap/extension-placeholder',
+      '@tiptap/pm',
+      '@tiptap/react',
+      '@tiptap/suggestion',
+    ],
+    { sameRangeAs: { '@tiptap/extension-list': '@tiptap/core', '@tiptap/extension-paragraph': '@tiptap/core' } }
+  ),
+};
 // peerDependencies: the sibling libs the bundle imports by name (`@nextblock-cms/*` stays
 // external below), at the versions libs/ui and libs/utils carry when this build runs. release:all
 // bumps both before it builds the editor (LIBS in tools/scripts/release-all.js), so the ranges
@@ -30,9 +58,12 @@ const siblingVersion = (lib: string): string => {
   }
   return sibling;
 };
+// react and react-dom (external below) are peers too, the app's single copy; through 0.23.5 the
+// manifest named neither.
 const peerDependencies = {
   '@nextblock-cms/ui': `^${siblingVersion('ui')}`,
   '@nextblock-cms/utils': `^${siblingVersion('utils')}`,
+  ...rootPackageRanges(['react', 'react-dom']),
 };
 
 export default defineConfig({
@@ -54,7 +85,7 @@ export default defineConfig({
           main: 'index.js',
           module: 'index.mjs',
           types: 'index.d.ts',
-          ...(dependencies ? { dependencies } : {}),
+          dependencies,
           peerDependencies,
           exports: {
             '.': {

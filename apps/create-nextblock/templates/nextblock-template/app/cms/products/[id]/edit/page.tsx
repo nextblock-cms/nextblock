@@ -30,10 +30,14 @@ import { createClient } from '@nextblock-cms/db/server';
 import {
   buildGlobalAttributesForForm,
   buildProductFormInitialData,
+  buildProductStockBaseline,
   getProductDraftEditNotices,
   mergeProductDraftMetaIntoFormInitialData,
+  readProductDraftGalleryMediaIds,
+  resolveProductDraftGalleryForEdit,
+  type ProductDraftGalleryMediaRow,
+  type ProductDraftGalleryTile,
 } from '../../productFormData';
-import { classifyProductDraftMeta } from '../../../../../lib/visual-editing/product-draft-meta';
 import { currentUserCanPublishProductDrafts } from '../../../../../lib/visual-editing/product-drafts';
 import { CortexAiPageContextRegistrar } from '../../../components/CortexAiPageContext';
 import BlockEditorArea from '../../../blocks/components/BlockEditorArea';
@@ -152,19 +156,32 @@ export default async function EditProductPage({
     .maybeSingle();
 
   const hasDraft = draftData !== null;
-  const liveInitialData = {
+  const liveFormData = {
     ...buildProductFormInitialData(product, languages),
     category_ids: assignedCategories.map((c: any) => c.id),
   };
+  // The stock the form loads, per SKU: the autosave records it in the draft, and publishing writes a
+  // SKU's stock only where the draft's quantity differs from it and from the current stock, as a change
+  // to the stock as it then is (buildProductStockBaseline), so a sale made while this page is open keeps
+  // its deduction. With a draft open, mergeProductDraftMetaIntoFormInitialData shows SKU by SKU what
+  // publishing that draft would write, and records the live stock of every SKU the product stocks.
+  const liveInitialData = { ...liveFormData, stock_baseline: buildProductStockBaseline(liveFormData) };
   let normalizedInitialData = liveInitialData;
-  // Notes above the form for a draft an earlier version wrote (getProductDraftEditNotices). One that
-  // publish refuses, shown with the live values for the fields it names (findPoisonedProductDraftFields):
-  // a pre-0.23.4 form autosave over a row snapshot (amounts equal to the live minor amounts or at
-  // least 20 times the live ones, a Freemius plan price in cents, rebuilt or emptied variants, the
-  // snapshot's stock, an emptied gallery or description), or the gallery, variants or description a
-  // pre-0.23.4 CMS draft import left empty. Or a pre-0.23.4 row snapshot, or an overlay rewritten
-  // from one (its recorded legacy_snapshot_fields), whose title, short description or description
-  // publish would skip.
+  // Notes above the form for a draft publish would refuse or skip parts of (getProductDraftEditNotices).
+  // One an earlier version wrote that publish refuses, shown with the live values for the fields it
+  // names (findPoisonedProductDraftFields): a pre-0.23.4 form autosave over a row snapshot (amounts
+  // equal to the live minor amounts or at least 20 times the live ones, a Freemius plan price in cents,
+  // rebuilt or emptied variants, the snapshot's stock, an emptied gallery or description), or the
+  // gallery, variants or description a pre-0.23.4 CMS draft import left empty. Or a pre-0.23.4 row
+  // snapshot, or an overlay rewritten from one (its recorded legacy_snapshot_fields), whose title, short
+  // description or description publish would skip. Or product values holding a stock or a SKU publish
+  // cannot read (findUnreadableProductDraftValues: only a hand-written draft holds one), which publish
+  // refuses; the form shows the live stock in place of a stock it cannot read. Or the SKUs whose stock the
+  // form shows already live, or applied to a stock that moved since the draft's change started at another
+  // figure than the draft's, each with its figures, the first five of a kind as publish's warning names
+  // them (reconcileProductDraftStock, from the same merge as the figures the form shows, run again over
+  // the same product): the next autosave records the live stock as the baseline, after which a publish
+  // sees neither case.
   let draftNotices: string[] = [];
   if (draftData && draftData.meta && typeof draftData.meta === 'object') {
     const meta = draftData.meta as any;
@@ -176,38 +193,30 @@ export default async function EditProductPage({
     // mergeProductDraftMetaIntoFormInitialData lays either over the live data instead of showing
     // it as form values (lib/visual-editing/product-draft-meta.ts).
     //
-    // Drafts store product_media as { media_id } only, so the gallery loses the
-    // file_path/object_key needed to render thumbnails. Re-hydrate from the
-    // media table so the main image (and the rest of the gallery) still loads.
-    let hydratedProductMedia: unknown[] | undefined;
-    if (
-      classifyProductDraftMeta(meta) === 'product-values' &&
-      Array.isArray(meta.product_media) &&
-      meta.product_media.length > 0
-    ) {
-      const draftMediaIds = meta.product_media
-        .map((pm: any) => pm?.media_id)
-        .filter(Boolean);
-      if (draftMediaIds.length > 0) {
-        const { data: mediaRows } = await supabase
+    // A draft's gallery is shown as publish will write it (resolveProductDraftGalleryForEdit): the
+    // ids publish writes, in its order, each drawn from its media row, never from the draft's own
+    // entries (any WRITER can write those, embedded `media` objects and `sort_order` included). The
+    // ids are uuids by then, so the query cannot fail on one; if it fails anyway the page fails
+    // rather than show a gallery it could not check.
+    let hydratedProductMedia: ProductDraftGalleryTile[] | undefined;
+    const draftGalleryMediaIds = readProductDraftGalleryMediaIds(meta);
+    if (draftGalleryMediaIds) {
+      let galleryMediaRows: ProductDraftGalleryMediaRow[] = [];
+      if (draftGalleryMediaIds.length > 0) {
+        const { data: mediaRows, error: mediaError } = await supabase
           .from('media')
           .select('id, file_path, object_key, file_name, description')
-          .in('id', draftMediaIds);
-        const mediaById = new Map((mediaRows || []).map((m: any) => [m.id, m]));
-        hydratedProductMedia = meta.product_media.map((pm: any, index: number) => {
-          const media = mediaById.get(pm?.media_id);
-          return {
-            media_id: pm?.media_id,
-            sort_order: pm?.sort_order ?? index,
-            media: media
-              ? {
-                  file_path: media.file_path,
-                  object_key: media.object_key,
-                  alt_text: media.description || media.file_name || '',
-                }
-              : pm?.media ?? null,
-          };
-        });
+          .in('id', draftGalleryMediaIds);
+        if (mediaError) {
+          throw new Error(`The draft's gallery could not be read: ${mediaError.message}`);
+        }
+        galleryMediaRows = (mediaRows ?? []) as ProductDraftGalleryMediaRow[];
+      }
+
+      const draftGallery = resolveProductDraftGalleryForEdit(meta, product, galleryMediaRows);
+      hydratedProductMedia = draftGallery?.tiles;
+      if (draftGallery?.notice) {
+        draftNotices.push(draftGallery.notice);
       }
     }
 

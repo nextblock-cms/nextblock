@@ -107,9 +107,24 @@
 //      different sets of migrations. A migrations/ folder that holds no top-level <digits>_*.sql
 //      file (only stray files, a subfolder or dot paths) is refused too. Only the names are compared, not the SQL: a migration edited after
 //      the bundle was generated still passes, and a file that was bundled as well still ships.
+//  15. Third-party packages the tarball imports but the manifest does not declare. ui's button.d.ts
+//      and badge.d.ts import class-variance-authority, which nothing in a scaffold installs, so
+//      TypeScript read `variant` and `size` as missing: 457 errors in every scaffold through 0.23.5,
+//      hidden by `typescript.ignoreBuildErrors`. The radix packages behind ui's dialogs and menus
+//      and the tiptap packages behind the editor's types resolved nowhere either, so their props
+//      were silently `any`. And utils, ui, editor and db imported react, react-dom, next,
+//      server-only or @supabase/* at runtime without declaring them, which worked only because the
+//      app installs them itself. In the shipped JavaScript every package must be declared
+//      (`dependencies`, `peerDependencies` or `optionalDependencies`). In a declaration file a
+//      package npm installs along with a declared one also resolves (TypeScript writes
+//      `import("@supabase/postgrest-js")` for a type inferred through @supabase/supabase-js), and a
+//      package that ships no types of its own needs its @types package declared too, unless it is a
+//      peer (the project that provides react provides @types/react). Node's own modules need nothing,
+//      and `@nextblock-cms/*` imports in JavaScript are check 11's.
 
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
+const { builtinModules } = require('node:module');
 const path = require('node:path');
 const { SUPABASE_PACKAGE_ENTRIES } = require('./copy-db-supabase.cjs');
 const { MIGRATION_FILE_RE, validateMigrationNames } = require('./lib/migration-naming');
@@ -461,8 +476,12 @@ const DECLARATION_FILE = /\.d\.(c|m)?ts$/;
  * regex, because bundled dependencies keep their comments and strings: highlight.js ships
  * `@typedef { import("./html_renderer").Renderer }` inside the editor bundle, and utils throws
  * "@nextblock-cms/utils server helpers cannot be imported …", and neither is an import.
+ *
+ * With `declarationReferences`, a declaration file's other ways of naming a package count too:
+ * `/// <reference types="x" />` and, in a module, the augmentation `declare module 'x' { … }`
+ * (both need the package to resolve, or the types they add are lost).
  */
-function moduleSpecifiersIn(file, text, accept) {
+function moduleSpecifiersIn(file, text, accept, { declarationReferences = false } = {}) {
   const ts = require('typescript');
   const scriptKind = DECLARATION_FILE.test(file) ? ts.ScriptKind.TS : ts.ScriptKind.JS;
   const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, false, scriptKind);
@@ -471,6 +490,17 @@ function moduleSpecifiersIn(file, text, accept) {
   const add = (node) => {
     if (node && ts.isStringLiteralLike(node) && accept(node.text)) specifiers.add(node.text);
   };
+
+  if (declarationReferences) {
+    for (const reference of source.typeReferenceDirectives) {
+      if (accept(reference.fileName)) specifiers.add(reference.fileName);
+    }
+    if (ts.isExternalModule(source)) {
+      for (const statement of source.statements) {
+        if (ts.isModuleDeclaration(statement) && ts.isStringLiteral(statement.name)) add(statement.name);
+      }
+    }
+  }
 
   const visit = (node) => {
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
@@ -1221,6 +1251,165 @@ function findSupabaseFileProblems(library, distDir, packed = listPackedFiles(dis
   return problems;
 }
 
+/* ----------------------- 15. undeclared third-party packages ----------------------- */
+
+/** Node's own modules: no manifest declares them, and their types come with @types/node. */
+const NODE_BUILTINS = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]));
+/** The sections npm installs a package from when it installs this one (an optional one may be absent on purpose). */
+const DECLARING_SECTIONS = ['dependencies', 'peerDependencies', 'optionalDependencies'];
+const ROOT_NODE_MODULES = path.join(workspaceRoot, 'node_modules');
+
+/** The npm package a bare specifier names: `@tiptap/core` out of `@tiptap/core/dist/x`, `next` out of `next/headers`. */
+function packageNameOf(specifier) {
+  const [first, second] = specifier.split('/');
+  return first.startsWith('@') && second ? `${first}/${second}` : first;
+}
+
+/**
+ * A specifier that names an installed package: not relative or absolute, not a URL, a `node:` module
+ * or a `#` subpath import, and not one of Node's own modules (`/// <reference types="node" />` included).
+ */
+function isPackageSpecifier(specifier) {
+  if (typeof specifier !== 'string' || specifier === '' || specifier === 'node' || /^[./\\#]/.test(specifier)) return false;
+  if (/^[A-Za-z][\w+.-]*:/.test(specifier)) return false;
+  return !NODE_BUILTINS.has(specifier) && !NODE_BUILTINS.has(packageNameOf(specifier));
+}
+
+/** `@types/scope__name` for `@scope/name`, `@types/name` for `name`: where DefinitelyTyped publishes a package's types. */
+function typesPackageFor(name) {
+  return name.startsWith('@') ? `@types/${name.slice(1).replace('/', '__')}` : `@types/${name}`;
+}
+
+/** The manifest of a package as the monorepo installed it (hoisted under the root node_modules), or null. */
+function readInstalledManifest(name, nodeModulesDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(nodeModulesDir, ...name.split('/'), 'package.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** Whether an installed package carries its own declarations (`types`, a `types` export condition, an index.d.ts). */
+function shipsOwnTypes(name, nodeModulesDir) {
+  const manifest = readInstalledManifest(name, nodeModulesDir);
+  if (!manifest) return true; // not installed here, so nothing to judge by: leave it to the scaffold rehearsal
+  if (manifest.types || manifest.typings || manifest.typesVersions) return true;
+  const hasTypesCondition = (entry) =>
+    Boolean(entry) && typeof entry === 'object' && ('types' in entry || Object.values(entry).some(hasTypesCondition));
+  if (hasTypesCondition(manifest.exports)) return true;
+  return fs.existsSync(path.join(nodeModulesDir, ...name.split('/'), 'index.d.ts'));
+}
+
+/**
+ * Every package npm installs along with `roots`, the roots included: their dependencies, optional
+ * dependencies and required peers, recursively, read from the installed manifests.
+ */
+function installedAlongWith(roots, nodeModulesDir) {
+  const installed = new Set();
+  const queue = [...roots];
+  while (queue.length > 0) {
+    const name = queue.shift();
+    if (installed.has(name)) continue;
+    installed.add(name);
+    const manifest = readInstalledManifest(name, nodeModulesDir);
+    if (!manifest) continue;
+    for (const section of DECLARING_SECTIONS) {
+      for (const dependency of Object.keys(manifest[section] ?? {})) {
+        if (section === 'peerDependencies' && manifest.peerDependenciesMeta?.[dependency]?.optional) continue;
+        if (!installed.has(dependency)) queue.push(dependency);
+      }
+    }
+  }
+  return installed;
+}
+
+/**
+ * Third-party packages (and, in declarations, `@nextblock-cms/*` siblings) that a packed file imports
+ * but the dist manifest does not declare (see check 15 at the top of this file). One problem per
+ * package, named by the first file (sorted) that imports it. `packed` and `nodeModulesDir` (the
+ * installed packages the reachability and types rules read; default the root node_modules) are
+ * parameters so tests never run `npm pack` or depend on what the monorepo installed.
+ */
+function findUndeclaredPackageImports(library, distDir, packed = listPackedFiles(distDir), { nodeModulesDir = ROOT_NODE_MODULES } = {}) {
+  const manifestPath = path.join(distDir, 'package.json');
+  if (!fs.existsSync(manifestPath)) return []; // checks 2 and 5 report a missing manifest
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const self = new Set([manifest.name, importNameFor(library)]);
+  const sectionOf = (name) =>
+    DECLARING_SECTIONS.find((section) => manifest[section] && typeof manifest[section] === 'object' && manifest[section][name] !== undefined);
+  /** package name -> the first file (sorted) importing it, and the specifier it used */
+  const fromCode = new Map();
+  const fromDeclarations = new Map();
+
+  for (const file of [...packed].sort()) {
+    const isDeclaration = DECLARATION_FILE.test(file);
+    if (!isDeclaration && !CODE_FILE.test(file)) continue;
+
+    const text = fs.readFileSync(path.join(distDir, ...file.split('/')), 'utf8');
+    const specifiers = moduleSpecifiersIn(file, text, isPackageSpecifier, { declarationReferences: isDeclaration });
+    for (const specifier of specifiers) {
+      const name = packageNameOf(specifier);
+      if (self.has(name)) continue;
+      // Siblings in JavaScript are check 11's, with its ecom alias rule.
+      if (!isDeclaration && SIBLING_PACKAGE.test(specifier)) continue;
+      const found = isDeclaration ? fromDeclarations : fromCode;
+      if (!found.has(name)) found.set(name, { file, specifier });
+    }
+  }
+
+  const problems = [];
+
+  for (const [name, { file, specifier }] of fromCode) {
+    if (sectionOf(name)) continue;
+    problems.push(
+      `${file} imports "${specifier}" but the package.json the build writes declares ${name} in none of dependencies, ` +
+        'peerDependencies or optionalDependencies, so a project that installs this package can lack it: declare it ' +
+        '(react, react-dom and next as peers, anything the package needs to run as a dependency)'
+    );
+  }
+
+  const declaredThirdParty = DECLARING_SECTIONS.flatMap((section) =>
+    Object.keys(manifest[section] && typeof manifest[section] === 'object' ? manifest[section] : {})
+  ).filter((name) => !SIBLING_PACKAGE.test(name));
+  let installed = null; // computed once, and only when a declaration needs it
+  const installedWithThisPackage = () => (installed ??= installedAlongWith(declaredThirdParty, nodeModulesDir));
+
+  for (const [name, { file, specifier }] of fromDeclarations) {
+    const section = sectionOf(name);
+    if (SIBLING_PACKAGE.test(name)) {
+      if (!section) {
+        problems.push(
+          `${file} imports types from "${specifier}" but the package.json the build writes does not declare ${name}, so ` +
+            'npm cannot tell which release those types come from: declare it as a dependency or peer'
+        );
+      }
+      continue;
+    }
+    if (!section && !installedWithThisPackage().has(name)) {
+      problems.push(
+        `${file} imports types from "${specifier}", but the package.json the build writes does not declare ${name} and nothing ` +
+          'it declares installs it, so TypeScript reads those types as any in every project that installs this package ' +
+          "(ui's class-variance-authority cost every scaffold 457 errors): declare it as a dependency"
+      );
+      continue;
+    }
+    // A peer is the project's to provide, types included (react comes with the project's @types/react).
+    if (section === 'peerDependencies' || shipsOwnTypes(name, nodeModulesDir)) continue;
+    const typesPackage = typesPackageFor(name);
+    if (sectionOf(typesPackage) || installedWithThisPackage().has(typesPackage)) continue;
+    problems.push(
+      `${file} imports types from "${specifier}", but ${name} ships no declarations of its own and the package.json the ` +
+        `build writes does not declare ${typesPackage}, so TypeScript reads those types as any: ` +
+        (section
+          ? `declare ${typesPackage} as a dependency`
+          : `declare ${name} as a peer (the project then provides its types, as it does @types/react), or ${typesPackage} as a dependency`)
+    );
+  }
+
+  return problems;
+}
+
 /* ------------------------------------ driver ------------------------------------ */
 
 /**
@@ -1231,7 +1420,7 @@ function findSupabaseFileProblems(library, distDir, packed = listPackedFiles(dis
  * @param {string} library
  * @param {string} distDir
  * @param {Set<string>} packed
- * @param {{ manifestFinalized?: boolean, bundledMigrationNames?: Iterable<string> }} [options] as for verifyLibDist
+ * @param {{ manifestFinalized?: boolean, bundledMigrationNames?: Iterable<string>, nodeModulesDir?: string }} [options] as for verifyLibDist
  */
 function collectDistProblems(library, distDir, packed, options = {}) {
   return [
@@ -1249,6 +1438,7 @@ function collectDistProblems(library, distDir, packed, options = {}) {
     ...findPackedDotPaths(library, distDir, packed).map((entry) => `dot path: ${entry}`),
     ...findSupabaseFolderProblems(library, distDir, packed).map((entry) => `supabase folder: ${entry}`),
     ...findSupabaseFileProblems(library, distDir, packed, options).map((entry) => `supabase file: ${entry}`),
+    ...findUndeclaredPackageImports(library, distDir, packed, options).map((entry) => `undeclared package: ${entry}`),
   ];
 }
 
@@ -1259,11 +1449,13 @@ function collectDistProblems(library, distDir, packed, options = {}) {
  *   distDir?: string,
  *   listPackedFiles?: (distDir: string) => Iterable<string>,
  *   bundledMigrationNames?: Iterable<string>,
+ *   nodeModulesDir?: string,
  * }} [options] `manifestFinalized`: the dist package.json is the one that will be published
  *   (release-lib.js has normalized it). `distDir` (default dist/libs/<lib>) and `listPackedFiles`
  *   (default `npm pack --dry-run` there) let a test run the gate itself on a fixture and a file list,
- *   and `bundledMigrationNames` (default: the names the /setup bundle embeds, readBundledMigrationNames)
- *   stands in for the bundle check 14 compares db's packed migrations with.
+ *   `bundledMigrationNames` (default: the names the /setup bundle embeds, readBundledMigrationNames)
+ *   stands in for the bundle check 14 compares db's packed migrations with, and `nodeModulesDir`
+ *   (default: the root node_modules) holds the installed packages check 15 reads.
  */
 function verifyLibDist(library, options = {}) {
   const { distDir = distDirFor(library), listPackedFiles: packFiles = listPackedFiles, ...checkOptions } = options;
@@ -1300,6 +1492,7 @@ module.exports = {
   findPackedDotPaths,
   findSupabaseFolderProblems,
   findSupabaseFileProblems,
+  findUndeclaredPackageImports,
   readBundledMigrationNames,
 };
 

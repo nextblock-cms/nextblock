@@ -2,10 +2,12 @@
 //
 // The libraries build with plain `vite build` (the inferred @nx/vite/plugin target), not the
 // @nx/vite:build executor, which Nx 24 removes. These two plugins cover what the configs used
-// to lean on the executor, or on vite-plugin-dts's afterBuild hook, for.
+// to lean on the executor, or on vite-plugin-dts's afterBuild hook, for; rootPackageRanges gives
+// the manifests they write their third-party ranges.
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * Put `'use client';` at the top of every entry chunk, in every output format.
@@ -60,4 +62,33 @@ export function copyIntoDist(libDir, outDir, files) {
       }
     },
   };
+}
+
+const ROOT_MANIFEST = fileURLToPath(new URL('../../package.json', import.meta.url));
+
+/**
+ * `{ name: range }` for the manifest a lib's build writes, each range read from the root
+ * package.json, so a published range always names the version the monorepo builds and tests
+ * against. `sameRangeAs` maps a package the root does not list to one it does that releases in
+ * lockstep with it (@tiptap/extension-list ships with @tiptap/core); anything else the root lacks
+ * throws, so a typo cannot publish a manifest without the package.
+ * `tools/scripts/verify-lib-dist.js` check 15 refuses a dist that imports a package it does not
+ * declare.
+ *
+ * @param {string[]} names
+ * @param {{ sameRangeAs?: Record<string, string> }} [options]
+ * @returns {Record<string, string>}
+ */
+export function rootPackageRanges(names, { sameRangeAs = {} } = {}) {
+  const root = JSON.parse(fs.readFileSync(ROOT_MANIFEST, 'utf8'));
+  const ranges = { ...root.devDependencies, ...root.dependencies };
+  return Object.fromEntries(
+    names.map((name) => {
+      const range = ranges[name] ?? (sameRangeAs[name] ? ranges[sameRangeAs[name]] : undefined);
+      if (typeof range !== 'string' || range.trim() === '') {
+        throw new Error(`${name} is not in the root package.json, so the lib build cannot take its published range from there`);
+      }
+      return [name, range];
+    }),
+  );
 }

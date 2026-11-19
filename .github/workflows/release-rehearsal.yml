@@ -1,0 +1,79 @@
+# Release rehearsal: everything a release ships, built the way a user gets it, published nowhere.
+#
+#   The CLI template is synced from apps/nextblock first (`npm run sync:create-nextblock`, as
+#   release-all does before it packs the CLI), so the scaffold carries the app in this push or pull
+#   request rather than the last committed sync; the result stays in the runner's checkout. Then
+#   tools/scripts/rehearse-release.js packs the eight libraries (release-lib.js --dry-run for each,
+#   with no npm credentials, then npm pack), packs the CLI, scaffolds a project from the extracted
+#   CLI tarball with every @nextblock-cms/* package installed from those tarballs, and runs, with
+#   nothing removed from the scaffold: `next build`, a scan of the build for bundled test tooling,
+#   `DOCKER_BUILD=true next build` plus a boot of the standalone server.js, and `tsc --noEmit`
+#   against the budget pinned in tools/scripts/release-rehearsal-tsc-budget.json.
+#
+# The monorepo resolves @nextblock-cms/* to TypeScript source and installs every devDependency at the
+# root, so it never sees what a scaffold sees: every scaffold from 0.23.0 to 0.23.3 failed `next
+# build` with "Can't resolve 'vitest'", and through 0.23.5 every one carried 457 type errors from a
+# declaration file that imported a package nothing installed. This job is where those show up before
+# a release. It also runs the CLI's own tests, which the unit job in security.yml does not collect.
+#
+# Nothing here touches a database or a registry account: the scaffold builds with no Supabase
+# settings (as a fresh `npm create nextblock` does), and `next build` runs directly, never
+# `npm run build`, whose prebuild hook migrates. Run it locally with the same two commands (docs/06 →
+# "The release rehearsal"). Forks and 1-click deploys inherit this file; only the upstream repository
+# spends the half hour.
+name: Release rehearsal
+
+# Every change but docs/ and Markdown, except a lib's README.md: it is that lib's npm page, and the
+# release-lib dry runs here are the only check of it before a release (verify-lib-dist check 8).
+# `paths` with `!`, not `paths-ignore`: GitHub documents `!` for `paths` only, where patterns apply
+# in order and the last one that matches decides. tools/scripts/release-rehearsal.test.ts pins this.
+on:
+  push:
+    branches: [master]
+    paths: ['**', '!docs/**', '!**/*.md', 'libs/*/README.md']
+  pull_request:
+    paths: ['**', '!docs/**', '!**/*.md', 'libs/*/README.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rehearse:
+    name: Pack, scaffold and build like a user
+    if: github.repository == 'nextblock-cms/nextblock'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # bin/ and scripts/ only: the bare apps/create-nextblock path also collects the template's
+      # copy of the app's tests, which only run from apps/nextblock.
+      - name: CLI tests
+        run: npx vitest run apps/create-nextblock/bin apps/create-nextblock/scripts
+      # The rehearsal packs the template as it is on disk. Pull requests change the app and leave the
+      # generated template alone (automated ones must), so without this the scaffold would be built
+      # from the last committed sync. Needs only the root install (fs-extra, chalk) and npm; it ends
+      # with the template and `npm pack --dry-run` checks a release runs. Nothing commits the result.
+      - name: Sync the CLI template from the app, as a release does
+        run: npm run sync:create-nextblock
+      - name: Rehearse the release and build the scaffold
+        run: node tools/scripts/rehearse-release.js --workdir "$RUNNER_TEMP/release-rehearsal"
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-rehearsal-logs
+          path: |
+            ${{ runner.temp }}/release-rehearsal/logs
+            ${{ runner.temp }}/release-rehearsal/rehearsal-report.json
+          if-no-files-found: ignore
+          retention-days: 14

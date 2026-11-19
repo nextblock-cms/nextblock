@@ -1,0 +1,5 @@
+{
+  "why": "tsc --noEmit errors allowed in a fresh scaffold built by tools/scripts/rehearse-release.js (test files left out: no scaffold installs vitest). Any count above its line fails the rehearsal, a new error code included, so with 0 every type error a release would ship fails it. 2026-11-18 (0.23.6): 685 errors before the lib manifests declared what their .d.ts files import (457 TS2322 from class-variance-authority alone), 194 after, 2 once the app declared @types/papaparse, @types/lodash.debounce and @types/js-cookie and test files were left out, 0 once the two monorepo-only scripts that imported monorepo paths (validate-editor-block-schema.ts, verify-custom-block-definitions.ts) moved from apps/nextblock/scripts to tools/scripts. Fix a new error rather than raising a number here; if one must be allowed, say why in this text.",
+  "total": 0,
+  "byCode": {}
+}

@@ -1,4 +1,4 @@
--- NextBlock DB security posture check (2026-10-19 red-team; migrations 02022, 02023, 02025-02028, 02030, 02035, 02036, 02037, 02038, 02041).
+-- NextBlock DB security posture check (2026-10-19 red-team; migrations 02022, 02023, 02025-02028, 02030, 02035, 02036, 02037, 02038, 02041, 02043, 02045).
 --
 -- Self-contained before/after harness for the RLS / trigger fixes in
 -- 02022_security_hardening_writer_boundary_and_aal.sql (sections 1-12), the aal2 widening
@@ -39,9 +39,17 @@
 -- 02038_site_settings_secret_rows_service_role_only.sql (section 42: service role only, whatever
 -- the admin's second factor), and the first-admin flag of
 -- 02041_site_settings_admin_created_flag_service_role_only.sql (section 43: no API role writes
--- site_settings.is_admin_created; anon still reads it). It creates throwaway fixtures, emulates PostgREST exactly (SET LOCAL ROLE + request.jwt.claims;
--- SET LOCAL reverts at each DO block's exit), prints PASS/FAIL per assertion, and ROLLS BACK so
--- the database is left untouched.
+-- site_settings.is_admin_created; anon still reads it), the atomic product draft publish of
+-- 02043_atomic_product_draft_publish.sql (section 44: SECURITY INVOKER functions anon cannot call, a
+-- WRITER refused, a stale draft refused, a failed publish writing nothing, an ADMIN publish keeping
+-- variant rows and scheduled prices, never deleting media, recording History and deleting the
+-- draft), and the media usage lookup of 02045_media_usage_lookup.sql (section 45: service role
+-- only, what it finds, a key right after a JSON escape and a key written with escaped slashes
+-- included, the secret rows it never reads, the keys it never searches, and a document that once
+-- cost tens of seconds per lookup answering within a 4 s statement timeout). It creates
+-- throwaway fixtures, emulates PostgREST exactly (SET LOCAL ROLE + request.jwt.claims; SET LOCAL
+-- reverts at each DO block's exit), prints PASS/FAIL per assertion, and ROLLS BACK so the database
+-- is left untouched.
 --
 --   Before 02022:  several checks print FAIL.
 --   After  02022:  sections 1-12 print PASS; the "aal1 is blocked" lines of 13-16 print FAIL.
@@ -77,7 +85,13 @@
 --   After  02038:  every check prints PASS (258 of 263) except the five hole checks of section 43:
 --                  an ADMIN at aal2, or without a factor, still updates, upserts, renames a row into
 --                  and deletes site_settings.is_admin_created, so its value does not survive either.
---   After  02041:  every check prints PASS (263), with or without the post-apply pass. Run it on
+--   After  02041:  sections 1-43 print PASS (263); section 44 stops at its first call with an
+--                  uncounted error (public.publish_product_draft is missing), which ends the run
+--                  (ON_ERROR_STOP), so the runner reports its 10 assertions and the fourteen of
+--                  section 45 as never run.
+--   After  02043:  sections 1-44 print PASS (273), and 02044 adds no check; the fourteen lines of
+--                  section 45 print FAIL (public.media_usage is missing).
+--   After  02045:  every check prints PASS (287), with or without the post-apply pass. Run it on
 --                  a database that went through that pass (a deployed one, or a replay followed
 --                  by GRANTS_SQL from apps/nextblock/tools/lib/migrate-core.mjs): that is where
 --                  grant regressions show up.
@@ -3805,6 +3819,496 @@ BEGIN
   RAISE NOTICE '%  anon still reads site_settings.is_admin_created (the proxy''s first-boot gate)', CASE WHEN n_anon = 1 THEN 'PASS' ELSE 'FAIL' END;
   RAISE NOTICE '%  the service role still writes site_settings.is_admin_created', CASE WHEN w_service THEN 'PASS' ELSE 'FAIL' END;
 END $$;
+
+-- 44. the atomic product draft publish (02043). public.publish_product_draft and
+--     public.product_revision_content are SECURITY INVOKER with a pinned search_path, so they can do
+--     nothing their caller could not already do over PostgREST; anon executes neither (after the
+--     post-apply grant pass as well: API_ROLE_REVOKE_SQL), nor their three private helpers. A WRITER's
+--     publish is refused with nothing written (product_revisions and the products write policies are
+--     ADMIN-only); so is a publish of a draft that changed after it was read (NBP02: a save landed in
+--     between), and a publish that fails part way (a block with no type) writes nothing. An ADMIN's
+--     publish keeps each variant row whose term set matches (same id, pending scheduled price kept),
+--     only unlinks the image the gallery drops (its media row stays: a save path never deletes media),
+--     replaces the blocks, records History with the commerce section, and deletes the draft. Two
+--     sessions against each other (a second publish, a save waiting on the lock) are in
+--     tools/scripts/product-draft-publish.db.test.ts, which needs real concurrent connections.
+RESET ROLE;
+DO $$
+DECLARE
+  v_admin text := '{"sub":"aa000000-0000-0000-0000-0000000000a1","role":"authenticated","aal":"aal2"}';
+  v_writer text := '{"sub":"aa000000-0000-0000-0000-0000000000f1","role":"authenticated","aal":"aal1"}';
+  v_publish text := 'public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb)';
+  v_helpers text[] := ARRAY[
+    'private.sync_product_draft_variants(uuid, jsonb)',
+    'private.apply_product_draft_values(uuid, jsonb)',
+    'private.record_product_revision(uuid, jsonb, jsonb)'];
+  v_product uuid := 'aa000000-0000-0000-0000-00000000d044';
+  v_keep_media uuid := 'aa000000-0000-0000-0000-00000000e441';
+  v_drop_media uuid := 'aa000000-0000-0000-0000-00000000e442';
+  v_currency text := public.get_default_currency_code();
+  v_attribute uuid;
+  v_red uuid;
+  v_blue uuid;
+  v_red_variant uuid;
+  v_blue_variant uuid;
+  v_draft_id bigint;
+  v_draft_at timestamptz;
+  v_product_at timestamptz;
+  v_values jsonb;
+  v_blocks jsonb := '[{"language_id":1,"block_type":"text","content":{"html_content":"<p>SV published</p>"},"order":0}]';
+  v_untouched jsonb;
+  v_result jsonb;
+  catalog_ok boolean;
+  helpers_ok boolean;
+  anon_none boolean;
+  authenticated_ok boolean;
+  writer_refused boolean := false;
+  stale_refused boolean := false;
+  failed boolean := false;
+  writer_unchanged boolean;
+  stale_unchanged boolean;
+  failed_unchanged boolean;
+BEGIN
+  SELECT count(*) = 2
+         AND bool_and(NOT p.prosecdef)
+         AND bool_and(EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%'))
+    INTO catalog_ok
+    FROM pg_proc p
+   WHERE p.oid IN (to_regprocedure(v_publish), to_regprocedure('public.product_revision_content(uuid)'));
+  SELECT count(*) = 3
+         AND bool_and(NOT p.prosecdef)
+         AND bool_and(EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%'))
+    INTO helpers_ok
+    FROM pg_proc p
+   WHERE p.oid IN (SELECT to_regprocedure(h) FROM unnest(v_helpers) h);
+  anon_none := NOT has_function_privilege('anon', v_publish, 'EXECUTE')
+    AND NOT has_function_privilege('anon', 'public.product_revision_content(uuid)', 'EXECUTE')
+    AND NOT EXISTS (SELECT 1 FROM unnest(v_helpers) h WHERE has_function_privilege('anon', h, 'EXECUTE'));
+  authenticated_ok := has_function_privilege('authenticated', v_publish, 'EXECUTE')
+    AND has_function_privilege('authenticated', 'public.product_revision_content(uuid)', 'EXECUTE')
+    AND NOT EXISTS (SELECT 1 FROM unnest(v_helpers) h WHERE NOT has_function_privilege('authenticated', h, 'EXECUTE'));
+
+  -- fixtures (as the table owner): a product with two variants (Red with a pending scheduled price,
+  -- Blue), a two-image gallery and one live block, and a block-edited draft.
+  INSERT INTO public.product_attributes (name, slug) VALUES ('SV colour', 'sv-colour-044') RETURNING id INTO v_attribute;
+  INSERT INTO public.product_attribute_terms (attribute_id, value, slug) VALUES (v_attribute, 'Red', 'red') RETURNING id INTO v_red;
+  INSERT INTO public.product_attribute_terms (attribute_id, value, slug) VALUES (v_attribute, 'Blue', 'blue') RETURNING id INTO v_blue;
+  INSERT INTO public.products (id, language_id, sku, title, slug, product_type, payment_provider, price, status)
+  VALUES (v_product, 1, 'SV-PUB-044', 'SV publish', 'sv-publish-044', 'physical', 'stripe', 1000, 'active');
+  INSERT INTO public.product_variants (product_id, sku, price, stock_quantity, scheduled_price, scheduled_price_at)
+  VALUES (v_product, 'SV-PUB-044-R', 1000, 2, 800, now() + interval '30 days') RETURNING id INTO v_red_variant;
+  INSERT INTO public.product_variants (product_id, sku, price, stock_quantity)
+  VALUES (v_product, 'SV-PUB-044-B', 1500, 1) RETURNING id INTO v_blue_variant;
+  INSERT INTO public.variant_attribute_mapping (variant_id, attribute_term_id) VALUES (v_red_variant, v_red), (v_blue_variant, v_blue);
+  INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id) VALUES
+    (v_keep_media, 'sv/publish-keep.jpg', 'publish-keep.jpg', 'sv/publish-keep.jpg', 'aa000000-0000-0000-0000-0000000000a1'),
+    (v_drop_media, 'sv/publish-drop.jpg', 'publish-drop.jpg', 'sv/publish-drop.jpg', 'aa000000-0000-0000-0000-0000000000a1');
+  INSERT INTO public.product_media (product_id, media_id, sort_order) VALUES (v_product, v_keep_media, 0), (v_product, v_drop_media, 1);
+  INSERT INTO public.blocks (product_id, language_id, block_type, content, "order")
+  VALUES (v_product, 1, 'text', '{"html_content":"<p>SV live</p>"}', 0);
+  INSERT INTO public.product_drafts (product_id, meta, blocks) VALUES (v_product, '{}', v_blocks)
+  RETURNING id, updated_at INTO v_draft_id, v_draft_at;
+  SELECT updated_at INTO v_product_at FROM public.products WHERE id = v_product;
+
+  -- What buildProductDraftPublishValues (libs/ecommerce) sends for a product-values draft (minor units).
+  v_values := jsonb_build_object(
+    'product_type', 'physical', 'title', 'SV publish (edited)', 'slug', 'sv-publish-044', 'sku', 'SV-PUB-044',
+    'upc', NULL, 'stock', 0, 'short_description', NULL, 'description_json', NULL,
+    'price', 1200, 'prices', jsonb_build_object(v_currency, 1200), 'sale_price', NULL, 'sale_prices', '{}'::jsonb,
+    'sale_start_at', NULL, 'sale_end_at', NULL, 'freemius_plan_id', NULL, 'freemius_product_id', NULL,
+    'trial_period_days', 0, 'trial_requires_payment_method', false, 'is_taxable', true, 'language_id', 1,
+    'meta_title', NULL, 'meta_description', NULL, 'custom_canonical', NULL,
+    'gallery_media_ids', jsonb_build_array(v_keep_media), 'category_ids', NULL,
+    'variants', jsonb_build_array(
+      jsonb_build_object('sku', 'SV-PUB-044-R', 'price', 1100, 'prices', jsonb_build_object(v_currency, 1100),
+        'sale_prices', '{}'::jsonb, 'stock_quantity', 3, 'attribute_term_ids', jsonb_build_array(v_red)),
+      jsonb_build_object('sku', 'SV-PUB-044-B', 'price', 1500, 'prices', jsonb_build_object(v_currency, 1500),
+        'sale_prices', '{}'::jsonb, 'stock_quantity', 1, 'attribute_term_ids', jsonb_build_array(v_blue))));
+
+  v_untouched := jsonb_build_object(
+    'content', public.product_revision_content(v_product),
+    'draft', (SELECT to_jsonb(d) FROM public.product_drafts d WHERE d.id = v_draft_id),
+    'revisions', (SELECT count(*) FROM public.product_revisions r WHERE r.product_id = v_product));
+
+  -- a WRITER
+  PERFORM set_config('request.jwt.claims', v_writer, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  BEGIN
+    PERFORM public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, v_values, NULL, v_blocks);
+  EXCEPTION WHEN insufficient_privilege THEN writer_refused := true;
+  END;
+  EXECUTE 'RESET ROLE';
+  writer_unchanged := v_untouched = jsonb_build_object(
+    'content', public.product_revision_content(v_product),
+    'draft', (SELECT to_jsonb(d) FROM public.product_drafts d WHERE d.id = v_draft_id),
+    'revisions', (SELECT count(*) FROM public.product_revisions r WHERE r.product_id = v_product));
+
+  -- an ADMIN, with the draft as it was before a save moved its updated_at
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  BEGIN
+    PERFORM public.publish_product_draft(v_product, v_draft_id, v_draft_at - interval '1 second', v_product_at, v_values, NULL, v_blocks);
+  EXCEPTION WHEN SQLSTATE 'NBP02' THEN stale_refused := true;
+  END;
+  EXECUTE 'RESET ROLE';
+  stale_unchanged := v_untouched = jsonb_build_object(
+    'content', public.product_revision_content(v_product),
+    'draft', (SELECT to_jsonb(d) FROM public.product_drafts d WHERE d.id = v_draft_id),
+    'revisions', (SELECT count(*) FROM public.product_revisions r WHERE r.product_id = v_product));
+
+  -- an ADMIN whose publish fails at the blocks, after the product values were written
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  BEGIN
+    PERFORM public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, v_values, NULL,
+      '[{"language_id":1,"block_type":null,"content":{},"order":0}]'::jsonb);
+  EXCEPTION WHEN not_null_violation THEN failed := true;
+  END;
+  EXECUTE 'RESET ROLE';
+  failed_unchanged := v_untouched = jsonb_build_object(
+    'content', public.product_revision_content(v_product),
+    'draft', (SELECT to_jsonb(d) FROM public.product_drafts d WHERE d.id = v_draft_id),
+    'revisions', (SELECT count(*) FROM public.product_revisions r WHERE r.product_id = v_product));
+
+  -- an ADMIN
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  v_result := public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, v_values, NULL, v_blocks);
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+
+  RAISE NOTICE '%  publish_product_draft and product_revision_content are SECURITY INVOKER with a pinned search_path', CASE WHEN catalog_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  the publish''s private helpers are SECURITY INVOKER with a pinned search_path', CASE WHEN helpers_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  anon executes neither function nor any of their private helpers', CASE WHEN anon_none THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  authenticated executes the publish, the History content and the helpers the publish calls', CASE WHEN authenticated_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  a WRITER''s publish is refused and writes nothing', CASE WHEN writer_refused AND writer_unchanged THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  a publish of a draft that changed after it was read is refused (NBP02) and writes nothing', CASE WHEN stale_refused AND stale_unchanged THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  a publish that fails part way writes nothing (product values, variants, gallery, blocks, History, draft)', CASE WHEN failed AND failed_unchanged THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  an ADMIN''s publish keeps the variant rows whose terms match, with their pending scheduled price', CASE WHEN
+    (SELECT price FROM public.product_variants WHERE id = v_red_variant) = 1100
+    AND (SELECT scheduled_price FROM public.product_variants WHERE id = v_red_variant) = 800
+    AND (SELECT count(*) FROM public.product_variants WHERE product_id = v_product AND id IN (v_red_variant, v_blue_variant)) = 2
+    AND (SELECT count(*) FROM public.product_variants WHERE product_id = v_product) = 2
+    THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  an ADMIN''s publish only unlinks the image the gallery drops: its media row stays', CASE WHEN
+    EXISTS (SELECT 1 FROM public.media WHERE id = v_drop_media)
+    AND (SELECT array_agg(media_id) FROM public.product_media WHERE product_id = v_product) = ARRAY[v_keep_media]
+    THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  an ADMIN''s publish replaces the blocks, records History with the commerce section and deletes the draft', CASE WHEN
+    (v_result->'revision'->>'recorded')::boolean
+    AND (SELECT content->'commerce'->>'price' FROM public.product_revisions WHERE product_id = v_product ORDER BY version DESC LIMIT 1) = '1200'
+    AND (SELECT array_agg(content->>'html_content') FROM public.blocks WHERE product_id = v_product) = ARRAY['<p>SV published</p>']
+    AND NOT EXISTS (SELECT 1 FROM public.product_drafts WHERE product_id = v_product)
+    THEN 'PASS' ELSE 'FAIL' END;
+END $$;
+
+-- 45. media_usage (02045): where each media item is used, for the media library's delete dialogs, its
+--     "Unused" view and the media edit page. Service role only: it reads every content table (drafts,
+--     revisions, partner pages, site settings) and returns their titles, so no API role executes it
+--     (the migration revokes it, and API_ROLE_REVOKE_SQL again after the blanket grant). The service
+--     role finds an item through a foreign key (gallery, variant image, feature image, logo) and by
+--     its id or a key its row owns in any document: a text block's HTML (a variant key), a nested
+--     section background (the id in uppercase), a content draft (an image optimizer URL, slashes
+--     percent-encoded), the social image setting (a storage URL); a revision-only use is reported
+--     under its own kind (history), an item nothing names reads total 0, and an entry that is not a
+--     uuid is ignored. It never reads the secret rows of site_settings (02038's rule: a named key such
+--     as cortex_ai_mcp_settings, and a key ending like a secret in any case), which would name a
+--     secret row to the caller, and it matches keys only as whole tokens: a key with a character the
+--     upload routes never mint (a space) is not found even where a document holds it verbatim (a
+--     substring search let a media row's author, any staff member, probe documents they cannot read,
+--     and cost a full scan of every document per key). A key right after a JSON escape is found: in a
+--     document's text a control character is an escape (a newline is a backslash and an n), whose
+--     letter glued to a key on the next line, so the file was listed as unused and "Delete unused"
+--     deleted it; an id right after a backspace or a form feed (escape letters b and f, both hex) is
+--     found too. An escaped backslash is one character: a key after a backslash and a newline is
+--     found, and so is a key starting with an escape letter right after a backslash, in a text block
+--     and in a navigation link (a plain text column, which the function reads through to_json). An
+--     escaped slash is a slash: a key written with escaped slashes is found, in JSON-LD in a text block
+--     (as PHP's json_encode writes it) and in a redirect target, and the backslashes before an escaped
+--     slash still end a key. The fixtures are this section's own (an earlier section deletes the draft
+--     product).
+RESET ROLE;
+DO $$
+DECLARE
+  fn regprocedure := to_regprocedure('public.media_usage(jsonb)');
+  v_lang bigint := coalesce((SELECT id FROM public.languages WHERE code = 'en'), (SELECT min(id) FROM public.languages));
+  v_page bigint;
+  v_product uuid := 'aa000000-0000-0000-0000-0000000044d1';
+  answer jsonb;
+  probe_answer jsonb;
+  escape_answer jsonb;
+  slash_answer jsonb;
+  api_x boolean := true;
+  public_x boolean := true;
+  svc_x boolean := false;
+  fk_ok boolean := false;
+  text_ok boolean := false;
+  history_ok boolean := false;
+  unused_ok boolean := false;
+  secret_ok boolean := false;
+  minted_ok boolean := false;
+  escaped_ok boolean := false;
+  backslash_ok boolean := false;
+  slashed_ok boolean := false;
+  slashed_plain_ok boolean := false;
+BEGIN
+  IF fn IS NOT NULL THEN
+    api_x := has_function_privilege('anon', fn, 'EXECUTE') OR has_function_privilege('authenticated', fn, 'EXECUTE');
+    public_x := EXISTS (
+      SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+       WHERE p.oid = fn AND a.grantee = 0 AND a.privilege_type = 'EXECUTE');
+    svc_x := has_function_privilege('service_role', fn, 'EXECUTE');
+
+    INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id, variants) VALUES
+      ('aa000000-0000-0000-0000-0000000044a1','sv/usage/text.webp','text.webp','sv/usage/text.webp','aa000000-0000-0000-0000-0000000000a1','[{"objectKey":"sv/usage/text_large.avif"}]'),
+      ('aa000000-0000-0000-0000-0000000044a2','sv/usage/background.webp','background.webp','sv/usage/background.webp','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a3','sv/usage/draft.webp','draft.webp','sv/usage/draft.webp','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a4','sv/usage/social.jpg','social.jpg','sv/usage/social.jpg','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a5','sv/usage/history.png','history.png','sv/usage/history.png','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a6','sv/usage/unused.webp','unused.webp','sv/usage/unused.webp','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a7','sv/usage/feature.webp','feature.webp','sv/usage/feature.webp','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a8','sv/usage/logo.webp','logo.webp','sv/usage/logo.webp','aa000000-0000-0000-0000-0000000000a1',NULL),
+      ('aa000000-0000-0000-0000-0000000044a9','sv/usage/gallery.webp','gallery.webp','sv/usage/gallery.webp','aa000000-0000-0000-0000-0000000000a1',NULL);
+    INSERT INTO public.pages (language_id, title, slug, status, feature_image_id)
+      VALUES (v_lang, 'SV usage', 'sv-usage', 'draft', 'aa000000-0000-0000-0000-0000000044a7') RETURNING id INTO v_page;
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order") VALUES
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', '<p><img src="https://cdn.sv/media/sv/usage/text_large.avif"></p>'), 0),
+      (v_page, v_lang, 'section', jsonb_build_object('background', jsonb_build_object('type', 'image',
+         'image', jsonb_build_object('media_id', upper('aa000000-0000-0000-0000-0000000044a2')))), 1);
+    INSERT INTO public.content_drafts (parent_type, parent_id, meta, blocks) VALUES
+      ('page', v_page, '{}', jsonb_build_array(jsonb_build_object('content', jsonb_build_object('html_content',
+         '<img src="/_next/image?url=https%3A%2F%2Fcdn.sv%2Fsv%2Fusage%2Fdraft.webp&w=640">'))));
+    INSERT INTO public.page_revisions (page_id, version, revision_type, content)
+      VALUES (v_page, 1, 'snapshot', '{"object_key":"sv/usage/history.png"}');
+    INSERT INTO public.site_settings (key, value)
+      VALUES ('site_social_image', '{"url":"https://cdn.sv/storage/v1/object/public/media/sv/usage/social.jpg"}')
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+    INSERT INTO public.logos (name, media_id) VALUES ('SV logo', 'aa000000-0000-0000-0000-0000000044a8');
+    INSERT INTO public.products (id, language_id, sku, title, slug, product_type, payment_provider, price, status)
+      VALUES (v_product, v_lang, 'SV-USAGE', 'SV usage product', 'sv-usage-product', 'physical', 'stripe', 1000, 'draft');
+    INSERT INTO public.product_media (product_id, media_id, sort_order) VALUES (v_product, 'aa000000-0000-0000-0000-0000000044a9', 0);
+    INSERT INTO public.product_variants (product_id, sku, price, main_media_id)
+      VALUES (v_product, 'SV-USAGE-1', 1000, 'aa000000-0000-0000-0000-0000000044a9');
+
+    PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+    EXECUTE 'SET LOCAL ROLE service_role';
+    EXECUTE 'SELECT public.media_usage($1)' INTO answer USING jsonb_build_object(
+      'aa000000-0000-0000-0000-0000000044a1', '["sv/usage/text.webp","sv/usage/text_large.avif"]'::jsonb,
+      upper('aa000000-0000-0000-0000-0000000044a2'), '["sv/usage/background.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a3', '["sv/usage/draft.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a4', '["sv/usage/social.jpg"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a5', '["sv/usage/history.png"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a6', '["sv/usage/unused.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a7', '["sv/usage/feature.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a8', '["sv/usage/logo.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044a9', '["sv/usage/gallery.webp"]'::jsonb,
+      'not-a-uuid', '["sv/usage/text.webp"]'::jsonb);
+    EXECUTE 'RESET ROLE';
+    PERFORM set_config('request.jwt.claims', '', true);
+
+    fk_ok := answer #> '{aa000000-0000-0000-0000-0000000044a9,by_kind}' = '{"product_gallery": 1, "product_variant": 1}'::jsonb
+         AND answer #> '{aa000000-0000-0000-0000-0000000044a7,by_kind}' = '{"page_feature_image": 1}'::jsonb
+         AND answer #> '{aa000000-0000-0000-0000-0000000044a8,by_kind}' = '{"logo": 1}'::jsonb;
+    text_ok := answer #> '{aa000000-0000-0000-0000-0000000044a1,by_kind}' = '{"block": 1}'::jsonb
+           AND answer #> '{aa000000-0000-0000-0000-0000000044a2,by_kind}' = '{"block": 1}'::jsonb
+           AND answer #> '{aa000000-0000-0000-0000-0000000044a3,by_kind}' = '{"content_draft": 1}'::jsonb
+           AND answer #> '{aa000000-0000-0000-0000-0000000044a4,by_kind}' = '{"site_setting": 1}'::jsonb
+           AND answer #>> '{aa000000-0000-0000-0000-0000000044a1,sites,0,label}' = 'SV usage';
+    history_ok := answer #> '{aa000000-0000-0000-0000-0000000044a5,by_kind}' = '{"page_revision": 1}'::jsonb;
+    unused_ok := answer -> 'aa000000-0000-0000-0000-0000000044a6' = '{"total": 0, "by_kind": {}, "sites": []}'::jsonb
+             AND NOT (answer ? 'not-a-uuid')
+             AND (SELECT count(*) FROM jsonb_object_keys(answer)) = 9;
+
+    -- Probes: a media id that three secret rows and one ordinary row name, and a key with a space that
+    -- a text block holds verbatim.
+    INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id) VALUES
+      ('aa000000-0000-0000-0000-0000000044aa','sv/usage/secret.webp','secret.webp','sv/usage/secret.webp','aa000000-0000-0000-0000-0000000000a1'),
+      ('aa000000-0000-0000-0000-0000000044ab','sv/usage/a b.webp','a b.webp','sv/usage/a b.webp','aa000000-0000-0000-0000-0000000000a1');
+    INSERT INTO public.site_settings (key, value) VALUES
+      ('cortex_ai_mcp_settings', '{"note":"aa000000-0000-0000-0000-0000000044aa"}'),
+      ('sv_x_token', '{"note":"aa000000-0000-0000-0000-0000000044aa"}'),
+      ('SV_X_SECRET', '{"note":"aa000000-0000-0000-0000-0000000044aa"}'),
+      ('sv_usage_control', '{"note":"aa000000-0000-0000-0000-0000000044aa"}')
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order") VALUES
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', '<p><img src="https://cdn.sv/media/sv/usage/a b.webp"></p>'), 2);
+
+    PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+    EXECUTE 'SET LOCAL ROLE service_role';
+    EXECUTE 'SELECT public.media_usage($1)' INTO probe_answer USING jsonb_build_object(
+      'aa000000-0000-0000-0000-0000000044aa', '["sv/usage/secret.webp"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044ab', '["sv/usage/a b.webp"]'::jsonb);
+    EXECUTE 'RESET ROLE';
+    PERFORM set_config('request.jwt.claims', '', true);
+
+    secret_ok := probe_answer #> '{aa000000-0000-0000-0000-0000000044aa,by_kind}' = '{"site_setting": 1}'::jsonb
+             AND probe_answer #>> '{aa000000-0000-0000-0000-0000000044aa,sites,0,label}' = 'sv_usage_control'
+             AND (SELECT count(*) FROM public.site_settings
+                   WHERE key IN ('cortex_ai_mcp_settings', 'sv_x_token', 'SV_X_SECRET')
+                     AND value->>'note' = 'aa000000-0000-0000-0000-0000000044aa') = 3;
+    minted_ok := probe_answer -> 'aa000000-0000-0000-0000-0000000044ab' = '{"total": 0, "by_kind": {}, "sites": []}'::jsonb
+             AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page AND strpos(content::text, 'sv/usage/a b.webp') > 0);
+
+    -- Keys and ids right after a JSON escape. The function reads each document as JSON text, where
+    -- chr(10) is a backslash and an n, chr(1) a backslash, a u and four hex digits, and a backslash
+    -- two backslashes; chr(92) below is a backslash. Six keys of one row each follow a control
+    -- character in a text block, one id follows a backspace and a form feed, and the keys of the
+    -- second row follow a backslash: one after a backslash and a newline, one starting with n right
+    -- after a backslash in a text block, and one in a navigation link (a plain text column).
+    INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id, variants) VALUES
+      ('aa000000-0000-0000-0000-0000000044ad','sv/usage/glued.webp','glued.webp','sv/usage/glued.webp','aa000000-0000-0000-0000-0000000000a1',
+       '[{"objectKey":"sv/usage/glued_xlarge.avif"},{"objectKey":"sv/usage/glued_large.avif"},{"objectKey":"sv/usage/glued_medium.avif"},{"objectKey":"sv/usage/glued_small.avif"},{"objectKey":"sv/usage/glued_thumbnail.avif"}]'),
+      ('aa000000-0000-0000-0000-0000000044ae','nb/usage/pair.webp','pair.webp','nb/usage/pair.webp','aa000000-0000-0000-0000-0000000000a1',
+       '[{"objectKey":"nb/usage/pair_large.avif"},{"objectKey":"nb/usage/pair_small.avif"}]'),
+      ('aa000000-0000-0000-0000-0000000044af','sv/usage/hex-id.webp','hex-id.webp','sv/usage/hex-id.webp','aa000000-0000-0000-0000-0000000000a1',NULL);
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order") VALUES
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(10) || 'sv/usage/glued.webp'), 3),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(13) || 'sv/usage/glued_xlarge.avif'), 4),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(9) || 'sv/usage/glued_large.avif'), 5),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(8) || 'sv/usage/glued_medium.avif'), 6),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(12) || 'sv/usage/glued_small.avif'), 7),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Gallery:' || chr(1) || 'sv/usage/glued_thumbnail.avif'), 8),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Image ' || chr(8) || 'aa000000-0000-0000-0000-0000000044af'), 9),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'Image ' || chr(12) || 'aa000000-0000-0000-0000-0000000044af'), 10),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'C:' || chr(92) || 'nb/usage/pair.webp'), 11),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'C:' || chr(92) || chr(10) || 'nb/usage/pair_small.avif'), 12);
+    INSERT INTO public.navigation_items (language_id, menu_key, label, url, "order")
+      VALUES (v_lang, 'FOOTER', 'SV usage', 'https://cdn.sv/media' || chr(92) || 'nb/usage/pair_large.avif', 99);
+
+    PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+    EXECUTE 'SET LOCAL ROLE service_role';
+    EXECUTE 'SELECT public.media_usage($1)' INTO escape_answer USING jsonb_build_object(
+      'aa000000-0000-0000-0000-0000000044ad', '["sv/usage/glued.webp","sv/usage/glued_xlarge.avif","sv/usage/glued_large.avif","sv/usage/glued_medium.avif","sv/usage/glued_small.avif","sv/usage/glued_thumbnail.avif"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044ae', '["nb/usage/pair.webp","nb/usage/pair_large.avif","nb/usage/pair_small.avif"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044af', '["sv/usage/hex-id.webp"]'::jsonb);
+    EXECUTE 'RESET ROLE';
+    PERFORM set_config('request.jwt.claims', '', true);
+
+    -- The text checks confirm each fixture is glued where the function reads it.
+    escaped_ok := escape_answer #> '{aa000000-0000-0000-0000-0000000044ad,by_kind}' = '{"block": 6}'::jsonb
+              AND escape_answer #> '{aa000000-0000-0000-0000-0000000044af,by_kind}' = '{"block": 2}'::jsonb
+              AND (SELECT count(*) FROM public.blocks
+                    WHERE page_id = v_page
+                      AND content::text ~ (chr(92) || chr(92) || '(n|r|t|b|f|u0001)(sv/usage/glued|aa000000-0000-0000-0000-0000000044af)')) = 8;
+    backslash_ok := escape_answer #> '{aa000000-0000-0000-0000-0000000044ae,by_kind}' = '{"block": 2, "navigation_item": 1}'::jsonb
+                AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page
+                             AND strpos(content::text, 'C:' || chr(92) || chr(92) || 'nb/usage/pair.webp') > 0)
+                AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page
+                             AND strpos(content::text, 'C:' || chr(92) || chr(92) || chr(92) || 'nnb/usage/pair_small.avif') > 0);
+
+    -- Keys written with escaped slashes. JSON pasted into a text field may escape every slash (JSON-LD
+    -- as PHP's json_encode writes it), and a stored backslash and slash are two backslashes and a slash
+    -- in the JSON text the function reads, where the escaped backslash cut the run at every slash: the
+    -- key was never found, so "Delete unused" deleted its file. The first row's key is spread over
+    -- escaped slashes in JSON-LD in a text block, and its two variants sit right before two and three
+    -- stored backslashes and a slash (4 and 6 backslashes in the JSON text), where the backslashes before
+    -- the escaped slash still end the key. The second row's key is spread over escaped slashes in a
+    -- redirect target (a plain text column, which the function reads through to_json).
+    INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id, variants) VALUES
+      ('aa000000-0000-0000-0000-0000000044b0','sv/usage/slashed.webp','slashed.webp','sv/usage/slashed.webp','aa000000-0000-0000-0000-0000000000a1',
+       '[{"objectKey":"sv/usage/slashed_large.avif"},{"objectKey":"sv/usage/slashed_medium.avif"}]'),
+      ('aa000000-0000-0000-0000-0000000044b1','sv/usage/redirected.webp','redirected.webp','sv/usage/redirected.webp','aa000000-0000-0000-0000-0000000000a1',NULL);
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order") VALUES
+      (v_page, v_lang, 'text', jsonb_build_object('html_content',
+         '<script type="application/ld+json">{"@type":"ImageObject","contentUrl":"https:' || chr(92) || '/' || chr(92) || '/cdn.sv'
+         || chr(92) || '/media' || chr(92) || '/sv' || chr(92) || '/usage' || chr(92) || '/slashed.webp"}</script>'), 13),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'sv/usage/slashed_large.avif' || repeat(chr(92), 2) || '/next'), 14),
+      (v_page, v_lang, 'text', jsonb_build_object('html_content', 'sv/usage/slashed_medium.avif' || repeat(chr(92), 3) || '/next'), 15);
+    INSERT INTO public.cms_redirects (source_path, destination_path)
+      VALUES ('/sv-usage-slashed', 'https://cdn.sv' || chr(92) || '/media' || chr(92) || '/sv' || chr(92) || '/usage' || chr(92) || '/redirected.webp');
+
+    PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+    EXECUTE 'SET LOCAL ROLE service_role';
+    EXECUTE 'SELECT public.media_usage($1)' INTO slash_answer USING jsonb_build_object(
+      'aa000000-0000-0000-0000-0000000044b0', '["sv/usage/slashed.webp","sv/usage/slashed_large.avif","sv/usage/slashed_medium.avif"]'::jsonb,
+      'aa000000-0000-0000-0000-0000000044b1', '["sv/usage/redirected.webp"]'::jsonb);
+    EXECUTE 'RESET ROLE';
+    PERFORM set_config('request.jwt.claims', '', true);
+
+    -- The text checks confirm each fixture holds, where the function reads it, the backslashes its line
+    -- names: two before each slash of the key, then four and six before one slash.
+    slashed_ok := slash_answer #> '{aa000000-0000-0000-0000-0000000044b0,by_kind}' = '{"block": 3}'::jsonb
+              AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page
+                           AND strpos(content::text, 'sv' || repeat(chr(92), 2) || '/usage' || repeat(chr(92), 2) || '/slashed.webp') > 0)
+              AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page
+                           AND strpos(content::text, 'slashed_large.avif' || repeat(chr(92), 4) || '/next') > 0)
+              AND EXISTS (SELECT 1 FROM public.blocks WHERE page_id = v_page
+                           AND strpos(content::text, 'slashed_medium.avif' || repeat(chr(92), 6) || '/next') > 0);
+    slashed_plain_ok := slash_answer #> '{aa000000-0000-0000-0000-0000000044b1,by_kind}' = '{"redirect": 1}'::jsonb
+                    AND EXISTS (SELECT 1 FROM public.cms_redirects WHERE source_path = '/sv-usage-slashed'
+                                 AND strpos(to_json(destination_path)::text,
+                                            'sv' || repeat(chr(92), 2) || '/usage' || repeat(chr(92), 2) || '/redirected.webp') > 0);
+  END IF;
+
+  RAISE NOTICE '%  anon / authenticated cannot EXECUTE media_usage, and PUBLIC holds no grant on it', CASE WHEN fn IS NOT NULL AND NOT api_x AND NOT public_x THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  the service role can EXECUTE media_usage', CASE WHEN svc_x THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage finds an item through a foreign key (gallery, variant image, feature image, logo)', CASE WHEN fk_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage finds an item by id or owned key in documents (text HTML, uppercase id in a section background, optimizer URL in a draft, the social image setting)', CASE WHEN text_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage reports a revision-only use under its own kind (history)', CASE WHEN history_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage answers total 0 for an item nothing names, and ignores an entry that is not a uuid', CASE WHEN unused_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage never reads the secret rows of site_settings by 02038''s rule (cortex_ai_mcp_settings, sv_x_token, SV_X_SECRET), and still reads an ordinary row', CASE WHEN secret_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage matches keys only as whole tokens: a key with a space is not found where a text block holds it verbatim (no substring search)', CASE WHEN minted_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage finds a key right after a JSON escape in a text block (a newline, a carriage return, a tab, a backspace, a form feed, U+0001), and an id right after a backspace or a form feed', CASE WHEN escaped_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage reads an escaped backslash as one character: a key after a backslash and a newline is found, and so is a key starting with n right after a backslash, in a text block and in a navigation link', CASE WHEN backslash_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage reads an escaped slash as a slash: a key in JSON-LD with escaped slashes in a text block is found, and the backslashes before an escaped slash still end a key (4 and 6 before the slash in the JSON text)', CASE WHEN slashed_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage reads an escaped slash as a slash in a plain text column too: a key in a redirect target with escaped slashes is found', CASE WHEN slashed_plain_ok THEN 'PASS' ELSE 'FAIL' END;
+END $$;
+
+-- 45, continued: what one document costs. media_usage cuts each run of storage-key characters into
+--     the suffixes that could equal a key sent. Building every suffix cost the square of a run's
+--     length, and non-staff write documents it reads: one profile picture URL of 20,000 slashes (signing
+--     up copies it from the user metadata) made every lookup take tens of seconds (36 to 85 s on local
+--     replays), far past the 8 s statement timeout of the API roles, so the Unused view listed nothing
+--     and "Delete unused" deleted nothing.
+--     This block runs under a 4 s statement timeout, half of that 8 s (the lookup takes milliseconds):
+--     the lookup must answer before it, a cancel is caught and printed as FAIL, and it must still find
+--     a key at the end of such a run, plain (the profile picture URL) and percent-encoded (an image
+--     optimizer URL of 13,334 escaped slashes in a text block).
+RESET ROLE;
+SET statement_timeout = '4s';
+DO $$
+DECLARE
+  fn regprocedure := to_regprocedure('public.media_usage(jsonb)');
+  v_lang bigint := coalesce((SELECT id FROM public.languages WHERE code = 'en'), (SELECT min(id) FROM public.languages));
+  v_page bigint;
+  answer jsonb;
+  answered boolean := false;
+  deep_ok boolean := false;
+BEGIN
+  IF fn IS NOT NULL THEN
+    INSERT INTO public.media (id, object_key, file_name, file_path, uploader_id, variants) VALUES
+      ('aa000000-0000-0000-0000-0000000044ac','sv/usage/deep.webp','deep.webp','sv/usage/deep.webp','aa000000-0000-0000-0000-0000000000a1','[{"objectKey":"sv/usage/deep_large.avif"}]');
+    INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, created_at, updated_at, raw_app_meta_data, raw_user_meta_data)
+      VALUES ('aa000000-0000-0000-0000-0000000044c1','00000000-0000-0000-0000-000000000000','authenticated','authenticated','sv-slashes@test.local','x',now(),now(),'{}',
+              jsonb_build_object('avatar_url', repeat('a/', 20000) || 'sv/usage/deep.webp'));
+    INSERT INTO public.pages (language_id, title, slug, status)
+      VALUES (v_lang, 'SV usage deep', 'sv-usage-deep', 'draft') RETURNING id INTO v_page;
+    INSERT INTO public.blocks (page_id, language_id, block_type, content, "order") VALUES
+      (v_page, v_lang, 'text', jsonb_build_object('html_content',
+         '<img src="/_next/image?url=' || repeat('%2F', 13334) || 'sv%2Fusage%2Fdeep_large.avif&w=640">'), 0);
+
+    BEGIN
+      PERFORM set_config('request.jwt.claims', '{"role":"service_role"}', true);
+      EXECUTE 'SET LOCAL ROLE service_role';
+      EXECUTE 'SELECT public.media_usage($1)' INTO answer USING jsonb_build_object(
+        'aa000000-0000-0000-0000-0000000044ac', '["sv/usage/deep.webp","sv/usage/deep_large.avif"]'::jsonb);
+      EXECUTE 'RESET ROLE';
+      PERFORM set_config('request.jwt.claims', '', true);
+      answered := true;
+    EXCEPTION WHEN query_canceled THEN
+      -- The statement timeout fired. Leaving this block rolls back its role and claims.
+      answered := false;
+    END;
+
+    deep_ok := answered
+           AND answer #> '{aa000000-0000-0000-0000-0000000044ac,by_kind}' = '{"block": 1, "profile": 1}'::jsonb
+           AND (SELECT length(avatar_url) FROM public.profiles WHERE id = 'aa000000-0000-0000-0000-0000000044c1') = 40018;
+  END IF;
+
+  RAISE NOTICE '%  media_usage answers within a 4 s statement timeout where a profile picture URL holds a run of 20,000 slashes (building every suffix took tens of seconds)', CASE WHEN answered THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  media_usage still finds a key at the end of such a run, plain (the profile picture URL) and percent-encoded (an image optimizer URL in a text block)', CASE WHEN deep_ok THEN 'PASS' ELSE 'FAIL' END;
+END $$;
+RESET statement_timeout;
 
 \echo '==========================================================================='
 \echo '(all fixtures rolled back below — database unchanged)'

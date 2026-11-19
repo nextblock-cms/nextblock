@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '@nextblock-cms/db/types';
 import type { ProductFormValues } from './product-schema';
+import { normalizeProductGallery } from './product-gallery';
 import { syncSharedInventoryForSavedProduct } from './shared-inventory';
 import { normalizeCurrencyCode } from '@nextblock-cms/utils/utils';
 import { buildPublishedAtOrFilter } from '@nextblock-cms/utils';
@@ -23,8 +24,29 @@ function serializePriceMap(
   );
 }
 
-function serializeVariantsForRpc(variants?: ProductFormValues['variants']) {
-  return (variants || []).map((variant) => ({
+type SerializedVariant = ReturnType<typeof serializeVariantForRpc>;
+
+/**
+ * The variants as the RPCs take them: none for null or undefined. Anything else that is not a list, or a
+ * list entry that is not an object, goes on as it is, for the database to refuse (publish_product_draft:
+ * NBP04, "not a list" or "not an object"), never read as no variants, which deletes every live variant:
+ * only a hand-written draft holds one, and the app's completeProductDraftValues reads a variant list that
+ * is not a list as a missing one, which keeps the live variants. Until 2026-11-18 this read
+ * `(variants || [])`: false, 0 or '' went out as no variants, so the publish deleted every live variant,
+ * and any other value that is not a list threw here.
+ */
+function serializeVariantsForRpc(variants?: ProductFormValues['variants']): SerializedVariant[] {
+  if (variants === null || variants === undefined) return [];
+  if (!Array.isArray(variants)) return variants as unknown as SerializedVariant[];
+  return variants.map((variant) =>
+    variant !== null && typeof variant === 'object' && !Array.isArray(variant)
+      ? serializeVariantForRpc(variant)
+      : (variant as unknown as SerializedVariant)
+  );
+}
+
+function serializeVariantForRpc(variant: NonNullable<ProductFormValues['variants']>[number]) {
+  return {
     id: variant.id,
     sku: variant.sku,
     upc: variant.upc ?? null,
@@ -40,7 +62,7 @@ function serializeVariantsForRpc(variants?: ProductFormValues['variants']) {
     stock_quantity: variant.stock_quantity,
     main_media_id: variant.main_media_id ?? null,
     attribute_term_ids: variant.attribute_term_ids,
-  }));
+  };
 }
 
 function buildProductRpcPayload(data: ProductFormValues, id?: string) {
@@ -608,33 +630,27 @@ export async function createProduct(supabase: SupabaseClient<Database>, data: Pr
   return product;
 }
 
-const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 type ProductGalleryRow = { product_id: string; media_id: string; sort_order: number };
 
 /**
- * The gallery a save writes, checked before any write: the values' `product_media` in order, each
- * media id once, and only ids that still have a media row. Null when the values carry no gallery
- * (the gallery is then left as it is). An image deleted from the media library while a draft still
- * listed it failed the whole insert on product_media_media_id_fkey, and the old delete-then-insert
- * left the product with no gallery while the save reported success.
+ * The gallery a save writes, checked before any write: the values' `product_media` as
+ * normalizeProductGallery reads it (in order, lowercased, each media id once, uuids only), and only
+ * ids that still have a media row. Null when the values carry no gallery (the gallery is then left
+ * as it is). The product edit page shows a draft's gallery through the same reading
+ * (apps/nextblock/app/cms/products/productFormData.ts, resolveProductDraftGalleryForEdit). An image
+ * deleted from the media library while a draft still listed it failed the whole insert on
+ * product_media_media_id_fkey, and the old delete-then-insert left the product with no gallery while
+ * the save reported success.
  */
 async function resolveProductGalleryRows(
   supabase: SupabaseClient<Database>,
   id: string,
   data: ProductFormValues
 ): Promise<ProductGalleryRow[] | null> {
-  if (!Array.isArray(data.product_media)) return null;
+  const gallery = normalizeProductGallery(data.product_media);
+  if (!gallery) return null;
 
-  const orderedIds: string[] = [];
-  for (const item of data.product_media) {
-    const rawId = (item as { media_id?: unknown } | null)?.media_id;
-    // Lowercased: Postgres returns uuids lowercase, so an uppercase spelling would read as deleted.
-    const mediaId = typeof rawId === 'string' ? rawId.toLowerCase() : null;
-    if (mediaId && MEDIA_ID_PATTERN.test(mediaId) && !orderedIds.includes(mediaId)) {
-      orderedIds.push(mediaId);
-    }
-  }
+  const orderedIds = gallery.mediaIds;
   if (orderedIds.length === 0) return [];
 
   const { data: existingMedia, error } = await supabase.from('media').select('id').in('id', orderedIds);
@@ -675,10 +691,92 @@ async function writeProductGallery(supabase: SupabaseClient<Database>, id: strin
   if (unlinkError) throw new Error(`The product's gallery was not saved: ${unlinkError.message}`);
 }
 
+/** The largest quantity an inventory row holds (`inventory_items.quantity` is an integer). */
+const MAX_STOCK_QUANTITY = 2147483647;
+
+/**
+ * A draft's `stock_baseline` (the stock the edit page loaded, per SKU) as publish_product_draft
+ * (migration 02044) reads it: each SKU as the inventory rows key it (surrounding spaces removed, as
+ * Postgres btrim() does), and only whole quantities from 0 to 2^31 - 1. Null when the values carry none
+ * (a draft an earlier version saved, a CMS draft import): the publish then writes every SKU's quantity
+ * as the draft holds it, as it always did.
+ */
+function serializeStockBaselineForRpc(baseline: unknown): Record<string, number> | null {
+  if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline)) {
+    return null;
+  }
+
+  const serialized: Record<string, number> = {};
+  for (const [sku, quantity] of Object.entries(baseline as Record<string, unknown>)) {
+    const key = sku.replace(/^ +| +$/g, '');
+    if (
+      key &&
+      typeof quantity === 'number' &&
+      Number.isInteger(quantity) &&
+      quantity >= 0 &&
+      quantity <= MAX_STOCK_QUANTITY
+    ) {
+      serialized[key] = quantity;
+    }
+  }
+  return serialized;
+}
+
+/**
+ * The product values a draft publish writes: the `p_values` of `public.publish_product_draft`
+ * (migration 02043), which writes all of them, the description blocks, History and the draft delete in
+ * one transaction. It is updateProduct()'s RPC payload (amounts in minor units, each variant with its
+ * attribute terms and the draft's copy of its id) without `id`, `status` (visibility belongs to the
+ * row), `metadata` and `payment_provider` (the function derives it from the product type, as
+ * upsert_product_with_variants does), plus what updateProduct() wrote after that RPC: the SEO fields
+ * (the function trims them, blank becomes NULL), `gallery_media_ids` (the values' `product_media` ids
+ * in order, or null when they carry no gallery, which then stays as it is) and `category_ids` (null
+ * when the values carry none). A top-level `media_id` and `explicitly_removed_media_ids` never reach
+ * it: a save path never deletes media, and the function only unlinks an image the gallery drops.
+ *
+ * `stock_baseline` (since migration 02044) is the stock the edit page loaded, per SKU: the function
+ * leaves a SKU's inventory alone when the draft's quantity equals that baseline or the SKU's current
+ * quantity, and otherwise applies the difference between the quantity and its baseline to the current
+ * quantity, never below 0, so a sale made while the page was open keeps its deduction. A SKU the
+ * baseline lacks, and every SKU when it is null (no baseline), is written as the values hold it. Its
+ * answer's `stock_adjusted` names each SKU whose change went live on a quantity that had moved
+ * (`reason` 'moved') or was left out because the quantity already equalled the draft's ('already_live'),
+ * which the app's publish turns into a warning.
+ */
+export function buildProductDraftPublishValues(data: ProductFormValues) {
+  const payload: Record<string, unknown> = { ...buildProductRpcPayload(data) };
+  delete payload['id'];
+  delete payload['status'];
+  delete payload['metadata'];
+  delete payload['payment_provider'];
+
+  return {
+    ...payload,
+    meta_title: data.meta_title ?? null,
+    meta_description: data.meta_description ?? null,
+    custom_canonical: data.custom_canonical ?? null,
+    gallery_media_ids: Array.isArray(data.product_media)
+      ? data.product_media
+          .map((item) => (item as { media_id?: unknown } | null)?.media_id)
+          .filter((mediaId): mediaId is string => typeof mediaId === 'string')
+      : null,
+    category_ids: Array.isArray(data.category_ids) ? data.category_ids : null,
+    stock_baseline: serializeStockBaselineForRpc(data.stock_baseline),
+  };
+}
+
+export type ProductDraftPublishValues = ReturnType<typeof buildProductDraftPublishValues>;
+
 /**
  * Saves a product's form values: the product row and its variants (`upsert_product_with_variants`),
  * the gallery (only `product_media`; a top-level `media_id` is ignored, the form never writes one),
  * taxability, SEO fields, the sale schedule, shared inventory and categories.
+ *
+ * Not the publish path: since migration 02043 a product draft publishes through
+ * `public.publish_product_draft` (buildProductDraftPublishValues above), in one transaction that keeps
+ * variant ids and pending scheduled prices. This function still sends separate requests with no
+ * transaction around them, and the RPC deletes and re-creates every variant (new ids, scheduled prices
+ * dropped); nothing in the app calls it.
  */
 export async function updateProduct(supabase: SupabaseClient<Database>, id: string, data: ProductFormValues) {
   // Checked before the first write, so a gallery that cannot be resolved stops the save untouched.

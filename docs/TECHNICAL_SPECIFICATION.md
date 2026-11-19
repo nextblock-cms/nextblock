@@ -6312,12 +6312,14 @@ The database embeds 30+ stored functions across migrations `00000000000004` and 
 | `handle_new_user()` | First-user ADMIN bootstrap via `is_admin_created` latch | SECURITY DEFINER |
 | `get_current_user_role()` | Role lookup via `auth.uid()` | SECURITY DEFINER |
 | `is_admin()` | Boolean helper used in RLS | SECURITY DEFINER |
-| `apply_order_inventory_deduction(p_order_id)` | Idempotent inventory deduction (RPC primary path) | PL/pgSQL, FOR UPDATE |
+| `apply_order_inventory_deduction(p_order_id)` (02001, SKU order since 02044) | Idempotent inventory deduction (RPC primary path); takes an order's lines in the order of the SKU each one locks (the variant's, else the product's), the order `publish_product_draft` locks inventory rows in; the SQL fallback (`applyOrderInventoryDeductionViaSql`) orders them the same way | PL/pgSQL, FOR UPDATE |
 | `assign_order_invoice_metadata(p_order_id, p_paid_at)` | Atomic invoice number assignment | FOR UPDATE lock |
 | `format_order_invoice_number(bigint)` | Returns `'INV-NNNNNN'` (6-digit padded) | Pure function |
 | `generate_order_invoice_number()` | Calls `nextval('order_invoice_number_seq')` | Sequence-backed |
 | `upsert_product_with_variants(payload jsonb)` | Rebuilds variants and mappings in one transaction | Admin-only via `is_admin()` |
-| `sync_inventory_cache_for_sku(sku)` | Back-syncs `inventory_items.quantity` → `product_variants.stock_quantity` + `products.stock` | Trigger-invoked |
+| `publish_product_draft(...)` (02043, stock since 02044) | Publishes a product draft in one transaction under the product and draft row locks: product values (variants kept by term set, scheduled prices kept, the inventory rows of every SKU of the products whose rows it can write locked first, in SKU order (the order the sale's deduction takes an order's SKUs in since 02044), a SKU's stock written only where the draft's quantity differs from both the `stock_baseline` the edit page loaded and the current stock, as a change to the current stock, a quantity that is not a number, plain decimal text or null refused (NBP04), the variant total held at 2147483647; answers `stock_adjusted` (code-point SKU order) with `reason` `already_live` or `moved`) or overlay fields, blocks, History, draft delete | SECURITY INVOKER, admin-only via `is_admin()`, no `anon` EXECUTE |
+| `product_revision_content(uuid)` (02043) | A product's History content: meta, blocks, commerce | SECURITY INVOKER, STABLE, no `anon` EXECUTE |
+| `sync_inventory_cache_for_sku(sku)` (02001, total held since 02044) | Back-syncs `inventory_items.quantity` → `product_variants.stock_quantity` + `products.stock` (a product with variants: the total of their inventory rows, held at 2147483647) | Trigger-invoked |
 | `get_default_currency_code()` | Returns default currency code | Pure lookup |
 | `normalize_currency_amount_map(jsonb)` | Canonicalizes multi-currency amount maps | Pure function |
 | `is_valid_currency_amount_map(jsonb)` | Validates JSONB shape and ISO 4217 codes | Pure function |

@@ -28,6 +28,9 @@ only: no build entry reaches it, so the package ships no JavaScript for it.
   barrel passes every local check and breaks standalone installs: add `lib/<dir>/index` to
   `build.lib.entry` plus an exports key in `vite.config.mts` afterBuild (see `./seo`).
 - Published deps and the exports map are written in `vite.config.mts` afterBuild, not `package.json`.
+  `react` and `next` are optional peers there: create-nextblock installs this package (through
+  `@nextblock-cms/db`) and npm would install a required peer. Declarations leave tests out
+  (`exclude` in the dts options).
 - Client code on public routes imports deep subpaths (`@nextblock-cms/utils/utils`,
   `/translations-context`, `/color`, …), never `.`: the barrel re-exports `authored-html`, whose
   sanitize-html (CommonJS, about 39 KB gzipped with htmlparser2) no bundler drops, plus Zod and the

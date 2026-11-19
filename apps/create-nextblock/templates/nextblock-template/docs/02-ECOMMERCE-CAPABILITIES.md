@@ -152,11 +152,13 @@ price changes via CSV.
 >    price shows (e.g. a "$25 – $32" range before the sale starts).
 > 3. **`getVariantEffectivePriceRange` is window-aware** — pass
 >    `sale_start_at`/`sale_end_at` per variant or it ignores the schedule.
-> 4. **Persisting on save/publish does not rely on the RPC.** Products are
->    written via `upsert_product_with_variants`, but some databases run a stale
->    copy of that function. `persistProductSaleSchedule` (`product-actions.ts`)
->    writes the window columns with a direct `update` right after the RPC (same
->    pattern as `persistProductTaxability`), matching variants by SKU.
+> 4. **Persisting on publish writes the window across the SKU.** A product
+>    draft publishes through `publish_product_draft` (migration 02043, one
+>    transaction: docs/09 → "Publishing: one transaction"), which writes the
+>    product's sale price and window to every product sharing its SKU and each
+>    variant's to the variants sharing its SKU, as `persistProductSaleSchedule`
+>    (`product-actions.ts`) does after `upsert_product_with_variants` for
+>    `updateProduct()`, which the app no longer calls.
 > 5. **Autosave must not `reset()` the form or revalidate the edit route.** The
 >    edit-form autosave (`ProductForm.tsx`) uses a serialized-snapshot guard to
 >    avoid a render loop; `updateProductAction` writes only the draft (no
@@ -587,7 +589,8 @@ and a coupon with no product scope applies to every product of the account. Ever
 reaches one awaits `requireEcomAdmin()` / `requireCmsAdmin()` before any call toward the push: the
 CMS coupon actions, the promotions import (`/cms/promotions`), `createProductAction` and the visual
 editor's product publish, which checks first whatever the draft holds (only a product-values draft
-reaches `updateProduct()` and the push: docs/09 → "Product Drafts").
+sends product values to `publish_product_draft` and reaches the push, after the publish commits:
+docs/09 → "Product Drafts").
 `tools/scripts/server-action-actors.test.ts` enforces it (docs/04 → "A Freemius coupon push needs
 a verified admin").
 
@@ -812,6 +815,17 @@ When tracking is enabled:
 - if a SKU is not yet cached there, product or variant stock fields are used as
   fallback
 - a paid order triggers `apply_order_inventory_deduction()`
+- publishing a product draft writes a SKU's stock only when the editor changed it
+  in the product form and the live stock does not already show the new quantity
+  (the publish warning names such a SKU), and then as a change to the current
+  quantity (migration 02044: docs/09 → "Stock: only what the editor changed"), so
+  an order deducted while the edit page was open stays deducted; until then every
+  publish wrote back the stock the page had loaded
+- since 02044 the deduction takes an order's SKUs in SKU order, and a product
+  publish first locks, in the same order and before the product row, the inventory
+  rows of every SKU of the products whose rows it writes, so a deduction and a
+  publish wait for each other instead of deadlocking, apart from the rarer cases
+  docs/09 lists
 
 The deduction flow is resilient:
 

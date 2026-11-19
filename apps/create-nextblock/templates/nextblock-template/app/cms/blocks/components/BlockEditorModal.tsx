@@ -61,9 +61,9 @@ type BlockEditorModalProps = {
  * or sonner's container). A publish warning's toast (react-hot-toast) never expires and sits top
  * right, over the dialog's header buttons, so clicking its Dismiss or Reload page counted as a click
  * outside the editor: it closed a clean editor, or asked whether to save a dirty one (review
- * 2026-11-15). sonner's toasts set no pointer-events of their own, so while a modal is open (Radix
- * sets pointer-events none on body) a click on one reaches the overlay instead and still counts as
- * outside; only react-hot-toast's toasts, which set pointer-events auto, are clickable over a modal.
+ * 2026-11-15). Both libraries' toasts are clickable over a modal (Radix sets pointer-events none on
+ * body): react-hot-toast's set pointer-events auto themselves, and ToasterProvider gives sonner's
+ * the same class, which they lacked until the 0.23.4 follow-up.
  */
 export function isToastInteraction(target: EventTarget | null): boolean {
   const element = target as { closest?: (selector: string) => unknown } | null;

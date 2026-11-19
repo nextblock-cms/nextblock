@@ -42,6 +42,11 @@ Entry points: `@nextblock-cms/db` (browser `createClient`, Row types); `/server`
   `migrations/` file that is not a top-level `<digits>_*.sql` passing `validateMigrationNames`, a
   non-`.html` template, and packed migration names that differ from those the `/setup` bundle
   embeds (names only, not the SQL: run `npm run generate:migrations-bundle` after adding one).
+- Every bare import stays external, so the manifest `vite.config.ts` writes declares the
+  third-party ones (`verify-lib-dist.js` check 15): `@supabase/supabase-js`, `@supabase/ssr` and
+  `server-only` as dependencies, `next` as an OPTIONAL peer (create-nextblock depends on this
+  package for `supabase/` alone, and npm installs a required peer: all of Next.js). A new external
+  import needs a line there. Declarations leave tests out (`exclude` in the dts options).
 
 Commands: `npx nx build db`, `npm run nx:lint:db`, `npx vitest run libs/db`.
 

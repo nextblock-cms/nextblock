@@ -13,6 +13,8 @@ import { getStorageBackend, getStorageBucket } from "../../../lib/storage/provid
 import { supabaseRemoveObjects } from "../../../lib/storage/supabase-storage";
 import { isPartnerUploadKey, mediaKeyStem, ownedMediaStorageKeys, withoutKeysInUse } from "../../../lib/storage/media-object-keys";
 import { getPublicMediaBaseUrl, resolveMediaUrl } from "../../../lib/media/resolveMediaUrl";
+import { findMediaUsage } from "../../../lib/media/media-usage";
+import { isMediaUnused, withoutAdminOnlyLabels, type MediaUsage } from "../../../lib/media/media-usage-format";
 
 type Media = Database['public']['Tables']['media']['Row'];
 
@@ -143,19 +145,26 @@ export async function updateMediaItem(
 }
 
 
+/**
+ * What deleteMediaItem answers: the delete button toasts either. Never a redirect: /cms/media
+ * reads no `?error=` / `?success=`, so a redirect lost the library's folder and search and showed
+ * nothing (through 0.23.4 every refusal redirected that way).
+ */
+export type DeleteMediaItemResult = { success: string; error?: undefined } | { error: string; success?: undefined };
+
 // `_objectKey` stays in the signature for existing callers; the keys to delete come from the
 // row that was actually deleted, never from the client.
-export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
+export async function deleteMediaItem(mediaId: string, _objectKey?: string): Promise<DeleteMediaItemResult> {
     const supabase = createClient();
     const { data: { user } } = await supabase.auth.getUser();
 
     if (!user) {
-      return encodedRedirect("error", "/cms/media", "User not authenticated.");
+      return { error: "User not authenticated." };
     }
 
     const refusal = await mediaStorageStaffRefusal();
     if (refusal) {
-        return encodedRedirect("error", "/cms/media", refusal);
+        return { error: refusal };
     }
 
     const backend = getStorageBackend();
@@ -163,10 +172,10 @@ export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
     const s3Client = backend === 's3' ? await getS3Client() : null;
 
     if (!bucket) {
-      return encodedRedirect("error", "/cms/media", "Storage bucket not configured for deletion.");
+      return { error: "Storage bucket not configured for deletion." };
     }
     if (backend === 's3' && !s3Client) {
-      return encodedRedirect("error", "/cms/media", "R2 client is not configured for deletion.");
+      return { error: "R2 client is not configured for deletion." };
     }
 
     // Delete the DB row FIRST and read back the rows that were actually removed. Under RLS
@@ -182,13 +191,13 @@ export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
 
     if (dbError) {
         console.error("Error deleting media record from DB:", dbError);
-        return encodedRedirect("error", "/cms/media", `Failed to delete media record: ${dbError.message}`);
+        return { error: `Failed to delete media record: ${dbError.message}` };
     }
 
     if (!deletedRows || deletedRows.length === 0) {
         // RLS removed nothing: the row either does not exist or belongs to another uploader.
         // Leave storage untouched so we never orphan an object we had no right to delete.
-        return encodedRedirect("error", "/cms/media", "Media item not found or you do not have permission to delete it.");
+        return { error: "Media item not found or you do not have permission to delete it." };
     }
 
     // Only the objects this row owns (its object_key and the variants of that same upload), and
@@ -221,25 +230,19 @@ export async function deleteMediaItem(mediaId: string, _objectKey?: string) {
     // returning it, which left an unhandled NEXT_REDIRECT rejection; returning it navigated to the
     // unfiltered library (review 2026-11-15).
     revalidatePath("/cms/media");
+    return { success: "Media item deleted." };
 }
 
-export async function deleteMultipleMediaItems(items: Array<{ id: string; objectKey: string }>) {
-  const supabase = createClient();
-  const { data: { user }, error: authError } = await supabase.auth.getUser();
-
-  if (authError || !user) {
-    return { error: "User not authenticated." };
-  }
-
-  const refusal = await mediaStorageStaffRefusal();
-  if (refusal) {
-    return { error: refusal };
-  }
-
-  if (!items || items.length === 0) {
-    return { error: "No items selected for deletion." };
-  }
-
+/**
+ * The shared body of the bulk deletes (deleteMultipleMediaItems, deleteUnusedMediaItems), run after
+ * the caller's staff check: delete the rows `ids` as the caller, then only the storage objects those
+ * rows own and no other row still lists. Answers the ids of the rows actually deleted, or the error
+ * the action returns as it is.
+ */
+async function deleteMediaRowsAndOwnedObjects(
+  supabase: ReturnType<typeof createClient>,
+  ids: string[]
+): Promise<{ error: string } | { deletedIds: string[]; deletedCount: number }> {
   const backend = getStorageBackend();
   const bucket = getStorageBucket();
   const s3Client = backend === 's3' ? await getS3Client() : null;
@@ -251,8 +254,6 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
     return { error: "R2 client is not configured for deletion." };
   }
 
-  const itemIdsToDelete = items.map(item => item.id);
-
   // Delete the DB rows FIRST and read back the rows that were actually removed. RLS
   // (media_delete_policy, migration 02022 §9) silently drops rows this user does not own, so
   // deleting storage up front would destroy objects while their rows survived (orphans) and
@@ -260,8 +261,8 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
   const { data: deletedRows, error: dbDeleteError } = await supabase
     .from("media")
     .delete()
-    .in("id", itemIdsToDelete)
-    .select("object_key, variants");
+    .in("id", ids)
+    .select("id, object_key, variants");
 
   if (dbDeleteError) {
     console.error("Error batch deleting media records from DB:", dbDeleteError);
@@ -310,16 +311,205 @@ export async function deleteMultipleMediaItems(items: Array<{ id: string; object
     return { error: `Deletion process encountered issues: ${r2DeletionError}` };
   }
 
+  return {
+    deletedIds: deletedRows.map((row) => (row as { id?: unknown }).id).filter((id): id is string => typeof id === "string"),
+    deletedCount: deletedRows.length,
+  };
+}
+
+export async function deleteMultipleMediaItems(items: Array<{ id: string; objectKey: string }>) {
+  const supabase = createClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
+
+  if (authError || !user) {
+    return { error: "User not authenticated." };
+  }
+
+  const refusal = await mediaStorageStaffRefusal();
+  if (refusal) {
+    return { error: refusal };
+  }
+
+  if (!items || items.length === 0) {
+    return { error: "No items selected for deletion." };
+  }
+
+  const itemIdsToDelete = items.map(item => item.id);
+  const outcome = await deleteMediaRowsAndOwnedObjects(supabase, itemIdsToDelete);
+  if ("error" in outcome) {
+    return { error: outcome.error };
+  }
+
   revalidatePath("/cms/media");
 
   // Some selected rows may have been left untouched by RLS (not owned). Report that honestly
   // instead of claiming a full success the user did not actually get.
-  const skipped = itemIdsToDelete.length - deletedRows.length;
+  const skipped = itemIdsToDelete.length - outcome.deletedCount;
   if (skipped > 0) {
-    return { success: `Deleted ${deletedRows.length} item(s); ${skipped} could not be deleted (not found, or you do not have permission).` };
+    return { success: `Deleted ${outcome.deletedCount} item(s); ${skipped} could not be deleted (not found, or you do not have permission).` };
   }
   // No redirect here, return success object for client-side handling
   return { success: "Selected media items deleted successfully." };
+}
+
+/** At most this many media items per usage lookup or "Delete unused" call. */
+const MEDIA_USAGE_BATCH_LIMIT = 500;
+
+const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The media ids of a request: uuids only, lowercased, each once. */
+function normalizeMediaIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  const unique = new Set<string>();
+  for (const id of ids) {
+    if (typeof id === "string" && MEDIA_ID_PATTERN.test(id)) unique.add(id.toLowerCase());
+  }
+  return [...unique];
+}
+
+/** The rows a media read returned, only those of `ids` (lowercased), with a string id. */
+function rowsWithIds(
+  rows: Array<{ id: unknown; object_key?: unknown; variants?: unknown }> | null,
+  ids: readonly string[]
+): Array<{ id: string; object_key?: unknown; variants?: unknown }> {
+  const wanted = new Set(ids);
+  return (rows ?? []).flatMap((row) =>
+    typeof row.id === "string" && wanted.has(row.id.toLowerCase()) ? [{ ...row, id: row.id }] : []
+  );
+}
+
+/** What getMediaUsage answers: each found item's usage by lowercased id, or why it could not say. */
+export type MediaUsageLookupResult =
+  | { usage: Record<string, MediaUsage>; error?: undefined }
+  | { error: string; usage?: undefined };
+
+/**
+ * Where each of these media items is used (public.media_usage, migration 02045), for the media
+ * library's delete dialogs. Staff past their second factor only (getCmsActor(): the lookup runs with
+ * the service role and reads every content table, so this check is its authorization). An id with
+ * no media row is left out of the answer. Anyone but an ADMIN gets it through withoutAdminOnlyLabels:
+ * a place whose record their own session cannot read (a partner storefront, a redirect, an ADMIN-tier
+ * setting) keeps its kind and count but loses its label, record id and parent. A failed lookup
+ * answers { error }, never an empty usage.
+ */
+export async function getMediaUsage(mediaIds: string[]): Promise<MediaUsageLookupResult> {
+  const supabase = createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) {
+    return { error: "User not authenticated." };
+  }
+
+  const actor = await getCmsActor();
+  if (!actor) {
+    return { error: "Complete two-factor verification, then try again." };
+  }
+  if (!isCmsStaffRole(actor.role)) {
+    return { error: "Forbidden: Insufficient permissions." };
+  }
+
+  const ids = normalizeMediaIds(mediaIds);
+  if (ids.length === 0) {
+    return { usage: {} };
+  }
+  if (ids.length > MEDIA_USAGE_BATCH_LIMIT) {
+    return { error: `Check at most ${MEDIA_USAGE_BATCH_LIMIT} files at a time.` };
+  }
+
+  const { data: rows, error: readError } = await supabase
+    .from("media")
+    .select("id, object_key, variants")
+    .in("id", ids);
+  if (readError) {
+    return { error: `Where this media is used could not be checked: ${readError.message}` };
+  }
+
+  try {
+    const usage = await findMediaUsage(rowsWithIds(rows, ids));
+    const answer: Record<string, MediaUsage> = {};
+    for (const [id, entry] of usage) {
+      answer[id] = actor.role === "ADMIN" ? entry : withoutAdminOnlyLabels(entry);
+    }
+    return { usage: answer };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** What deleteUnusedMediaItems answers: the ids it deleted, or why it deleted nothing. */
+export type DeleteUnusedMediaResult =
+  | { success: string; deletedIds: string[]; error?: undefined }
+  | { error: string; success?: undefined; deletedIds?: undefined };
+
+/**
+ * Deletes those of `mediaIds` that nothing uses, checked again here whatever the library showed (an
+ * image may have been placed since it last looked): public.media_usage after the caller's staff
+ * check, then the bulk delete's own path for the unused ones only (deleteMediaRowsAndOwnedObjects:
+ * the caller's RLS, the objects a row owns, never a key another row lists). A revision-only use
+ * does not keep an item (restoring that revision would show a missing image). A failed lookup
+ * deletes nothing. The cleanup that 0.23.4 removed from product saves, now where someone chooses it:
+ * a save path never deletes media.
+ */
+export async function deleteUnusedMediaItems(mediaIds: string[]): Promise<DeleteUnusedMediaResult> {
+  const supabase = createClient();
+  const { data: { user }, error: authError } = await supabase.auth.getUser();
+  if (authError || !user) {
+    return { error: "User not authenticated." };
+  }
+
+  const refusal = await mediaStorageStaffRefusal();
+  if (refusal) {
+    return { error: refusal };
+  }
+
+  const ids = normalizeMediaIds(mediaIds);
+  if (ids.length === 0) {
+    return { error: "No items selected for deletion." };
+  }
+  if (ids.length > MEDIA_USAGE_BATCH_LIMIT) {
+    return { error: `Delete at most ${MEDIA_USAGE_BATCH_LIMIT} files at a time.` };
+  }
+
+  const { data: rows, error: readError } = await supabase
+    .from("media")
+    .select("id, object_key, variants")
+    .in("id", ids);
+  if (readError) {
+    return { error: `Nothing was deleted: the files could not be read (${readError.message}).` };
+  }
+
+  const requestedRows = rowsWithIds(rows, ids);
+  let usage: Map<string, MediaUsage>;
+  try {
+    usage = await findMediaUsage(requestedRows);
+  } catch (error) {
+    return { error: `Nothing was deleted. ${error instanceof Error ? error.message : String(error)}` };
+  }
+
+  const unusedIds = requestedRows
+    .map((row) => row.id)
+    .filter((id) => {
+      const entry = usage.get(id.toLowerCase());
+      return entry !== undefined && isMediaUnused(entry);
+    });
+  if (unusedIds.length === 0) {
+    return { error: "Nothing was deleted: every selected file is in use, or no longer exists." };
+  }
+
+  const outcome = await deleteMediaRowsAndOwnedObjects(supabase, unusedIds);
+  if ("error" in outcome) {
+    return { error: outcome.error };
+  }
+
+  revalidatePath("/cms/media");
+
+  const kept = ids.length - unusedIds.length;
+  const refused = unusedIds.length - outcome.deletedCount;
+  const notes = [
+    `Deleted ${outcome.deletedCount} unused ${outcome.deletedCount === 1 ? "file" : "files"}.`,
+    kept > 0 ? `${kept} in use (or gone) ${kept === 1 ? "was" : "were"} kept.` : null,
+    refused > 0 ? `${refused} could not be deleted (you do not have permission).` : null,
+  ].filter((note): note is string => note !== null);
+  return { success: notes.join(" "), deletedIds: outcome.deletedIds };
 }
 
 

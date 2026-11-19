@@ -13,6 +13,7 @@ import type { Database } from '@nextblock-cms/db';
 import { useAuth } from '../../../../context/AuthContext';
 import { useHotkeys } from '../../../../hooks/use-hotkeys';
 import { resolveMediaUrl } from '../../../../lib/media/resolveMediaUrl';
+import { LocalDateTime } from '../../../../components/LocalDateTime';
 
 type Media = Database['public']['Tables']['media']['Row'];
 import { FileText, Loader2, Sparkles } from 'lucide-react';
@@ -251,7 +252,8 @@ export default function MediaEditForm({ mediaItem, formAction }: MediaEditFormPr
             <p><strong>Object Key:</strong> <span className="font-mono break-all">{mediaItem.object_key}</span></p>
             <p><strong>File Type:</strong> {mediaItem.file_type}</p>
             <p><strong>Size:</strong> {typeof mediaItem.size_bytes === 'number' ? (mediaItem.size_bytes / 1024 / 1024).toFixed(2) + ' MB' : 'Unknown'}</p>
-            <p><strong>Uploaded:</strong> {new Date(mediaItem.created_at).toLocaleString()}</p>
+            {/* Not toLocaleString() here: the server renders this form too (React #418). */}
+            <p><strong>Uploaded:</strong> <LocalDateTime value={mediaItem.created_at} /></p>
         </div>
       </div>
 

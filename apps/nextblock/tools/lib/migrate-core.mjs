@@ -5,7 +5,20 @@
 //     NEXTBLOCK_BUILD_MIGRATE=1). It must NEVER fail a build, so it imports this
 //     module dynamically inside a try/catch.
 //   * tools/update.mjs        — the explicit `npm run update` command, which applies
-//     migrations on purpose and reports what it did.
+//     migrations on purpose and reports what it did. It loads this file again after its
+//     code update replaced it, so an updater runs the NEXT release's copy: keep every call
+//     its MIGRATION_ENGINE_CALLS lists with the arguments it passes and the result it reads,
+//     loadEnvFiles(root) (keeps a variable already set), describeBackend() -> { kind,
+//     detail }, collectMigrations(root) -> { files: [{ version, name, dir }], sources:
+//     [{ label, contributed }] }, readAppliedVersions() -> { ok, versions: Set, error },
+//     applyMigrations(files, { onApplied }) -> { ok, applied, error } (onApplied(file) for
+//     each file it applies) and runSql(sql) -> { ok, error }, and keep applyMigrations([])
+//     running the grant pass on its own, which it calls when nothing is pending. That second
+//     import re-reads this file alone: a relative module it imported would resolve to the
+//     copy the first import loaded, the previous release's, and so would a package (Node
+//     caches it as well), so this file imports only the modules migrate-core.test.mjs lists
+//     (its builtins too), and GRANTS_SQL and API_ROLE_REVOKE_SQL stay in it. update.test.mjs pins
+//     the names; migrate-core.test.mjs the shapes, the pass and the imports.
 //
 // Behaviourally in lockstep with apps/nextblock/lib/setup/schema-apply.ts (the /setup
 // wizard's applier): same tracking table, same one-transaction-per-file contract, same
@@ -326,7 +339,11 @@ end $nb_trg$;`;
 // it everywhere else, and 02030's own revoke of it must survive this pass). Migration 02037 adds the
 // PayPal payout lifecycle (claim_paypal_affiliate_payout, record_paypal_affiliate_payout_batch,
 // note_paypal_affiliate_payout_item, complete_paypal_affiliate_payout, fail_paypal_affiliate_payout,
-// release_paypal_affiliate_payout).
+// release_paypal_affiliate_payout). Migration 02043 adds the atomic product draft publish: anon loses
+// EXECUTE on publish_product_draft and product_revision_content, as on upsert_product_with_variants
+// (both are SECURITY INVOKER; authenticated keeps them, its ADMINs publish through the first).
+// Migration 02045 adds media_usage (the media library's usage lookup, which reads every content
+// table: the app calls it with the service role after its own staff check).
 // To open one of these commands to a role, add the policy and the GRANT in a migration and
 // remove the table here and in schema-apply.ts.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
@@ -515,6 +532,12 @@ begin
   if to_regprocedure('public.upsert_product_with_variants(jsonb)') is not null then
     revoke execute on function public.upsert_product_with_variants(jsonb) from public, anon;
   end if;
+  if to_regprocedure('public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb)') is not null then
+    revoke execute on function public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) from public, anon;
+  end if;
+  if to_regprocedure('public.product_revision_content(uuid)') is not null then
+    revoke execute on function public.product_revision_content(uuid) from public, anon;
+  end if;
   if to_regprocedure('public.bump_email_2fa_attempts(uuid)') is not null then
     revoke execute on function public.bump_email_2fa_attempts(uuid) from public, anon, authenticated;
   end if;
@@ -619,6 +642,9 @@ begin
   end if;
   if to_regprocedure('public.release_paypal_affiliate_payout(uuid)') is not null then
     revoke execute on function public.release_paypal_affiliate_payout(uuid) from public, anon, authenticated;
+  end if;
+  if to_regprocedure('public.media_usage(jsonb)') is not null then
+    revoke execute on function public.media_usage(jsonb) from public, anon, authenticated;
   end if;
 end $nb_api$;`;
 

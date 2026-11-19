@@ -24,22 +24,27 @@ const SCAFFOLD_0_23_3 = readFileSync(path.join(here, 'lib/__fixtures__/scaffold-
 const KEEP_ENV = new Set(['PATH', 'PATHEXT', 'SYSTEMROOT', 'COMSPEC', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA']);
 // Each run starts Node and git; the default 5 s is too tight for two of them on a busy machine.
 const SPAWNS = { timeout: 60_000 };
-// `npm view` answers VERSION. `npm install create-nextblock@<v>` stages FAKE_TEMPLATE_DIR as that
-// package's template for a test that sets it; any other `npm install` succeeds only for a test that
-// sets FAKE_NPM_INSTALL; anything else fails, so a run that reached a command it should not would
-// show up as an error.
+// `npm view` answers VERSION. `npm install create-nextblock@<v>` stages that package's template for a
+// test that sets one: FAKE_TEMPLATE_DIRS[<v>] (a JSON map from version to folder, for a 3-way merge,
+// which stages the release the project is on as its base) or else FAKE_TEMPLATE_DIR. Any other
+// `npm install` succeeds only for a test that sets FAKE_NPM_INSTALL; anything else fails, so a run
+// that reached a command it should not would show up as an error.
 const FAKE_NPM = `import { cpSync } from 'node:fs';
 import path from 'node:path';
 const [command, spec = ''] = process.argv.slice(2);
+const template = spec.startsWith('create-nextblock@')
+  ? (JSON.parse(process.env.FAKE_TEMPLATE_DIRS || '{}')[spec.slice('create-nextblock@'.length)] ?? process.env.FAKE_TEMPLATE_DIR)
+  : undefined;
 if (command === 'view') console.log('${VERSION}');
-else if (command === 'install' && process.env.FAKE_TEMPLATE_DIR && spec.startsWith('create-nextblock@')) {
-  cpSync(process.env.FAKE_TEMPLATE_DIR, path.join('node_modules', 'create-nextblock', 'templates', 'nextblock-template'), { recursive: true });
+else if (command === 'install' && template) {
+  cpSync(template, path.join('node_modules', 'create-nextblock', 'templates', 'nextblock-template'), { recursive: true });
 } else if (!(command === 'install' && process.env.FAKE_NPM_INSTALL === '1')) process.exitCode = 1;
 `;
 // Preloaded with --require: answers the git commands updateCodeViaGit runs inside the updater, so no
 // git starts, no repository or commit is needed and nothing reaches the network. FAKE_GIT_BEHIND is
-// the upstream commit count; `git merge` copies FAKE_GIT_MERGE over the checkout. Any other git
-// command fails, so a run that reached one would show up as an error.
+// the upstream commit count; `git merge` copies FAKE_GIT_MERGE over the checkout; `git grep` finds
+// FAKE_GIT_CONFLICTS, the files that still hold an update's conflict markers. Any other git command
+// fails, so a run that reached one would show up as an error.
 const FAKE_GIT = `const childProcess = require('node:child_process');
 const { cpSync } = require('node:fs');
 const { syncBuiltinESMExports } = require('node:module');
@@ -59,6 +64,7 @@ childProcess.spawnSync = (command, args = [], options = {}) => {
     cpSync(process.env.FAKE_GIT_MERGE, options.cwd, { recursive: true });
     return reply('');
   }
+  if (args[0] === 'grep' && process.env.FAKE_GIT_CONFLICTS) return reply(process.env.FAKE_GIT_CONFLICTS);
   return reply('', 1);
 };
 // update.mjs imports spawnSync by name, so its ESM binding has to see the replacement.
@@ -98,13 +104,17 @@ function makeProject(nextConfig, packageJson = {}) {
   return { project, bin: makeBin(root) };
 }
 
-/** Runs update.mjs in `project` (its cwd); `nodeArgs` go to Node before the script (the git preload). */
-function runUpdate({ project, bin }, flags = [], extraEnv = {}, nodeArgs = []) {
+/**
+ * Runs update.mjs in `project` (its cwd); `nodeArgs` go to Node before the script (the git preload).
+ * `script` is the updater to run: the repository's, unless the site carries a copy of its own. The
+ * run gets --skip-db unless the site runs the schema step on a fake engine (`schema: true`).
+ */
+function runUpdate({ project, bin, script = UPDATE_SCRIPT, schema = false }, flags = [], extraEnv = {}, nodeArgs = []) {
   const env = {};
   for (const [key, value] of Object.entries(process.env)) if (KEEP_ENV.has(key.toUpperCase())) env[key] = value;
   const pathKey = Object.keys(env).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH';
   env[pathKey] = `${bin}${path.delimiter}${env[pathKey] ?? ''}`;
-  const res = spawnSync(process.execPath, [...nodeArgs, UPDATE_SCRIPT, '--skip-db', ...flags], {
+  const res = spawnSync(process.execPath, [...nodeArgs, script, ...(schema ? [] : ['--skip-db']), ...flags], {
     cwd: project,
     env: { ...env, ...extraEnv },
     encoding: 'utf8',
@@ -215,6 +225,23 @@ describe('npm run update on a project a release behind', () => {
     expect(run.output).toContain('0 new file(s), 1 file(s) to update.');
     expect(readFileSync(path.join(site.project, 'proxy.ts'), 'utf8')).toBe('// proxy 99\n');
     expect(readFileSync(path.join(site.project, 'proxy.test.ts'), 'utf8')).toBe('// proxy test 98\n');
+  });
+
+  it('brings instrumentation.ts and .browserslistrc to a project scaffolded before the updater listed them', SPAWNS, () => {
+    // Off FRAMEWORK_PATHS through 0.23.5: a project updated into 0.23.4 never got the
+    // instrumentation hook that registers the CMS second-factor gate on a cold server.
+    const site = makeProject(addPostcssBrowserAlias(SCAFFOLD_0_23_3).text, { nextblock: { version: '98.0.0' } });
+    const template = path.join(path.dirname(site.project), 'template');
+    mkdirSync(template);
+    writeFileSync(path.join(template, 'package.json'), '{}\n');
+    writeFileSync(path.join(template, 'instrumentation.ts'), 'export async function register() {}\n');
+    writeFileSync(path.join(template, '.browserslistrc'), 'chrome >= 109\n');
+
+    const run = runUpdate(site, ['--yes'], { FAKE_NPM_INSTALL: '1', FAKE_TEMPLATE_DIR: template });
+    expect(run.status, run.output).toBe(0);
+    expect(run.output).toContain('2 new file(s), 0 file(s) to update.');
+    expect(readFileSync(path.join(site.project, 'instrumentation.ts'), 'utf8')).toBe('export async function register() {}\n');
+    expect(readFileSync(path.join(site.project, '.browserslistrc'), 'utf8')).toBe('chrome >= 109\n');
   });
 });
 
@@ -743,5 +770,390 @@ describe('npm run update on a monorepo fork (the git channel)', () => {
     expect(run.output).not.toContain(WARNING);
     expect(suggestionsIn(run.output)).toEqual([]);
     expect(run.output).toContain('Code is already up to date.');
+  });
+});
+
+// The schema step. main() imports tools/lib/migrate-core.mjs before the code update, which replaces that
+// file (the template sync in a standalone project, the git merge in the monorepo). Through 0.23.5 the
+// update that brought a release applied its migrations with the previous release's engine, and so with
+// that release's post-apply grant pass, which lacks the revokes the new release adds to
+// API_ROLE_REVOKE_SQL: after the update to 0.23.6, anon could call publish_product_draft until the next
+// build hook run. Running the update again changed nothing, as a run with nothing pending ran no pass.
+// These run a copy of update.mjs inside the project, beside a fake engine that prints each call, so the
+// code update replaces the very file the updater loaded first.
+const ENGINE_FILE = path.join('tools', 'lib', 'migrate-core.mjs');
+/**
+ * A stand-in for tools/lib/migrate-core.mjs that prints `[engine <name>] <call>` for each call. The
+ * migrations are FAKE_MIGRATIONS, the versions the database records FAKE_APPLIED. loadEnvFiles sets
+ * FAKE_ENV_LOADED_BY unless it is set, as dotenv (override: false) keeps a variable already loaded.
+ */
+const fakeEngine = (name) => `const say = (line) => console.log('[engine ${name}] ' + line);
+const versions = (key) => (process.env[key] ?? '').split(',').filter(Boolean);
+export async function loadEnvFiles() {
+  say('loadEnvFiles');
+  process.env.FAKE_ENV_LOADED_BY ??= '${name}';
+}
+export function describeBackend() {
+  say('describeBackend');
+  return { kind: 'postgres', detail: 'env loaded by ' + process.env.FAKE_ENV_LOADED_BY };
+}
+export function collectMigrations() {
+  say('collectMigrations');
+  return { files: versions('FAKE_MIGRATIONS').map((version) => ({ version, name: version + '_fake.sql', dir: '.' })), sources: [] };
+}
+export async function readAppliedVersions() {
+  say('readAppliedVersions');
+  return { ok: true, versions: new Set(versions('FAKE_APPLIED')) };
+}
+export async function applyMigrations(files, options = {}) {
+  say('applyMigrations ' + (files.map((file) => file.version).join(',') || '(none)'));
+  const recorded = new Set(versions('FAKE_APPLIED'));
+  const pending = files.filter((file) => !recorded.has(file.version));
+  for (const file of pending) options.onApplied?.(file);
+  return { ok: true, applied: pending.length, backend: 'postgres' };
+}
+export async function runSql() {
+  say('runSql');
+  return { ok: true };
+}
+`;
+/** The calls engine `name` printed, in order. */
+const engineCalls = (output, name) => [...output.matchAll(new RegExp(`^\\[engine ${name}\\] (.+?)\\r?$`, 'gm'))].map((match) => match[1]);
+/** Each warning the updater printed, without its marker. */
+const warningsIn = (output) =>
+  output
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith('  ! '))
+    .map((line) => line.slice('  ! '.length));
+/** What the schema step asks the engine before it applies anything. */
+const SCHEMA_READS = ['describeBackend', 'collectMigrations', 'readAppliedVersions'];
+
+/**
+ * The line git merge-file writes to open a hunk under the updater's first label. Built, not written
+ * out: this file ships in every project's tools/, where a line holding only the marker would hold
+ * every update's schema step.
+ */
+const OPENER = `${'<'.repeat(7)} your version`;
+/** The lines of `text` that open a hunk, each as it ends: with its CR when the file is CRLF. */
+const openerLines = (text) => text.split('\n').filter((line) => line.startsWith(OPENER));
+/** The files the conflict hold listed, in the order it printed them. */
+function heldFiles(output) {
+  const lines = output.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.endsWith(' file(s) still contain unresolved merge conflicts:'));
+  if (start < 0) return [];
+  const end = lines.findIndex((line, index) => index > start && line.trim() === '');
+  return lines.slice(start + 1, end < 0 ? undefined : end).map((line) => line.trim());
+}
+/** UNRESOLVED_CONFLICT_PATTERN, the pattern update.mjs hands git grep for its hold, as Node reads the literal. */
+function holdPattern() {
+  const file = ts.createSourceFile('update.mjs', readFileSync(UPDATE_SCRIPT, 'utf8'), ts.ScriptTarget.Latest, true);
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const { name, initializer } of statement.declarationList.declarations) {
+      if (ts.isIdentifier(name) && name.text === 'UNRESOLVED_CONFLICT_PATTERN' && initializer && ts.isStringLiteral(initializer)) return initializer.text;
+    }
+  }
+  throw new Error('update.mjs declares no UNRESOLVED_CONFLICT_PATTERN string');
+}
+
+/**
+ * The environment for a real git that reads none of this machine's configuration (hooks, signing,
+ * autocrlf, a merge style), only `config` under `root`: no CRLF conversion and a committer. The
+ * GIT_* variables of the caller (a hook's GIT_DIR, say) are left out too.
+ */
+function isolatedGit(root) {
+  const config = path.join(root, 'gitconfig');
+  writeFileSync(config, '[core]\n\tautocrlf = false\n[user]\n\tname = NextBlock tests\n\temail = tests@example.invalid\n');
+  return { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: config };
+}
+/** Runs real git in `cwd` with the isolatedGit() `gitEnv`; returns the spawn result. */
+function gitIn(cwd, args, gitEnv) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('GIT_')));
+  return spawnSync('git', args, { cwd, env: { ...env, ...gitEnv }, encoding: 'utf8' });
+}
+/** Makes `project` a repository whose first commit holds every file in it. */
+function commitProject(project, gitEnv) {
+  for (const args of [['init', '-q'], ['add', '-A'], ['commit', '-q', '-m', 'the project']]) {
+    const res = gitIn(project, args, gitEnv);
+    if (res.status !== 0) throw new Error(`git ${args.join(' ')}: ${res.stderr || res.error}`);
+  }
+}
+/**
+ * A six-line file as `git merge-file` leaves it when the project and the release changed its third
+ * line, with the updater's labels; `eols` are the line endings, line by line, repeating.
+ */
+function mergedWithConflict(dir, eols, gitEnv) {
+  mkdirSync(dir, { recursive: true });
+  const text = (third) => ['one', 'two', third, 'four', 'five', 'six'].map((line, index) => line + eols[index % eols.length]).join('');
+  const [ours, base, theirs] = ['ours', 'base', 'theirs'].map((name) => path.join(dir, name));
+  writeFileSync(ours, text('three, as the project edited it'));
+  writeFileSync(base, text('three'));
+  writeFileSync(theirs, text('three, as the release changed it'));
+  const res = gitIn(dir, ['merge-file', '-L', 'your version', '-L', 'NextBlock 98.0.0', '-L', `NextBlock ${VERSION}`, ours, base, theirs], gitEnv);
+  if (res.status !== 1) throw new Error(`git merge-file left ${res.status} conflict(s), expected 1: ${res.stderr}`);
+  return readFileSync(ours, 'utf8');
+}
+/** `text` with every line ending in CRLF. */
+const crlf = (text) => text.replace(/\r?\n/g, '\r\n');
+
+describe("npm run update's schema step and the migration engine it runs on", () => {
+  const ONE_PENDING = { FAKE_MIGRATIONS: '02001,02002', FAKE_APPLIED: '02001' };
+  const NONE_PENDING = { FAKE_MIGRATIONS: '02001,02002', FAKE_APPLIED: '02001,02002' };
+
+  /** A standalone project on `version` that runs its own copy of update.mjs, with `engine` as its migration engine. */
+  function makeEngineProject(version, engine, files = {}) {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-update-engine-'));
+    roots.push(root);
+    const project = path.join(root, 'project');
+    writeFiles(project, {
+      'package.json': `${JSON.stringify({ name: 'site', private: true, nextblock: { version } }, null, 2)}\n`,
+      [path.join('tools', 'update.mjs')]: readFileSync(UPDATE_SCRIPT, 'utf8'),
+      [ENGINE_FILE]: engine,
+      ...files,
+    });
+    return { project, bin: makeBin(root), script: path.join(project, 'tools', 'update.mjs'), schema: true, template: path.join(root, 'template') };
+  }
+
+  /** Updates `site` to VERSION, whose template brings `engine` as tools/lib/migrate-core.mjs; `nodeArgs` as in runUpdate. */
+  function updateToRelease(site, engine, schemaEnv, nodeArgs = []) {
+    writeFiles(site.template, { 'package.json': '{}\n', [ENGINE_FILE]: engine });
+    return runUpdate(site, ['--yes'], { FAKE_NPM_INSTALL: '1', FAKE_TEMPLATE_DIR: site.template, ...schemaEnv }, nodeArgs);
+  }
+
+  it('runs a standalone update to a release on the engine that release brought, not the one it loaded first', SPAWNS, () => {
+    const site = makeEngineProject('98.0.0', fakeEngine('98'));
+
+    const run = updateToRelease(site, fakeEngine('99'), ONE_PENDING);
+    expect(run.status, run.output).toBe(0);
+    expect(readFileSync(path.join(site.project, ENGINE_FILE), 'utf8')).toBe(fakeEngine('99'));
+    // The engine loaded first only read the env files. Every database call ran on the new one, the
+    // update alert included, and it reads the env the first one loaded (its own load overrides nothing).
+    expect(engineCalls(run.output, '98')).toEqual(['loadEnvFiles']);
+    expect(engineCalls(run.output, '99')).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'applyMigrations 02001,02002', 'runSql']);
+    expect(run.output.indexOf('[engine 99] loadEnvFiles')).toBeGreaterThan(run.output.indexOf('Dependencies installed.'));
+    expect(run.output).toContain('Using the migration engine as this update left it (tools/lib/migrate-core.mjs).');
+    expect(run.output).toContain('Backend: postgres · env loaded by 98');
+    expect(run.output).toContain('applied 02002_fake.sql');
+    expect(run.output).toContain('Applied 1 migration(s) and re-applied the database grants.');
+    expect(warningsIn(run.output).filter((line) => line.includes('migrate-core') || line.includes('grants'))).toEqual([]);
+  });
+
+  it('runs a monorepo update on the engine the git merge brought to apps/nextblock/tools/lib', SPAWNS, () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-update-engine-git-'));
+    roots.push(root);
+    const checkout = path.join(root, 'checkout');
+    const appEngine = path.join('apps', 'nextblock', ENGINE_FILE);
+    const script = path.join(checkout, 'apps', 'nextblock', 'tools', 'update.mjs');
+    mkdirSync(path.join(checkout, 'libs', 'db', 'src', 'supabase', 'migrations'), { recursive: true });
+    writeFiles(checkout, { 'nx.json': '{}\n', [path.relative(checkout, script)]: readFileSync(UPDATE_SCRIPT, 'utf8'), [appEngine]: fakeEngine('98') });
+    const upstream = path.join(root, 'upstream');
+    writeFiles(upstream, { [appEngine]: fakeEngine('99') });
+    const bin = makeBin(root);
+    const fork = { FAKE_GIT_ORIGIN: 'https://github.com/someone/my-site.git', FAKE_GIT_BEHIND: '2', FAKE_GIT_MERGE: upstream, FAKE_NPM_INSTALL: '1' };
+
+    const run = runUpdate({ project: checkout, bin, script, schema: true }, ['--yes'], { ...fork, ...ONE_PENDING }, ['--require', path.join(bin, 'fake-git.cjs')]);
+    expect(run.status, run.output).toBe(0);
+    expect(run.output).toContain('Upstream merged.');
+    expect(readFileSync(path.join(checkout, appEngine), 'utf8')).toBe(fakeEngine('99'));
+    expect(engineCalls(run.output, '98')).toEqual(['loadEnvFiles']);
+    // No update alert to clear: a monorepo run records no version.
+    expect(engineCalls(run.output, '99')).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'applyMigrations 02001,02002']);
+    expect(run.output).toContain('Using the migration engine as this update left it (apps/nextblock/tools/lib/migrate-core.mjs).');
+    expect(run.output).toContain('Applied 1 migration(s) and re-applied the database grants.');
+  });
+
+  it('re-applies the database grants when nothing is pending, and not under --check, --skip-db, a conflict hold or Docker', SPAWNS, () => {
+    const site = makeEngineProject(VERSION, fakeEngine('99'));
+
+    // A plain run, which asks nothing for it (no --yes, no terminal), and --db-only.
+    for (const flags of [[], ['--db-only']]) {
+      const run = runUpdate(site, flags, NONE_PENDING);
+      expect(run.status, run.output).toBe(0);
+      expect(run.output).toContain('Schema is up to date (2 migration(s) recorded).');
+      expect(engineCalls(run.output, '99'), flags.join(' ')).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'applyMigrations (none)']);
+      expect(run.output).toContain('Re-applied the database grants: the blanket grants to the API roles, then the revokes this version lists.');
+    }
+
+    // --check says so and writes nothing.
+    const check = runUpdate(site, ['--check'], NONE_PENDING);
+    expect(check.status, check.output).toBe(0);
+    expect(engineCalls(check.output, '99')).toEqual(['loadEnvFiles', ...SCHEMA_READS]);
+    expect(check.output).toContain('Would re-apply the database grants.');
+    expect(check.output).not.toContain('Re-applied the database grants');
+
+    // --skip-db never reaches the schema step.
+    const skipped = runUpdate({ ...site, schema: false }, [], NONE_PENDING);
+    expect(skipped.status, skipped.output).toBe(0);
+    expect(skipped.output).not.toContain('Database schema');
+    expect(engineCalls(skipped.output, '99')).toEqual(['loadEnvFiles']);
+
+    // Unresolved conflicts from an earlier update hold the whole schema step.
+    const held = runUpdate(site, [], { ...NONE_PENDING, FAKE_GIT_CONFLICTS: 'app/page.tsx' }, ['--require', path.join(site.bin, 'fake-git.cjs')]);
+    expect(held.status, held.output).toBe(0);
+    expect(held.output).toContain('Migrations are on hold until those are resolved.');
+    expect(engineCalls(held.output, '99')).toEqual(['loadEnvFiles']);
+
+    // A Docker project's stack applies its migrations itself (docker/migrate/run-migrations.sh grants nothing).
+    const docker = makeEngineProject(VERSION, fakeEngine('99'), { 'docker-compose.yml': 'services: {}\n', '.env': 'POSTGRES_HOST=db\n' });
+    const stack = runUpdate(docker, [], NONE_PENDING);
+    expect(stack.status, stack.output).toBe(0);
+    expect(stack.output).toContain('The Docker stack applies them on npm run docker:up.');
+    expect(engineCalls(stack.output, '99')).toEqual(['loadEnvFiles']);
+  });
+
+  // The runs above are on VERSION already, so the code update brings nothing and no reload is tried.
+  // These update from 98, so the engine the release brings is on disk and the reload is due: the hold
+  // and the Docker hand-off must come first. Each fails with the reload moved above it.
+  it('reloads no engine while unresolved conflicts hold the schema step of an update to a release', SPAWNS, () => {
+    const site = makeEngineProject('98.0.0', fakeEngine('98'));
+
+    const run = updateToRelease(site, fakeEngine('99'), { ...ONE_PENDING, FAKE_GIT_CONFLICTS: 'app/page.tsx' }, ['--require', path.join(site.bin, 'fake-git.cjs')]);
+    expect(run.status, run.output).toBe(0);
+    expect(run.output).toContain('Dependencies installed.');
+    expect(readFileSync(path.join(site.project, ENGINE_FILE), 'utf8')).toBe(fakeEngine('99'));
+    expect(heldFiles(run.output)).toEqual(['app/page.tsx']);
+    expect(run.output).toContain('Migrations are on hold until those are resolved.');
+    // The engine loaded first only read the env files, and the release's engine was never loaded.
+    expect(engineCalls(run.output, '98')).toEqual(['loadEnvFiles']);
+    expect(engineCalls(run.output, '99')).toEqual([]);
+    expect(run.output).not.toContain('Using the migration engine as this update left it');
+  });
+
+  it("reloads no engine for a Docker project, whose stack applies the release's migrations itself", SPAWNS, () => {
+    const site = makeEngineProject('98.0.0', fakeEngine('98'), { 'docker-compose.yml': 'services: {}\n', '.env': 'POSTGRES_HOST=db\n' });
+
+    const run = updateToRelease(site, fakeEngine('99'), ONE_PENDING, ['--require', path.join(site.bin, 'fake-git.cjs')]);
+    expect(run.status, run.output).toBe(0);
+    expect(run.output).toContain('Dependencies installed.');
+    expect(readFileSync(path.join(site.project, ENGINE_FILE), 'utf8')).toBe(fakeEngine('99'));
+    expect(run.output).toContain('The Docker stack applies them on npm run docker:up.');
+    // No schema call on either engine. The hand-off returns no engine, so main() clears the update
+    // alert (runSql) with the one it loaded first, as every updater before 0.23.6 did.
+    expect(engineCalls(run.output, '98')).toEqual(['loadEnvFiles', 'runSql']);
+    expect(engineCalls(run.output, '99')).toEqual([]);
+    expect(run.output).not.toContain('Using the migration engine as this update left it');
+  });
+
+  it('keeps the engine it loaded first, and says so, when the one the code update brought does not load', SPAWNS, () => {
+    const brokenEngines = [
+      ['a syntax error', 'export const version = ;\n', "SyntaxError: Unexpected token ';'"],
+      ['a missing call', fakeEngine('99').replace('export async function readAppliedVersions', 'async function readAppliedVersions'), 'it exports no readAppliedVersions'],
+    ];
+    for (const [label, engine, reason] of brokenEngines) {
+      expect(engine, label).not.toBe(fakeEngine('99'));
+      const couldNotLoad = `Could not load tools/lib/migrate-core.mjs as this update left it: ${reason}`;
+
+      // A migration pending: the engine loaded first applies it, and its own grant pass, as earlier updaters did.
+      const pending = updateToRelease(makeEngineProject('98.0.0', fakeEngine('98')), engine, ONE_PENDING);
+      expect(pending.status, `${label}\n${pending.output}`).toBe(0);
+      expect(warningsIn(pending.output), label).toContain(couldNotLoad);
+      expect(engineCalls(pending.output, '98'), label).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'applyMigrations 02001,02002', 'runSql']);
+      expect(engineCalls(pending.output, '99'), label).toEqual([]);
+      expect(pending.output, label).toContain('Applied 1 migration(s), with the database grants of the version you updated from (above).');
+
+      // Nothing pending: no grant pass at all, as the engine loaded first is the previous version's.
+      const recorded = updateToRelease(makeEngineProject('98.0.0', fakeEngine('98')), engine, NONE_PENDING);
+      expect(recorded.status, `${label}\n${recorded.output}`).toBe(0);
+      expect(warningsIn(recorded.output), label).toContain(couldNotLoad);
+      expect(engineCalls(recorded.output, '98'), label).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'runSql']);
+      expect(warningsIn(recorded.output), label).toContain(
+        'The database grants were not re-applied: the migration engine this update brought did not load (above).',
+      );
+    }
+  });
+
+  // The hold reads the project with real git, and git merge-file writes its markers with CRLF when the
+  // files it merges use CRLF. Through 0.23.5 the hold's pattern ended in `$` alone, which the CR of such
+  // a marker line never matched, so an update that left a conflict in a CRLF file held nothing: it
+  // applied the migrations over the conflict, and with the reload it imported the conflicted engine,
+  // failed, and applied them with the engine it loaded first. The FAKE_GIT runs above answer `git grep`
+  // themselves.
+  describe('the conflict hold, on real git', () => {
+    it('holds an update that leaves a conflict in a CRLF tools/lib/migrate-core.mjs, and loads no engine for it', SPAWNS, () => {
+      // The project edited the engine's first line, which the release changes too: the merge conflicts there.
+      const local = crlf(fakeEngine('98')).replace('\r\n', ' // edited in this project\r\n');
+      const site = makeEngineProject('98.0.0', local);
+      const root = path.dirname(site.project);
+      const gitEnv = isolatedGit(root);
+      commitProject(site.project, gitEnv);
+      const templates = { '98.0.0': path.join(root, 'template-98'), [VERSION]: path.join(root, 'template-99') };
+      writeFiles(templates['98.0.0'], { 'package.json': '{}\n', [ENGINE_FILE]: crlf(fakeEngine('98')) });
+      writeFiles(templates[VERSION], { 'package.json': '{}\n', [ENGINE_FILE]: crlf(fakeEngine('99')) });
+
+      const run = runUpdate(site, ['--yes'], { FAKE_NPM_INSTALL: '1', FAKE_TEMPLATE_DIRS: JSON.stringify(templates), ...ONE_PENDING, ...gitEnv });
+      expect(run.status, run.output).toBe(0);
+      // git merge-file wrote the marker with CRLF, as the three copies it merged use.
+      expect(openerLines(readFileSync(path.join(site.project, ENGINE_FILE), 'utf8'))).toEqual([`${OPENER}\r`]);
+      const warnings = warningsIn(run.output);
+      expect(warnings).toContain('1 file(s) conflict with your edits and need resolving:');
+      expect(warnings).toContain('1 file(s) still contain unresolved merge conflicts:');
+      expect(heldFiles(run.output)).toEqual(['tools/lib/migrate-core.mjs']);
+      expect(run.output).toContain('Migrations are on hold until those are resolved.');
+      expect(run.output).toContain('Resolve the conflicts above, then re-run npm run update to migrate.');
+      // Nothing applied, no grant pass, and the conflicted engine never imported: the engine loaded
+      // first only read the env files.
+      expect(engineCalls(run.output, '98')).toEqual(['loadEnvFiles']);
+      expect(engineCalls(run.output, '99')).toEqual([]);
+      expect(run.output).not.toContain('Using the migration engine as this update left it');
+      expect(run.output).not.toContain('Could not load');
+    });
+
+    it('holds over every file an update left conflicted, whether its lines end in CRLF, LF or both', SPAWNS, () => {
+      const site = makeEngineProject(VERSION, fakeEngine('99'));
+      const root = path.dirname(site.project);
+      const gitEnv = isolatedGit(root);
+      const conflicted = {
+        'app/crlf.ts': mergedWithConflict(path.join(root, 'merge-crlf'), ['\r\n'], gitEnv),
+        'app/lf.ts': mergedWithConflict(path.join(root, 'merge-lf'), ['\n'], gitEnv),
+        // CRLF on the two lines before the hunk, LF on the next: git picks the marker's ending itself.
+        'app/mixed.ts': mergedWithConflict(path.join(root, 'merge-mixed'), ['\r\n', '\r\n', '\n'], gitEnv),
+      };
+      expect(openerLines(conflicted['app/crlf.ts'])).toEqual([`${OPENER}\r`]);
+      expect(openerLines(conflicted['app/lf.ts'])).toEqual([OPENER]);
+      expect(openerLines(conflicted['app/mixed.ts'])).toHaveLength(1);
+      writeFiles(site.project, conflicted);
+      commitProject(site.project, gitEnv);
+
+      const run = runUpdate(site, [], { ...NONE_PENDING, ...gitEnv });
+      expect(run.status, run.output).toBe(0);
+      expect(warningsIn(run.output)).toContain('3 file(s) still contain unresolved merge conflicts:');
+      expect(heldFiles(run.output)).toEqual(['app/crlf.ts', 'app/lf.ts', 'app/mixed.ts']);
+      expect(run.output).toContain('Migrations are on hold until those are resolved.');
+      expect(engineCalls(run.output, '99')).toEqual(['loadEnvFiles']);
+    });
+
+    it("matches no line of a file NextBlock ships, so the hold never stops an update on the release's own files", SPAWNS, () => {
+      // A docs page or a test holding the marker alone on a line, in a release, would hold the schema
+      // step of every update after it in every project. The pattern is git grep's, run as the hold runs it.
+      // libs/db/src/supabase ships too: the CLI copies its config.toml, migrations and templates into every
+      // project's tracked supabase/, and each update copies the migrations again (a seed migration quoting
+      // the marker on a line of its own would hold every standalone update once committed).
+      const pattern = holdPattern();
+      expect(pattern).toBe(`^${OPENER}\r?$`);
+      const top = gitIn(here, ['rev-parse', '--show-toplevel'], {});
+      expect(top.status, top.stderr).toBe(0);
+      const shipped = ['apps/nextblock', 'docs', 'apps/create-nextblock/templates/nextblock-template', 'libs/db/src/supabase'];
+      const found = gitIn(top.stdout.trim(), ['grep', '-lE', pattern, '--', ...shipped], {});
+      // 1 is git grep's "no line matched".
+      expect(found.status, `${found.stdout}${found.stderr}`).toBe(1);
+    });
+  });
+
+  it('keeps every call an updater makes on the engine exported by tools/lib/migrate-core.mjs', async () => {
+    // The update to a release runs its schema step on that release's engine, so each updater calls the
+    // engine of the release after it: a name dropped or renamed there leaves the update to that release on
+    // the previous engine and its grants. A call update.mjs starts making joins SHIPPED_CALLS for good.
+    // migrate-core.test.mjs pins what the calls take and answer, and that the engine imports no relative
+    // module (the reload re-reads migrate-core.mjs alone).
+    const SHIPPED_CALLS = ['loadEnvFiles', 'describeBackend', 'collectMigrations', 'readAppliedVersions', 'applyMigrations', 'runSql'];
+    const source = readFileSync(UPDATE_SCRIPT, 'utf8');
+    const listed = /^const MIGRATION_ENGINE_CALLS = \[([^\]]*)\];/m.exec(source)?.[1];
+    expect(listed, 'update.mjs lists the engine calls it makes in MIGRATION_ENGINE_CALLS').toBeDefined();
+    const calls = [...listed.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    const made = new Set([...source.matchAll(/\bcore\.(\w+)\(/g)].map((match) => match[1]));
+    expect([...made].sort()).toEqual([...calls].sort());
+    expect(SHIPPED_CALLS).toEqual(expect.arrayContaining(calls));
+    const engine = await import('./lib/migrate-core.mjs');
+    for (const name of SHIPPED_CALLS) expect(typeof engine[name], name).toBe('function');
   });
 });
