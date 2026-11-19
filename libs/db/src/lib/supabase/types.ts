@@ -3690,6 +3690,7 @@ export type Database = {
         Args: { p_exclude_id?: string; p_keys: string[] }
         Returns: string[]
       }
+      media_usage: { Args: { p_media: Json }; Returns: Json }
       normalize_currency_amount_map: { Args: { amounts: Json }; Returns: Json }
       note_paypal_affiliate_payout_item: {
         Args: {
@@ -3739,7 +3740,23 @@ export type Database = {
           isSetofReturn: true
         }
       }
+      product_revision_content: {
+        Args: { p_product_id: string }
+        Returns: Json
+      }
       promote_cleared_affiliate_commissions: { Args: never; Returns: number }
+      publish_product_draft: {
+        Args: {
+          p_blocks: Json
+          p_draft_id: number
+          p_draft_updated_at: string
+          p_overlay: Json
+          p_product_id: string
+          p_product_updated_at: string
+          p_values: Json
+        }
+        Returns: Json
+      }
       reconcile_affiliate_commissions: {
         Args: { p_limit?: number }
         Returns: Json
