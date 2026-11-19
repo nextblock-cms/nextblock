@@ -2528,6 +2528,32 @@ export type Database = {
           },
         ]
       }
+      product_stock_publishes: {
+        Row: {
+          product_id: string
+          publish_count: number
+          stock: Json
+        }
+        Insert: {
+          product_id: string
+          publish_count: number
+          stock?: Json
+        }
+        Update: {
+          product_id?: string
+          publish_count?: number
+          stock?: Json
+        }
+        Relationships: [
+          {
+            foreignKeyName: "product_stock_publishes_product_id_fkey"
+            columns: ["product_id"]
+            isOneToOne: true
+            referencedRelation: "products"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       product_variants: {
         Row: {
           created_at: string | null
@@ -3596,6 +3622,21 @@ export type Database = {
           tier_slug: string
         }[]
       }
+      delete_inventory_items: {
+        Args: { p_skus: string[] }
+        Returns: {
+          created_at: string
+          quantity: number
+          sku: string
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "inventory_items"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
       duplicate_block_definition: {
         Args: { target_id: string }
         Returns: {
@@ -3810,6 +3851,36 @@ export type Database = {
       sync_legacy_price_columns_for_currency: {
         Args: { target_currency: string }
         Returns: undefined
+      }
+      update_inventory_quantities: {
+        Args: { p_quantity: number; p_skus: string[] }
+        Returns: {
+          created_at: string
+          quantity: number
+          sku: string
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "inventory_items"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
+      upsert_inventory_items: {
+        Args: { p_on_conflict?: string; p_rows: Json }
+        Returns: {
+          created_at: string
+          quantity: number
+          sku: string
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "inventory_items"
+          isOneToOne: false
+          isSetofReturn: true
+        }
       }
       upsert_product_with_variants: {
         Args: { product_payload: Json }
