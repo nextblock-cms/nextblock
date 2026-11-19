@@ -4895,7 +4895,8 @@ export async function executeCreateCmsProduct(input: CreateCmsProductInput, cont
     return translationGroup.result;
   }
 
-  const { createProduct: createEcommerceProduct, productSchema } = await getEcommerceProductModule();
+  const { createProduct: createEcommerceProduct, isProductCreatedIncompleteError, productSchema } =
+    await getEcommerceProductModule();
   const isFreemiusProduct =
     parsed.product_type === 'digital' && parsed.payment_provider === 'freemius';
   const trialPeriodDays = isFreemiusProduct ? parsed.trial_period_days : 0;
@@ -4974,11 +4975,24 @@ export async function executeCreateCmsProduct(input: CreateCmsProductInput, cont
     }
   }
 
-  const product = await createEcommerceProduct(supabase as any, {
-    ...productPayload,
-    // First entry is the main product image; the rest become the gallery in order.
-    product_media: mediaIds.map((media_id) => ({ media_id })),
-  });
+  // A product createProduct() created but could not finish (a step after its product RPC failed: the
+  // stock, the categories...) exists: its description blocks still go in, and the answer says what was
+  // not saved, never a failed create (the model would create it again and meet its slug).
+  let product: { id: string; translation_group_id?: string | null } | null = null;
+  let incomplete: { steps: string[]; message: string } | null = null;
+  try {
+    product = await createEcommerceProduct(supabase as any, {
+      ...productPayload,
+      // First entry is the main product image; the rest become the gallery in order.
+      product_media: mediaIds.map((media_id) => ({ media_id })),
+    });
+  } catch (error) {
+    if (!isProductCreatedIncompleteError(error)) {
+      throw error;
+    }
+    incomplete = { steps: error.failedSteps, message: error.message };
+    product = { id: error.productId, translation_group_id: productPayload.translation_group_id ?? null };
+  }
 
   if (!product?.id) {
     throw new Error('Failed to create product.');
@@ -5013,6 +5027,7 @@ export async function executeCreateCmsProduct(input: CreateCmsProductInput, cont
     entityId: product.id,
     imageCount: mediaIds.length,
     ...(imageError ? { imageError } : {}),
+    ...(incomplete ? { incompleteSteps: incomplete.steps, warning: `${incomplete.message} Set them again on the product's edit page.` } : {}),
     mutationExecuted: true,
     slug,
     success: true,

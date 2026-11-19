@@ -826,12 +826,22 @@ When tracking is enabled:
   rows of every SKU of the products whose rows it writes, so a deduction and a
   publish wait for each other instead of deadlocking, apart from the rarer cases
   docs/09 lists
+- since 02046 every writer of `inventory_items` takes its rows in SKU order in one
+  statement before it writes any variant or product row: the deduction (all of an
+  order's rows, then the deduction in one statement, so two sales of one
+  product's variants no longer deadlock), the publish (creating a missing row of
+  its product's SKUs there), the product create and the Inventory screen
+  (`public.upsert_inventory_items`) and Cortex's database tool. The inventory
+  caches (variant stock, product stock and totals) sync once per statement, so a
+  publish that changes hundreds of SKUs stays well inside the 8 s statement
+  timeout, and every SKU a sale can deduct has an inventory row (02046's backfill)
 
 The deduction flow is resilient:
 
 - first it calls the database RPC `apply_order_inventory_deduction`
 - if that fails, it falls back to a direct SQL reconciliation path using
-  `POSTGRES_URL` or `DATABASE_URL`
+  `POSTGRES_URL` or `DATABASE_URL`, which runs the function's statements (it
+  skips the same SKUs, a SKU of spaces included, since 02046)
 
 Order statuses currently supported in code are:
 

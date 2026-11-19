@@ -773,6 +773,27 @@ describe('npm run update on a monorepo fork (the git channel)', () => {
   });
 });
 
+// PowerShell drops a bare `--`, so the help names the script to call directly, by its path from the
+// install's root. It used to give apps/nextblock/tools/update.mjs everywhere, a path no standalone
+// project has.
+describe('npm run update --help', () => {
+  it('names the updater by its path in each install', SPAWNS, () => {
+    const standalone = runUpdate(makeProject(''), ['--help']);
+    expect(standalone.status, standalone.output).toBe(0);
+    expect(standalone.output).toContain('call this script directly instead, e.g. node tools/update.mjs --db-only.');
+    expect(standalone.output).not.toContain('apps/nextblock');
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-update-help-'));
+    roots.push(root);
+    const checkout = path.join(root, 'checkout');
+    mkdirSync(path.join(checkout, 'libs', 'db', 'src', 'supabase', 'migrations'), { recursive: true });
+    writeFileSync(path.join(checkout, 'nx.json'), '{}\n');
+    const monorepo = runUpdate({ project: checkout, bin: makeBin(root) }, ['--help']);
+    expect(monorepo.status, monorepo.output).toBe(0);
+    expect(monorepo.output).toContain('call this script directly instead, e.g. node apps/nextblock/tools/update.mjs --db-only.');
+  });
+});
+
 // The schema step. main() imports tools/lib/migrate-core.mjs before the code update, which replaces that
 // file (the template sync in a standalone project, the git merge in the monorepo). Through 0.23.5 the
 // update that brought a release applied its migrations with the previous release's engine, and so with
@@ -786,6 +807,9 @@ const ENGINE_FILE = path.join('tools', 'lib', 'migrate-core.mjs');
  * A stand-in for tools/lib/migrate-core.mjs that prints `[engine <name>] <call>` for each call. The
  * migrations are FAKE_MIGRATIONS, the versions the database records FAKE_APPLIED. loadEnvFiles sets
  * FAKE_ENV_LOADED_BY unless it is set, as dotenv (override: false) keeps a variable already loaded.
+ * readAppliedVersions prints " (no files)" when the updater passes it none, and answers the engine's
+ * refusal of an empty history, with FAKE_REFUSAL as its message, when that is set; applyMigrations
+ * answers it with FAKE_APPLY_REFUSAL.
  */
 const fakeEngine = (name) => `const say = (line) => console.log('[engine ${name}] ' + line);
 const versions = (key) => (process.env[key] ?? '').split(',').filter(Boolean);
@@ -801,12 +825,17 @@ export function collectMigrations() {
   say('collectMigrations');
   return { files: versions('FAKE_MIGRATIONS').map((version) => ({ version, name: version + '_fake.sql', dir: '.' })), sources: [] };
 }
-export async function readAppliedVersions() {
-  say('readAppliedVersions');
+const refusal = (message) => ({ generation: 2, baselineGeneration: null, catchup: '02000_catchup_gen1.sql', retired: [], message });
+export async function readAppliedVersions(files) {
+  say('readAppliedVersions' + (Array.isArray(files) ? '' : ' (no files)'));
+  if (process.env.FAKE_REFUSAL) return { ok: false, versions: new Set(), error: process.env.FAKE_REFUSAL, refusal: refusal(process.env.FAKE_REFUSAL) };
   return { ok: true, versions: new Set(versions('FAKE_APPLIED')) };
 }
 export async function applyMigrations(files, options = {}) {
   say('applyMigrations ' + (files.map((file) => file.version).join(',') || '(none)'));
+  if (process.env.FAKE_APPLY_REFUSAL) {
+    return { ok: false, applied: 0, backend: 'postgres', error: process.env.FAKE_APPLY_REFUSAL, refusal: refusal(process.env.FAKE_APPLY_REFUSAL) };
+  }
   const recorded = new Set(versions('FAKE_APPLIED'));
   const pending = files.filter((file) => !recorded.has(file.version));
   for (const file of pending) options.onApplied?.(file);
@@ -962,6 +991,50 @@ describe("npm run update's schema step and the migration engine it runs on", () 
     expect(run.output).toContain('Applied 1 migration(s) and re-applied the database grants.');
   });
 
+  // A squash leaves its retired versions recorded with no file behind them, and the catch-up reads them
+  // to decide what to replay. The monorepo clears them afterwards with db:migrate:repair-history, as the
+  // `supabase db push` that its db:migrate runs refuses while they remain. That script is in the root
+  // package.json alone, and nothing a standalone project runs refuses the rows, so each install is told
+  // its own way. Both used to be told to run the script, which a standalone project does not have.
+  it('tells each install what to do about versions a squash retired, naming only scripts it has', SPAWNS, () => {
+    const CROSSING = { FAKE_MIGRATIONS: '02000,02001,02002', FAKE_APPLIED: '00000000000041,00000000000042' };
+    const NOTICE = '2 version(s) are recorded in the database with no matching file:';
+    const MONOREPO_ADVICE = 'Afterwards, clear the retired rows once with npm run db:migrate:repair-history';
+    const STANDALONE_ADVICE = 'In a standalone project, leave them: this updater, the build hook and /setup use the history';
+
+    const standalone = runUpdate(makeEngineProject(VERSION, fakeEngine('99')), ['--db-only', '--yes'], CROSSING);
+    expect(standalone.status, standalone.output).toBe(0);
+    expect(standalone.output).toContain('standalone project (npm create nextblock → managed cloud)');
+    expect(warningsIn(standalone.output)).toContain(NOTICE);
+    expect(standalone.output).toContain(STANDALONE_ADVICE);
+    expect(standalone.output).toContain('if you run it on this database, docs/13-STAYING-UP-TO-DATE.md');
+    expect(standalone.output).toContain('("The contract every applier honours") says when it is safe to remove them.');
+    expect(standalone.output).not.toContain('db:migrate');
+    expect(standalone.output).toContain('Applied 3 migration(s) and re-applied the database grants.');
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-update-retired-git-'));
+    roots.push(root);
+    const checkout = path.join(root, 'checkout');
+    const script = path.join(checkout, 'apps', 'nextblock', 'tools', 'update.mjs');
+    mkdirSync(path.join(checkout, 'libs', 'db', 'src', 'supabase', 'migrations'), { recursive: true });
+    writeFiles(checkout, {
+      'nx.json': '{}\n',
+      [path.relative(checkout, script)]: readFileSync(UPDATE_SCRIPT, 'utf8'),
+      [path.join('apps', 'nextblock', ENGINE_FILE)]: fakeEngine('99'),
+    });
+    const bin = makeBin(root);
+    const fork = { FAKE_GIT_ORIGIN: 'https://github.com/someone/my-site.git' };
+
+    const monorepo = runUpdate({ project: checkout, bin, script, schema: true }, ['--db-only', '--yes'], { ...fork, ...CROSSING }, ['--require', path.join(bin, 'fake-git.cjs')]);
+    expect(monorepo.status, monorepo.output).toBe(0);
+    expect(monorepo.output).toContain('Nx monorepo fork');
+    expect(warningsIn(monorepo.output)).toContain(NOTICE);
+    expect(monorepo.output).toContain(MONOREPO_ADVICE);
+    expect(monorepo.output).toContain('(it detects the squash and offers to reconcile). Do not run it first — the catch-up');
+    expect(monorepo.output).not.toContain(STANDALONE_ADVICE);
+    expect(monorepo.output).toContain('Applied 3 migration(s) and re-applied the database grants.');
+  });
+
   it('re-applies the database grants when nothing is pending, and not under --check, --skip-db, a conflict hold or Docker', SPAWNS, () => {
     const site = makeEngineProject(VERSION, fakeEngine('99'));
 
@@ -1060,6 +1133,76 @@ describe("npm run update's schema step and the migration engine it runs on", () 
         'The database grants were not re-applied: the migration engine this update brought did not load (above).',
       );
     }
+  });
+
+  // An empty migration history over a database with content that never crossed the last squash: the
+  // engine refuses to apply over it (emptyHistoryRefusal in tools/lib/migrate-core.mjs, which
+  // migrate-core.test.mjs runs against a database). The updater stops before it lists or asks anything,
+  // applies nothing and fails the run, with the engine's message and what that means for the install:
+  // only the monorepo has db:migrate and db:migrate:repair-history (its root package.json).
+  it('stops on an empty history the engine refuses, applies nothing, and tells each install what to do', SPAWNS, () => {
+    const MESSAGE =
+      'The migration history (supabase_migrations.schema_migrations) is empty, but this database already holds NextBlock content (public.site_settings). Restore it, then try again.';
+    const REFUSED = { FAKE_MIGRATIONS: '02000,02001,02002', FAKE_APPLIED: '', FAKE_REFUSAL: MESSAGE };
+    const REFUSING = 'Refusing to apply migrations to this database:';
+    const BUILD_HOOK = 'The build hook stops at the same point: a production build applies nothing until this is fixed.';
+    // The Done step, instead of a rebuild or a restart (or, under --check, "Run npm run update to apply").
+    const RERUN = 'The database was not changed. Fix what is described above, then run npm run update again.';
+    /** `output` with every run of whitespace as one space: the updater wraps the message. */
+    const flat = (output) => output.replace(/\s+/g, ' ');
+
+    // A standalone project, with and without --check, is told of no script it does not have.
+    const site = makeEngineProject(VERSION, fakeEngine('99'));
+    for (const flags of [['--db-only', '--yes'], ['--check']]) {
+      const run = runUpdate(site, flags, REFUSED);
+      expect(run.status, `${flags.join(' ')}\n${run.output}`).toBe(1);
+      expect(engineCalls(run.output, '99'), flags.join(' ')).toEqual(['loadEnvFiles', ...SCHEMA_READS]);
+      expect(run.output).toContain(REFUSING);
+      expect(flat(run.output)).toContain(MESSAGE);
+      expect(run.output).toContain(BUILD_HOOK);
+      expect(run.output).toContain(RERUN);
+      expect(run.output).not.toContain('db:migrate');
+      expect(run.output).not.toContain('pending migration(s):');
+      expect(run.output).not.toContain('Could not read the migration history');
+      expect(run.output).not.toContain('Rebuild and restart');
+      expect(run.output).not.toContain('Nothing was changed. Run "npm run update" to apply.');
+    }
+
+    // The monorepo is also told that db:migrate refuses it, and not to record its way past that.
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-update-refused-git-'));
+    roots.push(root);
+    const checkout = path.join(root, 'checkout');
+    const script = path.join(checkout, 'apps', 'nextblock', 'tools', 'update.mjs');
+    mkdirSync(path.join(checkout, 'libs', 'db', 'src', 'supabase', 'migrations'), { recursive: true });
+    writeFiles(checkout, {
+      'nx.json': '{}\n',
+      [path.relative(checkout, script)]: readFileSync(UPDATE_SCRIPT, 'utf8'),
+      [path.join('apps', 'nextblock', ENGINE_FILE)]: fakeEngine('99'),
+    });
+    const bin = makeBin(root);
+    const fork = { FAKE_GIT_ORIGIN: 'https://github.com/someone/my-site.git' };
+    const monorepo = runUpdate({ project: checkout, bin, script, schema: true }, ['--db-only', '--yes'], { ...fork, ...REFUSED }, ['--require', path.join(bin, 'fake-git.cjs')]);
+    expect(monorepo.status, monorepo.output).toBe(1);
+    expect(monorepo.output).toContain('Nx monorepo fork');
+    expect(engineCalls(monorepo.output, '99')).toEqual(['loadEnvFiles', ...SCHEMA_READS]);
+    expect(monorepo.output).toContain(REFUSING);
+    expect(flat(monorepo.output)).toContain(MESSAGE);
+    expect(monorepo.output).toContain('npm run db:migrate refuses this database too. Do not get past it with');
+    expect(monorepo.output).toContain("npm run db:migrate:repair-history: it records only this generation's versions, so the");
+    expect(monorepo.output).toContain('catch-up would still find no retired version recorded, and replay that whole generation.');
+    expect(monorepo.output).toContain(BUILD_HOOK);
+    expect(monorepo.output).toContain(RERUN);
+
+    // A refusal from applyMigrations itself (the history emptied after it was read) reads the same, never
+    // as a failed migration that rolled back.
+    const late = runUpdate(site, ['--db-only', '--yes'], { FAKE_MIGRATIONS: '02000,02001,02002', FAKE_APPLIED: '', FAKE_APPLY_REFUSAL: MESSAGE });
+    expect(late.status, late.output).toBe(1);
+    expect(engineCalls(late.output, '99')).toEqual(['loadEnvFiles', ...SCHEMA_READS, 'applyMigrations 02000,02001,02002']);
+    expect(late.output).toContain(REFUSING);
+    expect(flat(late.output)).toContain(MESSAGE);
+    expect(late.output).toContain(RERUN);
+    expect(late.output).not.toContain('Migration failed after');
+    expect(late.output).not.toContain('The failed migration rolled back');
   });
 
   // The hold reads the project with real git, and git merge-file writes its markers with CRLF when the

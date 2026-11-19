@@ -20,9 +20,13 @@ npm run update -- --db-only # schema only: pending migrations and the database g
 ```
 
 > **Windows (PowerShell):** a bare `--` is stripped by the shell, so every flagged form above
-> silently runs a *full* update instead. Invoke the script directly:
+> silently runs a *full* update instead. Invoke the script directly, from the project root:
 >
 > ```powershell
+> # a project made with npm create nextblock
+> node tools/update.mjs --check
+> node tools/update.mjs --db-only
+> # the monorepo (Vercel 1-click, fork or clone)
 > node apps/nextblock/tools/update.mjs --check
 > node apps/nextblock/tools/update.mjs --db-only
 > ```
@@ -482,14 +486,48 @@ Supabase CLI, the rules are the same:
   `SUPABASE_ACCESS_TOKEN` + a project ref are available — robust on IPv4 build networks),
   otherwise a direct Postgres connection via `POSTGRES_URL` / `DATABASE_URL`.
 
-> **Edge case:** if your project's migration history is empty/inconsistent, the hook skips
-> rather than risk misapplying. Run `npm run db:migrate:repair-history` then
-> `npm run db:migrate` once to reconcile (see [docs/04](./04-DATABASE-AND-AUTH.md)). If the
-> history still lists versions retired by a squash, `repair-history` detects that and offers
-> to reconcile the squash instead — take the offer; the plain repair is for a wiped history.
+> **Edge case: a history these appliers did not write.** `npm run update`, the build hook and
+> `/setup` apply each file whose version is not recorded, so a recorded version with no file, like
+> the ones a squash retires, changes nothing for them (the catch-up, `GG000_catchup_*`, reads those
+> rows to decide what to replay), and recorded versions without `public.site_settings` (the schema
+> was dropped) are cleared so every file runs again. Since 0.23.7 they refuse one shape, before
+> writing anything: an **empty** history over a database that has `public.site_settings`, when
+> `site_settings.migration_baseline_generation` is unset or below the folder's generation (it never
+> crossed the last squash, so the catch-up would replay the whole retired generation over its
+> content), or when the list holds a retired generation's file (it would run again as written). The
+> build hook logs it and the build goes on, `npm run update` fails and says what to do, and `/setup`
+> shows it. An empty database, and one born at or crossed to the current generation, still get every
+> file (docs/04 → "Production migration policy"). The way out is the history: restore
+> `supabase_migrations.schema_migrations` from a backup, or copy it from the database a
+> `public`-only dump came from (docs/04 → "How a squash crosses live databases"). What else to do
+> depends on the install:
+>
+> - **Monorepo:** `npm run db:migrate` is stricter: it refuses to apply the baseline over an
+>   empty history, and it stops while retired versions remain, which the `supabase db push` it
+>   runs would refuse. Run `npm run db:migrate:repair-history` then `npm run db:migrate` once to
+>   reconcile (see [docs/04](./04-DATABASE-AND-AUTH.md)). If the history still lists versions
+>   retired by a squash, `repair-history` detects that and offers to reconcile the squash instead
+>   — take the offer; the plain repair is for a wiped history on a database at the current
+>   generation. On one that never crossed the last squash, restore the history instead: the repair
+>   records only this generation's versions, and the catch-up would then replay the retired one.
+> - **Standalone project** (`npm create nextblock`): `db:migrate` and `db:migrate:repair-history`
+>   exist only in the monorepo's root `package.json`, and nothing here needs them. Leave retired
+>   versions in the history (`npm run update` lists them on every run). An empty history over a
+>   database at the current generation replays and records every file again, which every migration
+>   is written to survive (docs/04 → "Production migration policy"), and the catch-up skips itself
+>   there. One the appliers refuse needs its history restored, or, when the refusal names only
+>   retired files on a database that crossed already, those files removed from
+>   `supabase/migrations` (they came with the scaffold; nothing needs them). Only the Supabase CLI objects to retired versions: if you run it on this
+>   database, `supabase db push` refuses while they remain and prints the
+>   `supabase migration repair --status reverted …` command that removes them. Run it only once
+>   the catch-up has run (it is recorded, and `site_settings.migration_baseline_generation` holds
+>   the current generation, `2` today): until then those rows are its only record of what not to
+>   replay. Never record the catch-up with `--status applied`, as a recorded version never runs
+>   ([docs/04](./04-DATABASE-AND-AUTH.md) → "How a squash crosses live databases").
 >
 > **Windows:** PowerShell strips a bare `--`, so `npm run update -- --db-only` runs a full
-> update instead of the database-only one. Use `node apps/nextblock/tools/update.mjs --db-only`.
+> update instead of the database-only one. Use `node tools/update.mjs --db-only` (in the
+> monorepo, `node apps/nextblock/tools/update.mjs --db-only`).
 
 ---
 
@@ -524,6 +562,109 @@ ship: `verify-lib-dist.js` check 14 compares the file names (not the SQL).
 ## Upgrade notes
 
 Most releases need nothing beyond `npm run update`. These ask for a step of your own.
+
+### 0.23.7 — Product stock at scale, a stock backfill, a published change applied once, products created in part
+
+These concern every install. Migration 02046 changes how stock is written (it adds no table, column
+or policy), and 02047 adds one table, `product_stock_publishes`, that the stock rule counts from.
+
+- **Migrations 02046 and 02047.** They apply like any other migration ("Build-time migrations"
+  above): `npm run update` applies them when it has a database connection, after copying them into
+  `supabase/migrations` in a project made with `npm create nextblock` (a monorepo install gets them
+  through the merge); otherwise the build hook does at the next production build. A Docker project
+  applies them on `npm run docker:up`. `npm run update` asks first ("Apply N migration(s) now?", unless
+  you pass `--yes` or `CI=true` is set); the build hook and `npm run docker:up` do not. Run the query
+  in the backfill bullet below before any of them.
+  - **Coming from 0.23.5 or earlier, outside Docker,** also take the 0.23.6 grant step below
+    (rebuild with the build hook on, or run `npm run update -- --db-only` once): the updater you came
+    from applies 02046 and 02047 with its own grant pass, which leaves `anon` able to call the three
+    functions 02046 adds (`upsert_inventory_items`, `update_inventory_quantities`,
+    `delete_inventory_items`), and `anon` a SELECT and `authenticated` a DELETE on 02047's
+    `product_stock_publishes`, until this release's pass takes that back. The functions run with the
+    caller's own rights and `anon` can write no inventory, so such a call fails, and the table's row
+    policies still refuse those reads and deletes. Coming from 0.23.6 needs nothing more: its updater runs
+    this release's grant pass.
+  - **Until they are applied:** Cortex AI and MCP clients cannot write `inventory_items` (the call
+    answers that the function is missing); the CMS writes stock as in 0.23.6, and a publish counts a
+    draft's stock as 0.23.6 did.
+  - **By hand:** an install that applies migrations itself (the monorepo's `npm run db:migrate`)
+    runs `npm run db:migrate:check` first, confirms 02046 and 02047 are listed as pending, then runs
+    `npm run db:migrate`.
+- **The backfill gives shared stock its lowest figure.** 02046 gives every SKU a sale can deduct
+  (each variant's, and the SKU of each product without variants; blank ones aside) the inventory row
+  it lacks, holding the lowest stock among the variants and products that carry the SKU, and from
+  then on they all show that figure. The CMS Inventory screen does the same for the SKUs it lists
+  each time it opens, so where staff use that screen few such SKUs are left. Where a SKU's carriers
+  agree, its stock stays as it was; where several carry it at different figures (translations whose
+  stock drifted apart, two products sharing a SKU), the higher ones are replaced by the lowest. A
+  product with variants that carries one of those SKUs then shows as its total the sum of its
+  variants' inventory rows, as every stock change computes it: a total last computed while a variant
+  had no row now counts that variant, and a variant with a blank SKU counts 0. Before you update, run
+  this read-only query in the Supabase SQL editor. It lists each SKU whose carriers disagree, the
+  figure they will all show and the highest one now:
+
+  ```sql
+  WITH carrier AS (
+    SELECT v.sku, GREATEST(COALESCE(v.stock_quantity, 0), 0) AS quantity
+      FROM public.product_variants v
+    UNION ALL
+    SELECT p.sku, GREATEST(COALESCE(p.stock, 0), 0)
+      FROM public.products p
+     WHERE NOT EXISTS (SELECT 1 FROM public.product_variants v WHERE v.product_id = p.id)
+  )
+  SELECT c.sku, min(c.quantity) AS stock_after, max(c.quantity) AS highest_now, count(*) AS carriers
+    FROM carrier c
+   WHERE NULLIF(trim(c.sku), '') IS NOT NULL
+     AND NOT EXISTS (SELECT 1 FROM public.inventory_items i WHERE i.sku = c.sku)
+   GROUP BY c.sku
+  HAVING min(c.quantity) <> max(c.quantity)
+   ORDER BY c.sku;
+  ```
+
+  No rows: nothing to do. Otherwise keep the list, update, then set the stock of each listed SKU on
+  the Inventory screen where the lowest figure is wrong. An install that updates itself ("Track A"
+  above) applies 02046 at its next build, so run the query before then if you can: afterwards it
+  lists nothing, and the higher figures survive only in a database backup from before the update.
+  Then check, on the Inventory screen, the stock of SKUs that translations or several products share.
+- **Large stock publishes no longer time out.** Once 02046 has run, the 0.23.6 note's warning that a
+  product publish changing the stock of hundreds of SKUs can pass the 8 s statement timeout no longer
+  applies: the inventory trigger now runs once per statement, not once per row. On local replays a
+  publish changing 500 SKUs beside 2,000 other products took about 0.7 s, and a thousand SKUs 2 to
+  4 s. A draft that failed to publish that way can be published again. Two orders paid at the same
+  moment for variants of one product no longer deadlock in their stock deduction, nor does a stock
+  write from the CMS or Cortex AI with a publish (docs/09 → "Stock: only what the editor changed"
+  lists the cases left).
+- **A change already published is not applied again** (02047). An autosave that lands just after a
+  publish, or a tab opened before it, starts the draft again with the stock its page loaded before
+  that publish, and through 0.23.6 a publish of that draft applied the change again once a sale had
+  moved the stock. The edit page now records which publish it loaded the stock after, and the publish
+  counts such a draft's figures from the ones that publish entered: the same figures again leave the
+  stock as the store has it, sales since included (loaded 5, typed 10 and published, one sold: 9
+  stays, where 14 was written before), with a warning naming each such SKU, and a figure typed after
+  that publish lands as typed (12 after 10 was published from a load of 5: 12, where 17 was written
+  before). Drafts saved before the upgrade carry no such record and publish as before.
+- **A product created in part opens its edit page.** Through 0.23.6, when the CMS created a product
+  and its stock write then failed (it could lose a lock race with a publish or a sale of a SKU it
+  shares, as a translation's does), the page reported a failed create although the product existed,
+  and its categories were not saved. Now every step after the product row is checked (images, tax
+  setting, SEO fields, sale schedule, stock, categories), the stock write is retried, and a product
+  created in part opens on its edit page with a notice naming what was not saved: set the stock on
+  the Inventory screen, check the rest on the page, then save. Cortex AI's `create_cms_product`
+  reports such a product as created, naming the steps that failed. A product whose create reported a
+  failure before the update may exist without its categories: check the product list before you
+  create it again.
+- **Cortex AI and MCP clients write inventory rows in SKU order.** `execute_database_mutation` and
+  `execute_database_action_plan` write `inventory_items` through 02046's functions: a row carries
+  only `sku` and `quantity`, and an update sets only `quantity`. A call that names another column
+  (`created_at`, `updated_at`) is refused before confirmation.
+- **An empty migration history over an older database is refused.** `npm run update`, the build hook
+  and `/setup` now stop before writing anything when `supabase_migrations.schema_migrations` is
+  empty on a database that has content but never crossed the last squash, or when the migration list
+  holds a file from a retired generation: the catch-up would have replayed the whole retired
+  generation over that content. The build hook logs it and the build goes on; `npm run update` fails
+  and says what to do ("The contract every applier honours" above). A database whose history is
+  recorded sees no change. A project made with `npm create nextblock` whose history holds versions a
+  squash retired is no longer told to run the monorepo's `db:migrate` scripts: leave those rows.
 
 ### 0.23.6 — Supabase Storage on your own domain, two scripts, two missing files, product stock, media usage
 
@@ -1116,7 +1257,7 @@ The first three are for projects made with `npm create nextblock`; monorepo inst
 | :--- | :--- |
 | To update **any** install | `npm run update` |
 | To see what would change first | `npm run update -- --check` |
-| To know what a release asks of you after updating | "Upgrade notes" above (0.23.6: Supabase Storage images on a domain other than `*.supabase.co` (a `next.config.js` edit or one `.env` value), two monorepo scripts to delete, `npm run update -- --force` once for projects scaffolded before 0.22.3 (then check `package.json`), a rebuild or `npm run update -- --db-only` after the update that applies migrations 02043 to 02045, and a stock check of product drafts saved before the upgrade; 0.23.4: standalone builds that failed on `vitest`, the check of products published after a description-block or in-page edit (master from 2026-05-22, npm 0.8.11 through 0.23.3), the review of product drafts saved before the upgrade, the Freemius Product ID and webhook listeners, the license recheck, the `media` bucket limits, a second `npm run update` for the `postcss` browser alias, which also names block editors of your own that need a loader line). |
+| To know what a release asks of you after updating | "Upgrade notes" above (0.23.7: a read-only query, run before the update, that lists the SKUs whose stock migration 02046's backfill lowers, then the Inventory screen, and the 0.23.6 grant step when coming from 0.23.5 or earlier; 0.23.6: Supabase Storage images on a domain other than `*.supabase.co` (a `next.config.js` edit or one `.env` value), two monorepo scripts to delete, `npm run update -- --force` once for projects scaffolded before 0.22.3 (then check `package.json`), a rebuild or `npm run update -- --db-only` after the update that applies migrations 02043 to 02045, and a stock check of product drafts saved before the upgrade; 0.23.4: standalone builds that failed on `vitest`, the check of products published after a description-block or in-page edit (master from 2026-05-22, npm 0.8.11 through 0.23.3), the review of product drafts saved before the upgrade, the Freemius Product ID and webhook listeners, the license recheck, the `media` bucket limits, a second `npm run update` for the `postcss` browser alias, which also names block editors of your own that need a loader line). |
 | Fully hands-off updates | Fork **public**, deploy on Vercel, **enable Actions** once. |
 | To update a **Docker** install | `npm run update` then `npm run docker:up` |
 | To apply only pending migrations, or re-apply the database grants | `npm run update -- --db-only` |

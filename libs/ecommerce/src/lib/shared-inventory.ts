@@ -85,9 +85,45 @@ function mergeUsageType(
   return 'mixed';
 }
 
+/**
+ * What an inventory write does to a SKU that already has a row: 'update' sets its quantity, 'nothing'
+ * leaves it as it is (only the missing rows are created).
+ */
+type InventoryConflictRule = 'update' | 'nothing';
+
+/** Postgres answers for a write that lost a lock race and wrote nothing: a deadlock, a serialization failure, a lock timeout. */
+const RETRIED_INVENTORY_WRITE_CODES = new Set(['40P01', '40001', '55P03']);
+const INVENTORY_WRITE_ATTEMPTS = 3;
+const INVENTORY_WRITE_RETRY_DELAY_MS = 40;
+
+/** The function of migration 02046 is unknown: PostgREST's schema cache lacks it (PGRST202) or Postgres does (42883). */
+function isMissingInventoryWriteFunction(error: { code?: string | null } | null | undefined) {
+  return error?.code === 'PGRST202' || error?.code === '42883';
+}
+
+function inventoryWriteError(error: { message?: string | null; code?: string | null }) {
+  return Object.assign(new Error(error.message || 'The inventory rows were not saved.'), {
+    code: error.code ?? undefined,
+  });
+}
+
+/**
+ * Writes inventory rows through public.upsert_inventory_items (migration 02046), which takes them in SKU
+ * order in one statement: the order publish_product_draft and a sale's deduction lock inventory rows in
+ * (the sku column's collation, which a JavaScript sort does not reproduce, so the database sorts). Sent
+ * to PostgREST as a list they were written in the order given (a new product's variants in form order,
+ * the Inventory screen's missing rows in title order), and a write that held a later SKU of a publish
+ * while the publish held an earlier one deadlocked with it (40P01). Each SKU is trimmed and written once
+ * (the last quantity given wins), a blank one is skipped, and quantities are whole numbers from 0.
+ *
+ * A write that lost a lock race wrote nothing, and the same rows again are the same write, so it is
+ * tried up to INVENTORY_WRITE_ATTEMPTS times. A database without 02046 gets the PostgREST upsert of
+ * 0.23.6 and earlier, in the order given.
+ */
 async function upsertInventoryRows(
   supabase: SupabaseClient<Database>,
-  rows: Array<{ sku: string; quantity: number }>
+  rows: Array<{ sku: string; quantity: number }>,
+  onConflict: InventoryConflictRule = 'update'
 ) {
   const normalizedRows = Array.from(
     rows.reduce<Map<string, { sku: string; quantity: number }>>((accumulator, row) => {
@@ -109,12 +145,32 @@ async function upsertInventoryRows(
     return;
   }
 
-  const { error } = await (supabase as any)
-    .from('inventory_items')
-    .upsert(normalizedRows, { onConflict: 'sku' });
+  for (let attempt = 1; ; attempt += 1) {
+    const { error } = await (supabase as any).rpc('upsert_inventory_items', {
+      p_rows: normalizedRows,
+      p_on_conflict: onConflict,
+    });
 
-  if (error) {
-    throw new Error(error.message);
+    if (!error) {
+      return;
+    }
+
+    if (isMissingInventoryWriteFunction(error)) {
+      const { error: tableError } = await (supabase as any)
+        .from('inventory_items')
+        .upsert(normalizedRows, { onConflict: 'sku', ignoreDuplicates: onConflict === 'nothing' });
+
+      if (tableError) {
+        throw inventoryWriteError(tableError);
+      }
+      return;
+    }
+
+    if (attempt >= INVENTORY_WRITE_ATTEMPTS || !RETRIED_INVENTORY_WRITE_CODES.has(error.code)) {
+      throw inventoryWriteError(error);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, INVENTORY_WRITE_RETRY_DELAY_MS * attempt));
   }
 }
 
@@ -278,7 +334,9 @@ export async function getInventoryItems(client?: SupabaseClient<Database>) {
     });
 
   if (missingRows.length > 0) {
-    await upsertInventoryRows(supabase, missingRows);
+    // Only the rows still missing: one a sale or a publish created since the read above keeps its
+    // quantity (an upsert set it back to the fallback read before it).
+    await upsertInventoryRows(supabase, missingRows, 'nothing');
     inventoryBySku = await getInventoryQuantitiesBySku(supabase, usedSkus);
   }
 

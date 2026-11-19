@@ -15,6 +15,22 @@ function getDirectDatabaseUrl() {
   return process.env.POSTGRES_URL || process.env.DATABASE_URL || null;
 }
 
+/**
+ * public.apply_order_inventory_deduction (migration 02046) in the app's own transaction, statement for
+ * statement: the order row lock and the inventory_deducted_at guard, the track-quantities switch, then
+ * three statements (order-inventory.test.ts holds each to the function's):
+ *   1. the order's lines, read once: per (product, variant) the SKU it deducts from (its variant's when
+ *      variant_id is set, else its product's), the stock that variant or product shows and the quantity
+ *      bought, in SKU order, leaving out a SKU that is empty once trim() removes its spaces (until
+ *      2026-11-19 this fallback skipped only an empty SKU, and deducted a SKU of spaces the function
+ *      skips);
+ *   2. every inventory row those SKUs name, in SKU order and in one statement: a missing row created from
+ *      that stock, one there locked (ON CONFLICT ... WHERE false writes nothing to it). Each deduction
+ *      writes the variant and product rows carrying its SKU (the inventory trigger), so a sale that locked
+ *      its rows one by one could hold a product row while it waited for an inventory row another sale or
+ *      a publish held, whose trigger waited for that product row;
+ *   3. each SKU's total off its row, never below 0, in one statement.
+ */
 async function applyOrderInventoryDeductionViaSql(orderId: string) {
   const dbUrl = getDirectDatabaseUrl();
 
@@ -63,105 +79,51 @@ async function applyOrderInventoryDeductionViaSql(orderId: string) {
         return;
       }
 
-      // The lines in the order of the SKU each one locks below (the variant's when variant_id is set,
-      // else the product's), as apply_order_inventory_deduction takes them since migration 02044 and
-      // publish_product_draft locks inventory rows: two writers taking the same SKUs in one order never
-      // hold each other's next row (order-inventory.test.ts holds this query to the function's).
-      const orderItems = await sql<
-        {
-          product_id: string | null;
-          variant_id: string | null;
-          quantity: number;
-        }[]
-      >`
-        SELECT
-          product_id,
-          variant_id,
-          SUM(quantity)::integer AS quantity
-        FROM public.order_items
-        WHERE order_id = ${orderId}
-        GROUP BY product_id, variant_id
-        ORDER BY CASE
-                   WHEN order_items.variant_id IS NOT NULL
-                     THEN (SELECT v.sku FROM public.product_variants v WHERE v.id = order_items.variant_id)
-                   ELSE (SELECT p.sku FROM public.products p WHERE p.id = order_items.product_id)
-                 END,
-                 product_id,
-                 variant_id
+      const lines = await sql<{ sku: string; current_quantity: number; quantity: number }[]>`
+        SELECT line.sku, line.current_quantity, line.quantity
+          FROM (
+            SELECT order_items.product_id,
+                   order_items.variant_id,
+                   CASE WHEN order_items.variant_id IS NOT NULL THEN v.sku ELSE p.sku END AS sku,
+                   CASE
+                     WHEN order_items.variant_id IS NOT NULL THEN GREATEST(COALESCE(v.stock_quantity, 0), 0)
+                     ELSE GREATEST(COALESCE(p.stock, 0), 0)
+                   END AS current_quantity,
+                   SUM(order_items.quantity)::integer AS quantity
+              FROM public.order_items
+              LEFT JOIN public.product_variants v ON v.id = order_items.variant_id
+              LEFT JOIN public.products p ON p.id = order_items.product_id
+             WHERE order_items.order_id = ${orderId}
+             GROUP BY order_items.product_id, order_items.variant_id, v.sku, v.stock_quantity, p.sku, p.stock
+          ) AS line
+         WHERE NULLIF(trim(line.sku), '') IS NOT NULL
+         ORDER BY line.sku, line.product_id, line.variant_id
       `;
 
-      for (const item of orderItems) {
-        if (item.variant_id) {
-          const variantRows = await sql<
-            {
-              sku: string | null;
-              stock_quantity: number | null;
-            }[]
-          >`
-            SELECT
-              sku,
-              stock_quantity
-            FROM public.product_variants
-            WHERE id = ${item.variant_id}
-            LIMIT 1
-          `;
-          const variant = variantRows[0];
+      if (lines.length > 0) {
+        const skus = lines.map((line) => line.sku);
+        const currentQuantities = lines.map((line) => line.current_quantity);
+        const quantities = lines.map((line) => line.quantity);
 
-          if (!variant?.sku) {
-            continue;
-          }
+        await sql`
+          INSERT INTO public.inventory_items AS inventory (sku, quantity)
+          SELECT DISTINCT ON (line.sku) line.sku, line.current_quantity
+            FROM unnest(${skus}::text[], ${currentQuantities}::integer[]) WITH ORDINALITY AS line(sku, current_quantity, position)
+           ORDER BY line.sku, line.position
+              ON CONFLICT (sku) DO UPDATE SET quantity = inventory.quantity WHERE false
+        `;
 
-          await sql`
-            INSERT INTO public.inventory_items (sku, quantity)
-            VALUES (${variant.sku}, ${Math.max(0, variant.stock_quantity ?? 0)})
-            ON CONFLICT (sku) DO NOTHING
-          `;
-
-          await sql`
-            UPDATE public.inventory_items
-            SET
-              quantity = GREATEST(COALESCE(quantity, 0) - ${item.quantity}, 0),
-              updated_at = now()
-            WHERE sku = ${variant.sku}
-          `;
-
-          continue;
-        }
-
-        if (item.product_id) {
-          const productRows = await sql<
-            {
-              sku: string | null;
-              stock: number | null;
-            }[]
-          >`
-            SELECT
-              sku,
-              stock
-            FROM public.products
-            WHERE id = ${item.product_id}
-            LIMIT 1
-          `;
-          const product = productRows[0];
-
-          if (!product?.sku) {
-            continue;
-          }
-
-          await sql`
-            INSERT INTO public.inventory_items (sku, quantity)
-            VALUES (${product.sku}, ${Math.max(0, product.stock ?? 0)})
-            ON CONFLICT (sku) DO NOTHING
-          `;
-
-          await sql`
-            UPDATE public.inventory_items
-            SET
-              quantity = GREATEST(COALESCE(quantity, 0) - ${item.quantity}, 0),
-              updated_at = now()
-            WHERE sku = ${product.sku}
-          `;
-        }
+        await sql`
+          UPDATE public.inventory_items AS inventory
+             SET quantity = GREATEST(COALESCE(inventory.quantity, 0) - bought.quantity, 0),
+                 updated_at = now()
+            FROM (
+              SELECT line.sku, SUM(line.quantity)::integer AS quantity
+                FROM unnest(${skus}::text[], ${quantities}::integer[]) AS line(sku, quantity)
+               GROUP BY line.sku
+            ) AS bought
+           WHERE inventory.sku = bought.sku
+        `;
       }
 
       await sql`

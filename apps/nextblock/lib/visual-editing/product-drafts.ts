@@ -30,6 +30,7 @@ import {
   buildPoisonedProductDraftPublishError,
   buildUnreadableProductDraftPublishError,
   completeProductDraftValues,
+  describeProductStockChangeStart,
   findPoisonedProductDraftFields,
   findUnreadableProductDraftValues,
   listProductStockEntries,
@@ -272,17 +273,30 @@ function readUpdatedAt(row: unknown): string | null {
  *   publish), wrong for one meant to come on top of what moved the stock (loaded 10, 9 typed for a
  *   damaged unit, one sold meanwhile: 9 stays where 8 was meant). The rule stays on purpose, and the
  *   warning names every SKU it decides (review 2026-11-18).
+ * - `already_published` (migration 02047): the draft's baseline was loaded before the product's last
+ *   publish, which used the same baseline entry and entered the draft's quantity (`loaded` = `entered`),
+ *   so the SKU was left as it was: that publish made the change live, and what moved the stock since stays
+ *   (loaded 5, typed 10 and published, one sold, the same values again: 9, not 14). Wrong for a figure
+ *   meant to replace the stock as it now is, so the warning names it.
+ * `fromLastPublish` (migration 02047): `loaded` is the quantity the product's last publish entered, which
+ * the function counted the draft's change from instead of its baseline entry (that publish used the same
+ * entry): 10 published from a load of 5, then 12 typed on that page, publishes 12, not 17.
  */
 export interface AdjustedProductStock {
   sku: string;
-  reason: "moved" | "already_live";
+  reason: "moved" | "already_live" | "already_published";
   entered: number;
   loaded: number;
   current: number | null;
   published: number;
+  /** Absent reads as false (the function adds `from_last_publish` only when it counted from that figure). */
+  fromLastPublish?: boolean;
 }
 
-/** `stock_adjusted` as the function answers it; `reason` "already_live" is that kind, anything else (none included) moved. */
+/**
+ * `stock_adjusted` as the function answers it; `reason` "already_live" or "already_published" is that
+ * kind, anything else (none included) moved.
+ */
 function readAdjustedProductStock(value: unknown): AdjustedProductStock[] {
   const isCount = (count: unknown): count is number => typeof count === "number" && Number.isFinite(count);
   return (Array.isArray(value) ? value : []).flatMap((entry) =>
@@ -290,11 +304,15 @@ function readAdjustedProductStock(value: unknown): AdjustedProductStock[] {
       ? [
           {
             sku: entry.sku,
-            reason: entry.reason === "already_live" ? ("already_live" as const) : ("moved" as const),
+            reason:
+              entry.reason === "already_live" || entry.reason === "already_published"
+                ? (entry.reason as "already_live" | "already_published")
+                : ("moved" as const),
             entered: entry.entered,
             loaded: entry.loaded,
             current: isCount(entry.current) ? entry.current : null,
             published: entry.published,
+            fromLastPublish: entry.from_last_publish === true,
           },
         ]
       : []
@@ -318,22 +336,25 @@ function readPublishResult(data: unknown) {
  * - moved: the change was applied to the stock at publishing, which a sale, the Inventory screen, an
  *   import or a translation's publish had moved since the change started, instead of replacing it, so
  *   nothing sold meanwhile came back;
- * - already live: the stock already held the draft's figure, so the change was not applied on top of it.
- * Each says when to correct the stock. It names the draft, never the publisher: the figures may be another
- * editor's autosave, or a hand-written draft's that nobody typed (any WRITER can write a draft's
- * quantities and its `stock_baseline` over PostgREST). The draft bar shows it in a toast that stays until
- * it is dismissed.
+ * - already live: the stock already held the draft's figure, so the change was not applied on top of it;
+ * - already published (migration 02047): the product's last publish already entered the draft's figure,
+ *   from a draft started on a page loaded before it, so it was not applied again.
+ * A change counted from the figure the last publish entered says so (describeProductStockChangeStart, as
+ * the edit page's notes do). Each part says when to correct the stock. It names the draft, never the
+ * publisher: the figures may be another editor's autosave, or a hand-written draft's that nobody typed
+ * (any WRITER can write a draft's quantities, its `stock_baseline` and its `stock_baseline_publish_count`
+ * over PostgREST). The draft bar shows it in a toast that stays until it is dismissed.
  */
 export function describeAdjustedProductStock(adjusted: readonly AdjustedProductStock[]) {
   const parts: string[] = [];
 
-  const moved = adjusted.filter((entry) => entry.reason !== "already_live");
+  const moved = adjusted.filter((entry) => entry.reason === "moved");
   if (moved.length > 0) {
     const one = moved.length === 1;
     const list = listProductStockEntries(
       moved.map((entry) => {
         const meanwhile = entry.current === null ? "" : `, and it was ${entry.current} at publishing`;
-        return `${entry.sku} is now ${entry.published} (the draft changed ${entry.loaded} to ${entry.entered}${meanwhile})`;
+        return `${entry.sku} is now ${entry.published} (the draft changed ${describeProductStockChangeStart(entry.loaded, entry.fromLastPublish === true)} to ${entry.entered}${meanwhile})`;
       })
     );
     parts.push(
@@ -349,13 +370,26 @@ export function describeAdjustedProductStock(adjusted: readonly AdjustedProductS
     const list = listProductStockEntries(
       alreadyLive.map((entry) => {
         const atPublishing = entry.current === null ? "" : `, and it was already ${entry.current} at publishing`;
-        return `${entry.sku} stays at ${entry.published} (the draft changed ${entry.loaded} to ${entry.entered}${atPublishing})`;
+        return `${entry.sku} stays at ${entry.published} (the draft changed ${describeProductStockChangeStart(entry.loaded, entry.fromLastPublish === true)} to ${entry.entered}${atPublishing})`;
       })
     );
     parts.push(
       one
         ? `The stock already showed this draft's figure at publishing, so the change was not applied on top of it: ${list}. If the change was meant to come on top of what moved the stock (a damaged unit taken out after a sale, for example), correct the stock.`
         : `The stock already showed this draft's figures at publishing, so the changes were not applied on top of them: ${list}. If a change was meant to come on top of what moved the stock (a damaged unit taken out after a sale, for example), correct the stock.`
+    );
+  }
+
+  const alreadyPublished = adjusted.filter((entry) => entry.reason === "already_published");
+  if (alreadyPublished.length > 0) {
+    const one = alreadyPublished.length === 1;
+    const list = listProductStockEntries(
+      alreadyPublished.map((entry) => `${entry.sku} stays at ${entry.published} (the last publish entered ${entry.entered})`)
+    );
+    parts.push(
+      one
+        ? `This draft was started on a page loaded before the product's last publish, which already entered its stock figure, so the figure was not applied again and what sold or changed since stays: ${list}. If the figure was meant to replace the stock as it now is, correct the stock.`
+        : `This draft was started on a page loaded before the product's last publish, which already entered its stock figures, so the figures were not applied again and what sold or changed since stays: ${list}. If a figure was meant to replace the stock as it now is, correct the stock.`
     );
   }
 
@@ -837,7 +871,11 @@ export async function publishProductVisualEditingDraft(
       // image the gallery drops). Its `stock_baseline` (the stock the edit page loaded) goes along, for
       // the SKUs the live product stocks: the function writes a SKU's stock only where the draft's
       // quantity differs from it and from the current stock, as a change to the stock as it is at
-      // publishing (migration 02044), so a sale since the page load stays.
+      // publishing (migration 02044), so a sale since the page load stays. So does its
+      // `stock_baseline_publish_count` (the product's publish count when that page loaded): for a baseline
+      // loaded before the product's last publish, the function counts a SKU whose entry that publish used
+      // from the quantity that publish entered (migration 02047), so a change it made live is not applied
+      // again. The function reads the product's last publish itself, under the products row lock.
       values = buildProductDraftPublishValues(
         completeProductDraftValues(draft.meta as Record<string, unknown>, liveProduct) as unknown as ProductFormValues
       );

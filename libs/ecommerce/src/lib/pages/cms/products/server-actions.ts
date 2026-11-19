@@ -9,6 +9,7 @@ import { toProductGalleryDraftEntries } from '../../../product-gallery';
 import {
   createProduct as createProductLib,
   deleteProduct as deleteProductLib,
+  isProductCreatedIncompleteError,
   syncCategoriesForTranslationGroup
 } from '../../../product-actions';
 import { syncProductSaleCouponToFreemius } from '../../../freemius-coupons';
@@ -46,12 +47,27 @@ export async function createProductAction(data: ProductFormValues) {
     (currencies || []).map((currency) => normalizeCurrencyRecord(currency))
   );
 
-  const createdProduct = await createProductLib(supabase, sanitizedData);
+  // A product createProduct() created but could not finish (a step after its RPC failed: the stock, the
+  // categories...) exists: the editor is sent to it, with a notice naming what to set again, never shown
+  // a failed create (the form would offer to create it a second time).
+  let productId: string | null = null;
+  let failedSteps: string[] = [];
+  try {
+    const createdProduct = await createProductLib(supabase, sanitizedData);
+    productId = createdProduct?.id ?? null;
+  } catch (error) {
+    if (!isProductCreatedIncompleteError(error)) {
+      throw error;
+    }
+    console.error('[createProductAction] The product was created, but a step after it failed:', error.message);
+    productId = error.productId;
+    failedSteps = error.failedSteps;
+  }
 
-  if (sanitizedData.payment_provider === 'freemius' && createdProduct?.id) {
+  if (sanitizedData.payment_provider === 'freemius' && productId) {
     try {
       await syncProductSaleCouponToFreemius({
-        productId: createdProduct.id,
+        productId,
         client: serviceClient,
       });
     } catch (couponError) {
@@ -60,7 +76,11 @@ export async function createProductAction(data: ProductFormValues) {
   }
 
   revalidatePath('/cms/products');
-  redirect('/cms/products');
+  redirect(
+    productId && failedSteps.length > 0
+      ? `/cms/products/${encodeURIComponent(productId)}/edit?created_incomplete=${encodeURIComponent(failedSteps.join(','))}`
+      : '/cms/products'
+  );
 }
 
 /**

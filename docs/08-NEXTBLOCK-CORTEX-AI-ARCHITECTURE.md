@@ -2642,6 +2642,19 @@ The Pydantic-shaped layer here is Zod. Every layer a payload crosses:
    descriptions only while `products.updated_at` is not later than the draft's
    `created_at` (docs/09 → "Product Drafts"). `ai-global-agent-db-tools.test.ts` checks
    that a migration creates the column for every writable table whose entry lists it.
+   `inventory_items` is written through the inventory functions of migration 02046
+   (`executeInventoryMutation`): an insert or upsert through `upsert_inventory_items`
+   (`'error'` or `'update'` on an existing row), an update through
+   `update_inventory_quantities` and a delete through `delete_inventory_items`, each on
+   the rows its filter matched just before the write (those its confirmation named in
+   `execute_database_mutation`; in an action plan an earlier action can change what a
+   later one matches, as on every table). They take the rows in SKU order in one statement,
+   the order a product draft publish and a sale lock them in: PostgREST wrote an insert
+   or upsert in the order given and an update or delete in plan order, and could
+   deadlock with a publish. A row is a `sku` and a `quantity` and an update sets the
+   `quantity` only (refused before the confirmation otherwise): the database keeps
+   `created_at` and `updated_at`, and a SKU is renamed on its product, so no
+   `updated_at` stamp is sent.
 7. Database. Postgres enforces `check_exactly_one_parent` on `blocks`, the JSONB
    type checks on `content_drafts`, and the custom block definition checks above.
    There is no CHECK on `blocks.content` itself: the application layers above are

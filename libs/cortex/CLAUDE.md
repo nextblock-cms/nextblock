@@ -49,6 +49,12 @@ Modules: `ai-global-agent-tools.ts` (`createCortexGlobalAgentTools(context)`) pl
   every `products` update or upsert whatever the call carries (`ALWAYS_STAMPED_TABLES`: no trigger
   keeps it, and the app's pre-0.23.4 draft rule reads it). List `updated_at` only for a table whose
   migrations create it (`ai-global-agent-db-tools.test.ts`; PostgREST would refuse the update).
+  `inventory_items` is the exception: it goes through the inventory functions of migration 02046
+  (`executeInventoryMutation`: rows in SKU order, as a publish and a sale lock them), a row is a
+  `sku` and a `quantity`, an update sets the `quantity` only, and an update or delete writes the
+  rows its filter matched just before the write (`execute_database_mutation`: those its
+  confirmation named; an action plan reads each action's targets again when it runs, so an earlier
+  action can change them, as on every table).
 
 ## Gotchas
 - No call site reads `result.usage`; cached-token counts are not logged anywhere.

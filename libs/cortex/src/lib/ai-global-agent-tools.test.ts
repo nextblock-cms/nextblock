@@ -14,6 +14,8 @@ vi.mock('node:dns', () => {
 // itself (pinned DNS, redirect hops, byte cap) is tested against a real server in
 // ai-global-agent-ssrf.test.ts.
 const pageFetch = vi.hoisted(() => ({ html: null as string | null }));
+/** When set, the mocked createProduct() inserts the row, then fails a later step (ProductCreatedIncompleteError's shape). */
+const createProductFailure = vi.hoisted(() => ({ failedSteps: null as string[] | null }));
 
 vi.mock('./fetch-host-guard', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./fetch-host-guard')>();
@@ -149,8 +151,22 @@ vi.mock('@nextblock-cms/ecommerce/product-actions', async () => {
         })
         .select('*');
 
+      if (createProductFailure.failedSteps) {
+        throw Object.assign(
+          new Error(`The product was created, but its ${createProductFailure.failedSteps.join(', ')} could not be saved: stock: deadlock detected`),
+          // A uuid in a real database; this mock numbers its rows.
+          { name: 'ProductCreatedIncompleteError', productId: String(data?.[0]?.id), failedSteps: createProductFailure.failedSteps }
+        );
+      }
+
       return data?.[0] ?? null;
     },
+    // The real check's contract (libs/ecommerce product-actions.ts): the name and both fields.
+    isProductCreatedIncompleteError: (error: unknown) =>
+      error instanceof Error &&
+      error.name === 'ProductCreatedIncompleteError' &&
+      typeof (error as { productId?: unknown }).productId === 'string' &&
+      Array.isArray((error as { failedSteps?: unknown }).failedSteps),
     productSchema,
     updateProduct: async (supabase: any, id: string, input: Record<string, any>) => {
       const { data } = await supabase
@@ -3269,6 +3285,30 @@ describe('Cortex AI global agent tool executors', () => {
     expect(productBlocks.map((row) => row.block_type)).toEqual(['heading', 'text']);
     // check_exactly_one_parent: page_id/post_id must stay null for a product block.
     expect(productBlocks.every((row) => row.page_id === null && row.post_id === null)).toBe(true);
+  });
+
+  it('a product createProduct() created but could not finish (its stock write failed) still gets its blocks, and is reported created with the steps to set again, never as a failed create', async () => {
+    const { database, supabase } = createMockSupabase();
+    createProductFailure.failedSteps = ['stock'];
+    try {
+      const result = (await executeConfirmed(
+        executeCreateCmsProduct,
+        {
+          blocks: [{ blockType: 'text', content: { html_content: '<p>Traditional herbal support.</p>' } }],
+          price: 25,
+          title: 'Chanca Piedra',
+        },
+        { actorUserId: 'admin-1', revalidatePath: () => undefined, supabase }
+      )) as { blockCount: number; entityId: string; incompleteSteps?: string[]; success: boolean; warning?: string };
+
+      const productId = String(database.products[0].id);
+      expect(result).toMatchObject({ success: true, blockCount: 1, entityId: productId, incompleteSteps: ['stock'] });
+      expect(result.warning).toContain('The product was created, but its stock could not be saved');
+      expect(database.products).toHaveLength(1);
+      expect(database.blocks.filter((row) => String(row.product_id) === productId)).toHaveLength(1);
+    } finally {
+      createProductFailure.failedSteps = null;
+    }
   });
 
   it('names the description blocks in the product confirmation', async () => {

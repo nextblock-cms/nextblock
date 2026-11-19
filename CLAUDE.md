@@ -70,7 +70,18 @@ mirrors all but `db/types`).
   change to the current stock, so a sale made while the page was open stays sold; it first locks
   the inventory rows a sale could hold against it, in the order a sale takes them, and warns of each
   SKU left `already_live` or applied to a stock that `moved` (docs/09 → "Stock: only what the editor
-  changed").
+  changed"). Since 02047 the edit page reads `product_stock_publishes` (each product's last
+  product-values publish: its count and each SKU's baseline entry and figure) BEFORE the product and
+  records its count beside the baseline (`stock_baseline_publish_count`); a baseline whose count is
+  below the product's counts a SKU whose entry that publish used from the figure it entered
+  (`already_published` when equal), and the page mirrors it (`reconcileProductDraftStock`). Only an
+  ADMIN's publish writes that table; change the rule in the function and the page together.
+- `inventory_items` writers take their rows in SKU order in one statement (02046): through
+  `upsert_inventory_items` / `update_inventory_quantities` / `delete_inventory_items`
+  (`upsertInventoryRows` in libs/ecommerce, Cortex's DB tool), never a multi-row PostgREST write,
+  which deadlocks with a publish. Its trigger syncs variant and product stock once per statement
+  (`private.sync_inventory_caches`); a product whose only change from inserted rows is its total
+  keeps its `updated_at`.
 
 ## Auth and data access
 

@@ -20,6 +20,17 @@ export interface SchemaApplyResult {
   ok: boolean;
   applied: number;
   error?: string;
+  /** Set, with ok false and nothing written, when an empty history is refused (emptyHistoryRefusal). */
+  refusal?: EmptyHistoryRefusal;
+}
+
+/** Why an apply over an empty migration history was refused; see emptyHistoryRefusal. */
+export interface EmptyHistoryRefusal {
+  generation: number;
+  baselineGeneration: number | null;
+  catchup: string | null;
+  retired: string[];
+  message: string;
 }
 
 /**
@@ -208,7 +219,11 @@ end $nb_trg$;`;
 // release_paypal_affiliate_payout). Migration 02043 keeps anon off publish_product_draft and
 // product_revision_content (the atomic product draft publish), as off upsert_product_with_variants.
 // Migration 02045 adds media_usage (the media library's usage lookup, called with the service role
-// after the app's own staff check).
+// after the app's own staff check). Migration 02046 keeps anon off the inventory writes in SKU order
+// (upsert_inventory_items, update_inventory_quantities, delete_inventory_items), as off
+// publish_product_draft.
+// Migration 02047 keeps anon off product_stock_publishes and
+// authenticated from deleting its rows (staff read it, an ADMIN's publish writes it).
 // tools/lib/migrate-core.mjs carries the same two blocks for the build-time hook;
 // tools/lib/migrate-core.test.mjs fails when the two copies drift.
 const API_ROLE_REVOKE_SQL = `do $nb_api$
@@ -403,6 +418,10 @@ begin
   if to_regprocedure('public.product_revision_content(uuid)') is not null then
     revoke execute on function public.product_revision_content(uuid) from public, anon;
   end if;
+  if to_regclass('public.product_stock_publishes') is not null then
+    revoke select on table public.product_stock_publishes from anon;
+    revoke delete on table public.product_stock_publishes from authenticated;
+  end if;
   if to_regprocedure('public.bump_email_2fa_attempts(uuid)') is not null then
     revoke execute on function public.bump_email_2fa_attempts(uuid) from public, anon, authenticated;
   end if;
@@ -511,6 +530,15 @@ begin
   if to_regprocedure('public.media_usage(jsonb)') is not null then
     revoke execute on function public.media_usage(jsonb) from public, anon, authenticated;
   end if;
+  if to_regprocedure('public.upsert_inventory_items(jsonb, text)') is not null then
+    revoke execute on function public.upsert_inventory_items(jsonb, text) from public, anon;
+  end if;
+  if to_regprocedure('public.update_inventory_quantities(text[], integer)') is not null then
+    revoke execute on function public.update_inventory_quantities(text[], integer) from public, anon;
+  end if;
+  if to_regprocedure('public.delete_inventory_items(text[])') is not null then
+    revoke execute on function public.delete_inventory_items(text[]) from public, anon;
+  end if;
 end $nb_api$;`;
 
 const GRANTS_SQL =
@@ -536,6 +564,74 @@ function recordSql(version: string, file: string): string {
  */
 function transactionalMigration(version: string, file: string, sqlText: string): string {
   return `begin;\n${sqlText}\n;\n${recordSql(version, file)}\ncommit;`;
+}
+
+// The squash generation a database is at, as the catch-up (GG000) writes it as its last statement and
+// the baseline seed when it builds an empty database. `#>> '{}'` reads the jsonb scalar as text, as the
+// catch-up does. tools/lib/migrate-core.mjs carries the same query; migrate-core.test.mjs pins both.
+const BASELINE_GENERATION_SQL =
+  "select value #>> '{}' as generation from public.site_settings where key = 'migration_baseline_generation';";
+
+/** The generation in BASELINE_GENERATION_SQL's rows; null when the key is unset or holds no number. */
+function baselineGenerationOf(rows: ReadonlyArray<Record<string, unknown>>): number | null {
+  const generation = Number.parseInt(String(rows[0]?.generation ?? ''), 10);
+  return Number.isFinite(generation) ? generation : null;
+}
+
+/**
+ * Why migrations must not be applied over an empty migration history, or null when they may be. The
+ * appliers ask only for a database that has public.site_settings, before they write anything.
+ *
+ * Every file runs over an empty history. A database born at the folder's squash generation, or one
+ * that crossed it, survives that (docs/04 → "Production migration policy"). One that never crossed
+ * does not: the catch-up decides what to replay from the recorded versions, so with none recorded it
+ * runs the whole retired generation again over content that already has it (docs/04 → "How a squash
+ * crosses live databases"). A retired generation's file in the list runs again as written whatever the
+ * marker says: a standalone project keeps the files it was scaffolded with in supabase/migrations.
+ * tools/lib/migrate-core.mjs explains it in full and carries the same function, which
+ * migrate-core.test.mjs holds this one to, message included.
+ */
+export function emptyHistoryRefusal(
+  names: string[],
+  baselineGeneration: number | null,
+): EmptyHistoryRefusal | null {
+  const versionOf = (name: string) => name.split('_')[0];
+  // The folder's generation: the highest GG of a GGNNN file. A retired 14-digit file has none.
+  const generations = names
+    .map((name) => /^(\d{2})\d{3}$/.exec(versionOf(name)))
+    .filter((match): match is RegExpExecArray => match !== null);
+  if (generations.length === 0) return null;
+  const generation = Math.max(...generations.map((match) => Number.parseInt(match[1], 10)));
+  // Every retired generation sorts below this one's first version (docs/04 → "Current reality"); a
+  // project's own timestamp-numbered migration sorts above it and is not NextBlock's to judge.
+  const first = `${String(generation).padStart(2, '0')}000`;
+  const retired = names.filter((name) => versionOf(name) < first).sort();
+  const crossed = baselineGeneration !== null && baselineGeneration >= generation;
+  if (crossed && retired.length === 0) return null;
+
+  const catchup = names.find((name) => versionOf(name) === first) ?? null;
+  const sentences = [
+    'The migration history (supabase_migrations.schema_migrations) is empty, but this database already holds NextBlock content (public.site_settings).',
+  ];
+  if (!crossed) {
+    sentences.push(
+      `It never crossed squash generation ${generation} (site_settings.migration_baseline_generation is ${baselineGeneration ?? 'unset'}), ` +
+        `and ${catchup ?? `the generation-${generation} catch-up`} decides what to replay from the recorded versions: ` +
+        `with none recorded, it would run every generation-${generation - 1} migration again over that content.`,
+    );
+  }
+  if (retired.length > 0) {
+    const range = retired.length === 1 ? retired[0] : `${retired[0]} … ${retired[retired.length - 1]}`;
+    sentences.push(`${retired.length} file(s) from a retired squash generation (${range}) would ${crossed ? '' : 'also '}run again as written.`);
+  }
+  const docs = '(docs/13-STAYING-UP-TO-DATE.md, "The contract every applier honours")';
+  sentences.push(
+    crossed
+      ? `This database crossed generation ${generation} already, so nothing needs those files any more: remove them from supabase/migrations, or restore the history, and try again ${docs}.`
+      : 'Restore supabase_migrations.schema_migrations from a backup of this database (a dump of the public schema alone leaves it out: ' +
+          `copy it from the database the dump came from), then try again ${docs}.`,
+  );
+  return { generation, baselineGeneration, catchup, retired, message: sentences.join(' ') };
 }
 
 // Destructive reset: drop the public schema (all app tables + triggers) and the
@@ -694,26 +790,34 @@ async function applyViaManagementApi(
 
   let applied = 0;
   try {
-    await run(TRACKING_DDL);
+    // The history is read before anything is created, so a refusal below leaves the database as it was.
+    const tracked =
+      toRows(await run("select to_regclass('supabase_migrations.schema_migrations')::text as t;"))[0]?.t != null;
     const done = new Set(
-      toRows(await run('select version from supabase_migrations.schema_migrations;'))
-        .map((r) => r.version)
-        .filter(Boolean) as string[],
+      tracked
+        ? (toRows(await run('select version from supabase_migrations.schema_migrations;'))
+            .map((r) => r.version)
+            .filter(Boolean) as string[])
+        : [],
     );
+    const populated = toRows(await run("select to_regclass('public.site_settings') as t;"))[0]?.t != null;
 
     // Self-heal stale history: if versions are recorded but a core table is missing
     // (e.g. someone ran DROP SCHEMA public CASCADE without clearing the history, which
     // lives in the separate supabase_migrations schema), those records are lying — clear
     // them and re-apply everything from scratch.
-    if (done.size > 0) {
-      const exists =
-        toRows(await run("select to_regclass('public.site_settings') as t;"))[0]?.t != null;
-      if (!exists) {
-        await run('delete from supabase_migrations.schema_migrations;');
-        done.clear();
-      }
+    if (done.size > 0 && !populated) {
+      await run('delete from supabase_migrations.schema_migrations;');
+      done.clear();
     }
 
+    // Nothing recorded over a database with content: see emptyHistoryRefusal.
+    if (done.size === 0 && populated) {
+      const refusal = emptyHistoryRefusal(files, baselineGenerationOf(toRows(await run(BASELINE_GENERATION_SQL))));
+      if (refusal) return { ok: false, applied, error: refusal.message, refusal };
+    }
+
+    await run(TRACKING_DDL);
     for (const file of files) {
       const version = file.split('_')[0];
       if (done.has(version)) continue;
@@ -746,24 +850,40 @@ async function applyViaPostgres(
   const db = postgres(dbUrl, { ssl: 'require', onnotice: () => undefined, max: 1 });
   let applied = 0;
   try {
-    await db.unsafe(TRACKING_DDL);
-    const rows = await db<{ version: string }[]>`
-      select version from supabase_migrations.schema_migrations
-    `;
+    // The history is read before anything is created, so a refusal below leaves the database as it was.
+    const tracked = (
+      await db<{ t: string | null }[]>`
+        select to_regclass('supabase_migrations.schema_migrations')::text as t
+      `
+    )[0]?.t;
+    const rows: ReadonlyArray<{ version: string }> = tracked
+      ? await db<{ version: string }[]>`
+          select version from supabase_migrations.schema_migrations
+        `
+      : [];
     const done = new Set(rows.map((r) => r.version));
+    const populated = Boolean(
+      (
+        await db<{ t: string | null }[]>`
+          select to_regclass('public.site_settings')::text as t
+        `
+      )[0]?.t,
+    );
 
     // Self-heal stale history (see Management API backend): recorded versions but a core
     // table missing means the schema was wiped without clearing history — re-apply all.
-    if (done.size > 0) {
-      const sentinel = await db<{ t: string | null }[]>`
-        select to_regclass('public.site_settings')::text as t
-      `;
-      if (!sentinel[0]?.t) {
-        await db`delete from supabase_migrations.schema_migrations`;
-        done.clear();
-      }
+    if (done.size > 0 && !populated) {
+      await db`delete from supabase_migrations.schema_migrations`;
+      done.clear();
     }
 
+    // Nothing recorded over a database with content: see emptyHistoryRefusal.
+    if (done.size === 0 && populated) {
+      const refusal = emptyHistoryRefusal(files, baselineGenerationOf(await db.unsafe(BASELINE_GENERATION_SQL)));
+      if (refusal) return { ok: false, applied, error: refusal.message, refusal };
+    }
+
+    await db.unsafe(TRACKING_DDL);
     for (const file of files) {
       const version = file.split('_')[0];
       if (done.has(version)) continue;

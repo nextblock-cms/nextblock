@@ -14,6 +14,8 @@ import { z } from './zod-config';
 
 type SupabaseLike = {
   from: (table: string) => any;
+  /** inventory_items writes go through the inventory functions of migration 02046 (executeInventoryMutation). */
+  rpc?: (fn: string, args?: Record<string, unknown>) => any;
 };
 
 type ToolExecutionContext = {
@@ -201,6 +203,44 @@ async function assertValidBlockRowContent(params: {
 }
 
 /**
+ * What an inventory_items write may carry (executeInventoryMutation sends it to the inventory functions of
+ * migration 02046): an inserted or upserted row is a SKU and a quantity, an update sets the quantity. The
+ * database keeps created_at and updated_at (on_inventory_items_update stamps every update), and a SKU is
+ * renamed on its product, never here: an inventory row renamed alone leaves its products on the old SKU.
+ */
+function assertInventoryMutationShape(input: z.infer<typeof executeDatabaseMutationInputSchema>) {
+  if (input.operation === 'insert' || input.operation === 'upsert') {
+    for (const [index, row] of (input.rows ?? []).entries()) {
+      const extra = Object.keys(row).filter((column) => column !== 'sku' && column !== 'quantity');
+
+      if (extra.length > 0) {
+        throw new Error(
+          `An inventory_items row is a sku and a quantity (rows[${index}] also sets ${extra.join(', ')}): the database keeps created_at and updated_at.`
+        );
+      }
+
+      if (typeof row.sku !== 'string' || row.sku.trim() === '') {
+        throw new Error(`rows[${index}] needs a sku.`);
+      }
+
+      if (row.quantity === undefined || row.quantity === null) {
+        throw new Error(`rows[${index}] (${row.sku}) needs a quantity.`);
+      }
+    }
+  }
+
+  if (input.operation === 'update') {
+    const columns = Object.keys(input.values ?? {});
+
+    if (columns.length !== 1 || columns[0] !== 'quantity') {
+      throw new Error(
+        'An inventory_items update sets the quantity only: the database keeps created_at and updated_at, and a SKU is renamed on its product.'
+      );
+    }
+  }
+}
+
+/**
  * Content-aware checks that `validateMutationInput` cannot do synchronously:
  * `blocks.content` against its block type and known `site_settings` values against
  * their shape. Runs before the confirmation preview so a bad payload never earns a
@@ -211,6 +251,11 @@ async function validateMutationPayloads(
   table: TableName,
   context?: ToolExecutionContext
 ) {
+  if (table === 'inventory_items') {
+    assertInventoryMutationShape(input);
+    return;
+  }
+
   if (table === 'site_settings') {
     for (const row of input.rows ?? []) {
       if (typeof row.key === 'string') {
@@ -1379,11 +1424,59 @@ function withUpdatedAtStamp(
   };
 }
 
+/**
+ * inventory_items through the inventory functions of migration 02046, which take the rows in SKU order in
+ * one statement, the order publish_product_draft and a sale's deduction lock them in. PostgREST wrote an
+ * insert or upsert in the order given and an update or delete by filter in plan order, so a write holding
+ * a later SKU of a publish while the publish held an earlier one deadlocked with it (40P01). An insert
+ * fails on an existing row (23505) as before. An update or delete writes the targets the same filter read
+ * just before (targetRows): in execute_database_mutation the rows its confirmation phrase covers; an action
+ * plan reads each action's targets again when it runs, so an earlier action can change them, as on every
+ * table.
+ */
+async function executeInventoryMutation(
+  input: z.infer<typeof executeDatabaseMutationInputSchema>,
+  supabase: SupabaseLike,
+  targetRows: Array<Record<string, unknown>>
+) {
+  if (typeof supabase.rpc !== 'function') {
+    throw new Error('Writing inventory_items needs a Supabase client that can call database functions.');
+  }
+
+  const skus = targetRows.map((row) => row.sku).filter((sku): sku is string => typeof sku === 'string');
+  let result: { data: unknown; error: unknown };
+
+  if (input.operation === 'insert' || input.operation === 'upsert') {
+    result = await supabase.rpc('upsert_inventory_items', {
+      p_rows: (input.rows ?? []).map((row) => ({ sku: row.sku, quantity: row.quantity })),
+      p_on_conflict: input.operation === 'insert' ? 'error' : 'update',
+    });
+  } else if (input.operation === 'update') {
+    result = await supabase.rpc('update_inventory_quantities', {
+      p_skus: skus,
+      p_quantity: input.values?.quantity,
+    });
+  } else {
+    result = await supabase.rpc('delete_inventory_items', { p_skus: skus });
+  }
+
+  if (result.error) {
+    throw new Error(serializeError(result.error));
+  }
+
+  return Array.isArray(result.data) ? result.data : [];
+}
+
 async function executePreparedMutation(
   input: z.infer<typeof executeDatabaseMutationInputSchema>,
   table: TableName,
-  supabase: SupabaseLike
+  supabase: SupabaseLike,
+  targetRows: Array<Record<string, unknown>>
 ) {
+  if (table === 'inventory_items') {
+    return executeInventoryMutation(input, supabase, targetRows);
+  }
+
   const config = getTableConfig(table);
   const select = config.primaryKey.join(',');
   const payload = withUpdatedAtStamp(input, table);
@@ -1520,7 +1613,7 @@ export async function executeDatabaseMutation(
   }
 
   try {
-    const rows = await executePreparedMutation(parsed, table, supabase);
+    const rows = await executePreparedMutation(parsed, table, supabase, targetRows);
     const audit: AuditWriteResult = context?.skipAudit
       ? { auditLogged: false }
       : await writeAudit({

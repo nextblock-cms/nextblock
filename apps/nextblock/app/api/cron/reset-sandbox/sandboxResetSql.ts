@@ -26046,6 +26046,1310 @@ REVOKE ALL ON FUNCTION public.media_usage(jsonb) FROM PUBLIC, anon, authenticate
 GRANT EXECUTE ON FUNCTION public.media_usage(jsonb) TO service_role;
 
 
+-- >>> FROM: 02046_inventory_writes_in_sku_order.sql <<<
+-- 02046: stock writes take inventory rows in SKU order, and the inventory caches sync once per
+-- statement. Append-only, forward-only, re-runnable: the inventory trigger replaced (one row-level
+-- trigger by three statement-level ones, section 1), three inventory write functions added (section 2),
+-- the sale's deduction and the product draft publish replaced (sections 3 and 4), and a backfill of the
+-- missing inventory rows (section 5). No table, policy or column change. Closes what 02044 left open
+-- ("Not covered", "Not addressed").
+--
+-- 1. A publish that changes many SKUs. on_inventory_item_change ran public.sync_inventory_cache_for_sku
+--    once per inventory row written, and each run summed the variants of every product carrying the SKU
+--    again under the caller's row policies, so a publish's cost grew with the square of the SKUs it
+--    wrote. Measured 2026-11-19 on a local replay, as the ADMIN through \`authenticated\`, one product
+--    with 500 variants whose stock all changed: beside 50 other products 12 to 16 s, beside 2,000 other
+--    products 15 to 27 s, past the Data API's 8 s statement timeout for \`authenticated\` (57014: nothing
+--    written, the draft kept). Without the trigger the same publish took 0.9 to 2 s; with the inventory
+--    read policy checking the staff role first, 4.6 s (still a sum per SKU). Now three statement-level
+--    triggers (insert, update, delete, each with its transition table) hand the statement's SKUs to
+--    private.sync_inventory_caches, which writes each carrier once: the variants with those SKUs, the
+--    products without variants with them, and one total per product with a variant carrying one. The same
+--    publish: 0.9 to 1.5 s beside 50 products, 1.9 to 2.5 s beside 2,000 (0.6 to 0.8 s with this file
+--    applied on an idle machine). It also writes only what changes (a carrier already at the SKU's
+--    quantity keeps its row and its updated_at, so it is not locked either, and a publish is no longer
+--    refused NBP03 for a write that changed no stock), and it locks the products whose total it writes in
+--    id order before reading their variants: two syncs of two SKUs of one product (translations sharing
+--    both) took those rows in plan order, and the total read the other SKU's quantity from the
+--    statement's snapshot. A product is stamped (updated_at) when its own stock or one of its variants'
+--    changes, as 02001 stamped every carrier, and when only its total changes, except for rows a
+--    statement inserted: a row created from the stock its carriers show changes only a total the
+--    trigger computed while a variant had no row (a repair, not an edit), and stamped, the publish that
+--    created such a row refused itself (NBP03). A row inserted at another quantity than a carrier shows
+--    stamps that carrier's product, and a sale still trips a publish's NBP03.
+--    public.sync_inventory_cache_for_sku stays (nothing calls it now) as a wrapper of the same function.
+--
+-- 2. Multi-row inventory writers in another order. publish_product_draft and the sale lock inventory
+--    rows in SKU order (ORDER BY sku, the column's collation: a JavaScript sort does not reproduce it).
+--    upsertInventoryRows in libs/ecommerce sent its rows to PostgREST in the order it was handed:
+--    createProduct() writes a new product's variant SKUs in form order (a translation created on the
+--    CMS's new-product page carries its source's SKUs), and the Inventory screen writes its missing rows
+--    in title order. Cortex's execute_database_mutation inserted or upserted up to 20 rows in the given
+--    order, and updated or deleted by filter in plan order. Each could hold a later SKU of a publish while
+--    the publish held an earlier one (40P01). Now they write through these functions, which take the rows
+--    in SKU order in one statement:
+--      * public.upsert_inventory_items(p_rows jsonb, p_on_conflict text): rows { sku, quantity }, each SKU
+--        once; p_on_conflict 'update' (an upsert: the quantity), 'nothing' (only the missing rows, the
+--        others neither written nor locked) or 'error' (a plain insert: 23505 on an existing row);
+--      * public.update_inventory_quantities(p_skus text[], p_quantity integer): one quantity on those
+--        rows, locked in SKU order first;
+--      * public.delete_inventory_items(p_skus text[]): those rows, locked in SKU order first.
+--    All three are SECURITY INVOKER: the inventory_items policies decide (an ADMIN writes, the service
+--    role writes, nobody else: their write fails or touches nothing), so they can do nothing a caller
+--    could not do over PostgREST, only in SKU order. Each answers the rows it wrote. EXECUTE is revoked
+--    from PUBLIC and anon here and in API_ROLE_REVOKE_SQL (both copies), granted to authenticated and
+--    service_role.
+--
+-- 3. Two sales of one product's variants (since 02001). A sale locked each SKU's inventory row as it
+--    deducted it, and the row's trigger then wrote the product row, so a sale holding the product row
+--    could wait for an inventory row another sale held, whose trigger waited for that product row.
+--    public.apply_order_inventory_deduction now reads the order's lines once (each line's SKU as it was
+--    when the deduction started), takes every inventory row they name first, in SKU order and in one
+--    statement (a missing row is created from the stock its line's variant or product shows, as the loop
+--    did; a row there is locked: ON CONFLICT ... DO UPDATE ... WHERE false updates nothing and fires no
+--    update trigger, but locks the row), and only then deducts, in one statement, so it never holds a
+--    product row while it waits for an inventory row. The app's SQL fallback
+--    (applyOrderInventoryDeductionViaSql) runs the same three statements, so it skips the same SKUs too:
+--    one that is empty once trim() removes its spaces (until now the fallback deducted a SKU of spaces
+--    that the function skips).
+--
+-- 4. A SKU with no inventory row when a publish starts. The publish locked only the rows that existed,
+--    and its values helper created the missing ones last, so a sale that created such a row (its first
+--    sale) and then waited for a row the publish held deadlocked with it. publish_product_draft now takes
+--    its rows in one statement too: every SKU a sale could deduct of the products whose rows it can write
+--    (each variant's, and a product's own without variants, as stored) is created when it is missing and
+--    locked when it is there, and every other SKU of 02044's set is locked when it has a row (never
+--    created: a parent SKU of a product with variants, a SKU only the values carry). A row created there
+--    holds this product's stock as the values helper reads it (its first variant with the SKU, else its
+--    own stock), so the plan reads what it read before, or the least stock of the other products carrying
+--    it (as the Inventory screen creates one). It changes no carrier of this product, so the sync leaves
+--    this product's updated_at as it is (section 1) and the row never trips the publish's own NBP03.
+--    Everything else is 02044's, statement for statement.
+--
+-- 5. The backfill: every SKU a sale could deduct (each variant's, and a product's own without variants,
+--    as stored, blank ones aside) gets the inventory row it lacks, holding the least stock its carriers
+--    show, in one statement, so section 4 rarely needs to create one. Rows that exist are not touched.
+--
+-- Still not covered: a SKU another session adds to one of a publish's products between the publish's read
+-- of them and its locks; two writers creating the same new SKU at once (a publish adding a variant whose
+-- SKU a new product takes at the same moment); writers of products or variant rows that take several
+-- rows in another order (Cortex's execute_database_mutation on products or product_variants); cycles
+-- through other sessions. The database aborts one transaction of such a cycle (40P01), which writes
+-- nothing; createProduct() retries its stock write and reports a product it created but could not finish
+-- as created (libs/ecommerce product-actions.ts).
+--
+-- tools/scripts/product-draft-publish.db.test.ts runs these: the triggers' shape and a 500-SKU publish
+-- beside 2,000 products under the 8 s timeout, the caches every kind of write leaves (variants, a product
+-- without variants, totals, a delete, a statement that changes nothing, an insert that repairs a total
+-- unstamped, one at another figure stamped so a publish that read before it refuses), each writer in
+-- SKU order against a held row, two sales of one product's variants, a first
+-- sale against a publish of a SKU with no row, the backfill, and the SQL fallback's SKU of spaces; without
+-- a database, it holds section 4 to 02044's text but its one statement, and section 3 to its three steps.
+-- libs/ecommerce order-inventory.test.ts holds the SQL fallback to section 3's statements, and
+-- tools/scripts/migration-replay.db.test.ts replays every file over a migrated database.
+
+CREATE SCHEMA IF NOT EXISTS private;
+
+-- ---------------------------------------------------------------------------
+-- 1. The inventory caches, synced once per statement
+-- ---------------------------------------------------------------------------
+-- 02001's sync_inventory_cache_for_sku for a set of SKUs, in three statements: each SKU's quantity (0
+-- without a row, as for a deleted one) to the variants carrying it and to the products without variants
+-- carrying it; then each product with a variant carrying one takes the total of its variants' rows, held
+-- at 2147483647 (02044). A carrier already at its value is left out (not written, not locked). The
+-- products whose total it writes are locked in id order first, and the totals read after that lock.
+-- Stamps: a product whose own stock changes (a product without variants), or one of whose variants'
+-- stock changes, gets updated_at = now(), as 02001 stamped every carrier. A product whose only change
+-- is its total is stamped too unless \`p_stamp_products\` is false, which the trigger passes for the rows
+-- a statement inserted: a row created from the stock its carriers already show (a sale's first one, a
+-- kept SKU at publish, the Inventory screen's and section 5's backfills) changes no carrier's own stock,
+-- only a total the trigger computed while a variant had no row, a repair rather than an edit; stamped,
+-- it made the publish that created the row refuse itself (NBP03). A row inserted at another quantity
+-- than a carrier shows (the Inventory screen or Cortex creating a row for a carried SKU) changes that
+-- carrier and stamps its product. SECURITY INVOKER: the caller's row policies, as 02001's (an ADMIN or
+-- the service role; anyone else cannot write inventory_items).
+CREATE OR REPLACE FUNCTION private.sync_inventory_caches(p_skus text[], p_stamp_products boolean DEFAULT true)
+    RETURNS void
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_skus text[];
+  v_changed_products uuid[];
+BEGIN
+  SELECT array_agg(DISTINCT s.sku)
+    INTO v_skus
+    FROM unnest(p_skus) AS s(sku)
+   WHERE NULLIF(trim(s.sku), '') IS NOT NULL;
+
+  IF v_skus IS NULL THEN
+    RETURN;
+  END IF;
+
+  WITH changed AS (
+    UPDATE public.product_variants AS v
+       SET stock_quantity = COALESCE(i.quantity, 0),
+           updated_at = now()
+      FROM unnest(v_skus) AS s(sku)
+      LEFT JOIN public.inventory_items AS i ON i.sku = s.sku
+     WHERE v.sku = s.sku
+       AND v.stock_quantity IS DISTINCT FROM COALESCE(i.quantity, 0)
+    RETURNING v.product_id
+  )
+  SELECT COALESCE(array_agg(DISTINCT changed.product_id), '{}')
+    INTO v_changed_products
+    FROM changed;
+
+  UPDATE public.products AS p
+     SET stock = COALESCE(i.quantity, 0),
+         updated_at = now()
+    FROM unnest(v_skus) AS s(sku)
+    LEFT JOIN public.inventory_items AS i ON i.sku = s.sku
+   WHERE p.sku = s.sku
+     AND NOT EXISTS (SELECT 1 FROM public.product_variants AS v WHERE v.product_id = p.id)
+     AND p.stock IS DISTINCT FROM COALESCE(i.quantity, 0);
+
+  PERFORM 1
+     FROM public.products AS p
+    WHERE p.id IN (SELECT v.product_id FROM public.product_variants AS v WHERE v.sku = ANY (v_skus))
+    ORDER BY p.id
+      FOR UPDATE;
+
+  UPDATE public.products AS p
+     SET stock = totals.total,
+         updated_at = CASE WHEN p_stamp_products OR p.id = ANY (v_changed_products) THEN now() ELSE p.updated_at END
+    FROM (
+      SELECT v.product_id,
+             LEAST(COALESCE(SUM(COALESCE(i.quantity, 0)), 0), 2147483647)::integer AS total
+        FROM public.product_variants AS v
+        LEFT JOIN public.inventory_items AS i ON i.sku = v.sku
+       WHERE v.product_id IN (SELECT c.product_id FROM public.product_variants AS c WHERE c.sku = ANY (v_skus))
+       GROUP BY v.product_id
+    ) AS totals
+   WHERE p.id = totals.product_id
+     AND (p.stock IS DISTINCT FROM totals.total OR p.id = ANY (v_changed_products));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.sync_inventory_caches(text[], boolean) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.sync_inventory_caches(text[], boolean) TO authenticated, service_role;
+
+-- The statement's SKUs: the rows it inserted or updated (any column, as stored after the update), or the
+-- rows it deleted. A statement that wrote no row syncs nothing. For inserted rows a product whose only
+-- change is its total keeps its updated_at (see private.sync_inventory_caches).
+CREATE OR REPLACE FUNCTION public.handle_inventory_items_sync()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_skus text[];
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    SELECT array_agg(o.sku) INTO v_skus FROM old_rows AS o;
+  ELSE
+    SELECT array_agg(n.sku) INTO v_skus FROM new_rows AS n;
+  END IF;
+
+  PERFORM private.sync_inventory_caches(v_skus, TG_OP <> 'INSERT');
+  RETURN NULL;
+END;
+$$;
+
+-- A transition table needs a trigger per event. public.handle_inventory_item_change (02001's row-level
+-- function) stays: 02003 names it, and a replay creates that trigger again before this file drops it.
+DROP TRIGGER IF EXISTS on_inventory_item_change ON public.inventory_items;
+
+DROP TRIGGER IF EXISTS on_inventory_items_inserted ON public.inventory_items;
+CREATE TRIGGER on_inventory_items_inserted
+  AFTER INSERT ON public.inventory_items
+  REFERENCING NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();
+
+DROP TRIGGER IF EXISTS on_inventory_items_updated ON public.inventory_items;
+CREATE TRIGGER on_inventory_items_updated
+  AFTER UPDATE ON public.inventory_items
+  REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();
+
+DROP TRIGGER IF EXISTS on_inventory_items_deleted ON public.inventory_items;
+CREATE TRIGGER on_inventory_items_deleted
+  AFTER DELETE ON public.inventory_items
+  REFERENCING OLD TABLE AS old_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();
+
+-- Replaced, not dropped: the signature and the grants stay.
+CREATE OR REPLACE FUNCTION public.sync_inventory_cache_for_sku(p_sku text) RETURNS void
+    LANGUAGE plpgsql
+    SET search_path TO ''
+    AS $$
+BEGIN
+  PERFORM private.sync_inventory_caches(ARRAY[p_sku]);
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 2. Inventory writes in SKU order
+-- ---------------------------------------------------------------------------
+-- \`p_rows\`: a list of { "sku": text, "quantity": whole number }, nothing else, each SKU once (a blank
+-- SKU, a missing quantity or another key is refused, 22023; a repeated SKU 21000). The SKU is written
+-- as given (upsertInventoryRows trims its own). The rows are taken in SKU order in one statement.
+CREATE OR REPLACE FUNCTION public.upsert_inventory_items(p_rows jsonb, p_on_conflict text DEFAULT 'update')
+    RETURNS SETOF public.inventory_items
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_row record;
+  v_repeated text;
+BEGIN
+  IF p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array' THEN
+    RAISE EXCEPTION 'The inventory rows are not a list.' USING ERRCODE = '22023';
+  END IF;
+  IF p_on_conflict IS NULL OR p_on_conflict NOT IN ('update', 'nothing', 'error') THEN
+    RAISE EXCEPTION 'The conflict rule is ''update'', ''nothing'' or ''error'', not %.', COALESCE(p_on_conflict, 'null')
+      USING ERRCODE = '22023';
+  END IF;
+
+  FOR v_row IN
+    SELECT item.value, item.ordinality FROM jsonb_array_elements(p_rows) WITH ORDINALITY AS item(value, ordinality)
+  LOOP
+    IF jsonb_typeof(v_row.value) <> 'object' THEN
+      RAISE EXCEPTION 'Inventory row % is not an object.', v_row.ordinality USING ERRCODE = '22023';
+    END IF;
+    IF jsonb_typeof(v_row.value->'sku') IS DISTINCT FROM 'string' OR NULLIF(trim(v_row.value->>'sku'), '') IS NULL THEN
+      RAISE EXCEPTION 'Inventory row % has no SKU.', v_row.ordinality USING ERRCODE = '22023';
+    END IF;
+    IF jsonb_typeof(v_row.value->'quantity') IS NULL OR jsonb_typeof(v_row.value->'quantity') = 'null' THEN
+      RAISE EXCEPTION 'Inventory row % (%) has no quantity.', v_row.ordinality, v_row.value->>'sku' USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM jsonb_object_keys(v_row.value) AS k(key) WHERE k.key NOT IN ('sku', 'quantity')) THEN
+      RAISE EXCEPTION 'Inventory row % (%) sets more than a SKU and a quantity.', v_row.ordinality, v_row.value->>'sku'
+        USING ERRCODE = '22023';
+    END IF;
+  END LOOP;
+
+  SELECT item.value->>'sku'
+    INTO v_repeated
+    FROM jsonb_array_elements(p_rows) AS item(value)
+   GROUP BY item.value->>'sku'
+  HAVING count(*) > 1
+   LIMIT 1;
+  IF v_repeated IS NOT NULL THEN
+    RAISE EXCEPTION 'SKU % appears more than once.', v_repeated USING ERRCODE = '21000';
+  END IF;
+
+  IF p_on_conflict = 'update' THEN
+    RETURN QUERY
+    INSERT INTO public.inventory_items AS inventory (sku, quantity)
+    SELECT item.value->>'sku', (item.value->>'quantity')::integer
+      FROM jsonb_array_elements(p_rows) AS item(value)
+     ORDER BY item.value->>'sku'
+        ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity
+    RETURNING inventory.*;
+  ELSIF p_on_conflict = 'nothing' THEN
+    RETURN QUERY
+    INSERT INTO public.inventory_items AS inventory (sku, quantity)
+    SELECT item.value->>'sku', (item.value->>'quantity')::integer
+      FROM jsonb_array_elements(p_rows) AS item(value)
+     ORDER BY item.value->>'sku'
+        ON CONFLICT (sku) DO NOTHING
+    RETURNING inventory.*;
+  ELSE
+    RETURN QUERY
+    INSERT INTO public.inventory_items AS inventory (sku, quantity)
+    SELECT item.value->>'sku', (item.value->>'quantity')::integer
+      FROM jsonb_array_elements(p_rows) AS item(value)
+     ORDER BY item.value->>'sku'
+    RETURNING inventory.*;
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.upsert_inventory_items(jsonb, text) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.upsert_inventory_items(jsonb, text) TO authenticated, service_role;
+
+-- One quantity on the rows of \`p_skus\` (as stored), locked in SKU order before the update. A SKU
+-- without a row is skipped.
+CREATE OR REPLACE FUNCTION public.update_inventory_quantities(p_skus text[], p_quantity integer)
+    RETURNS SETOF public.inventory_items
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF p_skus IS NULL THEN
+    RAISE EXCEPTION 'No SKUs to update.' USING ERRCODE = '22023';
+  END IF;
+  IF p_quantity IS NULL THEN
+    RAISE EXCEPTION 'No quantity to set.' USING ERRCODE = '22023';
+  END IF;
+
+  PERFORM 1
+     FROM public.inventory_items AS inventory
+    WHERE inventory.sku = ANY (p_skus)
+    ORDER BY inventory.sku
+      FOR UPDATE;
+
+  RETURN QUERY
+  UPDATE public.inventory_items AS inventory
+     SET quantity = p_quantity
+   WHERE inventory.sku = ANY (p_skus)
+  RETURNING inventory.*;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.update_inventory_quantities(text[], integer) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.update_inventory_quantities(text[], integer) TO authenticated, service_role;
+
+-- The rows of \`p_skus\` (as stored), locked in SKU order before the delete. A SKU without a row is skipped.
+CREATE OR REPLACE FUNCTION public.delete_inventory_items(p_skus text[])
+    RETURNS SETOF public.inventory_items
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+BEGIN
+  IF p_skus IS NULL THEN
+    RAISE EXCEPTION 'No SKUs to delete.' USING ERRCODE = '22023';
+  END IF;
+
+  PERFORM 1
+     FROM public.inventory_items AS inventory
+    WHERE inventory.sku = ANY (p_skus)
+    ORDER BY inventory.sku
+      FOR UPDATE;
+
+  RETURN QUERY
+  DELETE FROM public.inventory_items AS inventory
+   WHERE inventory.sku = ANY (p_skus)
+  RETURNING inventory.*;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.delete_inventory_items(text[]) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.delete_inventory_items(text[]) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. The sale's deduction: the order's lines read once, its inventory rows taken first
+-- ---------------------------------------------------------------------------
+-- 02044's public.apply_order_inventory_deduction (the order row lock, the inventory_deducted_at guard, the
+-- track-quantities switch, a line's SKU: its variant's when variant_id is set, else its product's, skipped
+-- when trim() leaves it empty), in three steps instead of a loop that read, locked and deducted each line
+-- in turn:
+--   1. the order's lines are read once: per (product, variant), the SKU, the stock its variant or product
+--      shows and the quantity bought, in SKU order (02044's order). Read once, the SKUs are the ones the
+--      lines had when the deduction started: a line read again after a wait (a publish that dropped or
+--      renamed its variant meanwhile) gave the parent's SKU or the new one;
+--   2. one statement takes every row those SKUs name, in SKU order (see the header);
+--   3. one statement deducts each SKU's total from its row, never below 0 (the rows are held, so
+--      nothing waits; 02044 deducted line by line, which ends the same).
+-- Replaced, not dropped: the signature, the attributes (invoker, search_path) and the grants stay. The
+-- app's SQL fallback (applyOrderInventoryDeductionViaSql) runs the same three statements.
+CREATE OR REPLACE FUNCTION public.apply_order_inventory_deduction(p_order_id uuid) RETURNS void
+    LANGUAGE plpgsql
+    SET search_path TO 'public'
+    AS $$
+DECLARE
+  v_track_quantities boolean := public.get_ecommerce_track_quantities();
+  v_inventory_deducted_at timestamptz;
+  v_skus text[];
+  v_current_quantities integer[];
+  v_quantities integer[];
+BEGIN
+  SELECT inventory_deducted_at
+    INTO v_inventory_deducted_at
+  FROM public.orders
+  WHERE id = p_order_id
+  FOR UPDATE;
+
+  IF NOT FOUND OR v_inventory_deducted_at IS NOT NULL THEN
+    RETURN;
+  END IF;
+
+  IF NOT v_track_quantities THEN
+    UPDATE public.orders
+    SET inventory_deducted_at = now()
+    WHERE id = p_order_id;
+
+    RETURN;
+  END IF;
+
+  SELECT array_agg(line.sku ORDER BY line.sku, line.product_id, line.variant_id),
+         array_agg(line.current_quantity ORDER BY line.sku, line.product_id, line.variant_id),
+         array_agg(line.quantity ORDER BY line.sku, line.product_id, line.variant_id)
+    INTO v_skus, v_current_quantities, v_quantities
+    FROM (
+      SELECT order_items.product_id,
+             order_items.variant_id,
+             CASE WHEN order_items.variant_id IS NOT NULL THEN v.sku ELSE p.sku END AS sku,
+             CASE
+               WHEN order_items.variant_id IS NOT NULL THEN GREATEST(COALESCE(v.stock_quantity, 0), 0)
+               ELSE GREATEST(COALESCE(p.stock, 0), 0)
+             END AS current_quantity,
+             SUM(order_items.quantity)::integer AS quantity
+        FROM public.order_items
+        LEFT JOIN public.product_variants v ON v.id = order_items.variant_id
+        LEFT JOIN public.products p ON p.id = order_items.product_id
+       WHERE order_items.order_id = p_order_id
+       GROUP BY order_items.product_id, order_items.variant_id, v.sku, v.stock_quantity, p.sku, p.stock
+    ) AS line
+   WHERE NULLIF(trim(line.sku), '') IS NOT NULL;
+
+  IF v_skus IS NOT NULL THEN
+    INSERT INTO public.inventory_items AS inventory (sku, quantity)
+    SELECT DISTINCT ON (line.sku) line.sku, line.current_quantity
+      FROM unnest(v_skus, v_current_quantities) WITH ORDINALITY AS line(sku, current_quantity, position)
+     ORDER BY line.sku, line.position
+        ON CONFLICT (sku) DO UPDATE SET quantity = inventory.quantity WHERE false;
+
+    UPDATE public.inventory_items AS inventory
+       SET quantity = GREATEST(COALESCE(inventory.quantity, 0) - bought.quantity, 0),
+           updated_at = now()
+      FROM (
+        SELECT line.sku, SUM(line.quantity)::integer AS quantity
+          FROM unnest(v_skus, v_quantities) AS line(sku, quantity)
+         GROUP BY line.sku
+      ) AS bought
+     WHERE inventory.sku = bought.sku;
+  END IF;
+
+  UPDATE public.orders
+  SET inventory_deducted_at = now()
+  WHERE id = p_order_id;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4. The publish: its inventory rows taken in one statement, missing ones created
+-- ---------------------------------------------------------------------------
+-- 02044's public.publish_product_draft, statement for statement, but the statement that takes the
+-- inventory rows (see the header). Replaced, not dropped: the signature, the return type, the
+-- attributes and the grants stay, and so does its entry in API_ROLE_REVOKE_SQL.
+CREATE OR REPLACE FUNCTION public.publish_product_draft(
+    p_product_id uuid,
+    p_draft_id bigint,
+    p_draft_updated_at timestamp with time zone,
+    p_product_updated_at timestamp with time zone,
+    p_values jsonb,
+    p_overlay jsonb,
+    p_blocks jsonb
+)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_product public.products%ROWTYPE;
+  v_draft public.product_drafts%ROWTYPE;
+  v_before jsonb;
+  v_after jsonb;
+  v_revision jsonb;
+  v_values_result jsonb;
+  v_slug text;
+  v_payment_provider text;
+  v_value_variants jsonb;
+  v_stock_skus text[];
+  v_stock_products uuid[];
+BEGIN
+  IF NOT COALESCE(public.is_admin(), false) THEN
+    RAISE EXCEPTION 'Only an administrator can publish products.' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_values IS NOT NULL AND jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The product values to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_overlay IS NOT NULL AND jsonb_typeof(p_overlay) <> 'object' THEN
+    RAISE EXCEPTION 'The fields to publish are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_values IS NOT NULL AND p_overlay IS NOT NULL AND p_overlay <> '{}'::jsonb THEN
+    RAISE EXCEPTION 'A publish writes product values or overlay fields, not both.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF p_blocks IS NULL OR jsonb_typeof(p_blocks) <> 'array' THEN
+    RAISE EXCEPTION 'The description blocks to publish are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  -- Inventory rows, before the products row and in SKU order (02044's set): one statement creates the
+  -- missing row of each SKU a sale could deduct of those products (a variant's, or a product's own
+  -- without variants, as stored) and locks every row of the set that is there. A SKU of the set no sale
+  -- deducts (a parent SKU, one only the values carry) is locked when it has a row and never created.
+  -- ON CONFLICT ... DO UPDATE ... WHERE false writes nothing to an existing row and fires no update
+  -- trigger, but locks it. A row it creates holds this product's own stock for this product's SKUs, so
+  -- its sync (at the end of the statement) changes no carrier of this product and leaves its updated_at
+  -- as it is (02046 section 1): the product check below is not tripped by it.
+  IF p_values IS NOT NULL THEN
+    v_value_variants := COALESCE(p_values->'variants', '[]'::jsonb);
+    IF jsonb_typeof(v_value_variants) = 'array' THEN
+      v_stock_skus := ARRAY(
+        SELECT value_sku.sku
+          FROM (
+            SELECT btrim(item.value->>'sku') FROM jsonb_array_elements(v_value_variants) AS item(value)
+            UNION
+            SELECT btrim(p_values->>'sku') WHERE jsonb_array_length(v_value_variants) = 0
+          ) AS value_sku(sku)
+         WHERE value_sku.sku <> ''
+      );
+      v_stock_products := ARRAY(
+        SELECT p_product_id
+        UNION
+        SELECT p.id FROM public.products p WHERE p.sku = p_values->>'sku'
+        UNION
+        SELECT v.product_id FROM public.product_variants v WHERE v.sku = ANY (v_stock_skus)
+      );
+      v_stock_skus := v_stock_skus || ARRAY(
+        SELECT p.sku FROM public.products p WHERE p.id = ANY (v_stock_products) AND btrim(p.sku) <> ''
+        UNION
+        SELECT v.sku FROM public.product_variants v WHERE v.product_id = ANY (v_stock_products) AND btrim(v.sku) <> ''
+      );
+      INSERT INTO public.inventory_items AS inventory (sku, quantity)
+      SELECT slot.sku, slot.quantity
+        FROM (
+          SELECT DISTINCT ON (candidate.sku) candidate.sku, candidate.quantity
+            FROM (
+              SELECT v.sku, GREATEST(COALESCE(v.stock_quantity, 0), 0) AS quantity,
+                     v.product_id = p_product_id AS own, v.created_at, v.id
+                FROM public.product_variants v
+               WHERE v.product_id = ANY (v_stock_products)
+              UNION ALL
+              SELECT p.sku, GREATEST(COALESCE(p.stock, 0), 0), p.id = p_product_id, p.created_at, p.id
+                FROM public.products p
+               WHERE p.id = ANY (v_stock_products)
+                 AND NOT EXISTS (SELECT 1 FROM public.product_variants v WHERE v.product_id = p.id)
+              UNION ALL
+              SELECT i.sku, i.quantity, false, NULL::timestamp with time zone, NULL::uuid
+                FROM public.inventory_items i
+               WHERE i.sku = ANY (v_stock_skus)
+            ) AS candidate
+           WHERE btrim(candidate.sku) <> ''
+           -- A missing row of this product's SKU holds this product's stock as the values helper reads it
+           -- (its first variant with the SKU, else its own stock), so the plan reads what it read before
+           -- this file; one only other products carry holds the least of theirs.
+           ORDER BY candidate.sku,
+                    candidate.own DESC,
+                    CASE WHEN candidate.own THEN candidate.created_at END,
+                    CASE WHEN candidate.own THEN candidate.id END,
+                    candidate.quantity
+        ) AS slot
+       ORDER BY slot.sku
+          ON CONFLICT (sku) DO UPDATE SET quantity = inventory.quantity WHERE false;
+    END IF;
+  END IF;
+
+  -- The products row first, then the draft row, in every publish: two publishes queue here, and the
+  -- second finds the draft gone.
+  SELECT * INTO v_product FROM public.products WHERE id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  SELECT * INTO v_draft FROM public.product_drafts WHERE product_id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No draft exists for this product.' USING ERRCODE = 'NBP01';
+  END IF;
+  IF v_draft.id IS DISTINCT FROM p_draft_id OR v_draft.updated_at IS DISTINCT FROM p_draft_updated_at THEN
+    RAISE EXCEPTION 'The draft changed after it was read.' USING ERRCODE = 'NBP02';
+  END IF;
+  IF v_product.updated_at IS DISTINCT FROM p_product_updated_at THEN
+    RAISE EXCEPTION 'The product changed after it was read.' USING ERRCODE = 'NBP03';
+  END IF;
+
+  v_before := public.product_revision_content(p_product_id);
+
+  IF p_values IS NOT NULL THEN
+    v_values_result := private.apply_product_draft_values(p_product_id, p_values);
+  ELSIF p_overlay IS NOT NULL AND (p_overlay ? 'title' OR p_overlay ? 'short_description' OR p_overlay ? 'description_json') THEN
+    UPDATE public.products
+       SET title = CASE WHEN p_overlay ? 'title' THEN p_overlay->>'title' ELSE title END,
+           short_description = CASE WHEN p_overlay ? 'short_description' THEN p_overlay->>'short_description' ELSE short_description END,
+           description_json = CASE
+             WHEN p_overlay ? 'description_json' THEN NULLIF(p_overlay->'description_json', 'null'::jsonb)
+             ELSE description_json
+           END,
+           updated_at = now()
+     WHERE id = p_product_id;
+  END IF;
+
+  DELETE FROM public.blocks WHERE product_id = p_product_id;
+
+  INSERT INTO public.blocks (page_id, post_id, product_id, language_id, block_type, content, "order")
+  SELECT NULL,
+         NULL,
+         p_product_id,
+         (b.value->>'language_id')::bigint,
+         b.value->>'block_type',
+         NULLIF(b.value->'content', 'null'::jsonb),
+         COALESCE((b.value->>'order')::integer, (b.ordinality - 1)::integer)
+    FROM jsonb_array_elements(p_blocks) WITH ORDINALITY AS b(value, ordinality)
+   ORDER BY b.ordinality;
+
+  v_after := public.product_revision_content(p_product_id);
+  v_revision := private.record_product_revision(p_product_id, v_before, v_after);
+
+  DELETE FROM public.product_drafts WHERE id = v_draft.id;
+
+  SELECT p.slug, p.payment_provider INTO v_slug, v_payment_provider FROM public.products p WHERE p.id = p_product_id;
+
+  RETURN jsonb_build_object(
+    'product_id', p_product_id,
+    'previous_slug', v_product.slug,
+    'slug', v_slug,
+    'payment_provider', v_payment_provider,
+    'wrote_values', p_values IS NOT NULL,
+    'stock_adjusted', COALESCE(v_values_result->'stock_adjusted', '[]'::jsonb),
+    'revision', v_revision
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.publish_product_draft(uuid, bigint, timestamp with time zone, timestamp with time zone, jsonb, jsonb, jsonb) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 5. Backfill: every SKU a sale could deduct gets its inventory row
+-- ---------------------------------------------------------------------------
+-- Each variant's SKU and the SKU of each product without variants, as stored, blank ones aside, that has
+-- no row: one holding the least stock its carriers show (as the Inventory screen creates one), in SKU
+-- order, in one statement (section 1 then syncs their carriers once). A row that exists is not touched.
+INSERT INTO public.inventory_items (sku, quantity)
+SELECT missing.sku, missing.quantity
+  FROM (
+    SELECT carrier.sku, MIN(carrier.quantity) AS quantity
+      FROM (
+        SELECT v.sku, GREATEST(COALESCE(v.stock_quantity, 0), 0) AS quantity
+          FROM public.product_variants v
+        UNION ALL
+        SELECT p.sku, GREATEST(COALESCE(p.stock, 0), 0)
+          FROM public.products p
+         WHERE NOT EXISTS (SELECT 1 FROM public.product_variants v WHERE v.product_id = p.id)
+      ) AS carrier
+     WHERE NULLIF(trim(carrier.sku), '') IS NOT NULL
+     GROUP BY carrier.sku
+  ) AS missing
+ WHERE NOT EXISTS (SELECT 1 FROM public.inventory_items i WHERE i.sku = missing.sku)
+ ORDER BY missing.sku
+    ON CONFLICT (sku) DO NOTHING;
+
+
+-- >>> FROM: 02047_product_draft_publish_stock_marker.sql <<<
+-- 02047: a product draft's stock baseline says which publish it was loaded against.
+-- Append-only, forward-only, re-runnable: one table (public.product_stock_publishes, with its row policies
+-- and grants) and one function replaced (private.apply_product_draft_values), no data change.
+--
+-- 02044 applies the editor's stock change (the draft's quantity minus its \`stock_baseline\`, the stock the
+-- edit page loaded, per SKU) to the SKU's current stock. A draft started again after a publish (an
+-- autosave queued behind it, or a tab opened before it, found the draft gone and saved the form's values
+-- into a new one) still carries the baseline from before that publish, and nothing said so:
+--   * once the stock moved after that publish, the change was applied again: loaded 5, typed 10 and
+--     published, one sold, then the same values published 14 (02044 left the SKU alone only while the
+--     stock still equalled the published figure, \`already_live\`);
+--   * a figure typed while the publish ran read as a change from the older baseline: 10 published from a
+--     load of 5, then 12 typed on that form, 17;
+--   * a variant added before that publish is in no baseline, so its figure was written again, every sale
+--     of it since that publish undone.
+--
+-- The marker. public.product_stock_publishes holds one row per product that has had a product-values
+-- publish since this file: \`publish_count\`, how many there have been, and \`stock\`, what the last one did
+-- with each SKU of its values, { "<sku>": { "loaded": <its baseline entry, or null>, "entered": <the
+-- quantity its values carried> } } ({} when the values carried no baseline: a CMS draft import's stock is
+-- the file's, no editor's change to count from). The edit page reads the row before the product (a publish
+-- landing between the two reads then makes its baseline look older than it is, never newer), records its
+-- publish_count beside the baseline (\`stock_baseline_publish_count\` in the product values: ProductForm
+-- carries it unseen, the autosave stores it, buildProductDraftPublishValues sends it), and this function
+-- moves the count and rewrites \`stock\` on every product-values publish, under the products row lock
+-- public.publish_product_draft takes first, so two publishes of a product never interleave here.
+--
+-- The rules. A baseline counts as loaded before the last publish when the values carry a marker that is a
+-- whole number below the product's publish_count. For such a baseline, a SKU whose baseline entry is the
+-- one the last publish used (the same number, or none in both: a variant added before that publish, which
+-- the app sends as a null entry once the live product stocks it) counts from the quantity that publish
+-- entered instead of from its baseline entry: the change since that publish is the draft's quantity minus
+-- that figure. Every other SKU, and every SKU of values whose marker equals the count or is missing or
+-- unreadable (a draft saved before this file), counts from its baseline entry, as in 02044. Per SKU, in
+-- order ("counted from" is that figure; none for a SKU without a baseline entry that is not counted from
+-- the last publish):
+--   * equal to its baseline entry (the editor left it alone): kept, as in 02044;
+--   * counted from a figure and equal to the current quantity: kept, and named \`already_live\`, as in 02044
+--     (the user's rule: keep it, and warn);
+--   * counted from the last publish's figure and equal to it: kept, and named \`already_published\`: that
+--     publish made this change live, and whatever moved the stock since stays;
+--   * counted from a figure, with a current quantity: the change applied to the current quantity, never
+--     below 0, and named \`moved\` when that is not the figure typed (02044's rule, from that figure);
+--   * otherwise: the draft's quantity, as in 02044.
+-- So the examples above publish 9 (\`already_published\`), 12, and the variant's current stock
+-- (\`already_published\`). An answer entry counted from the last publish's figure carries
+-- \`from_last_publish: true\`, and its \`loaded\` is that figure (published = current + entered - loaded holds
+-- for \`moved\` either way).
+--
+-- What a hand-written marker can do. The marker is the draft's, so any product_drafts writer (a WRITER over
+-- PostgREST included) can write it, as it can write the baseline and the quantities. One equal to the
+-- count, missing, not a whole number, or not below the count gives 02044's rules. One below the count
+-- changes a SKU only where the draft's baseline entry is the one the last publish used, and then only to
+-- count from the quantity that publish entered, which this function recorded (no API role but an ADMIN
+-- writes the table, and the app writes it only here). No marker skips the stock: every SKU is decided by
+-- the rules above, and every one published at another figure than the one typed, or kept where the draft's
+-- figure is not its baseline entry, is named in \`stock_adjusted\`. The edit page decides each SKU by the
+-- same rules from the same row (reconcileProductDraftStock in apps/nextblock/app/cms/products/
+-- productFormData.ts), so it shows what a publish writes.
+--
+-- Not covered: only the last publish's figures are kept, so a draft whose change went live in an earlier
+-- publish, with another publish from another page since (one that loaded a different stock for the SKU),
+-- counts from its own baseline entry, as in 02044, and its change is applied again (named \`moved\`). A tab
+-- loaded at the same stock as the page whose draft the last publish made live counts from that publish's
+-- figure too: two tabs loaded at 5, 10 published from one, then 12 typed in the other publishes 12 (that
+-- tab's figure replaces the other's change), not 17.
+--
+-- Grants. Row security on; SELECT for an ADMIN or a WRITER (as product_drafts: the edit page shows a
+-- draft's stock from the row, and WRITERs edit drafts), INSERT and UPDATE for an ADMIN (is_admin(), as the
+-- products and inventory_items write policies: the publish runs as its ADMIN caller), no DELETE (the row
+-- goes with its product, ON DELETE CASCADE, which runs as the table owner). anon holds nothing,
+-- authenticated SELECT, INSERT and UPDATE, service_role everything. The post-apply grant pass grants anon
+-- SELECT and authenticated every command on every table in public, so API_ROLE_REVOKE_SQL
+-- (apps/nextblock/tools/lib/migrate-core.mjs and apps/nextblock/lib/setup/schema-apply.ts) takes anon's
+-- SELECT and authenticated's DELETE back. The helper keeps 02044's grants (CREATE OR REPLACE), restated
+-- below. public.publish_product_draft is unchanged: it passes \`stock_baseline_publish_count\` through in
+-- p_values and returns the helper's \`stock_adjusted\`.
+--
+-- tools/scripts/product-draft-publish.db.test.ts runs the marker against a real database (the three cases
+-- above, a marker equal to the count or unreadable, a marker below it beside a baseline the last publish
+-- did not use, two publishes since the load, a values publish without a baseline, the row's privileges);
+-- tools/scripts/security-verify.sql section 47 checks the table's privileges and policies.
+
+CREATE SCHEMA IF NOT EXISTS private;
+
+-- ---------------------------------------------------------------------------
+-- 1. The last product-values publish of each product
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.product_stock_publishes (
+  product_id uuid NOT NULL,
+  publish_count integer NOT NULL,
+  stock jsonb DEFAULT '{}'::jsonb NOT NULL,
+  CONSTRAINT product_stock_publishes_pkey PRIMARY KEY (product_id),
+  CONSTRAINT product_stock_publishes_product_id_fkey FOREIGN KEY (product_id) REFERENCES public.products (id) ON DELETE CASCADE,
+  CONSTRAINT product_stock_publishes_publish_count_check CHECK (publish_count > 0),
+  CONSTRAINT product_stock_publishes_stock_check CHECK (jsonb_typeof(stock) = 'object')
+);
+
+COMMENT ON TABLE public.product_stock_publishes IS
+  'One row per product: how many product-values publishes it has had since migration 02047, and what the last one did with each SKU ({ sku: { loaded, entered } }). Written by private.apply_product_draft_values only.';
+
+ALTER TABLE public.product_stock_publishes ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS product_stock_publishes_select_policy ON public.product_stock_publishes;
+CREATE POLICY product_stock_publishes_select_policy ON public.product_stock_publishes
+  FOR SELECT TO authenticated
+  USING ((( SELECT public.get_current_user_role() AS get_current_user_role) = ANY (ARRAY['ADMIN'::public.user_role, 'WRITER'::public.user_role])));
+
+DROP POLICY IF EXISTS product_stock_publishes_insert_policy ON public.product_stock_publishes;
+CREATE POLICY product_stock_publishes_insert_policy ON public.product_stock_publishes
+  FOR INSERT TO authenticated
+  WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+DROP POLICY IF EXISTS product_stock_publishes_update_policy ON public.product_stock_publishes;
+CREATE POLICY product_stock_publishes_update_policy ON public.product_stock_publishes
+  FOR UPDATE TO authenticated
+  USING ((( SELECT public.is_admin() AS is_admin) IS TRUE))
+  WITH CHECK ((( SELECT public.is_admin() AS is_admin) IS TRUE));
+
+-- Supabase grants nothing on a new table in public; local images and older projects grant everything by
+-- default privilege, so what no API role may hold is revoked first.
+REVOKE ALL ON TABLE public.product_stock_publishes FROM PUBLIC, anon;
+REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.product_stock_publishes FROM authenticated;
+GRANT SELECT, INSERT, UPDATE ON TABLE public.product_stock_publishes TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.product_stock_publishes TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 2. Product values: 02044's, counting a baseline loaded before the last publish from that publish
+-- ---------------------------------------------------------------------------
+-- Called only by public.publish_product_draft(), once it has locked the inventory rows of the values'
+-- SKUs (and the others a sale could hold against it: 02044's header) and then the products row. \`p_values\`
+-- is built by buildProductDraftPublishValues (libs/ecommerce product-actions.ts): the RPC payload of
+-- updateProduct() (minor units) without \`id\`, \`status\`, \`metadata\` and \`payment_provider\`, plus the SEO
+-- fields, \`gallery_media_ids\` (null: leave the gallery as it is), \`category_ids\` (null: leave the
+-- categories as they are), \`stock_baseline\` (null: none; a null entry: a SKU the live product stocks that
+-- the draft's baseline lacks) and \`stock_baseline_publish_count\` (null: none). Returns
+-- { stock_adjusted: [{ sku, reason, entered, loaded, current, published[, from_last_publish] }] } (02044's
+-- header, and this file's). Everything but the marker (the stock plan's figure to count from, the
+-- \`already_published\` rule and the row written at the end) is 02044's, statement for statement.
+CREATE OR REPLACE FUNCTION private.apply_product_draft_values(p_product_id uuid, p_values jsonb)
+    RETURNS jsonb
+    LANGUAGE plpgsql
+    SECURITY INVOKER
+    SET search_path TO ''
+    AS $$
+DECLARE
+  v_uuid_pattern constant text := '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  -- DECIMAL_TEXT_PATTERN of productFormData.ts, with ASCII digits spelled out
+  -- (tools/scripts/stock-quantity-pattern.test.ts compares the two).
+  v_quantity_pattern constant text := '^[ \\t\\n\\v\\f\\r]*[+-]?(?:[0-9]+\\.?[0-9]*|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?[ \\t\\n\\v\\f\\r]*$';
+  v_max_quantity constant numeric := 2147483647;
+  v_variants jsonb := COALESCE(p_values->'variants', '[]'::jsonb);
+  v_baseline jsonb;
+  v_has_variants boolean;
+  v_total_variant_stock integer := 0;
+  v_product_stock integer;
+  v_product_entered integer := 0;
+  v_read integer[] := '{}';
+  v_item record;
+  v_number numeric;
+  v_product_type text;
+  v_translation_group_id uuid;
+  v_saved record;
+  v_sku_group uuid[];
+  v_siblings uuid[];
+  v_gallery uuid[];
+  v_slot record;
+  v_entered integer;
+  v_loaded integer;
+  v_live integer;
+  v_mode text;
+  v_quantity integer;
+  v_steps integer := 0;
+  v_plan_skus text[] := '{}';
+  v_plan_modes text[] := '{}';
+  v_plan_quantities integer[] := '{}';
+  v_adjusted_count integer := 0;
+  v_adjusted jsonb[] := '{}';
+  -- 02047: the marker.
+  v_marker integer;
+  v_publish_count integer;
+  v_last_stock jsonb;
+  v_stale boolean;
+  v_last jsonb;
+  v_last_loaded integer;
+  v_last_entered integer;
+  v_reference integer;
+  v_from_last boolean;
+  v_plan_loaded integer[] := '{}';
+  v_plan_entered integer[] := '{}';
+  v_record jsonb;
+BEGIN
+  IF p_values IS NULL OR jsonb_typeof(p_values) <> 'object' THEN
+    RAISE EXCEPTION 'The draft''s product values are not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+  IF jsonb_typeof(v_variants) <> 'array' THEN
+    RAISE EXCEPTION 'The draft''s variants are not a list.' USING ERRCODE = 'NBP04';
+  END IF;
+  -- private.sync_product_draft_variants refuses one too; the stock plan below reads them first.
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_variants) AS item(value) WHERE jsonb_typeof(item.value) <> 'object') THEN
+    RAISE EXCEPTION 'A draft variant is not an object.' USING ERRCODE = 'NBP04';
+  END IF;
+
+  v_has_variants := jsonb_array_length(v_variants) > 0;
+  v_baseline := CASE WHEN jsonb_typeof(p_values->'stock_baseline') = 'object' THEN p_values->'stock_baseline' END;
+  v_translation_group_id := CASE
+    WHEN lower(COALESCE(p_values->>'translation_group_id', '')) ~ v_uuid_pattern THEN (p_values->>'translation_group_id')::uuid
+  END;
+  v_product_type := CASE
+    WHEN p_values->>'product_type' IN ('physical', 'digital') THEN p_values->>'product_type'
+    WHEN NULLIF(p_values->>'freemius_product_id', '') IS NOT NULL
+      OR NULLIF(p_values->>'freemius_plan_id', '') IS NOT NULL THEN 'digital'
+    ELSE 'physical'
+  END;
+
+  -- 02047: the publish count the baseline was loaded at (a whole number from 0, else none), and this
+  -- product's last product-values publish (none yet: a count of 0). publish_product_draft locked the
+  -- products row before calling this function, so no other publish of the product reads or writes the
+  -- row until this one commits. A baseline counts as loaded before the last publish only with a marker
+  -- below the count: one equal to it, above it, or missing gives 02044's rules.
+  v_marker := CASE WHEN jsonb_typeof(p_values->'stock_baseline_publish_count') = 'number' THEN
+    CASE
+      WHEN (p_values->>'stock_baseline_publish_count')::numeric BETWEEN 0 AND v_max_quantity
+       AND (p_values->>'stock_baseline_publish_count')::numeric = trunc((p_values->>'stock_baseline_publish_count')::numeric)
+      THEN (p_values->>'stock_baseline_publish_count')::integer
+    END
+  END;
+  SELECT recorded.publish_count, recorded.stock
+    INTO v_publish_count, v_last_stock
+    FROM public.product_stock_publishes recorded
+   WHERE recorded.product_id = p_product_id;
+  v_publish_count := COALESCE(v_publish_count, 0);
+  v_last_stock := CASE WHEN jsonb_typeof(v_last_stock) = 'object' THEN v_last_stock ELSE '{}'::jsonb END;
+  v_stale := v_baseline IS NOT NULL AND v_marker IS NOT NULL AND v_marker < v_publish_count;
+
+  -- Every stock quantity the values carry (each variant's, or the product's without variants): a JSON
+  -- number, or text matching v_quantity_pattern (the edit page's DECIMAL_TEXT_PATTERN; where the two
+  -- readers still part, see 02044's header), cut to its whole part and held between 0 and 2147483647; null
+  -- or none is 0; anything else is refused before anything is written. Each quantity read is kept by its
+  -- variant's position (v_read), and the variants are rebuilt once below with it or the planned one, so
+  -- everything after the plan (the stock total, the variant rows) reads whole numbers.
+  FOR v_item IN
+    SELECT item.ordinality AS position, btrim(item.value->>'sku') AS sku, item.value->'stock_quantity' AS quantity
+      FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+    UNION ALL
+    SELECT 0, btrim(p_values->>'sku'), p_values->'stock'
+     WHERE NOT v_has_variants
+  LOOP
+    v_number := CASE
+      WHEN v_item.quantity IS NULL OR jsonb_typeof(v_item.quantity) = 'null' THEN 0
+      WHEN jsonb_typeof(v_item.quantity) = 'number' THEN v_item.quantity::numeric
+    END;
+    IF jsonb_typeof(v_item.quantity) = 'string' AND (v_item.quantity #>> '{}') ~ v_quantity_pattern THEN
+      BEGIN
+        v_number := (v_item.quantity #>> '{}')::numeric;
+      EXCEPTION WHEN numeric_value_out_of_range THEN
+        -- More digits than numeric holds ('1e200000'): refused below like any other unreadable text.
+        v_number := NULL;
+      END;
+    END IF;
+    IF v_number IS NULL THEN
+      RAISE EXCEPTION 'The draft''s stock for % is not a number: %.',
+        CASE
+          WHEN COALESCE(v_item.sku, '') <> '' THEN 'SKU ' || v_item.sku
+          WHEN v_item.position = 0 THEN 'the product'
+          ELSE 'variant ' || v_item.position || ' (no SKU)'
+        END,
+        left(v_item.quantity::text, 40)
+        USING ERRCODE = 'NBP04';
+    END IF;
+    v_quantity := GREATEST(0, LEAST(v_max_quantity, trunc(v_number)))::integer;
+    IF v_item.position = 0 THEN
+      v_product_entered := v_quantity;
+    ELSE
+      -- In place (an expanded array): a jsonb_set on the whole list here copied it once per variant.
+      v_read[v_item.position] := v_quantity;
+    END IF;
+  END LOOP;
+
+  -- The stock, planned before anything is written: one entry per SKU the values carry (each variant's,
+  -- or the product's without variants; a later variant with the same SKU wins, as there is one
+  -- inventory row per SKU), in code-point SKU order (the order of the answer's entries), with the SKU's
+  -- current quantity read in the same query: its inventory row (publish_product_draft locked it before
+  -- the products row, so it is written below as it is read here), or without one the stock the live
+  -- rows show (a product saved before shared inventory), as apply_order_inventory_deduction reads it;
+  -- NULL when nothing live carries the SKU. One query, not one per SKU: the inventory row policy's
+  -- checks cost a scan of the variants per statement.
+  FOR v_slot IN
+    SELECT slot.sku, slot.entered, COALESCE(i.quantity, live.quantity) AS live
+      FROM (
+        SELECT DISTINCT ON (s.sku) s.sku, s.entered
+          FROM (
+            SELECT btrim(item.value->>'sku') AS sku, v_read[item.ordinality] AS entered, item.ordinality
+              FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+             WHERE v_has_variants
+            UNION ALL
+            SELECT btrim(p_values->>'sku'), v_product_entered, 1
+             WHERE NOT v_has_variants
+          ) s
+         WHERE COALESCE(s.sku, '') <> ''
+         ORDER BY s.sku, s.ordinality DESC
+      ) slot
+      LEFT JOIN public.inventory_items i ON i.sku = slot.sku
+      LEFT JOIN (
+        (SELECT DISTINCT ON (btrim(v.sku)) btrim(v.sku) AS sku, GREATEST(COALESCE(v.stock_quantity, 0), 0) AS quantity
+           FROM public.product_variants v
+          WHERE v_has_variants
+            AND v.product_id = p_product_id
+          ORDER BY btrim(v.sku), v.created_at, v.id)
+        UNION ALL
+        SELECT btrim(p.sku), GREATEST(COALESCE(p.stock, 0), 0)
+          FROM public.products p
+         WHERE NOT v_has_variants
+           AND p.id = p_product_id
+           AND NOT EXISTS (SELECT 1 FROM public.product_variants v WHERE v.product_id = p.id)
+      ) live ON live.sku = slot.sku
+     ORDER BY slot.sku COLLATE "C"
+  LOOP
+    v_entered := v_slot.entered;
+    v_live := v_slot.live;
+    v_loaded := CASE WHEN jsonb_typeof(v_baseline->v_slot.sku) = 'number' THEN
+      CASE
+        WHEN (v_baseline->>v_slot.sku)::numeric BETWEEN 0 AND v_max_quantity
+         AND (v_baseline->>v_slot.sku)::numeric = trunc((v_baseline->>v_slot.sku)::numeric)
+        THEN (v_baseline->>v_slot.sku)::integer
+      END
+    END;
+
+    -- 02047: the figure the change counts from. The baseline entry; or, for a baseline loaded before the
+    -- last publish whose entry for this SKU is the one that publish used (the same whole number, or a null
+    -- entry where that publish had none), the quantity that publish entered. An entry of the row that is
+    -- not a whole number (the table is written here only) is never counted from.
+    v_reference := v_loaded;
+    v_from_last := false;
+    IF v_stale THEN
+      v_last := v_last_stock->v_slot.sku;
+      v_last_entered := CASE WHEN jsonb_typeof(v_last->'entered') = 'number' THEN
+        CASE
+          WHEN (v_last->>'entered')::numeric BETWEEN 0 AND v_max_quantity
+           AND (v_last->>'entered')::numeric = trunc((v_last->>'entered')::numeric)
+          THEN (v_last->>'entered')::integer
+        END
+      END;
+      v_last_loaded := CASE WHEN jsonb_typeof(v_last->'loaded') = 'number' THEN
+        CASE
+          WHEN (v_last->>'loaded')::numeric BETWEEN 0 AND v_max_quantity
+           AND (v_last->>'loaded')::numeric = trunc((v_last->>'loaded')::numeric)
+          THEN (v_last->>'loaded')::integer
+        END
+      END;
+      IF v_last_entered IS NOT NULL
+         AND (v_last_loaded IS NOT NULL OR jsonb_typeof(v_last->'loaded') = 'null')
+         AND (v_loaded IS NOT NULL OR jsonb_typeof(v_baseline->v_slot.sku) = 'null')
+         AND v_loaded IS NOT DISTINCT FROM v_last_loaded THEN
+        v_reference := v_last_entered;
+        v_from_last := true;
+      END IF;
+    END IF;
+
+    IF v_loaded IS NOT NULL AND v_entered = v_loaded THEN
+      -- Not changed by the editor: the current quantity, whatever sold or changed since the page load.
+      v_mode := 'keep';
+      v_quantity := COALESCE(v_live, v_entered);
+    ELSIF v_reference IS NOT NULL AND v_entered = v_live THEN
+      -- Changed to the current quantity: already live, so applying the change again would count it
+      -- twice. A sale that reached the same quantity looks the same, so the answer names the SKU.
+      v_mode := 'keep';
+      v_quantity := v_live;
+      v_adjusted_count := v_adjusted_count + 1;
+      v_adjusted[v_adjusted_count] := jsonb_build_object(
+        'sku', v_slot.sku,
+        'reason', 'already_live',
+        'entered', v_entered,
+        'loaded', v_reference,
+        'current', v_live,
+        'published', v_live
+      ) || CASE WHEN v_from_last THEN jsonb_build_object('from_last_publish', true) ELSE '{}'::jsonb END;
+    ELSIF v_from_last AND v_live IS NOT NULL AND v_entered = v_reference THEN
+      -- 02047: the quantity the last publish entered, from a baseline loaded before it: that publish made
+      -- this change live, and what moved the stock since (a sale, the Inventory screen) stays. Named:
+      -- a figure meant to replace the stock as it now is looks the same.
+      v_mode := 'keep';
+      v_quantity := v_live;
+      v_adjusted_count := v_adjusted_count + 1;
+      v_adjusted[v_adjusted_count] := jsonb_build_object(
+        'sku', v_slot.sku,
+        'reason', 'already_published',
+        'entered', v_entered,
+        'loaded', v_reference,
+        'current', v_live,
+        'published', v_live,
+        'from_last_publish', true
+      );
+    ELSIF v_reference IS NOT NULL AND v_live IS NOT NULL THEN
+      -- Changed: the editor's change, applied to the current quantity.
+      v_mode := 'change';
+      v_quantity := GREATEST(0, LEAST(v_max_quantity, v_live::numeric + v_entered - v_reference))::integer;
+      IF v_quantity <> v_entered THEN
+        v_adjusted_count := v_adjusted_count + 1;
+        v_adjusted[v_adjusted_count] := jsonb_build_object(
+          'sku', v_slot.sku,
+          'reason', 'moved',
+          'entered', v_entered,
+          'loaded', v_reference,
+          'current', v_live,
+          'published', v_quantity
+        ) || CASE WHEN v_from_last THEN jsonb_build_object('from_last_publish', true) ELSE '{}'::jsonb END;
+      END IF;
+    ELSE
+      -- No figure to count from (a new SKU, values without a baseline) or nothing live: the draft's.
+      v_mode := 'set';
+      v_quantity := v_entered;
+    END IF;
+
+    v_steps := v_steps + 1;
+    v_plan_skus[v_steps] := v_slot.sku;
+    v_plan_modes[v_steps] := v_mode;
+    v_plan_quantities[v_steps] := v_quantity;
+    -- 02047: what the row written below records for this SKU: the draft's own baseline entry (never the
+    -- figure counted from, so a draft started again from the same page keeps matching it) and its quantity.
+    v_plan_loaded[v_steps] := v_loaded;
+    v_plan_entered[v_steps] := v_entered;
+  END LOOP;
+
+  -- The variants and the product row carry the planned quantities (a variant without a SKU keeps the
+  -- one read above); the trigger on inventory_items writes the same ones back for every SKU written
+  -- below. The product's stock beside variants is their total, held at 2147483647 (an integer column).
+  IF v_has_variants THEN
+    SELECT jsonb_agg(jsonb_set(item.value, '{stock_quantity}', to_jsonb(COALESCE(planned.quantity, v_read[item.ordinality])))
+                     ORDER BY item.ordinality),
+           LEAST(COALESCE(SUM(COALESCE(planned.quantity, v_read[item.ordinality])), 0), v_max_quantity)::integer
+      INTO v_variants, v_total_variant_stock
+      FROM jsonb_array_elements(v_variants) WITH ORDINALITY AS item(value, ordinality)
+      LEFT JOIN unnest(v_plan_skus, v_plan_quantities) AS planned(sku, quantity) ON planned.sku = btrim(item.value->>'sku');
+  ELSE
+    v_product_stock := COALESCE(v_plan_quantities[array_position(v_plan_skus, btrim(COALESCE(p_values->>'sku', '')))], v_product_entered);
+  END IF;
+
+  -- The product row.
+  UPDATE public.products
+     SET title = p_values->>'title',
+         slug = p_values->>'slug',
+         sku = p_values->>'sku',
+         product_type = v_product_type,
+         payment_provider = CASE WHEN v_product_type = 'digital' THEN 'freemius' ELSE 'stripe' END,
+         upc = NULLIF(p_values->>'upc', ''),
+         stock = CASE
+           WHEN v_has_variants THEN v_total_variant_stock
+           ELSE v_product_stock
+         END,
+         short_description = NULLIF(p_values->>'short_description', ''),
+         description_json = NULLIF(p_values->'description_json', 'null'::jsonb),
+         price = COALESCE((p_values->>'price')::integer, 0),
+         prices = COALESCE(p_values->'prices', '{}'::jsonb),
+         sale_price = CASE
+           WHEN p_values ? 'sale_price' AND p_values->>'sale_price' <> '' THEN (p_values->>'sale_price')::integer
+         END,
+         sale_prices = CASE
+           WHEN p_values ? 'sale_prices' THEN COALESCE(p_values->'sale_prices', '{}'::jsonb)
+         END,
+         sale_start_at = CASE
+           WHEN p_values ? 'sale_start_at' AND p_values->>'sale_start_at' <> '' THEN (p_values->>'sale_start_at')::timestamptz
+         END,
+         sale_end_at = CASE
+           WHEN p_values ? 'sale_end_at' AND p_values->>'sale_end_at' <> '' THEN (p_values->>'sale_end_at')::timestamptz
+         END,
+         freemius_plan_id = NULLIF(p_values->>'freemius_plan_id', ''),
+         freemius_product_id = NULLIF(p_values->>'freemius_product_id', ''),
+         trial_period_days = COALESCE((p_values->>'trial_period_days')::integer, 0),
+         trial_requires_payment_method = COALESCE((p_values->>'trial_requires_payment_method')::boolean, false),
+         is_taxable = COALESCE((p_values->>'is_taxable')::boolean, is_taxable),
+         meta_title = NULLIF(btrim(p_values->>'meta_title'), ''),
+         meta_description = NULLIF(btrim(p_values->>'meta_description'), ''),
+         custom_canonical = NULLIF(btrim(p_values->>'custom_canonical'), ''),
+         language_id = COALESCE((p_values->>'language_id')::bigint, language_id),
+         translation_group_id = COALESCE(v_translation_group_id, translation_group_id),
+         updated_at = now()
+   WHERE id = p_product_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found.' USING ERRCODE = 'NBP05';
+  END IF;
+
+  -- The variants (02043 section 2), with the planned quantities.
+  PERFORM private.sync_product_draft_variants(p_product_id, v_variants);
+
+  -- The gallery: the listed images that still have a media row, each once, in their order, then the
+  -- images it no longer lists unlinked. A dropped image keeps its media row and its files.
+  IF jsonb_typeof(p_values->'gallery_media_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(listed.media_id ORDER BY listed.position), '{}')
+      INTO v_gallery
+      FROM (
+        SELECT candidate.media_id, min(candidate.ordinality) AS position
+          FROM (
+            SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS media_id,
+                   item.ordinality
+              FROM jsonb_array_elements_text(p_values->'gallery_media_ids') WITH ORDINALITY AS item(value, ordinality)
+          ) candidate
+         WHERE candidate.media_id IS NOT NULL
+         GROUP BY candidate.media_id
+      ) listed
+     WHERE EXISTS (SELECT 1 FROM public.media m WHERE m.id = listed.media_id);
+
+    INSERT INTO public.product_media (product_id, media_id, sort_order)
+    SELECT p_product_id, g.media_id, (g.n - 1)::integer
+      FROM unnest(v_gallery) WITH ORDINALITY AS g(media_id, n)
+        ON CONFLICT (product_id, media_id) DO UPDATE SET sort_order = EXCLUDED.sort_order;
+
+    DELETE FROM public.product_media
+     WHERE product_id = p_product_id
+       AND NOT (media_id = ANY (v_gallery));
+  END IF;
+
+  -- The sale schedule belongs to the SKU: the saved row's canonical sale amounts (the currency trigger
+  -- has normalised them) and its window go to every product sharing the SKU (its translations), and
+  -- each variant's to the variants with its SKU in those products.
+  SELECT p.sku, p.sale_price, p.sale_prices, p.sale_start_at, p.sale_end_at, p.translation_group_id
+    INTO v_saved
+    FROM public.products p
+   WHERE p.id = p_product_id;
+
+  SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+    INTO v_sku_group
+    FROM public.products p
+   WHERE p.sku = v_saved.sku;
+
+  UPDATE public.products
+     SET sale_price = v_saved.sale_price,
+         sale_prices = v_saved.sale_prices,
+         sale_start_at = v_saved.sale_start_at,
+         sale_end_at = v_saved.sale_end_at,
+         updated_at = now()
+   WHERE id = ANY (v_sku_group);
+
+  IF v_has_variants THEN
+    UPDATE public.product_variants AS target
+       SET sale_price = source.sale_price,
+           sale_prices = source.sale_prices,
+           sale_start_at = source.sale_start_at,
+           sale_end_at = source.sale_end_at,
+           updated_at = now()
+      FROM public.product_variants AS source
+     WHERE source.product_id = p_product_id
+       AND target.sku = source.sku
+       AND target.product_id = ANY (v_sku_group);
+  END IF;
+
+  -- The shared inventory, by the plan above, in two statements. A kept SKU is never written; one
+  -- without a row gets one holding its current quantity (NOT EXISTS reads committed rows, so a row
+  -- another session created and committed since the publish took its locks is left as it is; one it is
+  -- still inserting is waited for: 02044's SKU with no inventory row). Every other SKU takes its
+  -- planned quantity: the rows were locked before the plan read them, so there is nothing to read
+  -- again. The trigger writes each quantity it sets back to every variant and product with that SKU
+  -- (translations included).
+  INSERT INTO public.inventory_items (sku, quantity)
+  SELECT step.sku, step.quantity
+    FROM unnest(v_plan_skus, v_plan_modes, v_plan_quantities) AS step(sku, mode, quantity)
+   WHERE step.mode = 'keep'
+     AND NOT EXISTS (SELECT 1 FROM public.inventory_items i WHERE i.sku = step.sku)
+   ORDER BY step.sku
+      ON CONFLICT (sku) DO NOTHING;
+
+  INSERT INTO public.inventory_items (sku, quantity)
+  SELECT step.sku, step.quantity
+    FROM unnest(v_plan_skus, v_plan_modes, v_plan_quantities) AS step(sku, mode, quantity)
+   WHERE step.mode <> 'keep'
+   ORDER BY step.sku
+      ON CONFLICT (sku) DO UPDATE SET quantity = EXCLUDED.quantity;
+
+  -- 02047: this publish, as the next one reads it. The count moves on every product-values publish (one
+  -- without a baseline included: a baseline loaded before it is older than the stock it wrote); the stock
+  -- entries are the plan's SKUs with the draft's own baseline entry and the quantity it entered, when the
+  -- values carry a baseline ({} otherwise: a CMS draft import's figures are no editor's change to count
+  -- from).
+  SELECT COALESCE(jsonb_object_agg(step.sku, jsonb_build_object('loaded', step.loaded, 'entered', step.entered)), '{}'::jsonb)
+    INTO v_record
+    FROM unnest(v_plan_skus, v_plan_loaded, v_plan_entered) AS step(sku, loaded, entered)
+   WHERE v_baseline IS NOT NULL;
+
+  INSERT INTO public.product_stock_publishes AS recorded (product_id, publish_count, stock)
+  VALUES (p_product_id, v_publish_count + 1, v_record)
+      ON CONFLICT (product_id) DO UPDATE
+     SET publish_count = recorded.publish_count + 1,
+         stock = EXCLUDED.stock;
+
+  -- Categories belong to the translation group: every product in it gets the listed categories that
+  -- still exist.
+  IF jsonb_typeof(p_values->'category_ids') = 'array' THEN
+    SELECT COALESCE(array_agg(p.id), ARRAY[p_product_id])
+      INTO v_siblings
+      FROM public.products p
+     WHERE p.translation_group_id = v_saved.translation_group_id;
+
+    DELETE FROM public.product_categories WHERE product_id = ANY (v_siblings);
+
+    INSERT INTO public.product_categories (product_id, category_id)
+    SELECT sibling.id, category.id
+      FROM unnest(v_siblings) AS sibling(id)
+     CROSS JOIN (
+       SELECT DISTINCT c.id
+         FROM (
+           SELECT CASE WHEN lower(item.value) ~ v_uuid_pattern THEN lower(item.value)::uuid END AS category_id
+             FROM jsonb_array_elements_text(p_values->'category_ids') AS item(value)
+         ) requested
+         JOIN public.categories c ON c.id = requested.category_id
+     ) category;
+  END IF;
+
+  RETURN jsonb_build_object('stock_adjusted', to_jsonb(v_adjusted));
+END;
+$$;
+
+REVOKE ALL ON FUNCTION private.apply_product_draft_values(uuid, jsonb) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.apply_product_draft_values(uuid, jsonb) TO authenticated, service_role;
+
+
   -- Step C2: Take the API roles' EXECUTE back off every trigger function. Step B's
   -- DEFAULT PRIVILEGES hand anon/authenticated EXECUTE on each function the migrations
   -- create; trigger functions never need it (EXECUTE is only checked at CREATE TRIGGER
@@ -26112,7 +27416,9 @@ GRANT EXECUTE ON FUNCTION public.media_usage(jsonb) TO service_role;
     ('02042', 'consent_cookie_settings_copy'),
     ('02043', 'atomic_product_draft_publish'),
     ('02044', 'product_draft_publish_stock_baseline'),
-    ('02045', 'media_usage_lookup')
+    ('02045', 'media_usage_lookup'),
+    ('02046', 'inventory_writes_in_sku_order'),
+    ('02047', 'product_draft_publish_stock_marker')
   ON CONFLICT (version) DO NOTHING;
 
   -- Step E: Anchor preserved profiles: the users Step A kept (the two ids and the demo admin's

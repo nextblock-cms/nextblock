@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   executeDatabaseActionPlan,
   executeDatabaseMutation,
@@ -1194,5 +1194,121 @@ describe('Cortex AI generic database tools: updated_at', () => {
       expect(created, `a migration creates ${table}.updated_at`).toBe(true);
       expect(migrations.some((sql) => dropColumn.test(sql)), `a migration drops ${table}.updated_at`).toBe(false);
     }
+  });
+});
+
+/**
+ * inventory_items writes go through the inventory functions of migration 02046, which take the rows in
+ * SKU order in one statement, the order a product draft publish and a sale's deduction lock them in:
+ * PostgREST wrote an insert or upsert in the order given and an update or delete by filter in plan order,
+ * so a write holding a later SKU of a publish while the publish held an earlier one deadlocked with it.
+ * tools/scripts/product-draft-publish.db.test.ts runs the functions' order against a held row.
+ */
+describe('Cortex AI database tools and inventory_items', () => {
+  function inventoryClient() {
+    const mock = createMockSupabase({
+      inventory_items: [
+        { sku: 'SKU-Z', quantity: 2 },
+        { sku: 'SKU-A', quantity: 9 },
+        { sku: 'OTHER', quantity: 1 },
+      ],
+    });
+    type RpcAnswer = { data: unknown; error: { code: string; message: string } | null };
+    const rpc = vi.fn(async (_fn: string, args: Record<string, any> = {}): Promise<RpcAnswer> => {
+      const skus: string[] = args.p_skus ?? (args.p_rows ?? []).map((row: { sku: string }) => row.sku);
+      return { data: skus.map((sku) => ({ sku, quantity: args.p_quantity ?? 0 })), error: null };
+    });
+    const supabase: { from: (table: string) => MockQuery; rpc: (fn: string, args?: Record<string, any>) => Promise<RpcAnswer> } = {
+      ...mock.supabase,
+      rpc,
+    };
+    return { database: mock.database, rpc, context: { actorUserId: 'user_1', skipConfirmation: true, supabase } };
+  }
+
+  it.each([
+    ['insert', 'error'],
+    ['upsert', 'update'],
+  ] as const)('sends an %s to upsert_inventory_items (%s on an existing row), each row a sku and a quantity, with no updated_at stamp', async (operation, rule) => {
+    const { database, rpc, context } = inventoryClient();
+    const result = await executeDatabaseMutation(
+      {
+        operation,
+        rows: [
+          { sku: 'SKU-Z', quantity: 4 },
+          { sku: 'SKU-A', quantity: 7 },
+        ],
+        table: 'inventory_items',
+      },
+      context
+    );
+
+    expect(result).toMatchObject({ success: true, mutationExecuted: true, affectedCount: 2 });
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(rpc).toHaveBeenCalledWith('upsert_inventory_items', {
+      p_rows: [
+        { sku: 'SKU-Z', quantity: 4 },
+        { sku: 'SKU-A', quantity: 7 },
+      ],
+      p_on_conflict: rule,
+    });
+    // Nothing went through PostgREST's table write.
+    expect(database.inventory_items).toEqual([
+      { sku: 'SKU-Z', quantity: 2 },
+      { sku: 'SKU-A', quantity: 9 },
+      { sku: 'OTHER', quantity: 1 },
+    ]);
+  });
+
+  it('writes an update or a delete to the rows the filter named when it was confirmed, through update_inventory_quantities and delete_inventory_items', async () => {
+    const { rpc, context } = inventoryClient();
+    const updated = await executeDatabaseMutation(
+      { filters: [{ column: 'sku', operator: 'in', value: ['SKU-Z', 'SKU-A'] }], operation: 'update', table: 'inventory_items', values: { quantity: 5 } },
+      context
+    );
+    expect(updated).toMatchObject({ success: true, affectedCount: 2 });
+    expect(rpc).toHaveBeenLastCalledWith('update_inventory_quantities', { p_skus: ['SKU-Z', 'SKU-A'], p_quantity: 5 });
+
+    const deleted = await executeDatabaseMutation(
+      { filters: [{ column: 'quantity', operator: 'lt', value: 3 }], operation: 'delete', table: 'inventory_items' },
+      context
+    );
+    expect(deleted).toMatchObject({ success: true, affectedCount: 2 });
+    expect(rpc).toHaveBeenLastCalledWith('delete_inventory_items', { p_skus: ['SKU-Z', 'OTHER'] });
+  });
+
+  it('refuses, before any confirmation, an inventory row that sets more than a sku and a quantity, a row without either, and an update of anything but the quantity', async () => {
+    const { rpc, context } = inventoryClient();
+    const confirmable = { ...context, skipConfirmation: false };
+
+    await expect(
+      executeDatabaseMutation(
+        { operation: 'upsert', rows: [{ sku: 'SKU-A', quantity: 1, updated_at: '2026-01-01T00:00:00Z' }], table: 'inventory_items' },
+        confirmable
+      )
+    ).rejects.toThrow('An inventory_items row is a sku and a quantity');
+    await expect(
+      executeDatabaseMutation({ operation: 'insert', rows: [{ quantity: 1 }], table: 'inventory_items' }, confirmable)
+    ).rejects.toThrow('rows[0] needs a sku.');
+    await expect(
+      executeDatabaseMutation({ operation: 'insert', rows: [{ sku: 'SKU-N' }], table: 'inventory_items' }, confirmable)
+    ).rejects.toThrow('rows[0] (SKU-N) needs a quantity.');
+    await expect(
+      executeDatabaseMutation(
+        { filters: [{ column: 'sku', operator: 'eq', value: 'SKU-A' }], operation: 'update', table: 'inventory_items', values: { sku: 'SKU-B' } },
+        confirmable
+      )
+    ).rejects.toThrow('An inventory_items update sets the quantity only');
+    expect(rpc).not.toHaveBeenCalled();
+  });
+
+  it('reports a refused write as a failure (the database rolled it back), not as executed', async () => {
+    const { context } = inventoryClient();
+    context.supabase.rpc = vi.fn(async () => ({ data: null, error: { code: '23505', message: 'duplicate key value violates unique constraint "inventory_items_pkey"' } }));
+    const result = await executeDatabaseMutation(
+      { operation: 'insert', rows: [{ sku: 'SKU-A', quantity: 1 }], table: 'inventory_items' },
+      { ...context, skipAudit: true }
+    );
+    expect(result).toMatchObject({ success: false, mutationExecuted: false });
+    expect((result as { message: string }).message).toContain('inventory_items_pkey');
   });
 });

@@ -178,7 +178,9 @@ describe('isSameOrInside (how refuseOverlap compares the real source and destina
   });
 });
 
-describe('copySupabaseAssets', () => {
+// Several cases start the copy script in a child node process (execFileSync): under 1.2 s alone, past
+// vitest's 5 s default in a loaded full run (2026-11-19), so the block gets room.
+describe('copySupabaseAssets', { timeout: 30_000 }, () => {
   it('copies config.toml, migrations/ and templates/ and nothing else: no local state, no dot entry at any depth', async () => {
     const source = tree(SUPABASE);
     const { distDir, dest } = distFolder();

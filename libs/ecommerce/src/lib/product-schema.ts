@@ -144,8 +144,15 @@ export const productSchema = z.object({
   // has none). The form never shows it; the autosave stores it in the draft, and publishing writes a
   // SKU's stock only when the draft's quantity differs from it (publish_product_draft, migration 02044),
   // so a sale made while the page was open keeps its deduction. Lenient on purpose: a hidden field that
-  // refused a value would block every autosave, and the publish ignores an entry it cannot read.
-  stock_baseline: z.record(z.string(), z.number()).nullable().optional(),
+  // refused a value would block every autosave, and the publish ignores an entry it cannot read. A null
+  // entry is what publish sends for a SKU the live product stocks that the draft's baseline lacks
+  // (resolvePublishedStockBaseline in the app); the form's own baseline holds numbers only.
+  stock_baseline: z.record(z.string(), z.number().nullable()).nullable().optional(),
+  // The product's publish count when the edit page loaded `stock_baseline` (public.product_stock_publishes,
+  // migration 02047). Carried unseen like the baseline: publishing counts a baseline loaded before the
+  // product's last publish from the figures that publish entered, so a change it made live is not applied
+  // again. Lenient for the same reason; the publish ignores a value that is not a whole number from 0.
+  stock_baseline_publish_count: z.number().nullable().optional(),
 }).refine(
   (product) =>
     product.sale_price === null ||

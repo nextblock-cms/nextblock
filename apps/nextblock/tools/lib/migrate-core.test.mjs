@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,30 +6,58 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { applyMigrations, collectMigrations, describeBackend, GRANTS_SQL, loadEnvFiles, readAppliedVersions, runSql } from './migrate-core.mjs';
+import { applyMigrations as applySetupMigrations, emptyHistoryRefusal as setupEmptyHistoryRefusal } from '../../lib/setup/schema-apply.ts';
+import {
+  applyMigrations,
+  collectMigrations,
+  describeBackend,
+  emptyHistoryRefusal,
+  GRANTS_SQL,
+  loadEnvFiles,
+  readAppliedVersions,
+  runSql,
+} from './migrate-core.mjs';
 
-// applyMigrations reaches Postgres through `await import('postgres')`: this stand-in records each
-// statement instead of connecting (the Management API backend runs on a stubbed fetch below). It
-// answers a history holding 02001, and the two table probes readAppliedVersions makes before it.
+// applyMigrations reaches Postgres through `await import('postgres')` (lib/setup/schema-apply.ts through
+// a static import): this stand-in records each statement instead of connecting (the Management API
+// backend runs on a stubbed fetch below, which answers from the same state). It answers from
+// `database`: a history holding 02001, the tracking table and public.site_settings present and no
+// generation marker, unless a test sets otherwise (database.reset() puts that back).
 const postgresStatements = vi.hoisted(() => []);
+const database = vi.hoisted(() => {
+  const DEFAULTS = { versions: ['02001'], tracked: true, siteSettings: true, generation: null };
+  const state = { ...DEFAULTS };
+  return {
+    state,
+    reset: () => Object.assign(state, DEFAULTS),
+    /** The rows a statement reads from the stand-in database; none for anything else. */
+    answer(text) {
+      if (text.includes('select version from supabase_migrations.schema_migrations')) return state.versions.map((version) => ({ version }));
+      if (text.includes("to_regclass('public.site_settings')")) return [{ t: state.siteSettings ? 'site_settings' : null }];
+      if (text.includes("to_regclass('supabase_migrations.schema_migrations')")) return [{ t: state.tracked ? 'supabase_migrations.schema_migrations' : null }];
+      if (text.includes("where key = 'migration_baseline_generation'")) return state.generation === null ? [] : [{ generation: String(state.generation) }];
+      return [];
+    },
+  };
+});
 vi.mock('postgres', () => ({
   default: () => {
     const db = (strings) => {
       const text = strings.join('$');
       postgresStatements.push(text);
-      if (text.includes('select version from supabase_migrations.schema_migrations')) return Promise.resolve([{ version: '02001' }]);
-      if (text.includes("to_regclass('public.site_settings')")) return Promise.resolve([{ t: 'site_settings' }]);
-      if (text.includes("to_regclass('supabase_migrations.schema_migrations')")) return Promise.resolve([{ t: 'supabase_migrations.schema_migrations' }]);
-      return Promise.resolve([]);
+      return Promise.resolve(database.answer(text));
     };
     db.unsafe = async (sql) => {
       postgresStatements.push(sql);
-      return [];
+      return database.answer(sql);
     };
     db.end = async () => undefined;
     return db;
   },
 }));
+// schema-apply.ts falls back to this bundle where no migration folder is on disk; the tests below run
+// in the monorepo, where it reads libs/db's folder like the build hook, so they need none of its 2.8 MB.
+vi.mock('../../lib/setup/migrations-bundle', () => ({ MIGRATIONS_BUNDLE: [] }));
 
 // The build-time hook (this directory) and the /setup wizard (lib/setup/schema-apply.ts)
 // both finish an apply with GRANTS_SQL: blanket grants on `public` for the API roles, then
@@ -47,7 +76,8 @@ const read = (rel) => readFileSync(path.resolve(here, rel), 'utf8').replace(/\r\
  * A static evaluator for a module's top-level string constants: string and template literals,
  * `+`, parentheses and references to other top-level constants. Anything else throws, so a
  * GRANTS_SQL built some other way fails the test instead of being half-compared.
- * (schema-apply.ts imports 'server-only' and the migrations bundle, so it cannot be imported.)
+ * (It reads schema-apply.ts as written; the tests further down import it, with its migrations
+ * bundle mocked, to run it.)
  */
 function constantsOf(source, fileName) {
   const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
@@ -210,8 +240,8 @@ describe('migrate-core post-apply grant pass', () => {
     }
     expect(GRANTS_SQL).toContain('revoke select on table public.profile_cards from anon;');
     expect(GRANTS_SQL).toContain('revoke insert, update, delete on table public.profile_cards from authenticated;');
-    // 29 tables of 02027 + profile_cards + the four partner tables of 02030
-    expect(GRANTS_SQL.match(/revoke select on table public\.\w+ from anon/g)).toHaveLength(34);
+    // 29 tables of 02027 + profile_cards + the four partner tables of 02030 + product_stock_publishes of 02047
+    expect(GRANTS_SQL.match(/revoke select on table public\.\w+ from anon/g)).toHaveLength(35);
     expect(GRANTS_SQL.indexOf('grant select on all tables in schema public to anon')).toBeLessThan(
       GRANTS_SQL.indexOf('revoke select on table public.orders from anon'),
     );
@@ -374,6 +404,7 @@ describe('applyMigrations with no file to apply', () => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     postgresStatements.length = 0;
+    database.reset();
   });
 
   it('runs the grant pass over the Management API', async () => {
@@ -383,12 +414,7 @@ describe('applyMigrations with no file to apply', () => {
     vi.stubGlobal('fetch', async (_url, init) => {
       const { query } = JSON.parse(init.body);
       queries.push(query);
-      const rows = query.startsWith('select version from')
-        ? [{ version: '02001' }]
-        : query.includes("to_regclass('public.site_settings')")
-          ? [{ t: 'site_settings' }]
-          : [];
-      return new Response(JSON.stringify(rows), { status: 200 });
+      return new Response(JSON.stringify(database.answer(query)), { status: 200 });
     });
 
     expect(await applyMigrations([])).toEqual({ ok: true, applied: 0, backend: 'management-api' });
@@ -458,6 +484,7 @@ describe('the engine contract an earlier updater relies on', () => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     postgresStatements.length = 0;
+    database.reset();
     for (const root of projects.splice(0)) rmSync(root, { recursive: true, force: true });
   });
 
@@ -610,4 +637,282 @@ describe('the engine contract an earlier updater relies on', () => {
     expect(await applyMigrations(files, { onApplied: () => expect.unreachable('nothing was applied') })).toMatchObject({ ok: false, applied: 0, error: refused });
     expect(await runSql('select 42;')).toMatchObject({ ok: false, error: refused });
   });
+});
+
+// The migration folder, found from this file as collectMigrations finds it (the monorepo's libs/db
+// from here and from the CLI template's copy of this file); schema-apply.ts finds the same folder from
+// the working directory. GENERATION is its squash generation, CATCHUP its GG000.
+const folder = collectMigrations(here).files;
+const GENERATION = Math.max(...folder.map((file) => Number.parseInt(file.version.slice(0, 2), 10)));
+const CATCHUP = folder.find((file) => file.version === `${String(GENERATION).padStart(2, '0')}000`)?.name;
+// Generation 1's first and last files, as a standalone project made before the generation-2 squash
+// still holds them in supabase/migrations: the update only ever adds to that folder.
+const RETIRED_FILES = ['00000000000000_baseline_schema.sql', '00000000000042_how_nextblock_works_css_diagram.sql'];
+
+/** The statements that change the database: everything an applier sends but its reads. */
+const writesIn = (statements) => statements.filter((sql) => !/^\s*select\b/i.test(sql));
+/** The versions the statements record, in order: one per migration applied. */
+const recordedIn = (statements) =>
+  statements.flatMap((sql) => [...sql.matchAll(/insert into supabase_migrations\.schema_migrations \(version, name\) values \('(\d+)'/g)].map((match) => match[1]));
+
+/**
+ * Runs `apply` against the stand-in database in `state`, over `kind` (the Management API on a stubbed
+ * fetch, or Postgres on the stand-in), and returns its result with the statements that backend received.
+ */
+async function runApplier(kind, state, apply) {
+  database.reset();
+  Object.assign(database.state, state);
+  postgresStatements.length = 0;
+  vi.stubEnv('SUPABASE_ACCESS_TOKEN', kind === 'management-api' ? 'stub-token' : '');
+  vi.stubEnv('SUPABASE_PROJECT_ID', kind === 'management-api' ? 'stubref' : '');
+  vi.stubEnv('POSTGRES_URL', kind === 'postgres' ? 'postgres://nextblock:stub@127.0.0.1:9/nextblock' : '');
+  vi.stubEnv('DATABASE_URL', '');
+  const queries = [];
+  vi.stubGlobal('fetch', async (_url, init) => {
+    const { query } = JSON.parse(init.body);
+    queries.push(query);
+    return new Response(JSON.stringify(database.answer(query)), { status: 200 });
+  });
+  const result = await apply();
+  return { result, statements: [...(kind === 'postgres' ? postgresStatements : queries)] };
+}
+
+// Each case replays the whole real folder through both appliers: about 0.2 s alone, past vitest's 5 s
+// default in a loaded full run (2026-11-19, 48 files), and a case that times out keeps applying into the
+// next case's stand-in database. The folder only grows, so the cases get room.
+describe('both appliers over an empty migration history', { timeout: 30_000 }, () => {
+  // tools/lib/migrate-core.mjs (the build hook and npm run update) and lib/setup/schema-apply.ts (/setup)
+  // apply every file supabase_migrations.schema_migrations does not record. Over an empty history on a
+  // database with content that never crossed the last squash, that replays the retired generation: the
+  // catch-up decides what to replay from the recorded versions (docs/04 → "How a squash crosses live
+  // databases"), which is why `npm run db:migrate` refuses the baseline over an empty history. Until
+  // 2026-11-19 both appliers applied it. They refuse it now, before they write anything, and still replay
+  // every file over an empty database and over one born at, or crossed to, the folder's generation.
+  // Each case runs on both appliers and both backends, against the stand-in database and the real folder.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+    postgresStatements.length = 0;
+    database.reset();
+  });
+
+  it('reads the real folder', () => {
+    expect(GENERATION).toBeGreaterThanOrEqual(2);
+    expect(CATCHUP).toBe(`${String(GENERATION).padStart(2, '0')}000_catchup_gen${GENERATION - 1}.sql`);
+    expect(folder.length).toBeGreaterThan(5);
+  });
+
+  const EVERY_FILE = 'every file';
+  const CASES = [
+    { name: 'an empty database', state: { versions: [], tracked: false, siteSettings: false }, applies: EVERY_FILE },
+    { name: `a database at generation ${GENERATION} (born there, or crossed) whose history was emptied`, state: { versions: [], generation: GENERATION }, applies: EVERY_FILE },
+    { name: 'recorded versions over a dropped public schema (the self-heal)', state: { versions: ['02001'], siteSettings: false }, applies: EVERY_FILE },
+    {
+      name: 'a recorded history on a database whose marker is unset (production after the squash reconcile)',
+      state: { versions: folder.slice(0, -1).map((file) => file.version), generation: null },
+      applies: 'the last file',
+    },
+    { name: 'a database that never crossed, its history emptied', state: { versions: [], generation: null }, refused: 'unset' },
+    { name: `a database behind generation ${GENERATION} (marker ${GENERATION - 1})`, state: { versions: [], generation: GENERATION - 1 }, refused: String(GENERATION - 1) },
+    { name: 'a database with content and no tracking table (a dump of the public schema alone)', state: { versions: [], tracked: false, generation: null }, refused: 'unset' },
+  ];
+
+  for (const backend of ['management-api', 'postgres']) {
+    for (const { name, state, applies, refused } of CASES) {
+      it(`${refused ? 'refuses' : 'applies'} ${name}, alike in both appliers, on ${backend}`, async () => {
+        const core = await runApplier(backend, state, () => applyMigrations(folder));
+        const setup = await runApplier(backend, state, () => applySetupMigrations());
+        for (const [label, { result, statements }] of [['migrate-core.mjs', core], ['schema-apply.ts', setup]]) {
+          if (refused) {
+            expect(result, label).toMatchObject({ ok: false, applied: 0 });
+            expect(result.refusal, label).toEqual({ generation: GENERATION, baselineGeneration: state.generation, catchup: CATCHUP, retired: [], message: result.error });
+            expect(result.error, label).toContain(`It never crossed squash generation ${GENERATION} (site_settings.migration_baseline_generation is ${refused}), and ${CATCHUP}`);
+            // Nothing written: no tracking table, no history row, no migration, no grant pass.
+            expect(writesIn(statements), label).toEqual([]);
+          } else {
+            const expected = applies === EVERY_FILE ? folder : folder.slice(-1);
+            expect(result, label).toMatchObject({ ok: true, applied: expected.length });
+            expect(result.refusal, label).toBeUndefined();
+            expect(recordedIn(statements), label).toEqual(expected.map((file) => file.version));
+            expect(statements.slice(-2), label).toEqual([GRANTS_SQL, "notify pgrst, 'reload schema';"]);
+          }
+        }
+        // The same answer, and the same files in the same order (only migrate-core.mjs names its backend).
+        expect({ ...setup.result, backend: undefined }).toEqual({ ...core.result, backend: undefined });
+        expect(recordedIn(setup.statements)).toEqual(recordedIn(core.statements));
+      });
+    }
+  }
+
+  for (const backend of ['management-api', 'postgres']) {
+    it(`readAppliedVersions answers the refusal applyMigrations would, before anything is applied, on ${backend}`, async () => {
+      const NEVER_CROSSED = { versions: [], generation: null };
+      const applying = await runApplier(backend, NEVER_CROSSED, () => applyMigrations(folder));
+      const read = await runApplier(backend, NEVER_CROSSED, () => readAppliedVersions(folder));
+      // ok false with the message as the error: an updater that predates the refusal reads only those, and stops.
+      expect(read.result).toEqual({ ok: false, versions: new Set(), error: applying.result.error, refusal: applying.result.refusal });
+      expect(writesIn(read.statements)).toEqual([]);
+      // Such an updater passes no files: the engine judges the ones it finds from the working directory.
+      const unnamed = await runApplier(backend, NEVER_CROSSED, () => readAppliedVersions());
+      expect(unnamed.result).toMatchObject({ ok: false, refusal: { generation: GENERATION, baselineGeneration: null, catchup: CATCHUP } });
+      // A database at the folder's generation, and an empty one, read as an empty history, which replays.
+      for (const state of [{ versions: [], generation: GENERATION }, { versions: [], tracked: false, siteSettings: false }]) {
+        expect((await runApplier(backend, state, () => readAppliedVersions(folder))).result).toEqual({ ok: true, versions: new Set() });
+      }
+      // A recorded history reads as before, whatever the marker.
+      expect((await runApplier(backend, { versions: ['02001'], generation: null }, () => readAppliedVersions(folder))).result).toEqual({
+        ok: true,
+        versions: new Set(['02001']),
+      });
+    });
+
+    it(`refuses a retired generation's files over an empty history, even at generation ${GENERATION}, on ${backend}`, async () => {
+      const retired = RETIRED_FILES.map((name) => ({ version: name.split('_')[0], name, dir: folder[0].dir }));
+      const files = [...retired, ...folder];
+      const AT_GENERATION = { versions: [], generation: GENERATION };
+      const refused = await runApplier(backend, AT_GENERATION, () => applyMigrations(files));
+      expect(refused.result).toMatchObject({
+        ok: false,
+        applied: 0,
+        refusal: { generation: GENERATION, baselineGeneration: GENERATION, catchup: CATCHUP, retired: RETIRED_FILES },
+      });
+      expect(refused.result.error).toContain(`2 file(s) from a retired squash generation (${RETIRED_FILES[0]} … ${RETIRED_FILES[1]}) would run again as written.`);
+      expect(refused.result.error).toContain(
+        `This database crossed generation ${GENERATION} already, so nothing needs those files any more: remove them from supabase/migrations, or restore the history, and try again`,
+      );
+      expect(refused.result.error).not.toContain('never crossed');
+      expect(writesIn(refused.statements)).toEqual([]);
+      const read = await runApplier(backend, AT_GENERATION, () => readAppliedVersions(files));
+      expect(read.result).toEqual({ ok: false, versions: new Set(), error: refused.result.error, refusal: refused.result.refusal });
+      // A history that records them is not the guard's to judge: recorded files are skipped, the rest applied.
+      const recorded = await runApplier(backend, { versions: files.slice(0, -1).map((file) => file.version), generation: GENERATION }, () => applyMigrations(files));
+      expect(recorded.result).toMatchObject({ ok: true, applied: 1 });
+    });
+  }
+});
+
+describe('emptyHistoryRefusal, alike in both appliers', () => {
+  const names = folder.map((file) => file.name);
+  // The next squash's folder, as GG000 to GG004 plus a forward migration would name it.
+  const NEXT = ['03000_catchup_gen2.sql', '03001_baseline_schema.sql', '03005_next_forward_migration.sql'];
+  const OWN = '20251201093000_my_own_table.sql'; // a project's own migration, numbered by `supabase migration new`
+
+  it('answers every input the same way, message included', () => {
+    const INPUTS = [
+      [names, null],
+      [names, GENERATION - 1],
+      [names, GENERATION],
+      [names, GENERATION + 1],
+      [[...RETIRED_FILES, ...names], null],
+      [[...RETIRED_FILES, ...names], GENERATION],
+      [[RETIRED_FILES[0], ...names], GENERATION],
+      [[...names, OWN], GENERATION],
+      [[...names, OWN], null],
+      [RETIRED_FILES, null],
+      [[], null],
+      [NEXT, 2],
+      [NEXT, 3],
+      [['02001_baseline_schema.sql'], null],
+    ];
+    for (const [list, generation] of INPUTS) {
+      expect(setupEmptyHistoryRefusal(list, generation), `${list.length} file(s), marker ${generation}`).toEqual(emptyHistoryRefusal(list, generation));
+    }
+  });
+
+  it("refuses a database behind the folder's generation and a list with a retired file, and nothing else", () => {
+    // At or past the folder's generation, holding its files or a project's own: every file replays.
+    expect(emptyHistoryRefusal(names, GENERATION)).toBeNull();
+    expect(emptyHistoryRefusal(names, GENERATION + 1)).toBeNull();
+    expect(emptyHistoryRefusal([...names, OWN], GENERATION)).toBeNull();
+    expect(emptyHistoryRefusal(NEXT, 3)).toBeNull();
+    // No GGNNN file, so no generation to hold the marker to.
+    expect(emptyHistoryRefusal(RETIRED_FILES, null)).toBeNull();
+    expect(emptyHistoryRefusal([], null)).toBeNull();
+
+    expect(emptyHistoryRefusal(names, null)).toEqual({
+      generation: GENERATION,
+      baselineGeneration: null,
+      catchup: CATCHUP,
+      retired: [],
+      message:
+        'The migration history (supabase_migrations.schema_migrations) is empty, but this database already holds NextBlock content (public.site_settings). ' +
+        `It never crossed squash generation ${GENERATION} (site_settings.migration_baseline_generation is unset), and ${CATCHUP} decides what to replay ` +
+        `from the recorded versions: with none recorded, it would run every generation-${GENERATION - 1} migration again over that content. ` +
+        'Restore supabase_migrations.schema_migrations from a backup of this database (a dump of the public schema alone leaves it out: copy it from ' +
+        'the database the dump came from), then try again (docs/13-STAYING-UP-TO-DATE.md, "The contract every applier honours").',
+    });
+    // Both reasons at once: restoring the history is the remedy, as the marker says the database never crossed.
+    const both = emptyHistoryRefusal([...RETIRED_FILES, ...names], null);
+    expect(both.retired).toEqual(RETIRED_FILES);
+    expect(both.message).toContain(`2 file(s) from a retired squash generation (${RETIRED_FILES[0]} … ${RETIRED_FILES[1]}) would also run again as written.`);
+    expect(both.message).toContain('Restore supabase_migrations.schema_migrations from a backup of this database');
+    expect(both.message).not.toContain('remove them');
+    // One retired file is named alone.
+    expect(emptyHistoryRefusal([RETIRED_FILES[0], ...names], GENERATION).message).toContain(
+      `1 file(s) from a retired squash generation (${RETIRED_FILES[0]}) would run again as written.`,
+    );
+    // The next squash: a database at generation 2 is behind a generation-3 folder, whose catch-up replays generation 2.
+    expect(emptyHistoryRefusal(NEXT, 2).message).toContain(
+      'It never crossed squash generation 3 (site_settings.migration_baseline_generation is 2), and 03000_catchup_gen2.sql decides what to ' +
+        'replay from the recorded versions: with none recorded, it would run every generation-2 migration again over that content.',
+    );
+    // A list without its catch-up still says which one decides.
+    expect(emptyHistoryRefusal(['02001_baseline_schema.sql'], null)).toMatchObject({
+      catchup: null,
+      message: expect.stringContaining('and the generation-2 catch-up decides what to replay'),
+    });
+  });
+
+  it('reads the generation marker with the same query in both appliers', () => {
+    const core = read('./migrate-core.mjs');
+    const setup = read('../../lib/setup/schema-apply.ts');
+    const query = constantsOf(core, 'migrate-core.mjs')('BASELINE_GENERATION_SQL');
+    expect(query).toContain("where key = 'migration_baseline_generation'");
+    expect(constantsOf(setup, 'schema-apply.ts')('BASELINE_GENERATION_SQL')).toBe(query);
+  });
+});
+
+describe('the build hook when the engine refuses an empty history', () => {
+  // tools/build-migrate.mjs runs before every production build and must never fail one. This runs the
+  // real file beside an engine whose applyMigrations answers emptyHistoryRefusal's refusal.
+  const roots = [];
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
+
+  it('logs the refusal and what it changed (nothing), and exits 0, so the build goes on', () => {
+    // As emptyHistoryRefusal words it (tested above); the hook prints whatever message the engine gives.
+    const message =
+      'The migration history (supabase_migrations.schema_migrations) is empty, but this database already holds NextBlock content ' +
+      '(public.site_settings). Restore supabase_migrations.schema_migrations from a backup of this database, then try again.';
+    const refusal = { generation: GENERATION, baselineGeneration: null, catchup: CATCHUP, retired: [], message };
+    const root = mkdtempSync(path.join(os.tmpdir(), 'nb-build-migrate-'));
+    roots.push(root);
+    mkdirSync(path.join(root, 'tools', 'lib'), { recursive: true });
+    writeFileSync(path.join(root, 'package.json'), '{}\n');
+    writeFileSync(path.join(root, 'tools', 'build-migrate.mjs'), read('../build-migrate.mjs'));
+    const files = folder.map(({ version, name }) => ({ version, name, dir: '.' }));
+    writeFileSync(
+      path.join(root, 'tools', 'lib', 'migrate-core.mjs'),
+      [
+        'export async function loadEnvFiles() {}',
+        "export function describeBackend() { return { kind: 'postgres', detail: 'stub' }; }",
+        `export function collectMigrations() { return { files: ${JSON.stringify(files)}, sources: [] }; }`,
+        `export async function applyMigrations() { return ${JSON.stringify({ ok: false, applied: 0, backend: 'postgres', error: refusal.message, refusal })}; }`,
+        '',
+      ].join('\n'),
+    );
+    const KEEP = new Set(['PATH', 'PATHEXT', 'SYSTEMROOT', 'COMSPEC', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'HOME', 'USERPROFILE']);
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => KEEP.has(key.toUpperCase())));
+    const run = spawnSync(process.execPath, [path.join(root, 'tools', 'build-migrate.mjs')], {
+      cwd: root,
+      env: { ...env, NEXTBLOCK_BUILD_MIGRATE: '1' },
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    expect(run.status, `${run.stdout}${run.stderr}`).toBe(0);
+    expect(run.stdout).toContain(`[build-migrate] WARNING: migrations not applied. ${refusal.message}`);
+    expect(run.stdout).toContain('[build-migrate] Continuing the build; the database was not changed.');
+    expect(run.stdout).not.toContain('apply later with "npm run update"');
+  }, 60_000);
 });

@@ -403,6 +403,9 @@ function buildProductFormDefaults(
     // what the stock was when this page opened and publishing writes only the quantities changed here.
     // Only the page knows whether its data is live or a draft's, so the form never computes one.
     stock_baseline: initialData?.stock_baseline ?? undefined,
+    // The product's publish count when the page loaded that baseline (migration 02047), carried unseen
+    // the same way, so a publish can tell a baseline from before the product's last publish.
+    stock_baseline_publish_count: initialData?.stock_baseline_publish_count ?? undefined,
   }, currencies);
 
   return {

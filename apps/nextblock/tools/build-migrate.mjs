@@ -13,8 +13,9 @@
 //     (the /setup wizard and the create/docker setup scripts write this into .env).
 //
 // Safety: this NEVER fails the build. A missing flag, a missing connection string, an
-// unreachable database — or even a broken ./lib/migrate-core.mjs — logs a warning and
-// exits 0 so static packaging always proceeds. That is why the engine is loaded with a
+// unreachable database, an empty migration history the engine refuses to apply over — or
+// even a broken ./lib/migrate-core.mjs — logs a warning and exits 0 so static packaging
+// always proceeds. That is why the engine is loaded with a
 // guarded dynamic import rather than a top-level one: an unresolvable top-level import
 // is a hard ESM error that no try/catch inside main() could contain.
 //
@@ -85,6 +86,13 @@ async function main() {
         ? `Applied ${result.applied} pending migration(s) via ${result.backend}.`
         : 'Schema already up to date.',
     );
+  } else if (result.refusal) {
+    // The engine refused an empty migration history: this database holds content, and the run would
+    // replay a retired squash generation over it (emptyHistoryRefusal in ./lib/migrate-core.mjs). It
+    // wrote nothing, and "npm run update" refuses the same way, so the log says what to restore instead
+    // of sending the reader there.
+    log(`WARNING: migrations not applied. ${result.error}`);
+    log('Continuing the build; the database was not changed.');
   } else {
     log(`WARNING: could not apply migrations: ${result.error}.`);
     log('Continuing the build — apply later with "npm run update".');

@@ -1681,6 +1681,45 @@ async function updateSchema(install, core, flags, { codeChanged = false } = {}) 
   return { ...(await applyPendingMigrations(install, engine, flags)), core: engine.core };
 }
 
+/** `text` in lines of at most `width` characters, broken at spaces (a longer word keeps a line to itself). */
+function wrapText(text, width = 96) {
+  const lines = [];
+  let line = '';
+  for (const word of String(text).split(/\s+/).filter(Boolean)) {
+    if (line && line.length + 1 + word.length > width) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = line ? `${line} ${word}` : word;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+/**
+ * The engine refused to apply over an empty migration history (emptyHistoryRefusal in
+ * ./lib/migrate-core.mjs), in readAppliedVersions or applyMigrations, and wrote nothing: this database
+ * holds content, and with nothing recorded the run would replay a retired squash generation over it.
+ * `message` says why and what to restore; this adds what that means for this install, and main() how
+ * to go on. An updater from before the refusal prints the same message as a history it could not read,
+ * or as a failed migration.
+ */
+function refuseEmptyHistory(install, message) {
+  fail('Refusing to apply migrations to this database:');
+  for (const line of wrapText(message)) info(line);
+  say();
+  // Only the monorepo has db:migrate and db:migrate:repair-history (its root package.json), and its
+  // refusal always means "never crossed": its folder holds one generation, so no retired file.
+  if (install.layout === 'monorepo') {
+    info(`${C.cyan('npm run db:migrate')} refuses this database too. Do not get past it with`);
+    info(`${C.cyan('npm run db:migrate:repair-history')}: it records only this generation's versions, so the`);
+    info('catch-up would still find no retired version recorded, and replay that whole generation.');
+  }
+  info('The build hook stops at the same point: a production build applies nothing until this is fixed.');
+  return { ok: false, applied: 0, refused: true };
+}
+
 /**
  * Apply what is pending on `core`, which then runs the grant pass; with nothing pending, run the
  * grant pass alone (reapplyDatabaseGrants). `current` is false for an engine the code update replaced.
@@ -1705,7 +1744,9 @@ async function applyPendingMigrations(install, { core, current }, flags) {
     }
   }
 
-  const applied = await core.readAppliedVersions();
+  // The engine judges an empty history by the files this run would apply, before anything is listed or asked.
+  const applied = await core.readAppliedVersions(files);
+  if (applied.refusal) return refuseEmptyHistory(install, applied.error);
   if (!applied.ok) {
     fail(`Could not read the migration history: ${applied.error}`);
     return { ok: false, applied: 0 };
@@ -1717,7 +1758,12 @@ async function applyPendingMigrations(install, { core, current }, flags) {
   // whose number is already recorded is skipped in silence, with no error and no output. Warn
   // rather than block — this applier is exactly the one that is SUPPOSED to run here. It
   // tolerates retired rows, and the catch-up reads them to decide what to replay, so the rows
-  // must survive until after it has run. Reconciling them away is the step that comes AFTER.
+  // must survive until after it has run. Reconciling them away is the step that comes AFTER,
+  // and only the monorepo has a reason and a script for it: its db:migrate runs `supabase db
+  // push`, which refuses while they remain, and its root package.json holds
+  // db:migrate:repair-history. A standalone project's package.json is apps/nextblock's, which
+  // has neither, and nothing it runs needs them gone: this applier, the build hook and /setup
+  // use the history only to skip recorded files (docs/13 → "The contract every applier honours").
   const localVersions = new Set(files.map((f) => f.version));
   const remoteOnly = [...applied.versions].filter((v) => !localVersions.has(v)).sort();
   if (remoteOnly.length > 0) {
@@ -1727,9 +1773,17 @@ async function applyPendingMigrations(install, { core, current }, flags) {
     info('Migrations are matched by version, never by content, so a local file reusing one');
     info('of those numbers would never run. A migration squash retired them; applying the');
     info('pending files below is what carries this database across it.');
-    info(`Afterwards, clear the retired rows once with ${C.cyan('npm run db:migrate:repair-history')}`);
-    info('(it detects the squash and offers to reconcile). Do not run it first — the catch-up');
-    info('reads those rows to decide what to replay.');
+    if (install.layout === 'monorepo') {
+      info(`Afterwards, clear the retired rows once with ${C.cyan('npm run db:migrate:repair-history')}`);
+      info('(it detects the squash and offers to reconcile). Do not run it first — the catch-up');
+      info('reads those rows to decide what to replay.');
+    } else {
+      info('In a standalone project, leave them: this updater, the build hook and /setup use the history');
+      info('only to skip recorded files, so rows without a file change nothing for them, and the catch-up');
+      info(`reads those rows to decide what to replay. Only the Supabase CLI objects (${C.cyan('supabase db push')}`);
+      info('refuses while they remain); if you run it on this database, docs/13-STAYING-UP-TO-DATE.md');
+      info('("The contract every applier honours") says when it is safe to remove them.');
+    }
     say();
   }
 
@@ -1752,6 +1806,7 @@ async function applyPendingMigrations(install, { core, current }, flags) {
   const result = await core.applyMigrations(files, {
     onApplied: (entry) => good(`applied ${entry.name}`),
   });
+  if (result.refusal) return refuseEmptyHistory(install, result.error);
   if (!result.ok) {
     fail(`Migration failed after ${result.applied} file(s): ${result.error}`);
     info('The failed migration rolled back; re-run once the cause is fixed.');
@@ -1801,7 +1856,10 @@ function parseFlags(argv) {
   };
 }
 
-function printHelp() {
+/** This script's path in this install, from its root: what PowerShell users run with node. */
+const updaterFile = (install) => (install.layout === 'monorepo' ? 'apps/nextblock/tools/update.mjs' : 'tools/update.mjs');
+
+function printHelp(install) {
   say(`
 ${C.bold('npm run update')} — bring this NextBlock install up to date.
 
@@ -1813,15 +1871,16 @@ ${C.bold('npm run update')} — bring this NextBlock install up to date.
   ${C.cyan('npm run update -- --db-only')}    schema only: pending migrations and the database grants
 
   On Windows PowerShell the bare ${C.cyan('--')} is stripped and the flag never arrives;
-  call this script directly instead, e.g. ${C.cyan('node apps/nextblock/tools/update.mjs --db-only')}.
+  call this script directly instead, e.g. ${C.cyan(`node ${updaterFile(install)} --db-only`)}.
 `);
 }
 
 async function main() {
   const flags = parseFlags(process.argv.slice(2));
-  if (flags.help) return printHelp();
-
+  // Before the help, which names this install's path to the script (a standalone project has no apps/).
   const install = detectInstall(process.cwd());
+  if (flags.help) return printHelp(install);
+
   say(`\n${C.bold('NextBlock update')} ${C.dim(flags.check ? '(check only)' : '')}`);
   info(describeInstall(install));
   info(C.dim(install.root));
@@ -1927,10 +1986,12 @@ async function main() {
 
   let schemaOk = true;
   let schemaDeferred = false;
+  let schemaRefused = false;
   if (!flags.skipDb) {
     const res = await updateSchema(install, core, flags, { codeChanged: codeChanged && !flags.check });
     schemaOk = res.ok;
     schemaDeferred = res.deferred === true;
+    schemaRefused = res.refused === true;
     if (res.core) core = res.core;
   }
 
@@ -1942,7 +2003,11 @@ async function main() {
   }
 
   step('Done');
-  if (flags.check) {
+  if (schemaRefused) {
+    // The engine refused an empty history (refuseEmptyHistory): no rebuild and no re-run applies
+    // anything until its cause is fixed, --check or not.
+    info(`The database was not changed. Fix what is described above, then run ${C.cyan('npm run update')} again.`);
+  } else if (flags.check) {
     info('Nothing was changed. Run "npm run update" to apply.');
   } else if (schemaDeferred) {
     info('Resolve the conflicts above, then re-run ' + C.cyan('npm run update') + ' to migrate.');

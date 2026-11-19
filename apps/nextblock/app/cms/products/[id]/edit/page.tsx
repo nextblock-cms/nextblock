@@ -14,6 +14,7 @@ import {
 } from '@nextblock-cms/ui';
 import ProductFormClientShell from '../../ProductFormClientShell';
 import { ProductDraftFlagProvider } from '../../ProductDraftFlagProvider';
+import { buildProductCreatedIncompleteNotice } from '@nextblock-cms/ecommerce/product-actions';
 import {
   getCmsProduct,
   getEnabledPaymentProviders,
@@ -34,9 +35,11 @@ import {
   getProductDraftEditNotices,
   mergeProductDraftMetaIntoFormInitialData,
   readProductDraftGalleryMediaIds,
+  readProductStockPublishAnswer,
   resolveProductDraftGalleryForEdit,
   type ProductDraftGalleryMediaRow,
   type ProductDraftGalleryTile,
+  type ProductStockPublish,
 } from '../../productFormData';
 import { currentUserCanPublishProductDrafts } from '../../../../../lib/visual-editing/product-drafts';
 import { CortexAiPageContextRegistrar } from '../../../components/CortexAiPageContext';
@@ -47,16 +50,32 @@ import { buildViewUrl } from '../../../../../lib/publishing/viewUrl';
 import { PageSeoProvider } from '../../../../../lib/seo/page-audit-context';
 import { PageSeoAuditSection } from '../../../../../components/seo/PageSeoAuditSection';
 
+/**
+ * The product's product_stock_publishes row as the page's caller reads it (staff read the table; the
+ * policy is migration 02047's), through readProductStockPublishAnswer.
+ */
+async function readStockPublishForEdit(
+  supabase: ReturnType<typeof createClient>,
+  productId: string
+): Promise<ProductStockPublish> {
+  const answer = await (supabase as any)
+    .from('product_stock_publishes')
+    .select('publish_count, stock')
+    .eq('product_id', productId)
+    .maybeSingle();
+  return readProductStockPublishAnswer(answer);
+}
+
 export default async function EditProductPage({
   params,
   searchParams,
 }: {
   params: Promise<{ id: string }>;
-  searchParams: Promise<{ missing_lang_id?: string }>;
+  searchParams: Promise<{ missing_lang_id?: string; created_incomplete?: string }>;
 }) {
   const [
     { id },
-    { missing_lang_id },
+    { missing_lang_id, created_incomplete },
     isOnline,
     languages,
     enabledProviders,
@@ -77,6 +96,18 @@ export default async function EditProductPage({
     redirect('/cms/settings/packages');
   }
 
+  const supabase = createClient();
+  // The product's last product-values publish (public.product_stock_publishes, migration 02047), read
+  // BEFORE the product: the form records its count beside the stock it loads (stock_baseline_publish_count),
+  // and a publish counts a baseline whose count is below the product's from the figures that publish
+  // entered. A publish landing between the two reads then makes this page's baseline look older than it
+  // is, never newer: read after the product, its count would vouch for a stock read before the publish,
+  // whose change the next publish would apply again. A draft's stock is shown as publish decides it from
+  // the same row. A database without the table (migration 02047 not applied yet) records no publish, as
+  // its publish ignores the count; any other failure fails the page rather than show a stock it could not
+  // check.
+  const stockPublish = await readStockPublishForEdit(supabase, id);
+
   const product = await getCmsProduct(id);
 
   if (!product) {
@@ -94,7 +125,6 @@ export default async function EditProductPage({
     // disabled with a note; the server checks again whatever this page showed.
     currentUserCanPublishProductDrafts(),
   ]);
-  const supabase = createClient();
   const { data: currenciesResult } = await supabase
     .from('currencies')
     .select(
@@ -163,9 +193,15 @@ export default async function EditProductPage({
   // The stock the form loads, per SKU: the autosave records it in the draft, and publishing writes a
   // SKU's stock only where the draft's quantity differs from it and from the current stock, as a change
   // to the stock as it then is (buildProductStockBaseline), so a sale made while this page is open keeps
-  // its deduction. With a draft open, mergeProductDraftMetaIntoFormInitialData shows SKU by SKU what
-  // publishing that draft would write, and records the live stock of every SKU the product stocks.
-  const liveInitialData = { ...liveFormData, stock_baseline: buildProductStockBaseline(liveFormData) };
+  // its deduction; beside it the product's publish count as read above, so a publish can tell a baseline
+  // loaded before the product's last publish (migration 02047). With a draft open,
+  // mergeProductDraftMetaIntoFormInitialData shows SKU by SKU what publishing that draft would write, and
+  // records the live stock of every SKU the product stocks, with this count.
+  const liveInitialData = {
+    ...liveFormData,
+    stock_baseline: buildProductStockBaseline(liveFormData),
+    stock_baseline_publish_count: stockPublish.count,
+  };
   let normalizedInitialData = liveInitialData;
   // Notes above the form for a draft publish would refuse or skip parts of (getProductDraftEditNotices).
   // One an earlier version wrote that publish refuses, shown with the live values for the fields it
@@ -183,9 +219,13 @@ export default async function EditProductPage({
   // the same product): the next autosave records the live stock as the baseline, after which a publish
   // sees neither case.
   let draftNotices: string[] = [];
+  // The CMS create sends the editor here when the product was created but a step after it was not saved
+  // (createProductAction, ProductCreatedIncompleteError): the notice names each step it knows from the
+  // URL's fixed list, and nothing else from the URL is shown.
+  const createdIncompleteNotice = buildProductCreatedIncompleteNotice(created_incomplete);
   if (draftData && draftData.meta && typeof draftData.meta === 'object') {
     const meta = draftData.meta as any;
-    draftNotices = getProductDraftEditNotices(meta, product, draftData.created_at);
+    draftNotices = getProductDraftEditNotices(meta, product, draftData.created_at, stockPublish);
 
     // Only the form's own autosave (or a CMS draft import) stages product values. A draft that a
     // block edit or the in-page editor created stages the title, short description and
@@ -231,6 +271,7 @@ export default async function EditProductPage({
       draftCreatedAt: draftData.created_at,
       hydratedProductMedia,
       globalAttributes,
+      stockPublish,
     });
   }
 
@@ -390,7 +431,7 @@ export default async function EditProductPage({
         </div>
       </div>
 
-      {draftNotices.map((notice) => (
+      {[...(createdIncompleteNotice ? [createdIncompleteNotice] : []), ...draftNotices].map((notice) => (
         <div
           key={notice}
           role="alert"

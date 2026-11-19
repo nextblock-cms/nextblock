@@ -336,7 +336,7 @@ change):
   forward migration revokes them. Both apply paths end with a blanket
   `grant execute on all functions in schema public` to the API roles, so each path must
   take it back in the same pass: `TRIGGER_FUNCTION_REVOKE_SQL` (every `RETURNS trigger`
-  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02028`/`02030`/`02035`–`02037`/`02043`/`02045`) in
+  function) and `API_ROLE_REVOKE_SQL` (the explicit revokes of `02021`/`02022`/`02025`–`02028`/`02030`/`02035`–`02037`/`02043`/`02045`–`02047`) in
   `lib/setup/schema-apply.ts` (`/setup`) and `tools/lib/migrate-core.mjs` (the build-time
   hook). The hook lacked both until 2026-10-20, so every production deploy re-granted the
   triggers and the advisor flagged them again; `02024` repairs the databases that were
@@ -1373,7 +1373,7 @@ whole `(product_id, sku)` key, under the caller's row policies, once per SKU a p
 Measured on local replays, five hundred changed SKUs beside 50 other products take 10 s or more
 without them and about 5 s with them on an idle machine (up to 9 s on a busy one, past the Data
 API's 8 s statement timeout); beside 2,000 other products they still take 9 to 13 s, and a publish
-past the timeout fails with nothing written. Both are a plain `CREATE INDEX IF NOT EXISTS` (a migration
+past the timeout fails with nothing written (02046, below, runs the trigger once per statement). Both are a plain `CREATE INDEX IF NOT EXISTS` (a migration
 runs in a transaction, where `CONCURRENTLY` cannot), which holds writes to its table until the
 file's transaction commits, right after it.
 `security-verify.sql` section 44 (10 assertions) checks the privileges and the behaviour, and
@@ -1426,6 +1426,62 @@ escaped backslash in a text block and in a navigation link), that a key written 
 is found (JSON-LD in a text block, where the backslashes before an escaped slash still end a key,
 and a redirect target), and that a profile picture URL of 20,000 slashes answers within a 4 s
 statement timeout with the key at its end still found; without the function all fourteen fail.
+
+`02046` (2026-11-19) makes every stock write take `inventory_items` rows in SKU order, and the
+inventory caches sync once per statement (docs/09 → "Stock: only what the editor changed", Limits
+and Locks). The row-level `on_inventory_item_change` is replaced by three statement-level triggers
+(`on_inventory_items_inserted`, `_updated`, `_deleted`, each with its transition table) calling
+`public.handle_inventory_items_sync()`, which hands the statement's SKUs to
+`private.sync_inventory_caches(text[], boolean)`: one write per carrier (the variants with those
+SKUs, the products without variants with them, one total per product with a variant carrying one,
+locked in id order first), only where the value changes, `products.updated_at` stamped where a
+product's own stock or a variant's changes and where its total changes, except a total that only
+rows a statement inserted changed (a repair: a row created from the stock its carriers show).
+`public.sync_inventory_cache_for_sku` stays as a wrapper of it. Until then each row written summed
+the product's variants again under the caller's row policies: five hundred changed SKUs took 12 to
+27 s on local replays (past the Data API's 8 s statement timeout), about 0.7 s now. Three inventory
+writers take their rows in SKU order in one statement: `public.upsert_inventory_items(p_rows jsonb,
+p_on_conflict text)` (`'update'`, `'nothing'` or `'error'`), `public.update_inventory_quantities(p_skus
+text[], p_quantity integer)` and `public.delete_inventory_items(p_skus text[])`; libs/ecommerce's
+`upsertInventoryRows` (with a fallback to the PostgREST upsert where the function is unknown) and
+Cortex's `execute_database_mutation` on `inventory_items` write through them. They and the sync are
+`SECURITY INVOKER` with `search_path ''`: the `inventory_items` policies decide (an ADMIN or the
+service role writes; a WRITER's insert is refused and its update or delete matches nothing), so they
+can do nothing a caller could not do over PostgREST. The migration revokes EXECUTE on the three
+writers and the sync from `PUBLIC, anon` and grants it to `authenticated` and `service_role`, and
+both copies of `API_ROLE_REVOKE_SQL` take `anon` back after the blanket grant (the sync lives in
+`private`, which the pass never touches). `apply_order_inventory_deduction` reads an order's lines
+once, takes every row they name in one statement (`INSERT ... ON CONFLICT (sku) DO UPDATE ... WHERE
+false`: a missing row is created, an existing one locked and not written), then deducts in one
+statement, and the app's SQL fallback runs the same three statements (`order-inventory.test.ts` holds
+them to the function's), so it now skips a SKU of spaces as the function does.
+`publish_product_draft` takes its rows the same way before the products row, creating the missing
+row of each SKU a sale could deduct of the products it can write. The file ends with a backfill:
+every variant's SKU and the SKU of every product without variants that lacks a row gets one, at the
+least stock its carriers show. `security-verify.sql` section 46 (6 assertions)
+checks the triggers, the privileges and a WRITER's and an ADMIN's writes;
+`tools/scripts/product-draft-publish.db.test.ts` runs the 500-SKU publish under the 8 s timeout and
+each lock order with several sessions.
+
+`02047` (2026-11-19) records which publish a product draft's stock baseline was loaded against
+(docs/09 → "Which publish a baseline was loaded against"). `public.product_stock_publishes` holds one
+row per product: `publish_count` and `stock` (`{ sku: { loaded, entered } }`, what the last
+product-values publish did with each SKU), which `private.apply_product_draft_values` (replaced,
+still `SECURITY INVOKER` with `search_path ''`) rewrites on every product-values publish and counts a
+baseline loaded before that publish from. The publish trusts the row, so it is never the caller's to
+write: row security on, `SELECT` for an ADMIN or a WRITER (as `product_drafts`: the edit page shows a
+draft's stock from it), `INSERT` and `UPDATE` for an ADMIN (`is_admin()`, as the products and
+inventory write policies: the publish runs as its ADMIN caller), no `DELETE` policy (the row goes with
+its product, `ON DELETE CASCADE`); `anon` holds nothing, `authenticated` `SELECT`, `INSERT` and
+`UPDATE`. Both copies of `API_ROLE_REVOKE_SQL` take back `anon`'s `SELECT` and `authenticated`'s
+`DELETE` after the blanket grants (`migration-grants.test.ts` fails on a table the pass would widen).
+A draft's own marker (`stock_baseline_publish_count`) is a WRITER's to write, like its baseline: a
+value that is not a whole number below the product's count changes nothing, and one below it only
+counts a SKU from the figure the last publish entered where the draft's baseline entry is the one that
+publish used. `security-verify.sql` section 47 (5 assertions, 298 in the file) checks the privileges,
+a WRITER's and anon's refusals, that a product-values publish records itself and an overlay publish
+does not, and that the same values again after a sale leave the stock as the sale left it; before
+`02047` the section stops at its first read of the table.
 
 ## Migration Structure
 
@@ -1523,11 +1579,37 @@ What each kind of database needs:
   ("Production migration policy").
 - **Downstream installs (Vercel, `npm create nextblock`, Docker):** nothing to do. The
   `/setup` wizard, the build hook, `npm run update` and the Docker runner all apply pending
-  files in order and cross the squash automatically.
-- **A database whose history was wiped:** `db:migrate` refuses to apply the baseline when
-  the remote history is completely empty, because the catch-up would then replay everything.
-  Repair the history first (`npm run db:migrate:repair-history`), or use
-  `db:migrate:fresh` if the database really is new.
+  files in order and cross the squash automatically, as long as the history they read is the
+  database's own (next bullet).
+- **A database whose history was wiped**, or a dump of the `public` schema alone loaded into a
+  new project (the dump leaves `supabase_migrations` behind): with nothing recorded every file is
+  pending, the catch-up finds no retired version to skip, and it would replay the whole retired
+  generation over content that already has it. The appliers stop there:
+  - `db:migrate` refuses to apply the baseline over a completely empty remote history.
+  - `/setup`, the build hook and `npm run update` refuse, before they write anything, when the
+    history is empty and `public.site_settings` exists, and either
+    `site_settings.migration_baseline_generation` is unset or below the folder's generation (the
+    highest `GG`), or the list holds a file from a retired generation, which would run again as
+    written whatever the marker says (a standalone project keeps the files it was scaffolded with
+    in `supabase/migrations`, and the update only adds to that folder). That is
+    `emptyHistoryRefusal`, the same in `apps/nextblock/tools/lib/migrate-core.mjs` and
+    `apps/nextblock/lib/setup/schema-apply.ts` (`migrate-core.test.mjs` runs both). The build
+    hook logs the refusal and the build goes on; `npm run update` fails and says what to do for
+    the install. An empty database, and one born at or crossed to the folder's generation with
+    only that generation's files, still get every file: each replays over a database that already
+    ran it ("Production migration policy").
+  - The Docker runner has no such refusal and needs none so far: its history,
+    `public._nextblock_docker_migrations`, sits in `public`, so a dump of `public` carries it
+    along and a dropped `public` takes it with the content.
+
+  The remedy is the history: restore `supabase_migrations.schema_migrations` from a backup of the
+  database, or copy it from the database the dump came from, then run the applier again. A
+  standalone project whose database crossed already may instead remove the retired generation's
+  files from `supabase/migrations`: nothing needs them there any more. On a database that never
+  crossed, `npm run db:migrate:repair-history` is no way round: its auto-detect records only this
+  generation's versions and leaves the catch-up pending, which then replays the whole retired
+  generation, under `db:migrate` and the other appliers alike (their refusal covers an empty
+  history only). Use `db:migrate:fresh` only if the database really is new.
 
 ### Production migration policy
 
@@ -1573,7 +1655,10 @@ production or shared database change.
   (`02001_baseline_schema.sql` …) as pending, do not replay them blindly. Use
   `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`
   (it auto-detects the applied high-water mark from the tables that exist), then rerun
-  `npm run db:migrate:check`. It never marks the catch-up applied, whatever it detects.
+  `npm run db:migrate:check`. It never marks the catch-up applied, whatever it detects. That
+  suits a database at the folder's generation, where the catch-up left pending skips itself; on
+  one that never crossed (`site_settings.migration_baseline_generation` unset), restore the
+  history instead ("How a squash crosses live databases").
 - `--through=<version>` overrides the detected level. It must name an exact version in the
   current folder — versions are compared as strings, so `2014` would sort above every `02xxx`
   and sweep the whole generation, and a retired 14-digit version is meaningless here; both are

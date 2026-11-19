@@ -650,6 +650,175 @@ describe('migration 02044 as written', () => {
   });
 });
 
+/**
+ * The same, for 02046: the inventory trigger replaced by three statement-level ones, three inventory
+ * write functions added, the deduction and the publish replaced (their inventory rows taken in one
+ * statement, in SKU order), and the backfill of missing rows.
+ */
+describe('migration 02046 as written', () => {
+  const sql = readMigration('02046_inventory_writes_in_sku_order.sql');
+  /** Whitespace collapsed (comments are gone already). */
+  const squeezed = (text: string) => text.replace(/\s+/g, ' ').trim();
+
+  function functionText(source: string, name: string): string {
+    const start = source.search(new RegExp(`create\\s+(?:or\\s+replace\\s+)?function\\s+${name.replace('.', '\\.')}\\s*\\(`, 'i'));
+    expect(start, `${name} is created`).toBeGreaterThan(-1);
+    return source.slice(start, source.indexOf('$$;', start) + 3);
+  }
+
+  it('creates no definer function, and every function it creates pins its search_path; the new ones and the publish are SECURITY INVOKER', () => {
+    const headers = sql.match(/create\s+(?:or\s+replace\s+)?function[\s\S]*?\bas\s+\$\$/gi) ?? [];
+    expect(headers).toHaveLength(8);
+    for (const header of headers) {
+      expect(header).toMatch(/\bset\s+search_path\s+to\s+'[^']*'/i);
+    }
+    for (const name of [
+      'private.sync_inventory_caches',
+      'public.upsert_inventory_items',
+      'public.update_inventory_quantities',
+      'public.delete_inventory_items',
+      'public.publish_product_draft',
+    ]) {
+      const header = headers.find((text) => new RegExp(`function\\s+${name.replace('.', '\\.')}\\s*\\(`, 'i').test(text));
+      expect(header, name).toMatch(/\bsecurity\s+invoker\b/i);
+      expect(header, name).toMatch(/\bset\s+search_path\s+to\s+''/i);
+    }
+    expect(sql).not.toMatch(/\bsecurity\s+definer\b/i);
+  });
+
+  it('revokes EXECUTE on every function it adds from PUBLIC and anon, and grants it to authenticated and service_role', () => {
+    for (const signature of [
+      'private.sync_inventory_caches(text[], boolean)',
+      'public.upsert_inventory_items(jsonb, text)',
+      'public.update_inventory_quantities(text[], integer)',
+      'public.delete_inventory_items(text[])',
+    ]) {
+      const escaped = signature.replace(/[.()[\]]/g, (char) => `\\${char}`);
+      expect(sql, signature).toMatch(new RegExp(`revoke\\s+all\\s+on\\s+function\\s+${escaped}\\s+from\\s+public,\\s*anon\\s*;`, 'i'));
+      expect(sql, signature).toMatch(new RegExp(`grant\\s+execute\\s+on\\s+function\\s+${escaped}\\s+to\\s+authenticated,\\s*service_role\\s*;`, 'i'));
+    }
+  });
+
+  it('drops the row-level inventory trigger and creates three statement-level ones, each with its transition table', () => {
+    expect(sql).toMatch(/drop\s+trigger\s+if\s+exists\s+on_inventory_item_change\s+on\s+public\.inventory_items\s*;/i);
+    const triggers = squeezed(sql).match(/CREATE TRIGGER [\s\S]*?;/g) ?? [];
+    expect(triggers).toEqual([
+      'CREATE TRIGGER on_inventory_items_inserted AFTER INSERT ON public.inventory_items REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();',
+      'CREATE TRIGGER on_inventory_items_updated AFTER UPDATE ON public.inventory_items REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();',
+      'CREATE TRIGGER on_inventory_items_deleted AFTER DELETE ON public.inventory_items REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION public.handle_inventory_items_sync();',
+    ]);
+    // Rows a statement inserted leave products.updated_at as it is; an update or a delete stamps it.
+    expect(squeezed(functionText(sql, 'public.handle_inventory_items_sync'))).toContain(
+      "PERFORM private.sync_inventory_caches(v_skus, TG_OP <> 'INSERT');"
+    );
+  });
+
+  it("replaces public.publish_product_draft with 02044's, statement for statement, but the statement that takes its inventory rows", () => {
+    const before = squeezed(functionText(readMigration('02044_product_draft_publish_stock_baseline.sql'), 'public.publish_product_draft'));
+    const after = squeezed(functionText(sql, 'public.publish_product_draft'));
+    const oldLock = before.match(/PERFORM 1 FROM public\.inventory_items i WHERE i\.sku = ANY \(v_stock_skus\) ORDER BY i\.sku FOR UPDATE;/)?.[0];
+    const newLock = after.match(/INSERT INTO public\.inventory_items AS inventory \(sku, quantity\) SELECT slot\.sku[\s\S]*?WHERE false;/)?.[0];
+    expect(oldLock, "02044's lock").toBeTruthy();
+    expect(newLock, "02046's statement").toBeTruthy();
+    expect(newLock).toContain('ORDER BY slot.sku ON CONFLICT (sku) DO UPDATE SET quantity = inventory.quantity WHERE false;');
+    expect(after.replace(newLock as string, oldLock as string)).toBe(before);
+    expect(after.indexOf(newLock as string)).toBeLessThan(after.indexOf('FROM public.products WHERE id = p_product_id FOR UPDATE;'));
+  });
+
+  it('replaces public.apply_order_inventory_deduction: the lines read once, the rows taken in one statement, then one deduction; no loop', () => {
+    const body = squeezed(functionText(sql, 'public.apply_order_inventory_deduction'));
+    expect(body).not.toMatch(/\bLOOP\b/);
+    const lines = body.indexOf('SELECT array_agg(line.sku ORDER BY line.sku, line.product_id, line.variant_id)');
+    const rows = body.indexOf('INSERT INTO public.inventory_items AS inventory');
+    const deduction = body.indexOf('UPDATE public.inventory_items AS inventory');
+    expect(lines).toBeGreaterThan(body.indexOf('IF NOT v_track_quantities THEN'));
+    expect(rows).toBeGreaterThan(lines);
+    expect(deduction).toBeGreaterThan(rows);
+    expect(body).toContain('ORDER BY line.sku, line.position ON CONFLICT (sku) DO UPDATE SET quantity = inventory.quantity WHERE false;');
+    expect(body).toContain("WHERE NULLIF(trim(line.sku), '') IS NOT NULL;");
+  });
+
+  it('backfills only the rows that are missing', () => {
+    const backfill = squeezed(sql).match(/INSERT INTO public\.inventory_items \(sku, quantity\) SELECT missing\.sku[\s\S]*?;/)?.[0] ?? '';
+    expect(backfill).toContain('WHERE NOT EXISTS (SELECT 1 FROM public.inventory_items i WHERE i.sku = missing.sku)');
+    expect(backfill.endsWith('ORDER BY missing.sku ON CONFLICT (sku) DO NOTHING;')).toBe(true);
+  });
+});
+
+/**
+ * Without a database: 02047 adds the marker's table and replaces the values helper only. The table is read
+ * by staff and written by an ADMIN's publish, never by anon; the helper stays SECURITY INVOKER (a definer
+ * one would write past the admin's RLS), and everything but the marker is 02044's.
+ */
+describe('migration 02047 as written', () => {
+  const sql = readMigration('02047_product_draft_publish_stock_marker.sql');
+  /** `sql` with its whitespace runs collapsed, for statements spread over lines. */
+  const flat = sql.replace(/\s+/g, ' ');
+
+  it('creates product_stock_publishes with row security, one row per product (cascading with it), a positive count and an object of stock entries', () => {
+    expect(flat).toMatch(/create table if not exists public\.product_stock_publishes \(/i);
+    expect(flat).toMatch(/primary key \(product_id\)/i);
+    expect(flat).toMatch(/foreign key \(product_id\) references public\.products \(id\) on delete cascade/i);
+    expect(flat).toMatch(/check \(publish_count > 0\)/i);
+    expect(flat).toMatch(/check \(jsonb_typeof\(stock\) = 'object'\)/i);
+    expect(flat).toMatch(/alter table public\.product_stock_publishes enable row level security;/i);
+  });
+
+  it('lets staff read it and only an ADMIN write it, never anon, and nobody but the service role delete it', () => {
+    const policies = flat.match(/create policy [^;]*;/gi) ?? [];
+    expect(policies).toHaveLength(3);
+    expect(policies.every((policy) => /\bto authenticated\b/i.test(policy))).toBe(true);
+    expect(policies.find((policy) => /for select/i.test(policy))).toMatch(/ARRAY\['ADMIN'::public\.user_role, 'WRITER'::public\.user_role\]/);
+    for (const command of ['insert', 'update']) {
+      expect(policies.find((policy) => new RegExp(`for ${command}`, 'i').test(policy))).toMatch(/public\.is_admin\(\)/i);
+    }
+    expect(flat).not.toMatch(/for delete/i);
+    expect(flat).toMatch(/revoke all on table public\.product_stock_publishes from public, anon;/i);
+    expect(flat).toMatch(/revoke delete, truncate, references, trigger on table public\.product_stock_publishes from authenticated;/i);
+    expect(flat).toMatch(/grant select, insert, update on table public\.product_stock_publishes to authenticated;/i);
+    expect(flat).not.toMatch(/grant [^;]* to [^;]*\banon\b/i);
+  });
+
+  it("replaces only the values helper, SECURITY INVOKER with search_path '' and its grants, and creates no definer function", () => {
+    const functions = sql.match(/create\s+(?:or\s+replace\s+)?function[\s\S]*?\bas\s+\$\$/gi) ?? [];
+    expect(functions).toHaveLength(1);
+    expect(functions[0]).toMatch(/private\.apply_product_draft_values\(p_product_id uuid, p_values jsonb\)/i);
+    expect(functions[0]).toMatch(/\bsecurity\s+invoker\b/i);
+    expect(functions[0]).toMatch(/\bset\s+search_path\s+to\s+''/i);
+    expect(sql).not.toMatch(/\bsecurity\s+definer\b/i);
+    expect(sql).not.toMatch(/public\.publish_product_draft\s*\(/i);
+    expect(flat).toMatch(/revoke all on function private\.apply_product_draft_values\(uuid, jsonb\) from public, anon;/i);
+    expect(flat).toMatch(/grant execute on function private\.apply_product_draft_values\(uuid, jsonb\) to authenticated, service_role;/i);
+  });
+
+  it("keeps 02044's helper but the marker: the same statements once the marker's are taken out", () => {
+    const helper = (source: string) => {
+      const start = source.search(/create\s+(?:or\s+replace\s+)?function\s+private\.apply_product_draft_values\s*\(/i);
+      return source.slice(start, source.indexOf('$$;', start) + 3);
+    };
+    const without02047 = helper(sql)
+      .replace(/^CREATE OR REPLACE FUNCTION/, 'CREATE FUNCTION')
+      // The marker's declarations and its read, its figure to count from, the already_published branch,
+      // the plan's two extra arrays and the row written at the end.
+      .replace(/\n {2}v_marker integer;[\s\S]*?\n {2}v_record jsonb;/, '')
+      .replace(/\n {2}v_marker := [\s\S]*?\n {2}v_stale := [^\n]*/, '')
+      .replace(/\n {4}v_reference := v_loaded;[\s\S]*?\n {4}END IF;\n(?=\s*IF v_loaded IS NOT NULL AND v_entered = v_loaded THEN)/, '')
+      .replace(/\n {4}ELSIF v_from_last AND v_live IS NOT NULL AND v_entered = v_reference THEN[\s\S]*?\n {6}\);(?=\n {4}ELSIF v_reference IS NOT NULL AND v_live IS NOT NULL THEN)/, '')
+      .replace(/\n {4}v_plan_loaded\[v_steps\] := v_loaded;\n {4}v_plan_entered\[v_steps\] := v_entered;/, '')
+      .replace(/\n {2}SELECT COALESCE\(jsonb_object_agg[\s\S]*?stock = EXCLUDED\.stock;\n/, '')
+      .replace(/ \|\| CASE WHEN v_from_last THEN jsonb_build_object\('from_last_publish', true\) ELSE '\{\}'::jsonb END;/g, ';')
+      .replace(/v_reference/g, 'v_loaded');
+    const normalize = (text: string) => text.replace(/\s+/g, ' ').trim();
+    expect(normalize(without02047)).toBe(normalize(helper(readMigration('02044_product_draft_publish_stock_baseline.sql'))));
+  });
+
+  it('never deletes from or updates media, and never touches storage', () => {
+    expect(sql).not.toMatch(/\bdelete\s+from\s+public\.media\b/i);
+    expect(sql).not.toMatch(/\bupdate\s+public\.media\b/i);
+    expect(sql).not.toMatch(/\bstorage\./i);
+  });
+});
+
 const describeDb = DB_URL ? describe : describe.skip;
 
 describeDb('public.publish_product_draft on a real database (migration 02043)', { timeout: 60_000 }, () => {
@@ -1483,6 +1652,373 @@ describeDb('public.publish_product_draft on a real database (migration 02043)', 
       expect(result.stock_adjusted).toEqual([]);
     });
 
+    /**
+     * Migration 02047: which publish a baseline was loaded against. Every product-values publish moves
+     * public.product_stock_publishes.publish_count and records what it did with each SKU (its baseline
+     * entry and the quantity it entered); the edit page records the count it read beside the baseline
+     * (`stock_baseline_publish_count`), and a baseline whose count is below the product's counts a SKU whose
+     * entry the last publish used from the quantity that publish entered. The edit page decides each SKU the
+     * same way (productFormData.test.ts, "the publish a baseline was loaded against"), with the same figures.
+     */
+    describe('which publish a baseline was loaded against (migration 02047)', () => {
+      /** The product's row, as the function reads it (null: no product-values publish yet). */
+      async function stockPublishOf(productId: string) {
+        const [row] = await owner`select publish_count, stock from public.product_stock_publishes where product_id = ${productId}`;
+        return row ? { count: row.publish_count as number, stock: row.stock as Row } : null;
+      }
+
+      /** An autosave that found the draft gone (a publish deleted it) saves the form's values into a new one. */
+      async function startDraftAgain(seeded: Seeded) {
+        await owner`insert into public.product_drafts (product_id, author_id, meta, blocks) values (${seeded.productId}, ${WRITER_ID}, '{}'::jsonb, '[]'::jsonb)`;
+      }
+
+      async function publishValues(seeded: Seeded, values: unknown) {
+        return publish(owner, { productId: seeded.productId, ...(await readForPublish(seeded)), values, blocks: [] });
+      }
+
+      it('records each product-values publish: the count moves on every one, and `stock` holds what the last one did with each SKU (its baseline entry, null for none, and the quantity it entered); {} without a baseline, and nothing for an overlay publish', async () => {
+        const product = await seedStockProduct(5, 3);
+        expect(await stockPublishOf(product.seeded.productId)).toBeNull();
+
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await stockPublishOf(product.seeded.productId)).toEqual({
+          count: 1,
+          stock: { [product.red]: { loaded: 5, entered: 10 }, [product.blue]: { loaded: 3, entered: 3 } },
+        });
+
+        // A baseline entry the values do not carry is recorded as none.
+        await startDraftAgain(product.seeded);
+        await publishValues(
+          product.seeded,
+          stockValues(product, { red: 10, blue: 4 }, { stock_baseline: { [product.red]: 10 }, stock_baseline_publish_count: 1 })
+        );
+        expect(await stockPublishOf(product.seeded.productId)).toEqual({
+          count: 2,
+          stock: { [product.red]: { loaded: 10, entered: 10 }, [product.blue]: { loaded: null, entered: 4 } },
+        });
+
+        // Values without a baseline (a CMS draft import): the count moves, and no figure is recorded.
+        await startDraftAgain(product.seeded);
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 4 }, { stock_baseline: undefined }));
+        expect(await stockPublishOf(product.seeded.productId)).toEqual({ count: 3, stock: {} });
+
+        // An overlay publish writes no stock and records nothing.
+        await startDraftAgain(product.seeded);
+        await publish(owner, {
+          productId: product.seeded.productId,
+          ...(await readForPublish(product.seeded)),
+          overlay: { title: 'Publish test (overlay)' },
+          blocks: [],
+        });
+        expect((await stockPublishOf(product.seeded.productId))?.count).toBe(3);
+      });
+
+      it('a draft started again after its publish, once the stock moved: the change that publish made live is not applied again (loaded 5, typed 10 and published, one sold: 9, not 14), and the answer names the SKU (already_published)', async () => {
+        const product = await seedStockProduct(5, 3);
+        // The page loaded Red 5 before any publish (count 0), the editor typed 10, and the draft was published.
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 10 });
+        // One Red sold after the publish.
+        await sell({ productId: product.seeded.productId, variantId: product.seeded.variantIds[product.red], quantity: 1 });
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 9 });
+
+        // An autosave queued behind the publish (or a tab opened before it) started the same values again,
+        // with the baseline and the count that page loaded.
+        await startDraftAgain(product.seeded);
+        const again = stockValues(
+          product,
+          { red: 10, blue: 3 },
+          { stock_baseline_publish_count: 0, title: 'Publish test (edited after the publish)' }
+        );
+        expect(again.stock_baseline).toEqual({ [product.red]: 5, [product.blue]: 3 });
+        const second = await publishValues(product.seeded, again);
+
+        // 9, not 9 + 10 - 5 = 14: that publish made the change live, and the sale since stays.
+        expect(await inventoryOf([product.red, product.blue])).toEqual({ [product.red]: 9, [product.blue]: 3 });
+        expect(await shownStockOf(product.seeded.productId)).toEqual({
+          product: 12,
+          variants: { [product.red]: 9, [product.blue]: 3 },
+        });
+        expect(second.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'already_published', entered: 10, loaded: 10, current: 9, published: 9, from_last_publish: true },
+        ]);
+        expect((await productState(product.seeded.productId)).product.title).toBe('Publish test (edited after the publish)');
+      });
+
+      it('a figure typed on the page while its publish ran counts from the figure that publish entered: 10 published from a load of 5, then 12 typed, publishes 12, not 17; with a sale since, 11 (moved, from_last_publish)', async () => {
+        const product = await seedStockProduct(5, 3);
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+
+        // The editor typed 12 on that page while the publish ran: its autosave started a new draft.
+        await startDraftAgain(product.seeded);
+        const typed = await publishValues(product.seeded, stockValues(product, { red: 12, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([product.red, product.blue])).toEqual({ [product.red]: 12, [product.blue]: 3 });
+        // Exactly the figure typed: not named.
+        expect(typed.stock_adjusted).toEqual([]);
+
+        // The same on a product with a sale after the publish: the editor's +2 lands on the stock as it is.
+        const sold = await seedStockProduct(5, 3);
+        await publishValues(sold.seeded, stockValues(sold, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        await sell({ productId: sold.seeded.productId, variantId: sold.seeded.variantIds[sold.red], quantity: 1 });
+        await startDraftAgain(sold.seeded);
+        const moved = await publishValues(sold.seeded, stockValues(sold, { red: 12, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([sold.red, sold.blue])).toEqual({ [sold.red]: 11, [sold.blue]: 3 });
+        expect(moved.stock_adjusted).toEqual([
+          { sku: sold.red, reason: 'moved', entered: 12, loaded: 10, current: 9, published: 11, from_last_publish: true },
+        ]);
+      });
+
+      it('a variant added before the publish (in no baseline) keeps the sales made of it since: the same values again leave it (already_published), where they wrote its figure again', async () => {
+        const red = `ST-K-${RUN}-${randomUUID().slice(0, 4)}`;
+        const green = `ST-N-${RUN}-${randomUUID().slice(0, 4)}`;
+        created.skus.push(green);
+        const seeded = await seedProduct({ variants: [{ sku: red, price: 5900, stock: 5, terms: [terms.Red] }], draftBlocks: [] });
+        await owner`insert into public.inventory_items (sku, quantity) values (${red}, 5)`;
+
+        // The page loaded Red 5 (count 0); the editor added Green at 6, and the draft was published.
+        const added = (baseline: Record<string, number | null>) =>
+          buildProductDraftPublishValues(
+            formValues(seeded, {
+              stock_baseline: baseline,
+              stock_baseline_publish_count: 0,
+              variants: [formVariant(red, 59, 5, [terms.Red], seeded.variantIds[red]), formVariant(green, 59, 6, [terms.Green])],
+            })
+          );
+        await publishValues(seeded, added({ [red]: 5 }));
+        expect(await inventoryOf([red, green])).toEqual({ [red]: 5, [green]: 6 });
+        await sell({
+          productId: seeded.productId,
+          variantId: (await owner`select id from public.product_variants where sku = ${green}`)[0].id,
+          quantity: 2,
+        });
+        expect(await inventoryOf([green])).toEqual({ [green]: 4 });
+
+        // The same values again, from the page loaded before the publish: Green is now live, so publish sends
+        // the null entry it sends for a SKU the live product stocks that the draft's baseline lacks.
+        await startDraftAgain(seeded);
+        const second = await publishValues(seeded, added({ [red]: 5, [green]: null }));
+
+        expect(await inventoryOf([red, green])).toEqual({ [red]: 5, [green]: 4 });
+        expect(second.stock_adjusted).toEqual([
+          { sku: green, reason: 'already_published', entered: 6, loaded: 6, current: 4, published: 4, from_last_publish: true },
+        ]);
+      });
+
+      it("a baseline from a page loaded after the publish (its count equal to the product's) counts from itself: a restock to the figure the last publish entered still lands", async () => {
+        const product = await seedStockProduct(5, 3);
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        // Five Red sold: the stock is back at 5, the figure the last publish loaded.
+        await sell({ productId: product.seeded.productId, variantId: product.seeded.variantIds[product.red], quantity: 5 });
+
+        // A page loaded now (count 1) at Red 5, and the editor restocked to 10 again.
+        await startDraftAgain(product.seeded);
+        const restock = await publishValues(
+          product.seeded,
+          stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 1 })
+        );
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 10 });
+        expect(restock.stock_adjusted).toEqual([]);
+        expect((await stockPublishOf(product.seeded.productId))?.count).toBe(2);
+      });
+
+      it.each([
+        ['missing', undefined],
+        ['text', '0'],
+        ['a fraction', 0.5],
+        ['negative', -1],
+        ['above the count', 7],
+      ] as const)("a marker that is not a whole number below the product's count (%s) gives 02044's rules: a hand-written one never skips the stock", async (_label, marker) => {
+        const product = await seedStockProduct(5, 3);
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        await sell({ productId: product.seeded.productId, variantId: product.seeded.variantIds[product.red], quantity: 1 });
+
+        await startDraftAgain(product.seeded);
+        const values: Row = { ...stockValues(product, { red: 10, blue: 3 }), stock_baseline_publish_count: marker ?? null };
+        const second = await publishValues(product.seeded, values);
+
+        // The baseline counts from itself, as before 02047: the change is applied to the stock as it is.
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 14 });
+        expect(second.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'moved', entered: 10, loaded: 5, current: 9, published: 14 },
+        ]);
+      });
+
+      it('a marker below the count changes only a SKU whose baseline entry is the one the last publish used: a tab that loaded another stock counts from its own baseline', async () => {
+        const product = await seedStockProduct(5, 3);
+        // Tab A loaded Red 5; a sale took it to 4; tab B loaded Red 4 (both at count 0).
+        await sell({ productId: product.seeded.productId, variantId: product.seeded.variantIds[product.red], quantity: 1 });
+        // Tab A's 10 is published: the change from 5 lands on 4.
+        const first = await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 9 });
+        expect(first.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'moved', entered: 10, loaded: 5, current: 4, published: 9 },
+        ]);
+
+        // Tab B raised Red from 4 to 6: its baseline entry is not the one that publish used, so its change
+        // counts from its own baseline, as before 02047.
+        await startDraftAgain(product.seeded);
+        const second = await publishValues(
+          product.seeded,
+          stockValues(
+            product,
+            { red: 6, blue: 3 },
+            { stock_baseline: { [product.red]: 4, [product.blue]: 3 }, stock_baseline_publish_count: 0 }
+          )
+        );
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 11 });
+        expect(second.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'moved', entered: 6, loaded: 4, current: 9, published: 11 },
+        ]);
+      });
+
+      it("two publishes since the baseline was loaded: only the last one's figures are kept, so a SKU whose entry that publish did not use counts from its own baseline (the documented limit; named moved)", async () => {
+        const product = await seedStockProduct(5, 3);
+        // Page A (count 0) published Red 10; page B, loaded after it (count 1) at 10, published 15.
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        await startDraftAgain(product.seeded);
+        await publishValues(
+          product.seeded,
+          stockValues(product, { red: 15, blue: 3 }, { stock_baseline: { [product.red]: 10, [product.blue]: 3 }, stock_baseline_publish_count: 1 })
+        );
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 15 });
+
+        // Page A's values again (an autosave queued behind its publish, landing only now): counted from its
+        // own baseline, its change lands a second time.
+        await startDraftAgain(product.seeded);
+        const late = await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 20 });
+        expect(late.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'moved', entered: 10, loaded: 5, current: 15, published: 20 },
+        ]);
+      });
+
+      it('a values publish without a baseline (a CMS draft import) moves the count and records no figure: a baseline from before it counts from itself', async () => {
+        const product = await seedStockProduct(5, 3);
+        // An import in draft mode set Red to 20 and was published.
+        await publishValues(product.seeded, stockValues(product, { red: 20, blue: 3 }, { stock_baseline: undefined }));
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 20 });
+
+        // A page loaded before it (count 0) at Red 5, where the editor had typed 7.
+        await startDraftAgain(product.seeded);
+        const second = await publishValues(product.seeded, stockValues(product, { red: 7, blue: 3 }, { stock_baseline_publish_count: 0 }));
+        expect(await inventoryOf([product.red])).toEqual({ [product.red]: 22 });
+        expect(second.stock_adjusted).toEqual([
+          { sku: product.red, reason: 'moved', entered: 7, loaded: 5, current: 20, published: 22 },
+        ]);
+      });
+
+      it('the row: staff read it, a WRITER cannot write it, anon cannot read it at all, and the publish writes it as its ADMIN caller', async () => {
+        const product = await seedStockProduct(5, 3);
+        await publishValues(product.seeded, stockValues(product, { red: 10, blue: 3 }, { stock_baseline_publish_count: 0 }));
+
+        const read = await asUser(connect(), WRITER_ID, (tx) =>
+          tx`select publish_count from public.product_stock_publishes where product_id = ${product.seeded.productId}`
+        );
+        expect(read.map((row: Row) => row.publish_count)).toEqual([1]);
+
+        // The UPDATE policy admits no row for a WRITER: nothing written.
+        const updated = await asUser(connect(), WRITER_ID, (tx) =>
+          tx`update public.product_stock_publishes set publish_count = 99 where product_id = ${product.seeded.productId} returning publish_count`
+        );
+        expect(updated).toHaveLength(0);
+        const other = await seedProduct({ createDraft: false });
+        await expect(
+          asUser(connect(), WRITER_ID, (tx) =>
+            tx`insert into public.product_stock_publishes (product_id, publish_count, stock) values (${other.productId}, 5, '{}'::jsonb)`
+          )
+        ).rejects.toThrow(/row-level security/);
+        await expect(
+          asUser(connect(), WRITER_ID, (tx) => tx`delete from public.product_stock_publishes where product_id = ${product.seeded.productId}`)
+        ).rejects.toThrow(/permission denied/);
+
+        await expect(
+          connect().begin(async (tx) => {
+            await tx.unsafe('set local role anon');
+            return tx`select publish_count from public.product_stock_publishes`;
+          })
+        ).rejects.toThrow(/permission denied/);
+
+        expect((await stockPublishOf(product.seeded.productId))?.count).toBe(1);
+      });
+
+      /**
+       * The stock rule (02044, and 02047's figure to count from) for one SKU, from the values publish sends:
+       * the model productFormData.test.ts holds the edit page to ("shows what publish writes for any
+       * figures"), so a SKU the page shows at one figure and the function publishes at another fails one
+       * of the two.
+       */
+      function modelPublished(
+        values: { stock_baseline: Record<string, number | null> | null; stock_baseline_publish_count: number | null },
+        sku: string,
+        entered: number,
+        current: number,
+        count: number,
+        last: { loaded: number | null; entered: number } | null
+      ): number {
+        const baseline = values.stock_baseline;
+        const loaded = baseline && typeof baseline[sku] === 'number' ? (baseline[sku] as number) : null;
+        const hasEntry = baseline !== null && Object.prototype.hasOwnProperty.call(baseline, sku);
+        const marker = values.stock_baseline_publish_count;
+        const stale = baseline !== null && marker !== null && marker < count;
+        const fromLast = stale && hasEntry && last !== null && last.loaded === loaded;
+        const reference = fromLast && last ? last.entered : loaded;
+        if (loaded !== null && entered === loaded) return current;
+        if (reference === null) return entered;
+        if (entered === current || (fromLast && entered === reference)) return current;
+        return Math.min(2147483647, Math.max(0, current + entered - reference));
+      }
+
+      it('publishes what the edit page shows for any figures, baseline, count and last publish (60 seeded cases against the model the page is held to)', async () => {
+        let state = 2046;
+        const random = () => {
+          state = (state * 1103515245 + 12345) % 2147483648;
+          return state / 2147483648;
+        };
+        const pick = <T,>(values: readonly T[]): T => values[Math.floor(random() * values.length)];
+        const FIGURES = [0, 3, 5, 8, 10] as const;
+        const failures: string[] = [];
+
+        for (let index = 0; index < 60; index += 1) {
+          const current = pick(FIGURES);
+          const entered = pick(FIGURES);
+          // A baseline entry, the null entry publish sends for a stocked SKU the draft's baseline lacks, or no baseline.
+          const baselineKind = pick(['entry', 'null', 'none'] as const);
+          const loaded = pick(FIGURES);
+          const count = pick([0, 1, 2] as const);
+          const marker = pick([null, 0, 1, 2, 3] as const);
+          const lastKind = pick(['none', 'unloaded', 'loaded'] as const);
+          const last = lastKind === 'none' ? null : { loaded: lastKind === 'unloaded' ? null : pick(FIGURES), entered: pick(FIGURES) };
+
+          const red = `ST-D-${RUN}-${randomUUID().slice(0, 6)}`;
+          const seeded = await seedProduct({ variants: [{ sku: red, price: 5900, stock: current, terms: [terms.Red] }], draftBlocks: [] });
+          await owner`insert into public.inventory_items (sku, quantity) values (${red}, ${current})`;
+          if (count > 0) {
+            await owner`
+              insert into public.product_stock_publishes (product_id, publish_count, stock)
+              values (${seeded.productId}, ${count}, ${owner.json(last ? { [red]: last } : {})})`;
+          }
+          const values = buildProductDraftPublishValues(
+            formValues(seeded, {
+              stock_baseline: baselineKind === 'entry' ? { [red]: loaded } : baselineKind === 'null' ? { [red]: null } : undefined,
+              stock_baseline_publish_count: marker,
+              variants: [formVariant(red, 59, entered, [terms.Red], seeded.variantIds[red])],
+            })
+          );
+          const expected = modelPublished(values, red, entered, current, count, count > 0 ? last : null);
+          const result = await publishValues(seeded, values);
+          const after = (await inventoryOf([red]))[red];
+          if (after !== expected) {
+            failures.push(JSON.stringify({ current, entered, baselineKind, loaded, count, marker, last, expected, after, adjusted: result.stock_adjusted }));
+          }
+        }
+
+        expect(failures).toEqual([]);
+        // Sixty products and about 480 statements: about 5 s alone, several times that right after
+        // migration-replay.db.test.ts has replayed every file in a rolled-back transaction (the catalog
+        // still holds its dead rows), so its own limit rather than the suite's 60 s.
+      }, LOCK_WAIT_MS);
+    });
+
     it('a sale that runs while the publish holds its locks waits for it, then keeps its deduction', async () => {
       const product = await seedStockProduct(5, 3);
       const orderId = await recordOrder({ productId: product.seeded.productId, variantId: product.seeded.variantIds[product.red], quantity: 1 });
@@ -2134,7 +2670,8 @@ describeDb('public.publish_product_draft on a real database (migration 02043)', 
         try {
           deducting = deductBy(path, orderId, 'order-of-skus');
           if (path === 'apply_order_inventory_deduction') await waitForLockWait('order-of-skus');
-          else await waitForLockWait('order-of-skus (fallback)', '%UPDATE public.inventory_items%');
+          // Since 02046 the fallback, like the function, takes every row in one statement before it deducts.
+          else await waitForLockWait('order-of-skus (fallback)', '%INSERT INTO public.inventory_items AS inventory%');
           // Only A is held, by the holder: in GROUP BY order the deduction took Z first and held it here.
           locked = await lockedInventoryRows([a, z]);
         } finally {
@@ -2264,6 +2801,544 @@ describeDb('public.publish_product_draft on a real database (migration 02043)', 
         expect((await first).error).toBeUndefined();
         expect((await second).error).toBeUndefined();
         expect(await inventoryOf([x, y])).toEqual({ [x]: 8, [y]: 8 });
+      });
+    });
+
+    describe('stock writes in SKU order (migration 02046)', () => {
+      const DEDUCTIONS = ['apply_order_inventory_deduction', "the app's SQL fallback"] as const;
+
+      /** updated_at of each variant (by SKU) and of the product, as text. */
+      async function stampsOf(productId: string) {
+        const [product] = await owner`select updated_at::text as updated_at from public.products where id = ${productId}`;
+        const variants = await owner`select sku, updated_at::text as updated_at from public.product_variants where product_id = ${productId}`;
+        return {
+          product: product.updated_at as string,
+          variants: Object.fromEntries(variants.map((row: Row) => [row.sku, row.updated_at as string])),
+        };
+      }
+
+      it('replaces the row-level inventory trigger by three statement-level ones, each with its transition table', async () => {
+        const rows = await owner`
+          select t.tgname, t.tgtype, p.proname, t.tgoldtable, t.tgnewtable
+            from pg_trigger t
+            join pg_proc p on p.oid = t.tgfoid
+           where t.tgrelid = 'public.inventory_items'::regclass and not t.tgisinternal
+           order by t.tgname`;
+        // tgtype: 1 row-level, 2 before, 4 insert, 8 delete, 16 update.
+        expect(rows.map((row: Row) => [row.tgname, row.tgtype, row.proname, row.tgoldtable, row.tgnewtable])).toEqual([
+          ['on_inventory_items_deleted', 8, 'handle_inventory_items_sync', 'old_rows', null],
+          ['on_inventory_items_inserted', 4, 'handle_inventory_items_sync', null, 'new_rows'],
+          ['on_inventory_items_update', 19, 'handle_inventory_items_update', null, null],
+          ['on_inventory_items_updated', 16, 'handle_inventory_items_sync', 'old_rows', 'new_rows'],
+        ]);
+      });
+
+      it("publishes 500 changed SKUs beside 2,000 other products within the Data API's 8 s statement timeout (02044: 15 to 27 s, then 57014)", async () => {
+        const tag = randomUUID().slice(0, 6);
+        // 2,000 other products with two variants each and their inventory rows, three statements.
+        const others = await owner`
+          insert into public.products (language_id, translation_group_id, sku, title, slug, product_type, payment_provider, price, prices, stock, status)
+          select 1, gen_random_uuid(), ${`ST-BIGO-${RUN}-${tag}-`} || lpad(n::text, 4, '0'), 'Other ' || n, ${`st-bigo-${RUN}-${tag}-`} || n,
+                 'physical', 'stripe', 1000, ${owner.json({ [currency]: 1000 })}, 20, 'active'
+            from generate_series(1, 2000) as n
+          returning id, sku`;
+        created.products.push(...others.map((row: Row) => row.id as string));
+        const otherVariants = await owner`
+          insert into public.product_variants (product_id, sku, price, prices, stock_quantity)
+          select p.id, p.sku || '-' || v, 1000, ${owner.json({ [currency]: 1000 })}, 10
+            from public.products p cross join generate_series(1, 2) as v
+           where p.id = any(${others.map((row: Row) => row.id)}::uuid[])
+          returning sku`;
+        const otherSkus = otherVariants.map((row: Row) => row.sku as string);
+        created.skus.push(...others.map((row: Row) => row.sku as string), ...otherSkus);
+        await owner`insert into public.inventory_items (sku, quantity) select unnest(${otherSkus}::text[]), 10`;
+
+        // The published product: 500 variants at 10 (no attribute terms: the publish matches them by id).
+        const seeded = await seedProduct({ draftBlocks: [] });
+        const variants = await owner`
+          insert into public.product_variants (product_id, sku, price, prices, stock_quantity, created_at)
+          select ${seeded.productId}, ${`ST-BIG-${RUN}-${tag}-`} || lpad(n::text, 4, '0'), 5900, ${owner.json({ [currency]: 5900 })}, 10,
+                 now() + n * interval '1 millisecond'
+            from generate_series(1, 500) as n
+          returning id, sku`;
+        const skus = variants.map((row: Row) => row.sku as string);
+        created.skus.push(...skus);
+        await owner`insert into public.inventory_items (sku, quantity) select unnest(${skus}::text[]), 10`;
+        await owner`update public.products set stock = 5000 where id = ${seeded.productId}`;
+        await owner.unsafe('analyze public.products, public.product_variants, public.inventory_items');
+
+        // Every stock changed from the 10 the page loaded to 11: the publish writes each SKU.
+        const values = buildProductDraftPublishValues(
+          formValues(seeded, {
+            stock_baseline: Object.fromEntries(skus.map((sku) => [sku, 10])),
+            variants: variants.map((row: Row) => formVariant(row.sku, 59, 11, [], row.id)),
+          })
+        );
+        const read = await readForPublish(seeded);
+        const started = Date.now();
+        const rows = (await asUser(connect(), ADMIN_ID, async (tx) => {
+          await tx.unsafe(`set local statement_timeout = '8s'`);
+          return publishStatement(tx, { productId: seeded.productId, ...read, values, blocks: [] }, 'large-publish');
+        })) as Row[];
+        const elapsed = Date.now() - started;
+
+        expect(rows[0].result.stock_adjusted).toEqual([]);
+        const [{ written }] = await owner`
+          select count(*)::int as written from public.inventory_items where sku = any(${skus}::text[]) and quantity = 11`;
+        expect(written).toBe(500);
+        const [{ shown }] = await owner`
+          select count(*)::int as shown from public.product_variants where product_id = ${seeded.productId} and stock_quantity = 11`;
+        expect(shown).toBe(500);
+        expect((await productState(seeded.productId)).product.stock).toBe(5500);
+        // About 0.7 s on a local replay since 02046.
+        expect(elapsed).toBeLessThan(8000);
+      }, 180_000);
+
+      it('syncs each carrier once per statement (the variants with a SKU, a product without variants, each product total), a deleted row as 0, and writes no carrier a statement leaves as it was', async () => {
+        const sku = (name: string) => `ST-C${name}-${RUN}-${randomUUID().slice(0, 4)}`;
+        const a = sku('A');
+        const b = sku('B');
+        const english = await seedProduct({
+          createDraft: false,
+          variants: [
+            { sku: a, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: b, price: 5900, stock: 3, terms: [terms.Blue] },
+          ],
+        });
+        const french = await seedProduct({
+          createDraft: false,
+          sku: english.sku,
+          groupId: english.groupId,
+          languageId: 2,
+          variants: [
+            { sku: a, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: b, price: 5900, stock: 3, terms: [terms.Blue] },
+          ],
+        });
+        const simple = await seedProduct({ createDraft: false });
+        await owner`update public.products set stock = 8 where id = any(${[english.productId, french.productId]}::uuid[])`;
+        await owner`insert into public.inventory_items (sku, quantity) values (${a}, 5), (${b}, 3), (${simple.sku}, 7)`;
+
+        // One statement, three SKUs: A to 9 (both translations), the product without variants to 2, B as it was.
+        const before = await stampsOf(english.productId);
+        await owner`select public.upsert_inventory_items(${owner.json([{ sku: b, quantity: 3 }, { sku: simple.sku, quantity: 2 }, { sku: a, quantity: 9 }])}::jsonb, 'update')`;
+        expect(await shownStockOf(english.productId)).toEqual({ product: 12, variants: { [a]: 9, [b]: 3 } });
+        expect(await shownStockOf(french.productId)).toEqual({ product: 12, variants: { [a]: 9, [b]: 3 } });
+        expect((await productState(simple.productId)).product.stock).toBe(2);
+        const after = await stampsOf(english.productId);
+        expect(after.variants[b], 'B kept its quantity: its variant row is not written').toBe(before.variants[b]);
+        expect(after.variants[a]).not.toBe(before.variants[a]);
+        expect(after.product, 'an update stamps the product').not.toBe(before.product);
+
+        // A statement that changes no quantity writes no carrier.
+        await owner`select public.update_inventory_quantities(${[a, b]}::text[], 9)`;
+        expect(await shownStockOf(english.productId)).toEqual({ product: 18, variants: { [a]: 9, [b]: 9 } });
+        const settledStamps = await stampsOf(english.productId);
+        await owner`select public.update_inventory_quantities(${[a, b]}::text[], 9)`;
+        expect(await stampsOf(english.productId)).toEqual(settledStamps);
+
+        // A deleted row reads 0.
+        await owner`select public.delete_inventory_items(${[simple.sku]}::text[])`;
+        expect((await productState(simple.productId)).product.stock).toBe(0);
+        expect(await inventoryOf([simple.sku])).toEqual({});
+      });
+
+      it('a row a statement inserts repairs the totals of the products carrying it without stamping them (a publish that creates it never trips its own NBP03); an update stamps them', async () => {
+        const r = `ST-IR-${RUN}-${randomUUID().slice(0, 4)}`;
+        const g = `ST-IG-${RUN}-${randomUUID().slice(0, 4)}`;
+        // R has a row, G has none, and the product's total (7) counts neither variant's stock.
+        const seeded = await seedProduct({
+          createDraft: false,
+          variants: [
+            { sku: r, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: g, price: 5900, stock: 4, terms: [terms.Green] },
+          ],
+        });
+        await owner`insert into public.inventory_items (sku, quantity) values (${r}, 5)`;
+        const before = await stampsOf(seeded.productId);
+        await owner`select public.upsert_inventory_items(${owner.json([{ sku: g, quantity: 4 }])}::jsonb, 'nothing')`;
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 9, variants: { [r]: 5, [g]: 4 } });
+        expect((await stampsOf(seeded.productId)).product).toBe(before.product);
+
+        await owner`select public.update_inventory_quantities(${[g]}::text[], 6)`;
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 11, variants: { [r]: 5, [g]: 6 } });
+        expect((await stampsOf(seeded.productId)).product).not.toBe(before.product);
+      });
+
+      it("a row inserted at another quantity than its carrier shows (the Inventory screen or Cortex creating a carried SKU's row) stamps the carrier's product: a publish that read before it refuses (NBP03) and writes nothing over it", async () => {
+        const g = `ST-IQ-${RUN}-${randomUUID().slice(0, 4)}`;
+        const seeded = await seedProduct({ variants: [{ sku: g, price: 5900, stock: 4, terms: [terms.Green] }], draftBlocks: [] });
+        const read = await readForPublish(seeded);
+        // G has no row; the Inventory screen sets it to 9.
+        await owner`select public.upsert_inventory_items(${owner.json([{ sku: g, quantity: 9 }])}::jsonb, 'update')`;
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 9, variants: { [g]: 9 } });
+
+        // A draft without a baseline (written as it holds it), read before the Inventory screen's write.
+        const values = buildProductDraftPublishValues(
+          formValues(seeded, { variants: [formVariant(g, 59, 4, [terms.Green], seeded.variantIds[g])] })
+        );
+        const outcome = await settled(publish(owner, { productId: seeded.productId, ...read, values, blocks: [] }));
+        expect(outcome.error).toMatchObject({ code: 'NBP03' });
+        expect(await inventoryOf([g])).toEqual({ [g]: 9 });
+      });
+
+      /** Each inventory writer of 02046, called with Z before A (form order). */
+      const WRITERS = [
+        {
+          name: "upsert_inventory_items ('update')",
+          query: `select public.upsert_inventory_items($1::jsonb, 'update')`,
+          params: (a: string, z: string) => [[{ sku: z, quantity: 7 }, { sku: a, quantity: 6 }]],
+          expected: (a: string, z: string) => ({ [a]: 6, [z]: 7 }),
+        },
+        {
+          name: 'update_inventory_quantities',
+          query: `select public.update_inventory_quantities($1::text[], 3)`,
+          params: (a: string, z: string) => [[z, a]],
+          expected: (a: string, z: string) => ({ [a]: 3, [z]: 3 }),
+        },
+        {
+          name: 'delete_inventory_items',
+          query: `select public.delete_inventory_items($1::text[])`,
+          params: (a: string, z: string) => [[z, a]],
+          expected: () => ({}),
+        },
+      ] as const;
+
+      it.each(WRITERS)('$name takes its rows in SKU order, as a publish and a sale do: waiting for the first, it holds no later one', async (writer) => {
+        const a = `ST-W0A-${RUN}-${randomUUID().slice(0, 4)}`;
+        const z = `ST-W9Z-${RUN}-${randomUUID().slice(0, 4)}`;
+        created.skus.push(a, z);
+        await owner`insert into public.inventory_items (sku, quantity) values (${a}, 5), (${z}, 5)`;
+        const tag = `writer-${writer.name.replace(/\W+/g, '-')}`;
+        const holder = await holdRows(`select 1 from public.inventory_items where sku = $1 for update`, [a]);
+        let writing: Promise<{ value?: unknown; error?: any }> = Promise.resolve({});
+        let locked: string[] = [];
+        try {
+          writing = settled(
+            connect().begin(async (tx) => {
+              await tx.unsafe(`set local lock_timeout = '10s'`);
+              return tx.unsafe(`/* nb-test:${tag} */ ${writer.query}`, writer.params(a, z) as any[]);
+            })
+          );
+          await waitForLockWait(tag);
+          // In the order given it took Z first and held it here, while it waited for A (a publish holding A
+          // and waiting for Z then deadlocked with it).
+          locked = await lockedInventoryRows([a, z]);
+        } finally {
+          holder.release();
+        }
+        expect((await holder.done).error).toBeUndefined();
+        expect((await writing).error).toBeUndefined();
+        expect(locked).toEqual([a]);
+        expect(await inventoryOf([a, z])).toEqual(writer.expected(a, z));
+      });
+
+      it("upsert_inventory_items ('nothing') only creates the missing rows: it neither writes nor waits for one that exists", async () => {
+        const a = `ST-N0A-${RUN}-${randomUUID().slice(0, 4)}`;
+        const z = `ST-N9Z-${RUN}-${randomUUID().slice(0, 4)}`;
+        created.skus.push(a, z);
+        await owner`insert into public.inventory_items (sku, quantity) values (${a}, 5)`;
+        const holder = await holdRows(`select 1 from public.inventory_items where sku = $1 for update`, [a]);
+        let written: Row[] = [];
+        try {
+          written = (await connect().begin(async (tx) => {
+            await tx.unsafe(`set local lock_timeout = '2s'`);
+            return tx.unsafe(`select (public.upsert_inventory_items($1::jsonb, 'nothing')).sku`, [
+              [{ sku: z, quantity: 1 }, { sku: a, quantity: 9 }],
+            ] as any[]);
+          })) as Row[];
+        } finally {
+          holder.release();
+        }
+        expect((await holder.done).error).toBeUndefined();
+        expect(written.map((row) => row.sku)).toEqual([z]);
+        expect(await inventoryOf([a, z])).toEqual({ [a]: 5, [z]: 1 });
+      });
+
+      it('the inventory writers refuse a malformed call; an ADMIN writes, a WRITER writes nothing, and anon cannot call them', async () => {
+        const x = `ST-V-${RUN}-${randomUUID().slice(0, 4)}`;
+        created.skus.push(x);
+        const refused = async (query: string, params: unknown[] = []) => {
+          try {
+            await owner.unsafe(query, params as any[]);
+          } catch (error: any) {
+            return error.code as string;
+          }
+          return 'none';
+        };
+        const upsert = `select public.upsert_inventory_items($1::jsonb, $2)`;
+        expect(await refused(upsert, [{ sku: x, quantity: 1 }, 'update'])).toBe('22023');
+        expect(await refused(upsert, [[1], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ quantity: 1 }], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: '   ', quantity: 1 }], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: x }], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: x, quantity: null }], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: x, quantity: 1, updated_at: '2026-01-01' }], 'update'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: x, quantity: 1 }], 'replace'])).toBe('22023');
+        expect(await refused(upsert, [[{ sku: x, quantity: 1 }, { sku: x, quantity: 2 }], 'update'])).toBe('21000');
+        expect(await refused(upsert, [[{ sku: x, quantity: -1 }], 'update'])).toBe('23514');
+        expect(await refused(`select public.update_inventory_quantities(null, 1)`)).toBe('22023');
+        expect(await refused(`select public.update_inventory_quantities($1::text[], null)`, [[x]])).toBe('22023');
+        expect(await refused(`select public.delete_inventory_items(null)`)).toBe('22023');
+        expect(await inventoryOf([x])).toEqual({});
+
+        // An ADMIN through `authenticated` writes; a plain insert refuses a row that exists.
+        await asUser(connect(), ADMIN_ID, (tx) => tx.unsafe(upsert, [[{ sku: x, quantity: 4 }], 'update'] as any[]));
+        expect(await inventoryOf([x])).toEqual({ [x]: 4 });
+        const duplicate = await settled(asUser(connect(), ADMIN_ID, (tx) => tx.unsafe(upsert, [[{ sku: x, quantity: 5 }], 'error'] as any[])));
+        expect(duplicate.error).toMatchObject({ code: '23505' });
+
+        // A WRITER: the insert policy refuses the row, the update and the delete match nothing.
+        const writerUpsert = await settled(asUser(connect(), WRITER_ID, (tx) => tx.unsafe(upsert, [[{ sku: x, quantity: 9 }], 'update'] as any[])));
+        expect(writerUpsert.error).toMatchObject({ code: '42501' });
+        const writerUpdate = (await asUser(connect(), WRITER_ID, (tx) =>
+          tx.unsafe(`select * from public.update_inventory_quantities($1::text[], 9)`, [[x]] as any[])
+        )) as Row[];
+        const writerDelete = (await asUser(connect(), WRITER_ID, (tx) =>
+          tx.unsafe(`select * from public.delete_inventory_items($1::text[])`, [[x]] as any[])
+        )) as Row[];
+        expect([writerUpdate.length, writerDelete.length]).toEqual([0, 0]);
+        expect(await inventoryOf([x])).toEqual({ [x]: 4 });
+
+        // anon: no EXECUTE at all.
+        for (const query of [
+          `select public.upsert_inventory_items('[]'::jsonb, 'update')`,
+          `select public.update_inventory_quantities(array[]::text[], 1)`,
+          `select public.delete_inventory_items(array[]::text[])`,
+        ]) {
+          const outcome = await settled(
+            connect().begin(async (tx) => {
+              await tx.unsafe('set local role anon');
+              return tx.unsafe(query);
+            })
+          );
+          expect(outcome.error, query).toMatchObject({ code: '42501' });
+        }
+      });
+
+      it("two sales of one product's variants no longer deadlock: a sale takes all its rows before its first deduction writes the product row (since 02001: 40P01)", async () => {
+        const a = `ST-2SA-${RUN}-${randomUUID().slice(0, 4)}`;
+        const z = `ST-2SZ-${RUN}-${randomUUID().slice(0, 4)}`;
+        const seeded = await seedProduct({
+          createDraft: false,
+          variants: [
+            { sku: a, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: z, price: 5900, stock: 5, terms: [terms.Blue] },
+          ],
+        });
+        // Another product carrying Z: a session holding its variant row stops a sale's cache sync for Z, before
+        // the sync reaches the product rows.
+        const pause = await seedProduct({ createDraft: false, variants: [{ sku: z, price: 5900, stock: 5, terms: [terms.Red] }] });
+        await owner`insert into public.inventory_items (sku, quantity) values (${a}, 5), (${z}, 5)`;
+        const zOnly = await recordOrderLines([{ productId: seeded.productId, variantId: seeded.variantIds[z], quantity: 1 }]);
+        const both = await recordOrderLines([
+          { productId: seeded.productId, variantId: seeded.variantIds[a], quantity: 1 },
+          { productId: seeded.productId, variantId: seeded.variantIds[z], quantity: 1 },
+        ]);
+
+        const held = await holdRows(`select 1 from public.product_variants where id = $1 for update`, [pause.variantIds[z]]);
+        let first: Promise<{ value?: unknown; error?: any }> = Promise.resolve({});
+        let second: Promise<{ value?: unknown; error?: any }> = Promise.resolve({});
+        try {
+          // The Z sale holds Z's row; its sync is stopped on the held variant.
+          first = saleInOneStatement(zOnly, 'two-sales-z');
+          await waitForLockWait('two-sales-z');
+          // The A-and-Z sale. Until 02046 it deducted A first, whose sync took the product row, then waited for
+          // Z: the Z sale's sync then waited for that product row (40P01). Now it takes A and Z before any
+          // deduction, so it waits for Z holding only A.
+          second = saleInOneStatement(both, 'two-sales-az');
+          await waitForLockWait('two-sales-az');
+        } finally {
+          held.release();
+        }
+        expect((await held.done).error).toBeUndefined();
+        expect((await first).error).toBeUndefined();
+        expect((await second).error).toBeUndefined();
+        expect(await inventoryOf([a, z])).toEqual({ [a]: 4, [z]: 3 });
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 7, variants: { [a]: 4, [z]: 3 } });
+      });
+
+      it('a first sale of a SKU with no inventory row, made while a publish that writes it runs, waits for the publish, which created the row in its first statement (02044: 40P01)', async () => {
+        const r = `ST-MRR-${RUN}-${randomUUID().slice(0, 4)}`;
+        const b = `ST-MRB-${RUN}-${randomUUID().slice(0, 4)}`;
+        const seeded = await seedProduct({
+          variants: [
+            { sku: r, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: b, price: 5900, stock: 3, terms: [terms.Blue] },
+          ],
+          gallery: [media.M1],
+          draftBlocks: [],
+        });
+        // R has its row; B has none (a product saved before shared inventory, or a SKU added by hand since).
+        await owner`insert into public.inventory_items (sku, quantity) values (${r}, 5)`;
+        const orderId = await recordOrder({ productId: seeded.productId, variantId: seeded.variantIds[b], quantity: 1 });
+        // R changed from 5 to 9, B kept at 3.
+        const values = buildProductDraftPublishValues(
+          formValues(seeded, {
+            stock_baseline: { [r]: 5, [b]: 3 },
+            variants: [formVariant(r, 59, 9, [terms.Red], seeded.variantIds[r]), formVariant(b, 59, 3, [terms.Blue], seeded.variantIds[b])],
+            product_media: [{ media_id: media.M1 }],
+          })
+        );
+        const read = await readForPublish(seeded);
+
+        // A session holding the gallery row stops the publish after its variant rows, before its stock.
+        const gallery = await holdRows(`select 1 from public.product_media where product_id = $1 and media_id = $2 for update`, [
+          seeded.productId,
+          media.M1,
+        ]);
+        let publishing: Promise<{ value?: unknown; error?: any }> = Promise.resolve({});
+        let sale: Promise<{ value?: unknown; error?: any }> = Promise.resolve({});
+        try {
+          publishing = publishInSession({ productId: seeded.productId, ...read, values, blocks: [] }, 'missing-row-publish');
+          await waitForLockWait('missing-row-publish');
+          // 02044: the sale created B's row, then its sync waited for B's variant row, which the publish held;
+          // the publish's stock write then waited for the sale's new row (40P01). Now the publish created B's
+          // row in its first statement, and the sale waits for it there, holding no inventory or product row.
+          sale = saleInOneStatement(orderId, 'missing-row-sale');
+          await waitForLockWait('missing-row-sale');
+        } finally {
+          gallery.release();
+        }
+        expect((await gallery.done).error).toBeUndefined();
+        const published = await publishing;
+        expect(published.error).toBeUndefined();
+        expect((await sale).error).toBeUndefined();
+        expect((published.value as Row[])[0].result.stock_adjusted).toEqual([]);
+        // R published at 9 (nothing sold); B kept at 3, the row created from its stock, then the sale's one.
+        expect(await inventoryOf([r, b])).toEqual({ [r]: 9, [b]: 2 });
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 11, variants: { [r]: 9, [b]: 2 } });
+      });
+
+      it("a publish creates the missing row of its product's SKU from the product's own stock (the plan reads what it read before) and does not refuse itself (NBP03) when that row repairs the product's total", async () => {
+        const r = `ST-PCR-${RUN}-${randomUUID().slice(0, 4)}`;
+        const g = `ST-PCG-${RUN}-${randomUUID().slice(0, 4)}`;
+        // No rows, a total (7) that is not the variants' (5 + 4), and a translation showing G at 6.
+        const seeded = await seedProduct({
+          variants: [
+            { sku: r, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: g, price: 5900, stock: 4, terms: [terms.Green] },
+          ],
+          draftBlocks: [],
+        });
+        const french = await seedProduct({
+          createDraft: false,
+          sku: seeded.sku,
+          groupId: seeded.groupId,
+          languageId: 2,
+          variants: [{ sku: g, price: 5900, stock: 6, terms: [terms.Green] }],
+        });
+        const values = buildProductDraftPublishValues(
+          formValues(seeded, {
+            stock_baseline: { [r]: 5, [g]: 4 },
+            variants: [formVariant(r, 59, 8, [terms.Red], seeded.variantIds[r]), formVariant(g, 59, 4, [terms.Green], seeded.variantIds[g])],
+          })
+        );
+        const result = await publish(owner, { productId: seeded.productId, ...(await readForPublish(seeded)), values, blocks: [] });
+
+        expect(result.stock_adjusted).toEqual([]);
+        // R changed 5 to 8; G kept at this product's 4 (not the translation's 6), which the translation now shows.
+        expect(await inventoryOf([r, g])).toEqual({ [r]: 8, [g]: 4 });
+        expect(await shownStockOf(seeded.productId)).toEqual({ product: 12, variants: { [r]: 8, [g]: 4 } });
+        expect((await shownStockOf(french.productId)).variants).toEqual({ [g]: 4 });
+      });
+
+      it('section 5 (the backfill) gives every SKU a sale could deduct its missing row, at the least stock its carriers show, stamping only a product whose own stock it moved; it leaves a row that exists, a parent SKU and a SKU of spaces alone', async () => {
+        const sku = (name: string) => `ST-BF${name}-${RUN}-${randomUUID().slice(0, 4)}`;
+        const x = sku('X');
+        const y = sku('Y');
+        const z = sku('Z');
+        const spaces = '    ';
+        const english = await seedProduct({
+          createDraft: false,
+          variants: [
+            { sku: x, price: 5900, stock: 4, terms: [terms.Red] },
+            { sku: y, price: 5900, stock: 0, terms: [terms.Blue] },
+            { sku: spaces, price: 5900, stock: 2, terms: [terms.Green] },
+          ],
+        });
+        const french = await seedProduct({
+          createDraft: false,
+          sku: english.sku,
+          groupId: english.groupId,
+          languageId: 2,
+          variants: [{ sku: x, price: 5900, stock: 6, terms: [terms.Red] }],
+        });
+        const simple = await seedProduct({ createDraft: false });
+        const kept = await seedProduct({ createDraft: false, variants: [{ sku: z, price: 5900, stock: 2, terms: [terms.Red] }] });
+        await owner`insert into public.inventory_items (sku, quantity) values (${z}, 9)`;
+        const backfill = readMigration('02046_inventory_writes_in_sku_order.sql').match(
+          /INSERT INTO public\.inventory_items \(sku, quantity\)\s+SELECT missing\.sku[\s\S]*?;/
+        )?.[0];
+        expect(backfill, 'section 5').toBeTruthy();
+
+        // Inside a transaction rolled back after reading: the statement fills every gap of the database.
+        const ids = [english.productId, french.productId, simple.productId, kept.productId];
+        const outcome = await owner
+          .begin(async (tx) => {
+            const stampsBefore = await tx`select id, updated_at::text as updated_at from public.products where id = any(${ids}::uuid[]) order by id`;
+            await tx.unsafe(backfill as string);
+            const rows = await tx`
+              select sku, quantity from public.inventory_items
+               where sku = any(${[x, y, z, spaces, english.sku, simple.sku, kept.sku]}::text[])`;
+            const shown = await tx`
+              select p.id, p.stock, (select jsonb_object_agg(v.sku, v.stock_quantity) from public.product_variants v where v.product_id = p.id) as variants
+                from public.products p where p.id = any(${ids}::uuid[])`;
+            const stampsAfter = await tx`select id, updated_at::text as updated_at from public.products where id = any(${ids}::uuid[]) order by id`;
+            throw Object.assign(new Error('rolled back'), {
+              outcome: {
+                rows: Object.fromEntries(rows.map((row: Row) => [row.sku, row.quantity])),
+                shown: Object.fromEntries(shown.map((row: Row) => [row.id, { product: row.stock, variants: row.variants }])),
+                stamped: Object.fromEntries(
+                  stampsAfter.map((row: Row, index: number) => [row.id, row.updated_at !== stampsBefore[index].updated_at])
+                ),
+              },
+            });
+          })
+          .catch((error: { outcome?: any }) => error.outcome);
+
+        expect(outcome, 'the backfill ran').toBeTruthy();
+        // X at the least of 4 and 6, Y at 0, the product without variants at its 7; Z kept its 9; no row for
+        // the parent SKUs or the SKU of spaces.
+        expect(outcome.rows).toEqual({ [x]: 4, [y]: 0, [simple.sku]: 7, [z]: 9 });
+        expect(outcome.shown[french.productId]).toEqual({ product: 4, variants: { [x]: 4 } });
+        expect(outcome.shown[english.productId]).toEqual({ product: 4, variants: { [x]: 4, [y]: 0, [spaces]: 2 } });
+        // Z's carriers show its row since the row was inserted above; the backfill did not write it.
+        expect(outcome.shown[kept.productId]).toEqual({ product: 9, variants: { [z]: 9 } });
+        // The English product only had its total repaired (X at its own 4, Y at its own 0): not stamped. The
+        // French one showed X at 6 and now shows 4, a stock change: stamped. The product without variants
+        // kept its 7, and Z's product was not touched.
+        expect(outcome.stamped).toEqual({
+          [english.productId]: false,
+          [french.productId]: true,
+          [simple.productId]: false,
+          [kept.productId]: false,
+        });
+        expect(await inventoryOf([x, y, simple.sku])).toEqual({});
+      });
+
+      it.each(DEDUCTIONS)('%s skips a SKU of spaces and deducts the rest of the order (until 02046 the fallback deducted it)', async (path) => {
+        const v = `ST-SP${path === 'apply_order_inventory_deduction' ? 'R' : 'F'}-${RUN}-${randomUUID().slice(0, 4)}`;
+        const spaces = '   ';
+        const seeded = await seedProduct({
+          createDraft: false,
+          variants: [
+            { sku: v, price: 5900, stock: 5, terms: [terms.Red] },
+            { sku: spaces, price: 5900, stock: 2, terms: [terms.Blue] },
+          ],
+        });
+        await owner`insert into public.inventory_items (sku, quantity) values (${v}, 5)`;
+        const orderId = await recordOrderLines([
+          { productId: seeded.productId, variantId: seeded.variantIds[spaces], quantity: 1 },
+          { productId: seeded.productId, variantId: seeded.variantIds[v], quantity: 1 },
+        ]);
+        const deducted =
+          path === 'apply_order_inventory_deduction' ? await saleInOneStatement(orderId, 'spaces-sku') : await settled(deductWithFallback(orderId));
+        expect(deducted.error).toBeUndefined();
+        if (path !== 'apply_order_inventory_deduction') expect(deducted.value).toEqual({ method: 'sql-fallback' });
+        expect(await inventoryOf([v, spaces])).toEqual({ [v]: 4 });
+        const [{ deductedAt }] = await owner`select inventory_deducted_at is not null as "deductedAt" from public.orders where id = ${orderId}`;
+        expect(deductedAt).toBe(true);
       });
     });
   });

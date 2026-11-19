@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -6,8 +6,9 @@ import { describe, expect, it } from 'vitest';
  * A draft's stock quantity written as text is read by two readers that must agree on which text is a
  * number: the edit page's readDraftStockQuantity (DECIMAL_TEXT_PATTERN, apps/nextblock/app/cms/products/
  * productFormData.ts), which decides what the form shows and whether publish refuses the draft
- * (findUnreadableProductDraftValues), and publish_product_draft's helper (v_quantity_pattern, migration
- * 02044), which decides what is written. Text one accepts and the other refuses is a stock the form
+ * (findUnreadableProductDraftValues), and publish_product_draft's helper (v_quantity_pattern, declared
+ * by 02044 and again by each later migration that replaces the helper: 02047), which decides what is
+ * written. Text one accepts and the other refuses is a stock the form
  * shows one way and the publish writes (or refuses) another. Neither constant is exported
  * (DECIMAL_TEXT_PATTERN is private to productFormData.ts, and v_quantity_pattern is SQL), so both are
  * read from their source text. The SQL pattern is written in the syntax both engines share (ASCII ranges
@@ -17,7 +18,22 @@ import { describe, expect, it } from 'vitest';
 
 const ROOT = path.resolve(__dirname, '../..');
 const FORM_DATA = 'apps/nextblock/app/cms/products/productFormData.ts';
-const MIGRATION = 'libs/db/src/supabase/migrations/02044_product_draft_publish_stock_baseline.sql';
+const MIGRATIONS_DIR = 'libs/db/src/supabase/migrations';
+/**
+ * The last migration that declares v_quantity_pattern: the helper a database runs is the one the last
+ * of them created (CREATE OR REPLACE), so a pattern changed there and not in the app, or the other way
+ * round, must fail here (02044 declared it first; 02047 replaces the helper with its own copy).
+ */
+const MIGRATION = (() => {
+  const files = readdirSync(path.join(ROOT, MIGRATIONS_DIR))
+    .filter((name) => /^\d{5}_[a-z0-9_]+\.sql$/.test(name))
+    .sort();
+  const declaring = files.filter((name) =>
+    /^\s*v_quantity_pattern constant text :=/m.test(readFileSync(path.join(ROOT, MIGRATIONS_DIR, name), 'utf8')),
+  );
+  if (declaring.length === 0) throw new Error(`no migration in ${MIGRATIONS_DIR} declares v_quantity_pattern`);
+  return `${MIGRATIONS_DIR}/${declaring[declaring.length - 1]}`;
+})();
 
 /** DECIMAL_TEXT_PATTERN's source and flags, as productFormData.ts declares it (a regex literal on one line). */
 function formPatternSource(): { source: string; flags: string } {
@@ -29,7 +45,7 @@ function formPatternSource(): { source: string; flags: string } {
   return { source: declarations[0][1], flags: declarations[0][2] };
 }
 
-/** v_quantity_pattern's text, as 02044 declares it (a standard SQL string: only '' is an escape). */
+/** v_quantity_pattern's text, as MIGRATION declares it (a standard SQL string: only '' is an escape). */
 function functionPatternSource(): string {
   const sql = readFileSync(path.join(ROOT, MIGRATION), 'utf8');
   const declarations = [...sql.matchAll(/^\s*v_quantity_pattern constant text := '((?:[^']|'')*)';\r?$/gm)];
@@ -84,7 +100,11 @@ const CORPUS: string[] = [
   `1e${'0'.repeat(20)}1`, `1e-${'0'.repeat(20)}1`, `5E+${'9'.repeat(13)}`,
 ];
 
-describe("the stock quantity patterns of the edit page and of publish_product_draft (02044's v_quantity_pattern)", () => {
+describe("the stock quantity patterns of the edit page and of publish_product_draft (the last migration's v_quantity_pattern)", () => {
+  it('reads the last migration that declares the pattern, the copy a database runs (02047 or later)', () => {
+    expect(MIGRATION >= `${MIGRATIONS_DIR}/02047_`).toBe(true);
+  });
+
   it('are read from their source text', () => {
     const form = formPatternSource();
     expect(form.source.length).toBeGreaterThan(0);

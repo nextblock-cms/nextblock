@@ -476,6 +476,101 @@ function readProductStockBaseline(value: unknown): Record<string, number> | null
   return baseline;
 }
 
+/** What a product's last product-values publish did with one SKU (ProductStockPublish). */
+export interface ProductStockPublishEntry {
+  /** The baseline entry that publish used for the SKU; null when it had none (a SKU the page had not loaded). */
+  loaded: number | null;
+  /** The quantity that publish's values carried for the SKU. */
+  entered: number;
+}
+
+/**
+ * A product's last product-values publish, as public.product_stock_publishes records it (migration 02047)
+ * and publish_product_draft reads it: `count`, how many product-values publishes the product has had (0
+ * before the first, and on a database without the table), and `entries`, what the last one did with each
+ * SKU of its values (none when its values carried no baseline). The edit page reads the row before the
+ * product, records `count` beside the form's baseline (`stock_baseline_publish_count`), and decides a
+ * draft's stock from it as publish does (reconcileProductDraftStock): a baseline whose count is below the
+ * product's was loaded before the last publish, and a SKU whose baseline entry is the one that publish
+ * used counts from the quantity that publish entered.
+ */
+export interface ProductStockPublish {
+  count: number;
+  entries: ReadonlyMap<string, ProductStockPublishEntry>;
+}
+
+/** No product-values publish recorded: a product without a row, or a database without the table. */
+export const NO_PRODUCT_STOCK_PUBLISH: ProductStockPublish = { count: 0, entries: new Map() };
+
+/**
+ * A product_stock_publishes row (`publish_count`, `stock`) as private.apply_product_draft_values reads it:
+ * a count that is not a whole number from 0 reads as 0, and an entry counts only with a whole `entered`
+ * and a whole or null `loaded` (the function counts from no other), keyed by the SKU as stored (trimmed
+ * when the function wrote it). Anything that is not a row reads as no publish.
+ */
+export function readProductStockPublish(row: unknown): ProductStockPublish {
+  if (!isRecord(row)) {
+    return NO_PRODUCT_STOCK_PUBLISH;
+  }
+
+  const entries = new Map<string, ProductStockPublishEntry>();
+  if (isRecord(row.stock)) {
+    for (const [sku, entry] of Object.entries(row.stock)) {
+      if (isRecord(entry) && isStockQuantity(entry.entered) && (entry.loaded === null || isStockQuantity(entry.loaded))) {
+        entries.set(sku, { loaded: entry.loaded, entered: entry.entered });
+      }
+    }
+  }
+  return { count: isStockQuantity(row.publish_count) ? row.publish_count : 0, entries };
+}
+
+/** PostgREST's code for a table its schema cache lacks, and Postgres' own: no product_stock_publishes yet. */
+const MISSING_TABLE_ERROR_CODES = new Set(['PGRST205', '42P01']);
+
+/**
+ * The edit page's read of a product's product_stock_publishes row (the `{ data, error }` of
+ * `.select('publish_count, stock').eq('product_id', id).maybeSingle()`): the row as publish reads it
+ * (readProductStockPublish; none for a product without one), no publish recorded on a database that has
+ * not applied migration 02047 (its publish ignores the count, so the page decides the stock as 02044 did),
+ * and an error for any other failure, which the page throws rather than show a stock it could not check.
+ */
+export function readProductStockPublishAnswer(answer: {
+  data?: unknown;
+  error?: { code?: unknown; message?: unknown } | null;
+}): ProductStockPublish {
+  const error = answer.error;
+  if (error) {
+    if (typeof error.code === 'string' && MISSING_TABLE_ERROR_CODES.has(error.code)) {
+      return NO_PRODUCT_STOCK_PUBLISH;
+    }
+    const message = typeof error.message === 'string' && error.message ? error.message : 'unknown error';
+    throw new Error(`The product's last publish could not be read: ${message}`);
+  }
+  return readProductStockPublish(answer.data);
+}
+
+/**
+ * Whether a draft's baseline was loaded before the product's last product-values publish, as
+ * publish_product_draft decides it (migration 02047): the values carry a baseline and a
+ * `stock_baseline_publish_count` that is a whole number below the product's count. A marker equal to the
+ * count, above it, missing or unreadable (a draft saved before 02047, a hand-written one) is not: 02044's
+ * rules then apply as they were.
+ */
+function isBaselineFromBeforeLastPublish(
+  draftValues: Record<string, unknown>,
+  stockPublish: ProductStockPublish
+): boolean {
+  const marker = draftValues.stock_baseline_publish_count;
+  return isRecord(draftValues.stock_baseline) && isStockQuantity(marker) && marker < stockPublish.count;
+}
+
+/** The trimmed SKUs whose stock publish plans from these values: each variant's, or the product's without variants. */
+function plannedStockSkus(values: Record<string, unknown>): string[] {
+  const variants = Array.isArray(values.variants) ? values.variants : [];
+  const skus = variants.length > 0 ? variants.map((variant) => (isRecord(variant) ? variant.sku : undefined)) : [values.sku];
+  return skus.map(stockSku).filter(Boolean);
+}
+
 /**
  * The live stock per SKU as the edit page reads it (reconcileProductDraftStock reads buildProductFormInitialData's
  * data, which keeps the products row's stock as it is): the values buildProductFormValuesFromLiveProduct made
@@ -509,13 +604,20 @@ function readLiveStockAsShown(
  * stock, and otherwise applies the difference to the current stock, never below 0: the rule the edit page
  * shows the same draft by (reconcileProductDraftStock), so a draft published as it stands, with no
  * autosave since the page loaded, writes what the page showed while the stock has not moved since.
+ *
+ * A SKU of the values the live product stocks that the draft's baseline lacks (a variant added, or a SKU
+ * renamed, on a page loaded before the product's last publish, which made it live) goes as a null entry:
+ * for a baseline loaded before that publish (`stock_baseline_publish_count`, migration 02047) the
+ * function counts it from the quantity that publish entered when that publish had no entry for it either,
+ * so a sale of it since that publish stays sold; otherwise it reads a null entry as none, and writes the
+ * draft's quantity, as before.
  */
 function resolvePublishedStockBaseline(
   draftValues: Record<string, unknown>,
   values: Record<string, unknown>,
   liveValues: { sku?: unknown; stock?: unknown; variants?: unknown },
   liveProduct: unknown
-): Record<string, number> | undefined {
+): Record<string, number | null> | undefined {
   const recorded = readProductStockBaseline(draftValues.stock_baseline);
   if (!recorded) {
     return undefined;
@@ -530,10 +632,15 @@ function resolvePublishedStockBaseline(
   }
 
   const live = readLiveStockAsShown(liveValues, liveProduct);
-  const sent: Record<string, number> = {};
+  const sent: Record<string, number | null> = {};
   for (const [sku, quantity] of Object.entries(recorded)) {
     if (hasOwn(live, sku)) {
       sent[sku] = quantity;
+    }
+  }
+  for (const sku of plannedStockSkus(values)) {
+    if (hasOwn(live, sku) && !hasOwn(sent, sku)) {
+      sent[sku] = null;
     }
   }
   return sent;
@@ -548,7 +655,9 @@ function resolvePublishedStockBaseline(
  * product's stock without variants, is the whole number readDraftStockQuantity reads (a quantity it
  * cannot read stays as it is, and publish refuses that draft first: findUnreadableProductDraftValues);
  * with variants the product's stock is their total, which the function writes whatever it is sent. Its
- * `stock_baseline` is the draft's, for the quantities that are the draft's (resolvePublishedStockBaseline).
+ * `stock_baseline` is the draft's, for the quantities that are the draft's (resolvePublishedStockBaseline),
+ * with the draft's `stock_baseline_publish_count` beside it (migration 02047), both dropped when the draft
+ * has no baseline.
  */
 export function completeProductDraftValues(meta: Record<string, unknown>, liveProduct: any) {
   const draftValues = withoutProductDraftFormMarker(meta);
@@ -568,6 +677,7 @@ export function completeProductDraftValues(meta: Record<string, unknown>, livePr
     values.stock_baseline = stockBaseline;
   } else {
     delete values.stock_baseline;
+    delete values.stock_baseline_publish_count;
   }
 
   for (const key of PRODUCT_DRAFT_KEYS_NEVER_PUBLISHED) {
@@ -1407,15 +1517,21 @@ export function buildPoisonedProductDraftNotice(
  * The notes the edit page shows above the form for an open draft that publish would refuse or skip
  * parts of: an unmarked product-values draft an earlier version wrote (findPoisonedProductDraftFields),
  * a product-values draft holding a stock or a SKU publish cannot read (findUnreadableProductDraftValues),
- * the SKUs whose stock the form shows already live, or applied to a stock that moved since the draft's
- * change started, at another figure than the draft's (reconcileProductDraftStock, from the edit page's own
- * merge run again here over the same live product, so a note names exactly the figures the form shows, the
- * first five of a kind in the order publish's warning names them), and a legacy row snapshot, or an
- * overlay rewritten from one, whose snapshot fields publish will skip (planProductDraftOverlayPublish,
- * which skips nothing for any other overlay). Built from the same functions publish uses, so the page
- * says what publish would do.
+ * the SKUs whose stock the form shows already live, already published by the product's last publish, or
+ * applied to a stock that moved since the draft's change started, at another figure than the draft's
+ * (reconcileProductDraftStock, from the edit page's own merge run again here over the same live product
+ * and the same `stockPublish`, the product's last product-values publish as the page read it, so a note
+ * names exactly the figures the form shows, the first five of a kind in the order publish's warning names
+ * them), and a legacy row snapshot, or an overlay rewritten from one, whose snapshot fields publish will
+ * skip (planProductDraftOverlayPublish, which skips nothing for any other overlay). Built from the same
+ * functions publish uses, so the page says what publish would do.
  */
-export function getProductDraftEditNotices(meta: unknown, liveProduct: unknown, draftCreatedAt: unknown): string[] {
+export function getProductDraftEditNotices(
+  meta: unknown,
+  liveProduct: unknown,
+  draftCreatedAt: unknown,
+  stockPublish: ProductStockPublish = NO_PRODUCT_STOCK_PUBLISH
+): string[] {
   const notices: string[] = [];
   const check = checkProductDraft(meta, liveProduct);
 
@@ -1434,6 +1550,7 @@ export function getProductDraftEditNotices(meta: unknown, liveProduct: unknown, 
       productId: typeof liveProduct.id === 'string' ? liveProduct.id : '',
       liveProduct,
       draftCreatedAt,
+      stockPublish,
     });
     notices.push(...describeProductDraftStockCases(stockCases));
   }
@@ -1605,16 +1722,23 @@ function deriveVariationAttributes(variants: unknown[]) {
  *   moved the stock (loaded 10, 9 typed for a damaged unit, one sold meanwhile: 9 stays where 8 was meant).
  * - `moved`: the live stock moved away from `loaded`, so the change is applied to it and `shown` is
  *   another figure than `entered`: wrong when the draft's figure already counted what moved the stock.
+ * - `already_published` (migration 02047): the draft's baseline was loaded before the product's last
+ *   publish, which used the same baseline entry and entered `entered` (`loaded` is that figure), so that
+ *   publish made the change live and the stock is left as it is, with what moved it since. Right for a
+ *   draft started again after its publish, wrong for a figure meant to replace the stock as it now is.
+ * `fromLastPublish`: the change counts from the quantity the product's last publish entered (`loaded`),
+ * not from the draft's baseline entry, which that publish used too (migration 02047).
  * The figures may be another editor's autosave or a hand-written draft's (any product_drafts writer can
  * set them), so the notes name the draft, never the reader.
  */
 interface ProductDraftStockCase {
   sku: string;
-  reason: 'already_live' | 'moved';
+  reason: 'already_live' | 'already_published' | 'moved';
   loaded: number;
   entered: number;
   current: number;
   shown: number;
+  fromLastPublish: boolean;
 }
 
 /**
@@ -1649,6 +1773,16 @@ interface ProductDraftStockCase {
  *   that publish). Until 2026-11-18 a SKU missing from a draft's baseline got no baseline here while the
  *   draft had one, so every publish of that draft wrote the variant's figure as it stood, each sale of it
  *   since that first publish undone.
+ * - For a baseline loaded before the product's last product-values publish (its
+ *   `stock_baseline_publish_count` is below `stockPublish.count`, migration 02047: an autosave queued
+ *   behind that publish, or a tab opened before it, started the draft again), a SKU whose baseline entry
+ *   is the one that publish used (the same number, or none in both: a variant added before that publish,
+ *   which publish then sends as a null entry) counts from the quantity that publish entered, as the
+ *   function does: equal to it, the live quantity (that publish made the change live; named
+ *   `already_published`), otherwise the rules above from that figure. Without this a change that publish
+ *   made live was applied again once the stock moved (loaded 5, typed 10 and published, one sold: 14), a
+ *   figure typed while it ran counted from the older baseline (12 typed after 10 was published from a load
+ *   of 5: 17), and a variant added before it was written as typed again, every sale of it since undone.
  * - For a SKU the live product does not stock (another product's SKU, one another publish removed since, a
  *   product whose stock is NULL): the quantity as read, with no baseline, as publish writes it.
  * - A quantity publish cannot read (a boolean, an object, other text, a value that is not finite) shows
@@ -1663,16 +1797,20 @@ interface ProductDraftStockCase {
  * draft's (`quantitiesFromDraft`, decided as resolvePublishedStockBaseline decides it for publish): beside
  * live quantities (a draft without a variant list, groups the old-draft check repairs) the draft's baseline
  * describes nothing shown, and publish sends the live stock as unchanged. Of variants sharing a SKU the
- * last one decides whether it is named, as it counts in the publish.
+ * last one decides whether it is named, as it counts in the publish. The form's
+ * `stock_baseline_publish_count` becomes `stockPublish.count`, the product's count as this page read it
+ * before the product: the baseline it records is this page load's.
  */
 function reconcileProductDraftStock(
   merged: Record<string, any>,
   liveInitialData: Record<string, any>,
-  draftBaseline: unknown,
-  quantitiesFromDraft: boolean
+  draftValues: Record<string, unknown>,
+  quantitiesFromDraft: boolean,
+  stockPublish: ProductStockPublish
 ): ProductDraftStockCase[] {
   const live = buildProductStockBaseline(liveInitialData);
-  const recorded = readProductStockBaseline(draftBaseline);
+  const recorded = readProductStockBaseline(draftValues.stock_baseline);
+  const fromBeforeLastPublish = isBaselineFromBeforeLastPublish(draftValues, stockPublish);
   const baseline: Record<string, number> = {};
   const cases = new Map<string, ProductDraftStockCase>();
 
@@ -1689,20 +1827,44 @@ function reconcileProductDraftStock(
     }
 
     baseline[key] = liveQuantity;
-    if (!recorded || !hasOwn(recorded, key)) {
+    if (!recorded) {
       return { shown: entered, found: null };
     }
 
-    const loaded = recorded[key];
-    if (entered === loaded) {
+    // What publish sends for this SKU (resolvePublishedStockBaseline): the draft's entry, or a null entry
+    // for a SKU the live product stocks that the draft's baseline lacks. The figure the change counts
+    // from: that entry, or, for a baseline loaded before the product's last publish whose entry is the
+    // one that publish used, the quantity that publish entered (private.apply_product_draft_values, 02047).
+    const loaded = hasOwn(recorded, key) ? recorded[key] : null;
+    const last = fromBeforeLastPublish ? stockPublish.entries.get(key) : undefined;
+    const fromLastPublish = last !== undefined && last.loaded === loaded;
+    const reference = fromLastPublish ? last.entered : loaded;
+
+    if (loaded !== null && entered === loaded) {
       return { shown: liveQuantity, found: null };
     }
-    const shown =
-      entered === liveQuantity ? liveQuantity : Math.min(MAX_STOCK_QUANTITY, Math.max(0, liveQuantity + entered - loaded));
-    const reason = entered === liveQuantity ? 'already_live' : shown !== entered ? 'moved' : null;
+    if (reference === null) {
+      return { shown: entered, found: null };
+    }
+
+    let shown: number;
+    let reason: ProductDraftStockCase['reason'] | null;
+    if (entered === liveQuantity) {
+      shown = liveQuantity;
+      reason = 'already_live';
+    } else if (fromLastPublish && entered === reference) {
+      shown = liveQuantity;
+      reason = 'already_published';
+    } else {
+      shown = Math.min(MAX_STOCK_QUANTITY, Math.max(0, liveQuantity + entered - reference));
+      reason = shown !== entered ? 'moved' : null;
+    }
     return {
       shown,
-      found: reason && quantitiesFromDraft ? { sku: key, reason, loaded, entered, current: liveQuantity, shown } : null,
+      found:
+        reason && quantitiesFromDraft
+          ? { sku: key, reason, loaded: reference, entered, current: liveQuantity, shown, fromLastPublish }
+          : null,
     };
   };
 
@@ -1736,6 +1898,7 @@ function reconcileProductDraftStock(
   }
 
   merged.stock_baseline = baseline;
+  merged.stock_baseline_publish_count = stockPublish.count;
   return [...cases.values()].sort((left, right) => compareStockSkus(left.sku, right.sku));
 }
 
@@ -1779,14 +1942,24 @@ export function listProductStockEntries(entries: readonly string[]): string {
 }
 
 /**
+ * The figure a stock note or a publish warning says a draft's change started from: the draft's baseline
+ * entry, or the quantity the product's last publish entered, said so (migration 02047).
+ */
+export function describeProductStockChangeStart(loaded: number, fromLastPublish: boolean): string {
+  return fromLastPublish ? `${loaded}, the figure the last publish entered,` : String(loaded);
+}
+
+/**
  * The notes above the edit form for the SKUs reconcileProductDraftStock names, one per kind: the stock the
  * draft's change started from has moved (the form shows the change applied to the current stock, at another
- * figure than the draft's), or the stock already holds the draft's figure (publishing leaves it). Each names
- * the first five SKUs of its kind in the order the cases come (publish's, so the publish warning names the
- * same five), then how many more. An autosave records the live stock as the baseline, after which a publish
- * sees neither case and says nothing: these notes are the only place the editor learns of them, and what
- * they show is what publishing writes. Each says what to do if the figure shown is not the one meant: enter
- * the figure the stock should have, which is absolute from this page load.
+ * figure than the draft's), the stock already holds the draft's figure (publishing leaves it), or the
+ * product's last publish already entered it, from a draft started on a page loaded before that publish
+ * (publishing leaves the stock, with what moved it since). Each names the first five SKUs of its kind in the
+ * order the cases come (publish's, so the publish warning names the same five), then how many more. An
+ * autosave records the live stock as the baseline, after which a publish sees none of these cases and says
+ * nothing: these notes are the only place the editor learns of them, and what they show is what publishing
+ * writes. Each says what to do if the figure shown is not the one meant: enter the figure the stock should
+ * have, which is absolute from this page load.
  */
 function describeProductDraftStockCases(cases: readonly ProductDraftStockCase[]): string[] {
   const notes: string[] = [];
@@ -1797,7 +1970,7 @@ function describeProductDraftStockCases(cases: readonly ProductDraftStockCase[])
     const list = listProductStockEntries(
       moved.map(
         (entry) =>
-          `${entry.sku} shows ${entry.shown} (the draft changed ${entry.loaded} to ${entry.entered}, and the stock is now ${entry.current})`
+          `${entry.sku} shows ${entry.shown} (the draft changed ${describeProductStockChangeStart(entry.loaded, entry.fromLastPublish)} to ${entry.entered}, and the stock is now ${entry.current})`
       )
     );
     notes.push(
@@ -1809,10 +1982,24 @@ function describeProductDraftStockCases(cases: readonly ProductDraftStockCase[])
   if (alreadyLive.length > 0) {
     const one = alreadyLive.length === 1;
     const list = listProductStockEntries(
-      alreadyLive.map((entry) => `${entry.sku} stays at ${entry.shown} (the draft changed ${entry.loaded} to ${entry.entered})`)
+      alreadyLive.map(
+        (entry) =>
+          `${entry.sku} stays at ${entry.shown} (the draft changed ${describeProductStockChangeStart(entry.loaded, entry.fromLastPublish)} to ${entry.entered})`
+      )
     );
     notes.push(
       `The stock already holds ${one ? "this draft's figure, so publishing leaves it as it is" : "this draft's figures, so publishing leaves them as they are"}: ${list}. If ${one ? 'the change was' : 'a change was'} meant to come on top of what moved the stock (a damaged unit taken out after a sale, for example), enter the figure the stock should have.`
+    );
+  }
+
+  const alreadyPublished = cases.filter((entry) => entry.reason === 'already_published');
+  if (alreadyPublished.length > 0) {
+    const one = alreadyPublished.length === 1;
+    const list = listProductStockEntries(
+      alreadyPublished.map((entry) => `${entry.sku} stays at ${entry.shown} (the last publish entered ${entry.entered})`)
+    );
+    notes.push(
+      `This draft was started on a page loaded before the product's last publish, which already entered ${one ? "this draft's stock figure, so publishing leaves the stock as it is" : "this draft's stock figures, so publishing leaves those stocks as they are"}, with what sold or changed since: ${list}. If ${one ? 'the figure was' : 'a figure was'} meant to replace the stock as it now is, enter the figure the stock should have.`
     );
   }
 
@@ -1838,11 +2025,13 @@ function describeProductDraftStockCases(cases: readonly ProductDraftStockCase[])
  *   the form shows read-only beside them; and a digital product's stock without naming it), so the
  *   next autosave repairs them together and stamps the marker. The stock and the form's
  *   `stock_baseline` come from reconcileProductDraftStock: what publishing the draft as it stands would
- *   write (a quantity left as loaded, or already live, shows live; a change shows applied to the live
- *   stock; a quantity publish cannot read shows live, and publish refuses the draft until an autosave),
- *   over the live stock as the baseline; getProductDraftEditNotices names the SKUs it shows already live,
- *   or applied to a stock that moved at another figure than the draft's, from the same merge (run again
- *   over the same live product). A variant list, a gallery or categories that
+ *   write (a quantity left as loaded, already live or already published by the product's last publish
+ *   shows live; a change shows applied to the live stock; a quantity publish cannot read shows live, and
+ *   publish refuses the draft until an autosave), over the live stock as the baseline, with
+ *   `stockPublish.count` as its `stock_baseline_publish_count`; getProductDraftEditNotices names the SKUs
+ *   it shows already live or already published, or applied to a stock that moved at another figure than
+ *   the draft's, from the same merge (run again over the same live product and `stockPublish`). A
+ *   variant list, a gallery or categories that
  *   are not a list show the live ones, which publish keeps (PRODUCT_VALUE_LIST_KEYS); variation
  *   attributes that are not a list show the live ones beside the live variants and come from the
  *   draft's own variants beside those (publish sends no variation attributes), and a draft without a
@@ -1875,6 +2064,12 @@ interface ProductDraftMergeOptions {
   hydratedProductMedia?: unknown;
   /** The global attributes the edit page gives ProductForm (buildGlobalAttributesForForm). */
   globalAttributes?: readonly ProductAttribute[];
+  /**
+   * The product's last product-values publish, as the page read it before the product
+   * (readProductStockPublish; none recorded when absent): the stock is shown as publish decides it from
+   * the same row, and the form records its count beside the baseline (migration 02047).
+   */
+  stockPublish?: ProductStockPublish;
 }
 
 /**
@@ -2029,8 +2224,9 @@ function mergeProductDraftForEdit<T extends Record<string, any>>(
   const stockCases = reconcileProductDraftStock(
     merged,
     liveInitialData,
-    draftValues.stock_baseline,
-    countRows(merged.variants) > 0 ? variantsFromDraft : stockFromDraft
+    draftValues,
+    countRows(merged.variants) > 0 ? variantsFromDraft : stockFromDraft,
+    options.stockPublish ?? NO_PRODUCT_STOCK_PUBLISH
   );
 
   return { initialData: merged as T, stockCases };

@@ -22,17 +22,26 @@ const mocks = vi.hoisted(() => ({
   attributes: [] as unknown[],
   /** getProductCategories()'s rows: the categories assigned live. */
   categories: [] as unknown[],
+  /** The product_stock_publishes read's answer (migration 02047): no row by default. */
+  stockPublish: { data: null, error: null } as { data: unknown; error: unknown },
+  /** The reads in the order the page awaited them: a table name, or 'getCmsProduct'. */
+  reads: [] as string[],
 }));
 
 function Stub({ children }: { children?: ReactNode }) {
   return <>{children}</>;
 }
 
-/** The PostgREST builder the page awaits (currencies, the draft, live blocks). */
+/** The PostgREST builder the page awaits (the product's last publish, currencies, the draft, live blocks). */
 function makeSupabase() {
   return {
     from: (table: string) => {
-      const answer = () => (table === 'product_drafts' ? { data: mocks.draft, error: null } : { data: [], error: null });
+      const answer = () => {
+        mocks.reads.push(table);
+        if (table === 'product_drafts') return { data: mocks.draft, error: null };
+        if (table === 'product_stock_publishes') return mocks.stockPublish;
+        return { data: [], error: null };
+      };
       const chain: Record<string, unknown> = {};
       for (const method of ['select', 'eq', 'order', 'in']) chain[method] = () => chain;
       chain.maybeSingle = async () => answer();
@@ -61,7 +70,10 @@ vi.mock('@nextblock-cms/ui', () => ({
   DropdownMenuButtonTrigger: Stub,
 }));
 vi.mock('@nextblock-cms/ecommerce/server', () => ({
-  getCmsProduct: async () => mocks.product,
+  getCmsProduct: async () => {
+    mocks.reads.push('getCmsProduct');
+    return mocks.product;
+  },
   getEnabledPaymentProviders: async () => ['stripe'],
   getGlobalProductAttributes: async () => mocks.attributes,
   getProductTranslations: async () => [],
@@ -195,6 +207,8 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.attributes = [];
   mocks.categories = [];
+  mocks.stockPublish = { data: null, error: null };
+  mocks.reads = [];
   mocks.draft = { id: 7, product_id: PRODUCT_ID, meta: {}, blocks: [], created_at: '2026-11-01T00:00:00+00:00' };
   mocks.product = {
     id: PRODUCT_ID,
@@ -429,6 +443,32 @@ describe('/cms/products/[id]/edit and the stock the form loads', () => {
   });
 });
 
+/**
+ * The CMS create sends the editor here when it created the product but a step after it was not saved
+ * (createProductAction, ProductCreatedIncompleteError): the page says so above the form, in its own words.
+ */
+describe('/cms/products/[id]/edit after a create that could not finish', () => {
+  it('names the steps that were not saved, above any draft notice', async () => {
+    mocks.draft = null;
+    const tree = await EditProductPage({
+      params: Promise.resolve({ id: PRODUCT_ID }),
+      searchParams: Promise.resolve({ created_incomplete: 'stock,categories' }),
+    });
+    expect(findNotices(tree)).toEqual([
+      'This product was created, but its stock, categories could not be saved. Set the stock on the Inventory screen; check the rest below, then save.',
+    ]);
+  });
+
+  it('shows nothing for a value that names no step (nothing else from the URL reaches the page)', async () => {
+    mocks.draft = null;
+    const tree = await EditProductPage({
+      params: Promise.resolve({ id: PRODUCT_ID }),
+      searchParams: Promise.resolve({ created_incomplete: '<img src=x onerror=alert(1)>' }),
+    });
+    expect(findNotices(tree)).toEqual([]);
+  });
+});
+
 describe('/cms/products/[id]/edit and a draft whose list fields are not lists', () => {
   it.each([
     ['objects', {}],
@@ -524,6 +564,64 @@ describe('/cms/products/[id]/edit and a draft whose list fields are not lists', 
       }),
     ]);
     expect(initialData.variation_attributes).toEqual([{ attribute_id: 'attr-color', term_ids: ['term-red'] }]);
+  });
+});
+
+// Migration 02047: the page reads the product's last product-values publish (product_stock_publishes)
+// BEFORE the product, so a publish landing between the two reads makes its baseline look older, never
+// newer; hands ProductForm its count beside the baseline; and decides a draft's stock, and the notes
+// about it, from the same row as publish does.
+describe("/cms/products/[id]/edit and the product's last publish", () => {
+  const draftOf = (meta: Record<string, unknown>) => ({
+    id: 7,
+    product_id: PRODUCT_ID,
+    meta: { [PRODUCT_DRAFT_FORM_MARKER_KEY]: PRODUCT_DRAFT_FORM_MARKER_VALUE, sku: 'PRO', price: 49, variants: [], ...meta },
+    blocks: [],
+    created_at: '2026-11-01T00:00:00+00:00',
+  });
+
+  it("reads it before the product and hands ProductForm its count beside the baseline", async () => {
+    mocks.canPublish.mockResolvedValue(true);
+    mocks.product = { ...mocks.product, sku: 'PRO', stock: 6 };
+    mocks.draft = null;
+    mocks.stockPublish = { data: { publish_count: 3, stock: { PRO: { loaded: 4, entered: 6 } } }, error: null };
+
+    expect((await shellProps()).initialData).toMatchObject({ stock: 6, stock_baseline: { PRO: 6 }, stock_baseline_publish_count: 3 });
+    expect(mocks.reads.indexOf('product_stock_publishes')).toBeGreaterThan(-1);
+    expect(mocks.reads.indexOf('product_stock_publishes')).toBeLessThan(mocks.reads.indexOf('getCmsProduct'));
+  });
+
+  it('shows a draft started again after that publish as publish writes it, names the SKU, and records the count it read', async () => {
+    mocks.canPublish.mockResolvedValue(true);
+    // Loaded 5 before the publish (count 0), typed 10 and published; one sold since: 9 live.
+    mocks.product = { ...mocks.product, sku: 'PRO', stock: 9 };
+    mocks.stockPublish = { data: { publish_count: 1, stock: { PRO: { loaded: 5, entered: 10 } } }, error: null };
+    mocks.draft = draftOf({ stock: 10, stock_baseline: { PRO: 5 }, stock_baseline_publish_count: 0 });
+
+    const tree = await EditProductPage({ params: Promise.resolve({ id: PRODUCT_ID }), searchParams: Promise.resolve({}) });
+    const initialData = findElement(tree, ProductFormClientShell)?.props.initialData as Record<string, any>;
+
+    // 9, not 14: the form shows the stock as it is, and records this page load's stock and count.
+    expect(initialData).toMatchObject({ stock: 9, stock_baseline: { PRO: 9 }, stock_baseline_publish_count: 1 });
+    expect(findNotices(tree)).toContain(
+      "This draft was started on a page loaded before the product's last publish, which already entered this draft's stock figure, so publishing leaves the stock as it is, with what sold or changed since: PRO stays at 9 (the last publish entered 10). If the figure was meant to replace the stock as it now is, enter the figure the stock should have."
+    );
+    const [, , options] = vi.mocked(mergeProductDraftMetaIntoFormInitialData).mock.calls[0];
+    expect(options.stockPublish?.count).toBe(1);
+    expect(Object.fromEntries(options.stockPublish?.entries ?? [])).toEqual({ PRO: { loaded: 5, entered: 10 } });
+  });
+
+  it('records no publish on a database without the table (02047 not applied), and fails on any other error rather than show a stock it could not check', async () => {
+    mocks.canPublish.mockResolvedValue(true);
+    mocks.product = { ...mocks.product, sku: 'PRO', stock: 9 };
+    mocks.draft = draftOf({ stock: 10, stock_baseline: { PRO: 5 }, stock_baseline_publish_count: 0 });
+
+    mocks.stockPublish = { data: null, error: { code: 'PGRST205', message: "Could not find the table 'public.product_stock_publishes'" } };
+    // As 02044 publishes it: the change from 5 applied to 9.
+    expect((await shellProps()).initialData).toMatchObject({ stock: 14, stock_baseline: { PRO: 9 }, stock_baseline_publish_count: 0 });
+
+    mocks.stockPublish = { data: null, error: { code: '42501', message: 'permission denied for table product_stock_publishes' } };
+    await expect(shellProps()).rejects.toThrow("The product's last publish could not be read: permission denied");
   });
 });
 

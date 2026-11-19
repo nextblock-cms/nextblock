@@ -146,10 +146,21 @@ describe('ProductForm carries the stock the page loaded to every autosave', () =
 
     const values = await firstAutosave(updateAction);
     expect(values.stock_baseline ?? null).toBeNull();
+    expect(values.stock_baseline_publish_count ?? null).toBeNull();
+  });
+
+  // Migration 02047: the product's publish count when the page loaded the baseline rides along the same
+  // way, so a publish can tell a baseline loaded before the product's last publish.
+  it('carries the publish count the page loaded the baseline at, unseen, beside the baseline', async () => {
+    const { container, updateAction } = await mount(initialData({ stock_baseline: { PRO: 4 }, stock_baseline_publish_count: 3 }));
+
+    await type(container, '#stock', '9');
+
+    expect(await firstAutosave(updateAction)).toMatchObject({ stock: 9, stock_baseline: { PRO: 4 }, stock_baseline_publish_count: 3 });
   });
 
   it('saves nothing on open: the baseline dirties nothing', async () => {
-    const { updateAction } = await mount(initialData({ stock_baseline: { PRO: 4 } }));
+    const { updateAction } = await mount(initialData({ stock_baseline: { PRO: 4 }, stock_baseline_publish_count: 3 }));
 
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 700));

@@ -71,11 +71,17 @@ first-boot wizard under `app/setup`. Standalone projects are a copy of this dire
     the draft's quantity differs from both the `stock_baseline` the edit page loaded
     (`buildProductStockBaseline`) and the current stock, as a change to the current stock, so a sale
     made while the page was open stays sold, and its `stock_adjusted` answer (`already_live`,
-    `moved`) becomes a publish warning naming the draft's figures; publish refuses a draft holding a
+    `moved`, since 02047 `already_published`) becomes a publish warning naming the draft's figures;
+    since 02047 the edit page reads the product's `product_stock_publishes` row BEFORE the product
+    (`readStockPublishForEdit`; never after it, or a count would vouch for a stock read before a
+    publish) and records its count beside the baseline (`stock_baseline_publish_count`), and a
+    baseline whose count is below the product's counts a SKU whose entry the last publish used from
+    the figure that publish entered (publish sends a null baseline entry for a SKU the live product
+    stocks that the baseline lacks); publish refuses a draft holding a
     stock or a SKU it cannot read (`findUnreadableProductDraftValues`), and with a draft open
-    `reconcileProductDraftStock` shows what that publish would write, over the live stock as the
-    baseline, and `getProductDraftEditNotices` names both kinds above the form (docs/09 → "Stock:
-    only what the editor changed"); the Freemius coupon push runs after the commit;
+    `reconcileProductDraftStock` shows what that publish would write, from the same row, over the
+    live stock as the baseline, and `getProductDraftEditNotices` names each kind above the form
+    (docs/09 → "Stock: only what the editor changed"); the Freemius coupon push runs after the commit;
     every error the database answers rolled it all back, only a call with no answer may have
     committed) and the in-page save (a legacy snapshot becomes an overlay; it refuses a draft
     publish refuses, `findPoisonedProductDraftFields`, and an edit that would make publish refuse

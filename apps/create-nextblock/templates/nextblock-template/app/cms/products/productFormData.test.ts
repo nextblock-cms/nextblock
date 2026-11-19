@@ -36,6 +36,10 @@ import {
   findUnreadableProductDraftValues,
   getProductDraftEditNotices,
   mergeProductDraftMetaIntoFormInitialData,
+  NO_PRODUCT_STOCK_PUBLISH,
+  readProductStockPublish,
+  readProductStockPublishAnswer,
+  type ProductStockPublish,
 } from './productFormData';
 import {
   PRODUCT_DRAFT_FORM_MARKER_KEY,
@@ -768,11 +772,13 @@ describe('the stock baseline: the stock the form loaded, so publishing writes on
   /**
    * What publish_product_draft (migration 02044) writes for one SKU: the current stock where the
    * draft's quantity equals its baseline or the current stock, otherwise the difference applied to the
-   * current stock, never below 0; the draft's quantity without a baseline.
+   * current stock, never below 0; the draft's quantity without a baseline entry (none, or the null entry
+   * publish sends for a SKU the draft's baseline lacks, which the function reads as none unless the
+   * baseline predates the product's last publish: migration 02047, modelled in the marker suite below).
    * tools/scripts/product-draft-publish.db.test.ts runs the function itself.
    */
-  const publishedStock = (entered: number, loaded: number | undefined, current: number) =>
-    loaded === undefined
+  const publishedStock = (entered: number, loaded: number | null | undefined, current: number) =>
+    loaded === undefined || loaded === null
       ? entered
       : entered === loaded || entered === current
         ? current
@@ -1159,9 +1165,11 @@ describe('the stock baseline: the stock the form loaded, so publishing writes on
     ]);
     const recreated = { ...autosaveOf(initialData, [4, 5], { 'PRO-RED': 4 }), stock: 9 };
 
-    // As it stands, publish writes BLUE as the draft holds it (no baseline entry), and the page shows that.
+    // As it stands, publish writes BLUE as the draft holds it (its baseline entry is the null one publish
+    // sends for a SKU the live product stocks that the draft's baseline lacks, which counts as none here:
+    // this draft carries no publish count, migration 02047), and the page shows that.
     const asItStands = buildProductDraftPublishValues(completeProductDraftValues(recreated, liveProduct) as any);
-    expect(asItStands.stock_baseline).toEqual({ 'PRO-RED': 4 });
+    expect(asItStands.stock_baseline).toEqual({ 'PRO-RED': 4, 'PRO-BLUE': null });
     expect(publishedStock(5, asItStands.stock_baseline?.['PRO-BLUE'], 5)).toBe(5);
     const page = mergeProductDraftMetaIntoFormInitialData(initialData, recreated, { ...options, liveProduct });
     expect(page.variants.map((variant: { stock_quantity: unknown }) => variant.stock_quantity)).toEqual([4, 5]);
@@ -1429,6 +1437,304 @@ describe('the stock baseline: the stock the form loaded, so publishing writes on
 
       expect(getProductDraftEditNotices(twice(15, 9), liveProduct, DRAFT_CREATED_AT)).toEqual([ALREADY_LIVE_NOTE]);
       expect(getProductDraftEditNotices(twice(9, 10), liveProduct, DRAFT_CREATED_AT)).toEqual([]);
+    });
+  });
+
+  /**
+   * Migration 02047: the publish a baseline was loaded against. The edit page reads the product's last
+   * product-values publish (public.product_stock_publishes) before the product, records its count beside
+   * the baseline (`stock_baseline_publish_count`), and decides a draft's stock as publish does: a baseline
+   * whose count is below the product's counts a SKU whose entry the last publish used from the quantity that
+   * publish entered. tools/scripts/product-draft-publish.db.test.ts runs the function on the same figures
+   * (9, 12, 11, the variant's 4, the restock's 10, tab B's 11, 14 for an unreadable marker).
+   */
+  describe('the publish a baseline was loaded against (migration 02047)', () => {
+    /** The product's last publish: `count` publishes, the last one having entered `entries`. */
+    const lastPublish = (count: number, entries: Record<string, [number | null, number]>): ProductStockPublish => ({
+      count,
+      entries: new Map(Object.entries(entries).map(([sku, [loaded, entered]]) => [sku, { loaded, entered }])),
+    });
+
+    /**
+     * What private.apply_product_draft_values (02047) writes for `sku` from the values publish sends, the
+     * SKU's current stock and the product's last publish: 02044's rules, from the quantity the last publish
+     * entered where the values' baseline predates it and its entry is the one that publish used.
+     */
+    const publishedSince02047 = (
+      values: { stock_baseline: Record<string, number | null> | null; stock_baseline_publish_count: number | null },
+      sku: string,
+      entered: number,
+      current: number,
+      stockPublish: ProductStockPublish
+    ) => {
+      const baseline = values.stock_baseline;
+      const loaded = baseline && typeof baseline[sku] === 'number' ? (baseline[sku] as number) : null;
+      const hasEntry = baseline !== null && Object.prototype.hasOwnProperty.call(baseline, sku);
+      const marker = values.stock_baseline_publish_count;
+      const stale = baseline !== null && marker !== null && marker < stockPublish.count;
+      const last = stale && hasEntry ? stockPublish.entries.get(sku) : undefined;
+      const fromLast = last !== undefined && last.loaded === loaded;
+      const reference = fromLast ? last.entered : loaded;
+      if (loaded !== null && entered === loaded) return current;
+      if (reference === null) return entered;
+      if (entered === current || (fromLast && entered === reference)) return current;
+      return Math.min(2147483647, Math.max(0, current + entered - reference));
+    };
+
+    /** The page's figure and publish's for each SKU of `draft` over `liveProduct`, the live stock `current`. */
+    const pageAndPublish = (
+      draft: Record<string, unknown>,
+      liveProduct: unknown,
+      initialData: Record<string, any>,
+      stockPublish: ProductStockPublish,
+      current: Record<string, number>
+    ) => {
+      const page = mergeProductDraftMetaIntoFormInitialData(initialData, draft, { ...options, liveProduct, stockPublish });
+      const values = buildProductDraftPublishValues(completeProductDraftValues(draft, liveProduct) as any);
+      const sent = values as unknown as {
+        variants: Array<{ sku: string; stock_quantity: number }>;
+        stock_baseline: Record<string, number | null> | null;
+        stock_baseline_publish_count: number | null;
+      };
+      const shown = Object.fromEntries(
+        (page.variants as Array<{ sku: string; stock_quantity: number }>).map((variant) => [variant.sku, variant.stock_quantity])
+      );
+      const published = Object.fromEntries(
+        sent.variants.map((variant) => [
+          variant.sku,
+          publishedSince02047(sent, variant.sku, variant.stock_quantity, current[variant.sku], stockPublish),
+        ])
+      );
+      return { page, values: sent, shown, published };
+    };
+
+    const ALREADY_PUBLISHED_NOTE =
+      "This draft was started on a page loaded before the product's last publish, which already entered this draft's stock figure, so publishing leaves the stock as it is, with what sold or changed since: PRO-RED stays at 9 (the last publish entered 10). If the figure was meant to replace the stock as it now is, enter the figure the stock should have.";
+
+    it("a draft started again after its publish, once the stock moved, shows the stock as it is and names the SKU: loaded 5, typed 10 and published, one sold, shows 9 (not 14), as publish writes", () => {
+      const { liveProduct, initialData } = liveAt(9);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const again = { ...autosave(10, { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+
+      const { page, values, shown, published } = pageAndPublish(again, liveProduct, initialData, stockPublish, { 'PRO-RED': 9 });
+      expect(shown).toEqual({ 'PRO-RED': 9 });
+      expect(published).toEqual(shown);
+      expect(values.stock_baseline).toEqual({ 'PRO-RED': 5 });
+      expect(values.stock_baseline_publish_count).toBe(0);
+      // The form records this page load's stock and the count it read.
+      expect(page.stock_baseline).toEqual({ 'PRO-RED': 9 });
+      expect(page.stock_baseline_publish_count).toBe(1);
+      expect(getProductDraftEditNotices(again, liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([ALREADY_PUBLISHED_NOTE]);
+
+      // Read without the row (a database before 02047), the draft shows as 02044 publishes it: 14.
+      const before = mergeProductDraftMetaIntoFormInitialData(initialData, again, { ...options, liveProduct });
+      expect(before.variants[0].stock_quantity).toBe(14);
+      expect(before.stock_baseline_publish_count).toBe(0);
+    });
+
+    it('a figure typed on the page while its publish ran counts from the figure that publish entered: shows 12 (not 17), and 11 with a sale since, named as counted from the last publish', () => {
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const typed = { ...autosave(12, { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+
+      const atTen = liveAt(10);
+      const asTyped = pageAndPublish(typed, atTen.liveProduct, atTen.initialData, stockPublish, { 'PRO-RED': 10 });
+      expect(asTyped.shown).toEqual({ 'PRO-RED': 12 });
+      expect(asTyped.published).toEqual(asTyped.shown);
+      expect(getProductDraftEditNotices(typed, atTen.liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([]);
+
+      const atNine = liveAt(9);
+      const afterSale = pageAndPublish(typed, atNine.liveProduct, atNine.initialData, stockPublish, { 'PRO-RED': 9 });
+      expect(afterSale.shown).toEqual({ 'PRO-RED': 11 });
+      expect(afterSale.published).toEqual(afterSale.shown);
+      expect(getProductDraftEditNotices(typed, atNine.liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([
+        "The stock has moved since this draft's stock change started (after a sale or another stock update, for example), so the form shows the change applied to the current stock, as publishing would write it: PRO-RED shows 11 (the draft changed 10, the figure the last publish entered, to 12, and the stock is now 9). If the draft's figure already counted that, enter the figure the stock should have.",
+      ]);
+    });
+
+    it("a variant added before the publish (in no baseline) shows its stock as it is, as publish leaves it: publish sends a null entry for a SKU the live product stocks that the draft's baseline lacks", () => {
+      // Green was added at 6 on the page that loaded Red 5, and published; two Green sold since.
+      const { liveProduct, initialData } = liveWithVariants([
+        ['PRO-RED', 5],
+        ['PRO-GREEN', 4],
+      ]);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 5], 'PRO-GREEN': [null, 6] });
+      const again = { ...autosaveOf(initialData, [5, 6], { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+
+      const { page, values, shown, published } = pageAndPublish(again, liveProduct, initialData, stockPublish, {
+        'PRO-RED': 5,
+        'PRO-GREEN': 4,
+      });
+      expect(values.stock_baseline).toEqual({ 'PRO-RED': 5, 'PRO-GREEN': null });
+      expect(shown).toEqual({ 'PRO-RED': 5, 'PRO-GREEN': 4 });
+      expect(published).toEqual(shown);
+      expect(page.stock_baseline).toEqual({ 'PRO-RED': 5, 'PRO-GREEN': 4 });
+      expect(getProductDraftEditNotices(again, liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([
+        "This draft was started on a page loaded before the product's last publish, which already entered this draft's stock figure, so publishing leaves the stock as it is, with what sold or changed since: PRO-GREEN stays at 4 (the last publish entered 6). If the figure was meant to replace the stock as it now is, enter the figure the stock should have.",
+      ]);
+    });
+
+    it("a baseline from a page loaded after the publish (its count the product's) counts from itself: a restock to the figure the last publish entered shows, and publishes, as typed", () => {
+      const { liveProduct, initialData } = liveAt(5);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const restock = { ...autosave(10, { 'PRO-RED': 5 }), stock_baseline_publish_count: 1 };
+
+      const { shown, published } = pageAndPublish(restock, liveProduct, initialData, stockPublish, { 'PRO-RED': 5 });
+      expect(shown).toEqual({ 'PRO-RED': 10 });
+      expect(published).toEqual(shown);
+      expect(getProductDraftEditNotices(restock, liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([]);
+    });
+
+    it.each([
+      ['missing', undefined, null],
+      ['text', '0', null],
+      ['a fraction', 0.5, null],
+      ['negative', -1, null],
+      ['above the count', 7, 7],
+    ] as const)("a marker that is not a whole number below the product's count (%s) shows the draft by 02044's rules, as publish writes it", (_label, marker, sent) => {
+      const { liveProduct, initialData } = liveAt(9);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const again = { ...autosave(10, { 'PRO-RED': 5 }), ...(marker === undefined ? {} : { stock_baseline_publish_count: marker }) };
+
+      const { values, shown, published } = pageAndPublish(again, liveProduct, initialData, stockPublish, { 'PRO-RED': 9 });
+      expect(values.stock_baseline_publish_count).toBe(sent);
+      expect(shown).toEqual({ 'PRO-RED': 14 });
+      expect(published).toEqual(shown);
+    });
+
+    it('a marker below the count changes only a SKU whose baseline entry is the one the last publish used: a tab that loaded another stock counts from its own baseline', () => {
+      const { liveProduct, initialData } = liveAt(9);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const tabB = { ...autosave(6, { 'PRO-RED': 4 }), stock_baseline_publish_count: 0 };
+
+      const { shown, published } = pageAndPublish(tabB, liveProduct, initialData, stockPublish, { 'PRO-RED': 9 });
+      expect(shown).toEqual({ 'PRO-RED': 11 });
+      expect(published).toEqual(shown);
+      expect(getProductDraftEditNotices(tabB, liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([
+        "The stock has moved since this draft's stock change started (after a sale or another stock update, for example), so the form shows the change applied to the current stock, as publishing would write it: PRO-RED shows 11 (the draft changed 4 to 6, and the stock is now 9). If the draft's figure already counted that, enter the figure the stock should have.",
+      ]);
+    });
+
+    it('a hand-written marker below the count beside a baseline entry the last publish used: the page shows and names what publish then writes', () => {
+      // A fresh restock (5 to 10, the figures of the last publish) whose count a WRITER rewrote to 0: the
+      // stock stays at 5, and the page says so before anyone publishes (the publish warning names it too).
+      const { liveProduct, initialData } = liveAt(5);
+      const stockPublish = lastPublish(1, { 'PRO-RED': [5, 10] });
+      const rewritten = { ...autosave(10, { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+
+      const { shown, published } = pageAndPublish(rewritten, liveProduct, initialData, stockPublish, { 'PRO-RED': 5 });
+      expect(shown).toEqual({ 'PRO-RED': 5 });
+      expect(published).toEqual(shown);
+      expect(getProductDraftEditNotices(rewritten, liveProduct, DRAFT_CREATED_AT, stockPublish)).toEqual([
+        ALREADY_PUBLISHED_NOTE.replace('PRO-RED stays at 9', 'PRO-RED stays at 5'),
+      ]);
+    });
+
+    it('publish sends the draft\'s count beside its baseline, a null entry only for a SKU the live product stocks that the baseline lacks, and neither without a baseline', () => {
+      const { liveProduct, initialData } = liveWithVariants([
+        ['PRO-RED', 5],
+        ['PRO-GREEN', 4],
+      ]);
+      const send = (draft: Record<string, unknown>) =>
+        buildProductDraftPublishValues(completeProductDraftValues(draft, liveProduct) as any) as unknown as {
+          stock_baseline: Record<string, number | null> | null;
+          stock_baseline_publish_count: number | null;
+        };
+
+      const withBaseline = send({ ...autosaveOf(initialData, [5, 6], { 'PRO-RED': 5 }), stock_baseline_publish_count: 3 });
+      expect(withBaseline.stock_baseline).toEqual({ 'PRO-RED': 5, 'PRO-GREEN': null });
+      expect(withBaseline.stock_baseline_publish_count).toBe(3);
+
+      // A SKU the live product does not stock (renamed in the draft) gets no entry at all.
+      const renamed = autosaveOf(initialData, [5, 6], { 'PRO-RED': 5 });
+      (renamed.variants[1] as Record<string, unknown>).sku = 'PRO-RENAMED';
+      expect(send(renamed).stock_baseline).toEqual({ 'PRO-RED': 5 });
+
+      // No baseline (an earlier version's draft, a CMS draft import): no count either.
+      const withoutBaseline = send({ ...autosaveOf(initialData, [5, 6]), stock_baseline_publish_count: 3 });
+      expect(withoutBaseline.stock_baseline).toBeNull();
+      expect(withoutBaseline.stock_baseline_publish_count).toBeNull();
+    });
+
+    it('two publishes since the load, or a last publish without a baseline: the SKU counts from its own baseline, as the function does', () => {
+      // Page A (count 0) published 10 from a load of 5; page B (count 1) then 15 from a load of 10.
+      const twice = liveAt(15);
+      const late = { ...autosave(10, { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+      const afterTwo = pageAndPublish(late, twice.liveProduct, twice.initialData, lastPublish(2, { 'PRO-RED': [10, 15] }), { 'PRO-RED': 15 });
+      expect(afterTwo.shown).toEqual({ 'PRO-RED': 20 });
+      expect(afterTwo.published).toEqual(afterTwo.shown);
+
+      // A CMS draft import set 20 and was published (no baseline: no entries recorded).
+      const imported = liveAt(20);
+      const typed = { ...autosave(7, { 'PRO-RED': 5 }), stock_baseline_publish_count: 0 };
+      const afterImport = pageAndPublish(typed, imported.liveProduct, imported.initialData, lastPublish(1, {}), { 'PRO-RED': 20 });
+      expect(afterImport.shown).toEqual({ 'PRO-RED': 22 });
+      expect(afterImport.published).toEqual(afterImport.shown);
+    });
+
+    // The page and the function decide by one rule: a seeded run over every combination of figures that can
+    // collide (the live stock, the draft's figure, its baseline entry or none, its count, the last publish's
+    // count and entry). tools/scripts/product-draft-publish.db.test.ts runs the same model against the
+    // function itself on a database.
+    it('shows what publish writes for any figures, baseline, count and last publish (2,000 seeded cases)', () => {
+      let state = 2046;
+      const random = () => {
+        state = (state * 1103515245 + 12345) % 2147483648;
+        return state / 2147483648;
+      };
+      const pick = <T,>(values: readonly T[]): T => values[Math.floor(random() * values.length)];
+      const FIGURES = [0, 3, 5, 8, 10] as const;
+
+      for (let index = 0; index < 2000; index += 1) {
+        const current = pick(FIGURES);
+        const entered = pick(FIGURES);
+        // A baseline entry, a baseline lacking the SKU, or no baseline at all.
+        const baselineKind = pick(['entry', 'lacks', 'none'] as const);
+        const loaded = pick(FIGURES);
+        const count = pick([0, 1, 2] as const);
+        const marker = pick([undefined, 0, 1, 2, 3] as const);
+        const lastKind = pick(['none', 'unloaded', 'loaded'] as const);
+        const lastEntry: Record<string, [number | null, number]> =
+          lastKind === 'none' ? {} : { 'PRO-RED': [lastKind === 'unloaded' ? null : pick(FIGURES), pick(FIGURES)] };
+
+        const { liveProduct, initialData } = liveAt(current);
+        const draft = {
+          ...autosave(entered, baselineKind === 'entry' ? { 'PRO-RED': loaded } : baselineKind === 'lacks' ? {} : undefined),
+          ...(marker === undefined ? {} : { stock_baseline_publish_count: marker }),
+        };
+        const { shown, published } = pageAndPublish(draft, liveProduct, initialData, lastPublish(count, lastEntry), {
+          'PRO-RED': current,
+        });
+        expect(shown, JSON.stringify({ current, entered, baselineKind, loaded, count, marker, lastEntry })).toEqual(published);
+      }
+    });
+
+    it('reads the row as the function does, none on a database without the table, and fails on any other error', () => {
+      expect(
+        readProductStockPublish({
+          publish_count: 4,
+          stock: {
+            'PRO-RED': { loaded: 5, entered: 10 },
+            'PRO-GREEN': { loaded: null, entered: 6 },
+            // Never counted from: a fraction, a missing or text `loaded`, a negative `entered`.
+            'PRO-A': { loaded: 5.5, entered: 10 },
+            'PRO-B': { entered: 10 },
+            'PRO-C': { loaded: '5', entered: 10 },
+            'PRO-D': { loaded: 5, entered: -1 },
+          },
+        })
+      ).toEqual(lastPublish(4, { 'PRO-RED': [5, 10], 'PRO-GREEN': [null, 6] }));
+      expect(readProductStockPublish(null)).toEqual(NO_PRODUCT_STOCK_PUBLISH);
+      expect(readProductStockPublish([])).toEqual(NO_PRODUCT_STOCK_PUBLISH);
+      expect(readProductStockPublish({ publish_count: 'many', stock: [] })).toEqual(NO_PRODUCT_STOCK_PUBLISH);
+
+      expect(readProductStockPublishAnswer({ data: null, error: null })).toEqual(NO_PRODUCT_STOCK_PUBLISH);
+      expect(readProductStockPublishAnswer({ data: { publish_count: 2, stock: {} }, error: null })).toEqual(lastPublish(2, {}));
+      for (const code of ['PGRST205', '42P01']) {
+        expect(readProductStockPublishAnswer({ data: null, error: { code, message: 'no such table' } })).toEqual(NO_PRODUCT_STOCK_PUBLISH);
+      }
+      expect(() => readProductStockPublishAnswer({ data: null, error: { code: '42501', message: 'permission denied' } })).toThrow(
+        "The product's last publish could not be read: permission denied"
+      );
     });
   });
 });

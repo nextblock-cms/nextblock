@@ -82,11 +82,16 @@ vi.mock('@nextblock-cms/db/server', () => ({
     return serviceClient;
   },
 }));
-vi.mock('../../../product-actions', () => ({
-  createProduct: mocks.createProduct,
-  deleteProduct: vi.fn(),
-  syncCategoriesForTranslationGroup: vi.fn(),
-}));
+vi.mock('../../../product-actions', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../product-actions')>();
+  return {
+    createProduct: mocks.createProduct,
+    deleteProduct: vi.fn(),
+    isProductCreatedIncompleteError: actual.isProductCreatedIncompleteError,
+    ProductCreatedIncompleteError: actual.ProductCreatedIncompleteError,
+    syncCategoriesForTranslationGroup: vi.fn(),
+  };
+});
 vi.mock('../../../freemius-coupons', () => ({
   syncProductSaleCouponToFreemius: mocks.syncProductSaleCouponToFreemius,
 }));
@@ -176,6 +181,38 @@ describe('createProductAction authorizes through requireEcomAdmin() first', () =
 
     expect(mocks.createProduct).toHaveBeenCalledTimes(1);
     expect(mocks.syncProductSaleCouponToFreemius).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A product createProduct() created but could not finish (a step after its RPC failed: the stock write
+ * that lost a lock race, the categories...) exists. Until 2026-11-19 the action let the error through, so
+ * the form reported a failed create (and a second Save met the product's slug).
+ */
+describe('createProductAction and a product it created but could not finish', () => {
+  it('sends the editor to the product, naming the failed steps, after the coupon push; never a failed create', async () => {
+    const { ProductCreatedIncompleteError } = await import('../../../product-actions');
+    mocks.createProduct.mockRejectedValueOnce(
+      new ProductCreatedIncompleteError('product-9', [
+        { step: 'stock', message: 'deadlock detected' },
+        { step: 'categories', message: 'fetch failed' },
+      ])
+    );
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await createProductAction(productForm('freemius'));
+
+    expect(mocks.syncProductSaleCouponToFreemius).toHaveBeenCalledWith({ productId: 'product-9', client: serviceClient });
+    expect(mocks.revalidatePath).toHaveBeenCalledWith('/cms/products');
+    expect(mocks.redirect).toHaveBeenCalledTimes(1);
+    expect(mocks.redirect).toHaveBeenCalledWith('/cms/products/product-9/edit?created_incomplete=stock%2Ccategories');
+  });
+
+  it('lets any other error through: nothing was created', async () => {
+    mocks.createProduct.mockRejectedValueOnce(Object.assign(new Error('duplicate key value violates unique constraint "products_slug_key"'), { code: '23505' }));
+
+    await expect(createProductAction(productForm('stripe'))).rejects.toMatchObject({ code: '23505' });
+    expect(mocks.redirect).not.toHaveBeenCalled();
   });
 });
 

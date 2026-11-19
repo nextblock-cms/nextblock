@@ -70,10 +70,12 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   Its UPDATE selects the row back: none means a publish (or a discard) deleted the draft after the
   read, and the values start a new draft instead of being reported saved. The values carry
   `stock_baseline` (`productSchema`, lenient on purpose: a hidden field that refused a value would
-  block every autosave), the stock the app's edit page loaded per SKU: `ProductForm` passes
-  `initialData.stock_baseline` through unseen and never computes one (only the page knows whether
-  its data is live or a draft's). With a draft open the page records the live stock as the baseline
-  and shows what that draft's publish would write (docs/09 → "Stock: only what the editor changed").
+  block every autosave), the stock the app's edit page loaded per SKU, and since 02047
+  `stock_baseline_publish_count`, the product's publish count when the page loaded it (lenient the
+  same way): `ProductForm` passes both from `initialData` through unseen and never computes either
+  (only the page knows whether its data is live or a draft's, and which publish it read). With a
+  draft open the page records the live stock as the baseline, with the count it read, and shows
+  what that draft's publish would write (docs/09 → "Stock: only what the editor changed").
 - A product draft publishes through `public.publish_product_draft` (migration 02043: one
   transaction under the product and draft row locks), with `buildProductDraftPublishValues(values)`
   as `p_values`: `updateProduct()`'s RPC payload in minor units without `id`, `status`, `metadata`
@@ -87,9 +89,26 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   one, applies the difference to the current quantity otherwise (a sale made while the page was
   open stays sold), writes a SKU the baseline lacks as typed, refuses a quantity that is not a
   number, plain decimal text or null (NBP04), and answers `stock_adjusted` (`already_live`,
-  `moved`), which the app warns of (docs/09 → "Stock: only what the editor changed"). The sale's
-  deduction takes an order's SKUs in the order the publish locks them in, since 02044: keep
-  `applyOrderInventoryDeductionViaSql` (`order-inventory.ts`) in step (`order-inventory.test.ts`).
+  `moved`), which the app warns of (docs/09 → "Stock: only what the editor changed"). Since 02047
+  the baseline may hold a null entry (a SKU the live product stocks that the draft's baseline lacks,
+  which the app's publish adds) and the values carry `stock_baseline_publish_count` (whole numbers
+  only, else null): below the product's count in `public.product_stock_publishes`, which the
+  function rewrites on every product-values publish, a SKU whose entry the last publish used counts
+  from the figure that publish entered (`already_published` when equal, `from_last_publish` on an
+  entry so counted). The sale's deduction takes an order's SKUs in the order the publish locks
+  them in, since 02044, and since 02046 reads its lines once, takes every row in one statement,
+  then deducts in one: keep
+  `applyOrderInventoryDeductionViaSql` (`order-inventory.ts`) running the same three statements
+  (`order-inventory.test.ts`).
+- Every write of `inventory_items` takes its rows in SKU order in one statement (migration 02046;
+  a publish and a sale lock them in that order, the column's collation, which a JavaScript sort
+  does not reproduce): write through `upsertInventoryRows` (`shared-inventory.ts`, which calls
+  `public.upsert_inventory_items`, retries a write that lost a lock race and falls back to the
+  PostgREST upsert where the function is unknown), never `.from('inventory_items')` with several
+  rows. `createProduct()` runs every step after its product RPC and throws
+  `ProductCreatedIncompleteError` (product id, failed steps) for a product it created but could not
+  finish; `createProductAction` then opens its edit page with `?created_incomplete=`
+  (`buildProductCreatedIncompleteNotice`), never a failed create.
   A field added to the values changes both sides: `tools/scripts/product-draft-publish.db.test.ts`
   runs the builder against the function on a real database. `updateProduct()` is not the publish
   path any more (nothing in the app calls it; its RPC still re-creates every variant, and with

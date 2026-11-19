@@ -26,6 +26,8 @@ const mocks = vi.hoisted(() => ({
   mediaReadError: null as string | null,
   upsertError: null as string | null,
   unlinkError: null as string | null,
+  /** createProduct's gallery insert. */
+  insertError: null as string | null,
   /** Every write, in order: [table, op, values, filters, options]. */
   writes: [] as unknown[][],
   rpcCalls: 0,
@@ -43,7 +45,15 @@ vi.mock('./shared-inventory', () => ({
   syncSharedInventoryForSavedProduct: vi.fn(async () => undefined),
 }));
 
-import { copyProductFromLanguage, updateProduct } from './product-actions';
+import {
+  buildProductCreatedIncompleteNotice,
+  copyProductFromLanguage,
+  createProduct,
+  isProductCreatedIncompleteError,
+  ProductCreatedIncompleteError,
+  updateProduct,
+} from './product-actions';
+import { syncSharedInventoryForSavedProduct } from './shared-inventory';
 
 function makeSupabase() {
   function resolve(state: any) {
@@ -65,6 +75,7 @@ function makeSupabase() {
     }
 
     if (table === 'product_media') {
+      if (op === 'insert' && mocks.insertError) return { data: null, error: { message: mocks.insertError } };
       if (op === 'upsert' && mocks.upsertError) return { data: null, error: { message: mocks.upsertError } };
       if (op === 'delete' && mocks.unlinkError) return { data: null, error: { message: mocks.unlinkError } };
       return { data: null, error: null };
@@ -145,8 +156,103 @@ beforeEach(() => {
   mocks.mediaReadError = null;
   mocks.upsertError = null;
   mocks.unlinkError = null;
+  mocks.insertError = null;
   mocks.writes = [];
   mocks.rpcCalls = 0;
+});
+
+/** The kinds of write each table got, in order. */
+function writesTo(table: string) {
+  return mocks.writes.filter((write) => write[0] === table).map((write) => write[1]);
+}
+
+/**
+ * createProduct() once upsert_product_with_variants committed: each later step is its own request, so a
+ * failure there never undoes the product. Until 2026-11-19 the first such failure was rethrown as it was
+ * (the stock write could deadlock with a publish taking the same SKUs in another order): the CMS reported
+ * a failed create for a product that existed, and the steps after it, the categories included, never ran.
+ */
+describe('createProduct once the product exists', () => {
+  it('runs every step and returns the product', async () => {
+    const supabase = makeSupabase();
+    const product = await createProduct(supabase as any, {
+      ...baseData,
+      product_media: [{ media_id: IMAGE_A }],
+      category_ids: ['cat-1'],
+    });
+    expect(product).toMatchObject({ id: PRODUCT_ID });
+    expect(vi.mocked(syncSharedInventoryForSavedProduct)).toHaveBeenCalledWith(PRODUCT_ID, expect.objectContaining({ sku: 'SKU-1' }));
+    expect(writesTo('product_media')).toEqual(['insert']);
+    expect(writesTo('product_categories')).toEqual(['delete', 'insert']);
+  });
+
+  it('a stock write that failed still lets the categories sync, and reports a created product (its id, the step), never a failed create', async () => {
+    vi.mocked(syncSharedInventoryForSavedProduct).mockRejectedValueOnce(Object.assign(new Error('deadlock detected'), { code: '40P01' }));
+    const supabase = makeSupabase();
+    const error = await createProduct(supabase as any, { ...baseData, category_ids: ['cat-1'] }).then(
+      () => null,
+      (reason) => reason
+    );
+    expect(error).toBeInstanceOf(ProductCreatedIncompleteError);
+    expect(isProductCreatedIncompleteError(error)).toBe(true);
+    expect(error).toMatchObject({ productId: PRODUCT_ID, failedSteps: ['stock'] });
+    expect(error.message).toBe('The product was created, but its stock could not be saved: stock: deadlock detected');
+    expect(writesTo('product_categories')).toEqual(['delete', 'insert']);
+  });
+
+  it('runs every step after a failed one, and names each failed step in its order', async () => {
+    mocks.insertError = 'insert or update on table "product_media" violates foreign key constraint';
+    vi.mocked(syncSharedInventoryForSavedProduct).mockRejectedValueOnce(new Error('canceling statement due to statement timeout'));
+    const supabase = makeSupabase();
+    const error = await createProduct(supabase as any, {
+      ...baseData,
+      product_media: [{ media_id: DELETED_IMAGE }],
+      category_ids: [],
+    }).then(
+      () => null,
+      (reason) => reason
+    );
+    expect(isProductCreatedIncompleteError(error)).toBe(true);
+    expect(error.failedSteps).toEqual(['gallery', 'stock']);
+    expect(error.message).toContain('its images, stock could not be saved');
+    // Taxability, SEO and the sale schedule wrote the product row; the categories ran too.
+    expect(writesTo('products').length).toBeGreaterThan(0);
+    expect(writesTo('product_categories')).toEqual(['delete']);
+  });
+
+  it('a refused product RPC throws its own error: nothing was created, and no later step runs', async () => {
+    const supabase = makeSupabase();
+    supabase.rpc.mockResolvedValueOnce({ data: null, error: { message: 'duplicate key value violates unique constraint "products_slug_key"', code: '23505' } } as any);
+    const error = await createProduct(supabase as any, baseData).then(
+      () => null,
+      (reason) => reason
+    );
+    expect(error).toMatchObject({ code: '23505' });
+    expect(isProductCreatedIncompleteError(error)).toBe(false);
+    expect(vi.mocked(syncSharedInventoryForSavedProduct)).not.toHaveBeenCalled();
+    expect(mocks.writes.filter((write) => write[0] !== 'rpc')).toEqual([]);
+  });
+});
+
+describe('buildProductCreatedIncompleteNotice (the edit page, after a create that could not finish)', () => {
+  it('names each step it knows once, in the order given, and sends the stock to the Inventory screen', () => {
+    expect(buildProductCreatedIncompleteNotice('stock,categories,stock')).toBe(
+      'This product was created, but its stock, categories could not be saved. Set the stock on the Inventory screen; check the rest below, then save.'
+    );
+    expect(buildProductCreatedIncompleteNotice('seo')).toBe(
+      'This product was created, but its SEO fields could not be saved. Check them below, then save.'
+    );
+  });
+
+  it('shows nothing from the URL but its own words: no notice for a value naming no step it knows', () => {
+    expect(buildProductCreatedIncompleteNotice(undefined)).toBeNull();
+    expect(buildProductCreatedIncompleteNotice('')).toBeNull();
+    expect(buildProductCreatedIncompleteNotice('<script>alert(1)</script>')).toBeNull();
+    expect(buildProductCreatedIncompleteNotice(['stock'])).toBeNull();
+    expect(buildProductCreatedIncompleteNotice('stock,<b>x</b>')).toBe(
+      'This product was created, but its stock could not be saved. Set the stock on the Inventory screen; check the rest below, then save.'
+    );
+  });
 });
 
 describe('updateProduct and the gallery: a save never deletes media', () => {
@@ -484,6 +590,31 @@ describe('buildProductDraftPublishValues', () => {
     expect(buildProductDraftPublishValues(formValues).stock_baseline).toBeNull();
     expect(buildProductDraftPublishValues({ ...formValues, stock_baseline: null }).stock_baseline).toBeNull();
     expect(buildProductDraftPublishValues({ ...formValues, stock_baseline: ['SKU-1-RED'] }).stock_baseline).toBeNull();
+  });
+
+  // Migration 02047: the app's publish sends a null entry for a SKU the live product stocks that the
+  // draft's baseline lacks (a variant added before the product's last publish), and the publish count the
+  // baseline was loaded at beside it; the function counts a baseline whose count is below the product's
+  // from the figures the last publish entered (tools/scripts/product-draft-publish.db.test.ts).
+  it('keeps a null baseline entry (a SKU the baseline lacks) and sends the publish count the baseline was loaded at, whole numbers only', async () => {
+    const { buildProductDraftPublishValues } = await import('./product-actions');
+
+    const values = buildProductDraftPublishValues({
+      ...formValues,
+      stock_baseline: { 'SKU-1-RED': 3, ' SKU-1-BLUE ': null },
+      stock_baseline_publish_count: 4,
+    });
+    expect(values.stock_baseline).toEqual({ 'SKU-1-RED': 3, 'SKU-1-BLUE': null });
+    expect(values.stock_baseline_publish_count).toBe(4);
+
+    for (const marker of [undefined, null, -1, 2.5, 2147483648, Number.NaN]) {
+      expect(buildProductDraftPublishValues({ ...formValues, stock_baseline_publish_count: marker }).stock_baseline_publish_count).toBeNull();
+    }
+    expect(buildProductDraftPublishValues({ ...formValues, stock_baseline_publish_count: 0 }).stock_baseline_publish_count).toBe(0);
+    // A text count (a hand-written draft) is no count.
+    expect(
+      buildProductDraftPublishValues({ ...formValues, stock_baseline_publish_count: '4' as unknown as number }).stock_baseline_publish_count
+    ).toBeNull();
   });
 
   // Review 2026-11-18: a hand-written draft's variant list that was not a list threw here

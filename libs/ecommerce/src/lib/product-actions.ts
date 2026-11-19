@@ -592,6 +592,91 @@ export async function getProductBySlug(
   return { data: selectedProduct, error: null };
 }
 
+/** The steps createProduct() runs once the product row exists, each in its own request. */
+export const PRODUCT_CREATE_STEPS = ['gallery', 'taxability', 'seo', 'sale_schedule', 'stock', 'categories'] as const;
+
+export type ProductCreateStep = (typeof PRODUCT_CREATE_STEPS)[number];
+
+/** Each step as the notice on the product's edit page names it. */
+const PRODUCT_CREATE_STEP_LABELS: Record<ProductCreateStep, string> = {
+  gallery: 'images',
+  taxability: 'tax setting',
+  seo: 'SEO fields',
+  sale_schedule: 'sale schedule',
+  stock: 'stock',
+  categories: 'categories',
+};
+
+const PRODUCT_CREATED_INCOMPLETE_ERROR_NAME = 'ProductCreatedIncompleteError';
+
+/**
+ * Thrown by createProduct() for a product it created (upsert_product_with_variants committed) when a
+ * later step was not saved. Until 2026-11-19 the first such failure was rethrown as it was: the CMS
+ * reported a failed create for a product that existed (a second Save then met its slug), and the steps
+ * after it never ran, the categories included. The stock write was the likely one: it could deadlock
+ * with a publish taking the same SKUs in another order (fixed by migration 02046) and is retried, but
+ * any step can fail. Now every step runs, and this names the product and each step that failed.
+ */
+export class ProductCreatedIncompleteError extends Error {
+  readonly productId: string;
+  readonly failedSteps: ProductCreateStep[];
+
+  constructor(productId: string, failures: Array<{ step: ProductCreateStep; message: string }>) {
+    super(
+      `The product was created, but its ${failures.map((failure) => PRODUCT_CREATE_STEP_LABELS[failure.step]).join(', ')} ` +
+        `could not be saved: ${failures.map((failure) => `${failure.step}: ${failure.message}`).join('; ')}`
+    );
+    this.name = PRODUCT_CREATED_INCOMPLETE_ERROR_NAME;
+    this.productId = productId;
+    this.failedSteps = failures.map((failure) => failure.step);
+  }
+}
+
+/** A ProductCreatedIncompleteError, by its name and fields (a second copy of this module still counts). */
+export function isProductCreatedIncompleteError(error: unknown): error is ProductCreatedIncompleteError {
+  return (
+    error instanceof Error &&
+    error.name === PRODUCT_CREATED_INCOMPLETE_ERROR_NAME &&
+    typeof (error as { productId?: unknown }).productId === 'string' &&
+    Array.isArray((error as { failedSteps?: unknown }).failedSteps)
+  );
+}
+
+/**
+ * The notice the product's edit page shows when the CMS create sent the editor there with the steps that
+ * failed (`?created_incomplete=stock,categories`, ProductCreatedIncompleteError's failedSteps): null when
+ * the value names no step this file knows.
+ */
+export function buildProductCreatedIncompleteNotice(failedSteps: unknown): string | null {
+  const steps = (typeof failedSteps === 'string' ? failedSteps.split(',') : []).filter(
+    (step, index, list): step is ProductCreateStep =>
+      (PRODUCT_CREATE_STEPS as readonly string[]).includes(step) && list.indexOf(step) === index
+  );
+  if (steps.length === 0) {
+    return null;
+  }
+  const remedy = steps.includes('stock')
+    ? ' Set the stock on the Inventory screen; check the rest below, then save.'
+    : ' Check them below, then save.';
+  return `This product was created, but its ${steps.map((step) => PRODUCT_CREATE_STEP_LABELS[step]).join(', ')} could not be saved.${remedy}`;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message;
+  }
+  return String(error);
+}
+
+/**
+ * Creates a product from the form's values: the product row and its variants
+ * (`upsert_product_with_variants`, which commits on its own), then the gallery, taxability, SEO fields, the
+ * sale schedule, the shared inventory and the categories, each in its own request. A failure of the
+ * product RPC throws as it is (nothing was created). From then on the product exists: every step runs,
+ * and if one failed this throws ProductCreatedIncompleteError naming the product and the failed steps,
+ * never an error that reads as a failed create.
+ */
 export async function createProduct(supabase: SupabaseClient<Database>, data: ProductFormValues) {
   const { data: productId, error } = await supabase.rpc('upsert_product_with_variants', {
     product_payload: buildProductRpcPayload(data),
@@ -599,31 +684,46 @@ export async function createProduct(supabase: SupabaseClient<Database>, data: Pr
 
   if (error || !productId) throw error || new Error('Failed to create product');
 
-  if (data.product_media && data.product_media.length > 0) {
-      const mediaInserts = data.product_media.map((item, index) => ({
-        product_id: productId,
-        media_id: item.media_id,
-        sort_order: index,
-      }));
-      await supabase.from('product_media').insert(mediaInserts);
-  } else if (data.media_id) {
-    await supabase.from('product_media').insert({
-      product_id: productId,
-      media_id: data.media_id,
-      sort_order: 0,
-    });
-  }
+  const failures: Array<{ step: ProductCreateStep; message: string }> = [];
+  const attempt = async (step: ProductCreateStep, run: () => Promise<unknown>) => {
+    try {
+      await run();
+    } catch (stepError) {
+      failures.push({ step, message: errorMessage(stepError) });
+    }
+  };
 
-  await persistProductTaxability(supabase, productId, data.is_taxable);
+  await attempt('gallery', async () => {
+    const mediaInserts =
+      data.product_media && data.product_media.length > 0
+        ? data.product_media.map((item, index) => ({
+            product_id: productId,
+            media_id: item.media_id,
+            sort_order: index,
+          }))
+        : data.media_id
+          ? [{ product_id: productId, media_id: data.media_id, sort_order: 0 }]
+          : [];
+    if (mediaInserts.length === 0) return;
+    const { error: mediaError } = await supabase.from('product_media').insert(mediaInserts);
+    if (mediaError) throw mediaError;
+  });
 
-  await persistProductSeoMeta(supabase, productId, data);
+  await attempt('taxability', () => persistProductTaxability(supabase, productId, data.is_taxable));
 
-  await persistProductSaleSchedule(supabase, productId, data);
+  await attempt('seo', () => persistProductSeoMeta(supabase, productId, data));
 
-  await syncSharedInventoryForSavedProduct(productId, data);
+  await attempt('sale_schedule', () => persistProductSaleSchedule(supabase, productId, data));
+
+  await attempt('stock', () => syncSharedInventoryForSavedProduct(productId, data));
 
   if (data.category_ids !== undefined) {
-    await syncCategoriesForTranslationGroup(supabase, productId, data.category_ids);
+    const categoryIds = data.category_ids;
+    await attempt('categories', () => syncCategoriesForTranslationGroup(supabase, productId, categoryIds));
+  }
+
+  if (failures.length > 0) {
+    throw new ProductCreatedIncompleteError(productId, failures);
   }
 
   const { data: product } = await supabase.from('products').select('*').eq('id', productId).single();
@@ -694,28 +794,30 @@ async function writeProductGallery(supabase: SupabaseClient<Database>, id: strin
 /** The largest quantity an inventory row holds (`inventory_items.quantity` is an integer). */
 const MAX_STOCK_QUANTITY = 2147483647;
 
+/** A whole number from 0 to 2^31 - 1, as publish_product_draft reads a stock figure or a publish count. */
+function isWholeStockNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_STOCK_QUANTITY;
+}
+
 /**
  * A draft's `stock_baseline` (the stock the edit page loaded, per SKU) as publish_product_draft
  * (migration 02044) reads it: each SKU as the inventory rows key it (surrounding spaces removed, as
- * Postgres btrim() does), and only whole quantities from 0 to 2^31 - 1. Null when the values carry none
- * (a draft an earlier version saved, a CMS draft import): the publish then writes every SKU's quantity
- * as the draft holds it, as it always did.
+ * Postgres btrim() does), and only whole quantities from 0 to 2^31 - 1, or null: the entry the app's
+ * publish sends for a SKU the live product stocks that the draft's baseline lacks (a variant added
+ * before the product's last publish), which the function counts from that publish's figure when the
+ * baseline predates it (migration 02047) and otherwise reads as no entry. Null when the values carry
+ * none (a draft an earlier version saved, a CMS draft import): the publish then writes every SKU's
+ * quantity as the draft holds it, as it always did.
  */
-function serializeStockBaselineForRpc(baseline: unknown): Record<string, number> | null {
+function serializeStockBaselineForRpc(baseline: unknown): Record<string, number | null> | null {
   if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline)) {
     return null;
   }
 
-  const serialized: Record<string, number> = {};
+  const serialized: Record<string, number | null> = {};
   for (const [sku, quantity] of Object.entries(baseline as Record<string, unknown>)) {
     const key = sku.replace(/^ +| +$/g, '');
-    if (
-      key &&
-      typeof quantity === 'number' &&
-      Number.isInteger(quantity) &&
-      quantity >= 0 &&
-      quantity <= MAX_STOCK_QUANTITY
-    ) {
+    if (key && (quantity === null || isWholeStockNumber(quantity))) {
       serialized[key] = quantity;
     }
   }
@@ -742,6 +844,12 @@ function serializeStockBaselineForRpc(baseline: unknown): Record<string, number>
  * answer's `stock_adjusted` names each SKU whose change went live on a quantity that had moved
  * (`reason` 'moved') or was left out because the quantity already equalled the draft's ('already_live'),
  * which the app's publish turns into a warning.
+ *
+ * `stock_baseline_publish_count` (since migration 02047) is the product's publish count when the edit
+ * page loaded that baseline (whole numbers from 0 only; null without one). Below the product's count,
+ * the baseline predates its last publish, and a SKU whose baseline entry is the one that publish used
+ * counts from the quantity that publish entered: its answer then names the SKU `already_published` when
+ * the draft's quantity is that figure, and marks an entry so counted `from_last_publish`.
  */
 export function buildProductDraftPublishValues(data: ProductFormValues) {
   const payload: Record<string, unknown> = { ...buildProductRpcPayload(data) };
@@ -762,6 +870,9 @@ export function buildProductDraftPublishValues(data: ProductFormValues) {
       : null,
     category_ids: Array.isArray(data.category_ids) ? data.category_ids : null,
     stock_baseline: serializeStockBaselineForRpc(data.stock_baseline),
+    stock_baseline_publish_count: isWholeStockNumber(data.stock_baseline_publish_count)
+      ? data.stock_baseline_publish_count
+      : null,
   };
 }
 

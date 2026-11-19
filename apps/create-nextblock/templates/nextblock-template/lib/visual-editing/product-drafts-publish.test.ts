@@ -651,6 +651,35 @@ describe('an ADMIN publish of product values', () => {
     expect(publishArgs().p_values.stock_baseline).toBeNull();
   });
 
+  // Migration 02047: the draft's `stock_baseline_publish_count` (the product's publish count when the edit
+  // page loaded the baseline) goes beside the baseline; the function reads the product's last publish
+  // itself, under the products row lock, and counts a baseline whose count is below it from that publish.
+  it('sends the publish count the baseline was loaded at beside it, a whole number only, and none without a baseline', async () => {
+    for (const [marker, sent] of [
+      [3, 3],
+      [0, 0],
+      ['3', null],
+      [2.5, null],
+      [-1, null],
+      [undefined, null],
+    ] as const) {
+      vi.clearAllMocks();
+      mocks.draftMeta = {
+        ...structuredClone(FORM_AUTOSAVE_META),
+        stock_baseline: { 'PRO-RED': 6 },
+        ...(marker === undefined ? {} : { stock_baseline_publish_count: marker }),
+      };
+      await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({ success: true });
+      expect(publishArgs().p_values.stock_baseline_publish_count).toBe(sent);
+    }
+
+    vi.clearAllMocks();
+    mocks.draftMeta = { ...structuredClone(FORM_AUTOSAVE_META), stock_baseline_publish_count: 3 };
+    await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({ success: true });
+    expect(publishArgs().p_values.stock_baseline).toBeNull();
+    expect(publishArgs().p_values.stock_baseline_publish_count).toBeNull();
+  });
+
   it('sends the live stock as unchanged when the draft carries a baseline but not the quantities (they come from live)', async () => {
     mocks.draftMeta = { sku: 'PRO', price: 59, ...MARKER, stock_baseline: { 'PRO-RED': 6 } };
 
@@ -771,6 +800,68 @@ describe('an ADMIN publish of product values', () => {
           warning: `Published. ${MOVED_PART}`,
         });
       }
+    });
+
+    // Migration 02047: a draft whose baseline predates the product's last publish, which used the same
+    // entry, counts from the quantity that publish entered. Equal to it, the SKU is left as it is and named
+    // `already_published` (loaded 5, typed 10 and published, one sold, the same values again: 9, not 14);
+    // otherwise its `moved` / `already_live` entry says the change started from that figure.
+    const ALREADY_PUBLISHED = {
+      sku: 'PRO-RED',
+      reason: 'already_published' as const,
+      entered: 10,
+      loaded: 10,
+      current: 9,
+      published: 9,
+      fromLastPublish: true,
+    };
+    const ALREADY_PUBLISHED_PART =
+      "This draft was started on a page loaded before the product's last publish, which already entered its stock figure, so the figure was not applied again and what sold or changed since stays: PRO-RED stays at 9 (the last publish entered 10). If the figure was meant to replace the stock as it now is, correct the stock.";
+
+    it('a figure the last publish already entered (migration 02047): left as it was, and said so, after the other kinds', async () => {
+      expect(describeAdjustedProductStock([ALREADY_PUBLISHED])).toBe(`Published. ${ALREADY_PUBLISHED_PART}`);
+      expect(describeAdjustedProductStock([ALREADY_PUBLISHED, ALREADY_LIVE, MOVED])).toBe(
+        `Published. ${MOVED_PART} ${ALREADY_LIVE_PART} ${ALREADY_PUBLISHED_PART}`
+      );
+      expect(
+        describeAdjustedProductStock([ALREADY_PUBLISHED, { ...ALREADY_PUBLISHED, sku: 'PRO-BLUE', entered: 6, loaded: 6, current: 4, published: 4 }])
+      ).toBe(
+        "Published. This draft was started on a page loaded before the product's last publish, which already entered its stock figures, so the figures were not applied again and what sold or changed since stays: PRO-RED stays at 9 (the last publish entered 10); PRO-BLUE stays at 4 (the last publish entered 6). If a figure was meant to replace the stock as it now is, correct the stock."
+      );
+      expect(describeAdjustedProductStock([ALREADY_PUBLISHED])).not.toMatch(/\byou(r)?\b/i);
+
+      // As the function answers it (snake_case, `from_last_publish` only where it counted from that figure).
+      mocks.draftMeta = structuredClone(FORM_AUTOSAVE_META);
+      mocks.rpcAnswer = published({
+        stock_adjusted: [{ sku: 'PRO-RED', reason: 'already_published', entered: 10, loaded: 10, current: 9, published: 9, from_last_publish: true }],
+      });
+      await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({
+        success: true,
+        warning: `Published. ${ALREADY_PUBLISHED_PART}`,
+      });
+    });
+
+    it('a change counted from the figure the last publish entered says so (from_last_publish)', async () => {
+      mocks.draftMeta = structuredClone(FORM_AUTOSAVE_META);
+      mocks.rpcAnswer = published({
+        stock_adjusted: [
+          { sku: 'PRO-BLUE', reason: 'already_live', entered: 12, loaded: 10, current: 12, published: 12, from_last_publish: true },
+          { sku: 'PRO-RED', reason: 'moved', entered: 12, loaded: 10, current: 9, published: 11, from_last_publish: true },
+        ],
+      });
+
+      const result = await publishProductVisualEditingDraft(PRODUCT_ID);
+      expect((result as { warning: string }).warning).toContain(
+        'PRO-RED is now 11 (the draft changed 10, the figure the last publish entered, to 12, and it was 9 at publishing).'
+      );
+      expect((result as { warning: string }).warning).toContain(
+        'PRO-BLUE stays at 12 (the draft changed 10, the figure the last publish entered, to 12, and it was already 12 at publishing).'
+      );
+      // Anything but `true` reads as counted from the draft's baseline.
+      mocks.rpcAnswer = published({
+        stock_adjusted: [{ sku: 'PRO-RED', reason: 'moved', entered: 15, loaded: 5, current: 4, published: 14, from_last_publish: 'yes' }],
+      });
+      await expect(publishProductVisualEditingDraft(PRODUCT_ID)).resolves.toEqual({ success: true, warning: `Published. ${MOVED_PART}` });
     });
 
     it('publishes with both parts when the answer holds both kinds', async () => {

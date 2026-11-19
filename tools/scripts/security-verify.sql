@@ -46,7 +46,13 @@
 -- draft), and the media usage lookup of 02045_media_usage_lookup.sql (section 45: service role
 -- only, what it finds, a key right after a JSON escape and a key written with escaped slashes
 -- included, the secret rows it never reads, the keys it never searches, and a document that once
--- cost tens of seconds per lookup answering within a 4 s statement timeout). It creates
+-- cost tens of seconds per lookup answering within a 4 s statement timeout), the stock writes in
+-- SKU order of 02046_inventory_writes_in_sku_order.sql (section 46: three statement-level inventory
+-- triggers, the inventory writers SECURITY INVOKER and closed to anon, a WRITER's write refused, an
+-- ADMIN's two-row write syncing every carrier), and the stock baseline
+-- marker of 02047_product_draft_publish_stock_marker.sql (section 47: product_stock_publishes read by
+-- staff, written by an ADMIN's publish only, nothing for anon; a publish records itself, an overlay
+-- publish does not, and a baseline loaded before it counts from it). It creates
 -- throwaway fixtures, emulates PostgREST exactly (SET LOCAL ROLE + request.jwt.claims; SET LOCAL
 -- reverts at each DO block's exit), prints PASS/FAIL per assertion, and ROLLS BACK so the database
 -- is left untouched.
@@ -91,7 +97,14 @@
 --                  section 45 as never run.
 --   After  02043:  sections 1-44 print PASS (273), and 02044 adds no check; the fourteen lines of
 --                  section 45 print FAIL (public.media_usage is missing).
---   After  02045:  every check prints PASS (287), with or without the post-apply pass. Run it on
+--   After  02045:  sections 1-45 print PASS (287); section 46 stops before its first line with an
+--                  uncounted error (the 02046 inventory functions are missing), which ends the run
+--                  (ON_ERROR_STOP), so the runner reports its six assertions and the five of
+--                  section 47 as never run.
+--   After  02046:  sections 1-46 print PASS (293); section 47 stops before its first line with an
+--                  uncounted error (public.product_stock_publishes is missing), which ends the run
+--                  (ON_ERROR_STOP), so the runner reports its five assertions as never run.
+--   After  02047:  every check prints PASS (298), with or without the post-apply pass. Run it on
 --                  a database that went through that pass (a deployed one, or a replay followed
 --                  by GRANTS_SQL from apps/nextblock/tools/lib/migrate-core.mjs): that is where
 --                  grant regressions show up.
@@ -4309,6 +4322,233 @@ BEGIN
   RAISE NOTICE '%  media_usage still finds a key at the end of such a run, plain (the profile picture URL) and percent-encoded (an image optimizer URL in a text block)', CASE WHEN deep_ok THEN 'PASS' ELSE 'FAIL' END;
 END $$;
 RESET statement_timeout;
+
+-- 46. stock writes in SKU order (02046). inventory_items syncs its caches once per statement: three
+--     statement-level triggers (insert, update, delete, each with its transition table) call
+--     private.sync_inventory_caches, and the row-level on_inventory_item_change is gone (it summed every
+--     product's variants again for each row written, which took a 500-SKU publish past the 8 s
+--     timeout). The inventory writers (upsert_inventory_items, update_inventory_quantities,
+--     delete_inventory_items) take their rows in SKU order; they and the sync are SECURITY INVOKER with a
+--     pinned search_path, so the inventory_items policies decide who writes: an ADMIN (or the service
+--     role); a WRITER's insert is refused and its update and delete match nothing. anon executes none of
+--     them (after the post-apply grant pass as well: API_ROLE_REVOKE_SQL). A write of several rows in one
+--     statement syncs every carrier. The lock order against a publish and a sale runs in
+--     tools/scripts/product-draft-publish.db.test.ts, which needs concurrent connections.
+RESET ROLE;
+DO $$
+DECLARE
+  v_admin text := '{"sub":"aa000000-0000-0000-0000-0000000000a1","role":"authenticated","aal":"aal2"}';
+  v_writer text := '{"sub":"aa000000-0000-0000-0000-0000000000f1","role":"authenticated","aal":"aal1"}';
+  v_functions text[] := ARRAY[
+    'public.upsert_inventory_items(jsonb, text)',
+    'public.update_inventory_quantities(text[], integer)',
+    'public.delete_inventory_items(text[])',
+    'private.sync_inventory_caches(text[], boolean)'];
+  v_product uuid := 'aa000000-0000-0000-0000-00000000d046';
+  v_skus text[] := ARRAY['SV-INV-046-B', 'SV-INV-046-A'];
+  v_rows jsonb := '[{"sku":"SV-INV-046-B","quantity":7},{"sku":"SV-INV-046-A","quantity":5}]';
+  v_writer_rows integer;
+  triggers_ok boolean;
+  catalog_ok boolean;
+  anon_none boolean;
+  callers_ok boolean;
+  writer_insert_refused boolean := false;
+  writer_untouched boolean;
+  admin_ok boolean;
+BEGIN
+  triggers_ok := NOT EXISTS (
+      SELECT 1 FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+       WHERE t.tgrelid = 'public.inventory_items'::regclass AND NOT t.tgisinternal
+         AND (t.tgname = 'on_inventory_item_change' OR p.proname IN ('handle_inventory_item_change', 'sync_inventory_cache_for_sku')))
+    AND (SELECT count(*) FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid
+          WHERE t.tgrelid = 'public.inventory_items'::regclass AND NOT t.tgisinternal
+            AND p.proname = 'handle_inventory_items_sync'
+            AND (t.tgtype & 1) = 0   -- statement-level
+            AND (t.tgtype & 2) = 0   -- after
+            AND (t.tgoldtable IS NOT NULL OR t.tgnewtable IS NOT NULL)) = 3;
+  SELECT count(*) = 4
+         AND bool_and(NOT p.prosecdef)
+         AND bool_and(EXISTS (SELECT 1 FROM unnest(p.proconfig) c WHERE c LIKE 'search_path=%'))
+    INTO catalog_ok
+    FROM pg_proc p
+   WHERE p.oid IN (SELECT to_regprocedure(f) FROM unnest(v_functions) f);
+  anon_none := NOT EXISTS (SELECT 1 FROM unnest(v_functions) f WHERE has_function_privilege('anon', f, 'EXECUTE'));
+  callers_ok := NOT EXISTS (
+    SELECT 1 FROM unnest(v_functions) f
+     WHERE NOT has_function_privilege('authenticated', f, 'EXECUTE')
+        OR NOT has_function_privilege('service_role', f, 'EXECUTE'));
+
+  -- fixtures (as the table owner): a product with two variants and their inventory rows at 1.
+  INSERT INTO public.products (id, language_id, sku, title, slug, product_type, payment_provider, price, stock, status)
+  VALUES (v_product, 1, 'SV-INV-046', 'SV inventory', 'sv-inventory-046', 'physical', 'stripe', 1000, 2, 'active');
+  INSERT INTO public.product_variants (product_id, sku, price, stock_quantity) VALUES
+    (v_product, 'SV-INV-046-A', 1000, 1),
+    (v_product, 'SV-INV-046-B', 1000, 1);
+  INSERT INTO public.inventory_items (sku, quantity) VALUES ('SV-INV-046-A', 1), ('SV-INV-046-B', 1);
+
+  -- a WRITER
+  PERFORM set_config('request.jwt.claims', v_writer, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  BEGIN
+    PERFORM public.upsert_inventory_items(v_rows, 'update');
+  EXCEPTION WHEN insufficient_privilege THEN writer_insert_refused := true;
+  END;
+  SELECT count(*) INTO v_writer_rows FROM public.update_inventory_quantities(v_skus, 50);
+  v_writer_rows := v_writer_rows + (SELECT count(*) FROM public.delete_inventory_items(v_skus));
+  EXECUTE 'RESET ROLE';
+  writer_untouched := v_writer_rows = 0
+    AND (SELECT array_agg(quantity ORDER BY sku) FROM public.inventory_items WHERE sku = ANY (v_skus)) = ARRAY[1, 1];
+
+  -- an ADMIN: both rows in one statement, given out of SKU order
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  PERFORM public.upsert_inventory_items(v_rows, 'update');
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+  admin_ok := (SELECT array_agg(quantity ORDER BY sku) FROM public.inventory_items WHERE sku = ANY (v_skus)) = ARRAY[5, 7]
+    AND (SELECT array_agg(stock_quantity ORDER BY sku) FROM public.product_variants WHERE product_id = v_product) = ARRAY[5, 7]
+    AND (SELECT stock FROM public.products WHERE id = v_product) = 12;
+
+  RAISE NOTICE '%  inventory_items syncs its caches through three statement-level triggers with transition tables; the row-level on_inventory_item_change is gone', CASE WHEN triggers_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  the inventory writers and the cache sync are SECURITY INVOKER with a pinned search_path', CASE WHEN catalog_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  anon executes none of the inventory writers nor the cache sync', CASE WHEN anon_none THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  authenticated and the service role execute the inventory writers and the cache sync', CASE WHEN callers_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  a WRITER''s inventory insert is refused, and its update and delete write nothing', CASE WHEN writer_insert_refused AND writer_untouched THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  an ADMIN''s inventory write of two rows lands, and its one statement syncs both variants and the product total', CASE WHEN admin_ok THEN 'PASS' ELSE 'FAIL' END;
+END $$;
+
+-- 47. which publish a product draft's stock baseline was loaded against (02047). public.product_stock_publishes
+--     holds each product's last product-values publish: its count and what it did with each SKU. The
+--     publish counts a baseline loaded before that publish from those figures, so the row is trusted:
+--     staff read it (the edit page shows a draft's stock from it), an ADMIN's publish writes it, and no
+--     other API role writes it (a WRITER can write a draft's marker, never the row it is checked against).
+--     anon holds nothing on it, after the post-apply grant pass too (API_ROLE_REVOKE_SQL takes back the
+--     SELECT and DELETE its blanket grants add). An ADMIN's product-values publish records itself, an
+--     overlay publish does not, and the same values again from the page loaded before that publish, after
+--     a sale, leave the stock as the sale left it (already_published) instead of applying the change twice.
+--     tools/scripts/product-draft-publish.db.test.ts runs the marker's other cases.
+RESET ROLE;
+DO $$
+DECLARE
+  v_admin text := '{"sub":"aa000000-0000-0000-0000-0000000000a1","role":"authenticated","aal":"aal2"}';
+  v_writer text := '{"sub":"aa000000-0000-0000-0000-0000000000f1","role":"authenticated","aal":"aal1"}';
+  v_product uuid := 'aa000000-0000-0000-0000-00000000d470';
+  v_other uuid := 'aa000000-0000-0000-0000-00000000d471';
+  v_currency text := public.get_default_currency_code();
+  v_draft_id bigint;
+  v_draft_at timestamptz;
+  v_product_at timestamptz;
+  v_values jsonb;
+  v_result jsonb;
+  v_rows integer;
+  catalog_ok boolean;
+  writer_reads boolean := false;
+  writer_insert_refused boolean := false;
+  writer_update_none boolean := false;
+  writer_delete_refused boolean := false;
+  anon_refused boolean := false;
+  recorded_ok boolean;
+  overlay_ok boolean;
+  counted_ok boolean;
+BEGIN
+  SELECT c.relrowsecurity
+         AND NOT has_table_privilege('anon', c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+         AND has_table_privilege('authenticated', c.oid, 'SELECT')
+         AND has_table_privilege('authenticated', c.oid, 'INSERT')
+         AND has_table_privilege('authenticated', c.oid, 'UPDATE')
+         AND NOT has_table_privilege('authenticated', c.oid, 'DELETE, TRUNCATE, REFERENCES, TRIGGER')
+    INTO catalog_ok
+    FROM pg_class c
+   WHERE c.oid = to_regclass('public.product_stock_publishes');
+
+  -- fixtures (as the table owner): a product without variants, 5 in stock, its inventory row and a draft;
+  -- a second product for the WRITER's insert.
+  INSERT INTO public.products (id, language_id, sku, title, slug, product_type, payment_provider, price, stock, status) VALUES
+    (v_product, 1, 'SV-MARK-046', 'SV marker', 'sv-marker-046', 'physical', 'stripe', 1000, 5, 'active'),
+    (v_other, 1, 'SV-MARK-047', 'SV marker other', 'sv-marker-047', 'physical', 'stripe', 1000, 1, 'active');
+  INSERT INTO public.inventory_items (sku, quantity) VALUES ('SV-MARK-046', 5);
+  INSERT INTO public.product_drafts (product_id, meta, blocks) VALUES (v_product, '{}', '[]')
+  RETURNING id, updated_at INTO v_draft_id, v_draft_at;
+  SELECT updated_at INTO v_product_at FROM public.products WHERE id = v_product;
+
+  -- What buildProductDraftPublishValues sends: the page loaded 5 before any publish (count 0), 10 typed.
+  v_values := jsonb_build_object(
+    'product_type', 'physical', 'title', 'SV marker', 'slug', 'sv-marker-046', 'sku', 'SV-MARK-046',
+    'upc', NULL, 'stock', 10, 'short_description', NULL, 'description_json', NULL,
+    'price', 1000, 'prices', jsonb_build_object(v_currency, 1000), 'sale_price', NULL, 'sale_prices', '{}'::jsonb,
+    'sale_start_at', NULL, 'sale_end_at', NULL, 'freemius_plan_id', NULL, 'freemius_product_id', NULL,
+    'trial_period_days', 0, 'trial_requires_payment_method', false, 'is_taxable', true, 'language_id', 1,
+    'meta_title', NULL, 'meta_description', NULL, 'custom_canonical', NULL,
+    'gallery_media_ids', NULL, 'category_ids', NULL, 'variants', '[]'::jsonb,
+    'stock_baseline', jsonb_build_object('SV-MARK-046', 5), 'stock_baseline_publish_count', 0);
+
+  -- an ADMIN publishes it
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  PERFORM public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, v_values, NULL, '[]'::jsonb);
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+  recorded_ok := (SELECT r.publish_count = 1 AND r.stock = '{"SV-MARK-046": {"loaded": 5, "entered": 10}}'::jsonb
+                    FROM public.product_stock_publishes r WHERE r.product_id = v_product)
+                 AND (SELECT quantity FROM public.inventory_items WHERE sku = 'SV-MARK-046') = 10;
+
+  -- a WRITER reads the row, and cannot write one
+  PERFORM set_config('request.jwt.claims', v_writer, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  writer_reads := EXISTS (SELECT 1 FROM public.product_stock_publishes WHERE product_id = v_product);
+  BEGIN
+    INSERT INTO public.product_stock_publishes (product_id, publish_count, stock) VALUES (v_other, 9, '{}');
+  EXCEPTION WHEN insufficient_privilege THEN writer_insert_refused := true;
+  END;
+  UPDATE public.product_stock_publishes SET publish_count = 99 WHERE product_id = v_product;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  writer_update_none := v_rows = 0;
+  BEGIN
+    DELETE FROM public.product_stock_publishes WHERE product_id = v_product;
+  EXCEPTION WHEN insufficient_privilege THEN writer_delete_refused := true;
+  END;
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+
+  -- anon reads nothing of it
+  EXECUTE 'SET LOCAL ROLE anon';
+  BEGIN
+    PERFORM 1 FROM public.product_stock_publishes;
+  EXCEPTION WHEN insufficient_privilege THEN anon_refused := true;
+  END;
+  EXECUTE 'RESET ROLE';
+
+  -- an overlay publish records nothing
+  INSERT INTO public.product_drafts (product_id, meta, blocks) VALUES (v_product, '{}', '[]')
+  RETURNING id, updated_at INTO v_draft_id, v_draft_at;
+  SELECT updated_at INTO v_product_at FROM public.products WHERE id = v_product;
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  PERFORM public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, NULL, '{"title":"SV marker (overlay)"}'::jsonb, '[]'::jsonb);
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+  overlay_ok := (SELECT publish_count FROM public.product_stock_publishes WHERE product_id = v_product) = 1;
+
+  -- one sold since; the same values again, from the page loaded before the publish
+  UPDATE public.inventory_items SET quantity = 9 WHERE sku = 'SV-MARK-046';
+  INSERT INTO public.product_drafts (product_id, meta, blocks) VALUES (v_product, '{}', '[]')
+  RETURNING id, updated_at INTO v_draft_id, v_draft_at;
+  SELECT updated_at INTO v_product_at FROM public.products WHERE id = v_product;
+  PERFORM set_config('request.jwt.claims', v_admin, true);
+  EXECUTE 'SET LOCAL ROLE authenticated';
+  v_result := public.publish_product_draft(v_product, v_draft_id, v_draft_at, v_product_at, v_values, NULL, '[]'::jsonb);
+  EXECUTE 'RESET ROLE';
+  PERFORM set_config('request.jwt.claims', '', true);
+  counted_ok := (SELECT quantity FROM public.inventory_items WHERE sku = 'SV-MARK-046') = 9
+                AND v_result->'stock_adjusted' = '[{"sku": "SV-MARK-046", "reason": "already_published", "entered": 10, "loaded": 10, "current": 9, "published": 9, "from_last_publish": true}]'::jsonb
+                AND (SELECT publish_count FROM public.product_stock_publishes WHERE product_id = v_product) = 2;
+
+  RAISE NOTICE '%  product_stock_publishes has row security, anon holds no privilege on it, and authenticated holds SELECT, INSERT and UPDATE only', CASE WHEN catalog_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  a WRITER reads a product''s row but cannot insert, update or delete one', CASE WHEN writer_reads AND writer_insert_refused AND writer_update_none AND writer_delete_refused THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  anon reads nothing of product_stock_publishes (fails on the grant)', CASE WHEN anon_refused THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  an ADMIN''s product-values publish records its count and each SKU''s baseline entry and figure; an overlay publish records nothing', CASE WHEN recorded_ok AND overlay_ok THEN 'PASS' ELSE 'FAIL' END;
+  RAISE NOTICE '%  the same values again from the page loaded before that publish, after a sale, leave the stock as the sale left it (already_published, not applied twice)', CASE WHEN counted_ok THEN 'PASS' ELSE 'FAIL' END;
+END $$;
 
 \echo '==========================================================================='
 \echo '(all fixtures rolled back below — database unchanged)'
