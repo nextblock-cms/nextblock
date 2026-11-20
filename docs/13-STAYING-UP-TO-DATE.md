@@ -568,6 +568,15 @@ ship: `verify-lib-dist.js` check 14 compares the file names (not the SQL).
 
 Most releases need nothing beyond `npm run update`. These ask for a step of your own.
 
+### 0.23.11 — `npm run deploy:supabase` without a shell
+
+- `tools/deploy-supabase.js` (updated by `npm run update`) now starts the Supabase CLI directly
+  instead of running one shell command string. A database password holding `&`, `|`, `$`, `;`, `"`
+  or another shell character broke the command (or ran part of it as another one), and the script
+  printed the password in its log; both are fixed, and the log shows `<db-password>`. It runs your
+  project's installed CLI, or `npm exec --yes -- supabase` through npm when none is installed.
+  Nothing to do.
+
 ### 0.23.10 — Docker images on Node 26, dependency refresh, Supabase CLI 3, `postgres` 4
 
 - **Docker installs run Node 26 LTS.** The `Dockerfile` (one of the files `npm run update` manages)

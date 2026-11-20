@@ -1,6 +1,6 @@
 {
   "name": "@nextblock-cms/affiliates",
-  "version": "0.23.10",
+  "version": "0.23.11",
   "description": "NextBlock Affiliates & Creator Storefronts: partner signup, admin-approved storefronts and commission payouts. An add-on for NextBlock Commerce Pro: it needs an active Commerce Pro license on the same site.",
   "license": "AGPL-3.0-or-later",
   "publishConfig": {

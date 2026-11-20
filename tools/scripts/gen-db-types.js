@@ -2,7 +2,7 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
-const { assertProjectRef, genTypesArgs, isStaleCliRefusal } = require('./lib/supabase-cli');
+const { assertProjectRef, genTypesArgs, isStaleCliRefusal, supabaseCliInvocation } = require('./lib/supabase-cli');
 
 // Load env from monorepo root .env.local
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local'), quiet: true });
@@ -24,12 +24,15 @@ function main() {
   }
 
   let args;
+  let cli;
   try {
     // `gen types --remote=<ref>`, run from the repo root with no --workdir: CLI 3 reads the LOCAL
     // database when no target is given, and with no link in the current directory it generates
     // through the Management API, as CLI 2's `--project-id` did (lib/supabase-cli.js).
     assertProjectRef(PROJECT_ID);
     args = genTypesArgs({ projectRef: PROJECT_ID });
+    // No shell: the CLI's Node entry under this Node (supabaseCliInvocation).
+    cli = supabaseCliInvocation({ from: process.cwd() });
   } catch (error) {
     console.error(`Error: ${error.message}`);
     process.exit(1);
@@ -37,11 +40,9 @@ function main() {
 
   console.log(`Generating Supabase types for project '${PROJECT_ID}'...`);
 
-  const isWindows = process.platform === 'win32';
-  const result = spawnSync(isWindows ? 'npx.cmd' : 'npx', ['supabase', ...args], {
+  const result = spawnSync(cli.command, [...cli.prefix, ...args], {
     cwd: process.cwd(),
     env: process.env,
-    shell: isWindows,
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
   });

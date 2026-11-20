@@ -17,7 +17,6 @@ const colors = {
 const repoRoot = path.resolve(__dirname, '../..');
 const workdir = path.join(repoRoot, 'libs/db/src');
 const migrationsDir = path.join(workdir, 'supabase/migrations');
-const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const argv = process.argv.slice(2);
 const args = new Set(argv);
 const {
@@ -28,7 +27,7 @@ const {
 } = require('./lib/migration-naming');
 // Every Supabase CLI command comes from one module with an explicit `--remote=<ref>`: CLI 3 targets
 // the LOCAL stack when a script leaves the target out.
-const { PROJECT_REF_RE, linkArgs, migrationRepairArgs } = require('./lib/supabase-cli');
+const { PROJECT_REF_RE, linkArgs, migrationRepairArgs, supabaseCliInvocation } = require('./lib/supabase-cli');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -120,20 +119,23 @@ function projectRef() {
   return process.env.SUPABASE_PROJECT_ID;
 }
 
-function run(command, commandArgs) {
+/**
+ * Runs a command with no shell (lib/supabase-cli.js → supabaseCliInvocation: cmd.exe would get the
+ * database password unescaped). `shownAs` is what the log prints in place of the real argv.
+ */
+function run(command, commandArgs, shownAs) {
   const dbPassword = getDbPassword();
-  const printable = [command, ...commandArgs.map((arg) => {
+  const printable = (shownAs || [command, ...commandArgs]).map((arg) => {
     if (arg === dbPassword) {
       return '<db-password>';
     }
     return arg.includes(' ') ? `"${arg}"` : arg;
-  })].join(' ');
+  }).join(' ');
 
   log(`Running: ${printable}`, colors.blue);
   const result = spawnSync(command, commandArgs, {
     cwd: repoRoot,
     env: cliEnv(),
-    shell: process.platform === 'win32',
     stdio: 'inherit',
   });
 
@@ -148,7 +150,14 @@ function run(command, commandArgs) {
 }
 
 function supabase(commandArgs) {
-  run(npxBin, ['supabase', ...commandArgs]);
+  let cli;
+  try {
+    cli = supabaseCliInvocation({ from: repoRoot });
+  } catch (error) {
+    log(error.message, colors.red);
+    process.exit(1);
+  }
+  run(cli.command, [...cli.prefix, ...commandArgs], ['supabase', ...commandArgs]);
 }
 
 /** The catch-up file names the last version it replays in a header line. */

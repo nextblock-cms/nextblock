@@ -1,5 +1,8 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+
 /**
  * Every Supabase CLI command the monorepo's database scripts run, built in one place with an
  * explicit target, plus the parser and the target guard for `supabase migration list`.
@@ -139,6 +142,49 @@ function configPushArgs({ workdir, projectRef }) {
  */
 function genTypesArgs({ projectRef, schema = 'public' }) {
   return ['gen', 'types', '--lang', 'typescript', '--schema', schema, remoteFlag(projectRef)];
+}
+
+/**
+ * How to start the installed Supabase CLI with no shell: `{ command, prefix }`, run as
+ * `spawnSync(command, [...prefix, ...args])` (never with `shell: true`).
+ *
+ * The `supabase` package's bin is a Node script in 2.117+ and 3.x (`dist/supabase.js`, which finds
+ * the platform binary and starts it), so it runs under this Node; a package whose bin is the binary
+ * itself has it started directly. Never `npx.cmd`: on Windows a `.cmd` file only starts with
+ * `shell: true`, and cmd.exe then gets the arguments joined without escaping, the database password
+ * included, so a password holding `&`, `|`, `<`, `>`, `^`, `%` or `"` breaks the command or runs part
+ * of it as another one (Node 24+ warns: DEP0190). supabase-cli.test.ts holds the database scripts
+ * to this.
+ */
+function supabaseCliInvocation({
+  from = process.cwd(),
+  resolvePackageJson = (dir) => require.resolve('supabase/package.json', { paths: [dir] }),
+  readFile = (file) => fs.readFileSync(file, 'utf8'),
+  exists = fs.existsSync,
+  platform = process.platform,
+  nodePath = process.execPath,
+} = {}) {
+  let packageJsonPath;
+  try {
+    packageJsonPath = resolvePackageJson(from);
+  } catch {
+    throw new Error('The Supabase CLI is not installed (no `supabase` package). Run `npm ci` first.');
+  }
+  const manifest = JSON.parse(readFile(packageJsonPath));
+  const bin = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin && manifest.bin.supabase;
+  if (typeof bin !== 'string' || bin.length === 0) {
+    throw new Error(`The installed supabase package (${manifest.version || 'unknown version'}) has no \`supabase\` bin.`);
+  }
+  const binPath = path.resolve(path.dirname(packageJsonPath), bin);
+  if (/\.[cm]?js$/i.test(binPath)) {
+    return { command: nodePath, prefix: [binPath] };
+  }
+  // The binary itself (a package whose postinstall downloaded it). Windows starts only a path with
+  // its extension when no shell is involved.
+  if (platform === 'win32' && !/\.exe$/i.test(binPath) && exists(`${binPath}.exe`)) {
+    return { command: `${binPath}.exe`, prefix: [] };
+  }
+  return { command: binPath, prefix: [] };
 }
 
 /**
@@ -375,4 +421,5 @@ module.exports = {
   migrationRepairArgs,
   parseMigrationList,
   remoteFlag,
+  supabaseCliInvocation,
 };

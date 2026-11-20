@@ -14,7 +14,6 @@ const colors = {
 
 const repoRoot = path.resolve(__dirname, '../..');
 const workdir = path.join(repoRoot, 'libs/db/src');
-const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 const args = new Set(process.argv.slice(2));
 // File naming (GGNNN squash generations), the baseline/catch-up classification and the
 // directory lint all live in one place so the CLI, the generators and the tests agree.
@@ -35,6 +34,7 @@ const {
   migrationListArgs,
   migrationListTargetProblem,
   parseMigrationList,
+  supabaseCliInvocation,
 } = require('./lib/supabase-cli');
 
 function log(message, color = colors.reset) {
@@ -117,21 +117,24 @@ function cliEnv() {
   return env;
 }
 
+/**
+ * Runs a command with no shell (lib/supabase-cli.js → supabaseCliInvocation: cmd.exe would get the
+ * database password unescaped). `shownAs` is what the log prints in place of the real argv.
+ */
 function run(command, commandArgs, options = {}) {
-  const { allowFailure = false, echoStdout = true, ...spawnOptions } = options;
-  const printable = [command, ...commandArgs.map((arg) => {
+  const { allowFailure = false, echoStdout = true, shownAs, ...spawnOptions } = options;
+  const printable = (shownAs || [command, ...commandArgs]).map((arg) => {
     if (arg === getDbPassword()) {
       return '<db-password>';
     }
     return arg.includes(' ') ? `"${arg}"` : arg;
-  })].join(' ');
+  }).join(' ');
 
   log(`Running: ${printable}`, colors.blue);
   const capture = options.capture === true;
   const result = spawnSync(command, commandArgs, {
     cwd: repoRoot,
     env: cliEnv(),
-    shell: process.platform === 'win32',
     stdio: capture ? 'pipe' : 'inherit',
     encoding: capture ? 'utf8' : undefined,
     ...spawnOptions,
@@ -167,7 +170,14 @@ function run(command, commandArgs, options = {}) {
 }
 
 function supabase(commandArgs, options = {}) {
-  return run(npxBin, ['supabase', ...commandArgs], options);
+  let cli;
+  try {
+    cli = supabaseCliInvocation({ from: repoRoot });
+  } catch (error) {
+    log(error.message, colors.red);
+    process.exit(1);
+  }
+  return run(cli.command, [...cli.prefix, ...commandArgs], { ...options, shownAs: ['supabase', ...commandArgs] });
 }
 
 function getMigrationVersion(fileName) {

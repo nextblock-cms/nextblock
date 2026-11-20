@@ -1793,6 +1793,17 @@ letters up as a BRANCH NAME of whatever project the directory is linked to.
 `tools/scripts/supabase-cli.test.ts` (in `security:check`) pins those argvs and fails on any npm
 script that runs a database or hosted CLI command without `--remote` (`db:reset` excepted).
 
+The scripts start the CLI with no shell: `supabaseCliInvocation` (same module) runs the `supabase`
+package's own Node entry (`node_modules/supabase/dist/supabase.js`, which starts the platform binary)
+under the current Node, and `spawnSync` gets the arguments as an array. Until 2026-11-20 they ran
+`npx.cmd` with `shell: true` on Windows, so cmd.exe received the arguments joined without escaping:
+a database password holding `&`, `|`, `<`, `>`, `^`, `%` or `"` broke the command or ran part of it as
+another one, and Node 24+ printed DEP0190 on every run. A scaffold's `tools/deploy-supabase.js`
+carries its own copy of the function (it built one shell command string with the password in it,
+and printed it). `supabase-cli.test.ts` fails on a database script that uses `npx` or a shell, and
+`apps/nextblock/tools/deploy-supabase.test.mjs` on the scaffold script, holding the two copies to
+the same answer.
+
 The root `.env.local` reaches the CLI through the scripts' environment (dotenv, `dotenv run`), so
 its variables count as shell values. Of its `SUPABASE_*` names only `SUPABASE_PROJECT_ID` maps to a
 config key (`project_id`, which `config.toml` already reads through `env()`); the CLI reads no

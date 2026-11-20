@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve as resolvePath } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -200,5 +202,88 @@ describe('create-nextblock', () => {
     const root = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
     expect(fallback).toBe(root.devDependencies.supabase);
     expect(root.devDependencies.supabase).toMatch(/^\^3\./);
+  });
+});
+
+/**
+ * The database scripts start the CLI with no shell. On Windows `npx.cmd` only starts with
+ * `shell: true`, and cmd.exe then gets the arguments joined without escaping: a database password
+ * holding `&`, `|`, `^`, `%` or `"` broke the command or ran part of it as another one, and Node 24+
+ * printed DEP0190 on every `npm run db:migrate:check` (2026-11-20).
+ */
+describe('supabaseCliInvocation', () => {
+  const fakePackage = (bin: unknown) => ({
+    resolvePackageJson: () => '/p/node_modules/supabase/package.json',
+    readFile: () => JSON.stringify({ version: '9.9.9', bin }),
+    nodePath: '/usr/bin/node',
+  });
+
+  it("resolves the repo's CLI to its Node entry under this Node, and starts it with no shell", () => {
+    const invocation = cli.supabaseCliInvocation({ from: ROOT });
+    expect(invocation.command).toBe(process.execPath);
+    expect(invocation.prefix).toEqual([join(ROOT, 'node_modules', 'supabase', 'dist', 'supabase.js')]);
+    const result = spawnSync(invocation.command, [...invocation.prefix, '--version'], { encoding: 'utf8' });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^3\.\d+\.\d+$/);
+  });
+
+  it('hands every argument over as it is, shell metacharacters included', () => {
+    // A throwaway `supabase` package whose bin prints the arguments it received.
+    const dir = mkdtempSync(join(tmpdir(), 'nb-supabase-cli-'));
+    try {
+      const pkg = join(dir, 'node_modules', 'supabase');
+      mkdirSync(join(pkg, 'dist'), { recursive: true });
+      writeFileSync(join(pkg, 'package.json'), JSON.stringify({ name: 'supabase', version: '3.0.0', bin: { supabase: 'dist/supabase.js' } }));
+      writeFileSync(join(pkg, 'dist', 'supabase.js'), 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n');
+      const password = 'p&w|o"r^d%x$y;z`<a>b c';
+      const args = cli.migrationListArgs({ workdir: WORKDIR, projectRef: REF, password });
+      const invocation = cli.supabaseCliInvocation({ from: dir });
+      const result = spawnSync(invocation.command, [...invocation.prefix, ...args], { encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual(args);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs a Node-script bin under this Node, and starts a binary bin directly (.exe on Windows)', () => {
+    expect(cli.supabaseCliInvocation(fakePackage({ supabase: 'dist/supabase.js' }))).toEqual({
+      command: '/usr/bin/node',
+      prefix: [resolvePath('/p/node_modules/supabase', 'dist/supabase.js')],
+    });
+    const bin = resolvePath('/p/node_modules/supabase', 'bin/supabase');
+    expect(cli.supabaseCliInvocation({ ...fakePackage('bin/supabase'), platform: 'linux' })).toEqual({ command: bin, prefix: [] });
+    expect(
+      cli.supabaseCliInvocation({ ...fakePackage('bin/supabase'), platform: 'win32', exists: (file: string) => file === `${bin}.exe` }),
+    ).toEqual({ command: `${bin}.exe`, prefix: [] });
+  });
+
+  it('refuses a missing package or a package with no supabase bin', () => {
+    const missing = () => {
+      throw new Error('Cannot find module');
+    };
+    expect(() => cli.supabaseCliInvocation({ resolvePackageJson: missing })).toThrow(/Run `npm ci`/);
+    expect(() => cli.supabaseCliInvocation(fakePackage(undefined))).toThrow(/no `supabase` bin/);
+  });
+
+  // Code only: comments may name what they forbid.
+  const code = (file: string) =>
+    readFileSync(join(ROOT, file), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+
+  it.each([
+    'tools/scripts/push-db-migrations.js',
+    'tools/scripts/repair-db-migration-history.js',
+    'tools/scripts/gen-db-types.js',
+    'tools/scripts/supabase-link.js',
+  ])('%s starts the CLI through supabaseCliInvocation, never npx or a shell', (file) => {
+    const source = code(file);
+    expect(source).toMatch(/supabaseCliInvocation\(/);
+    expect(source).not.toMatch(/['"`]npx(\.cmd)?['"`]|\bnpxBin\b/);
+    expect(source).not.toMatch(/shell\s*:/);
+    // child_process's exec / execSync (a RegExp's `.exec(` is fine).
+    expect(source).not.toMatch(/\bexecSync\b|(?<![.\w])exec\(/);
   });
 });

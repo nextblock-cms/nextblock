@@ -11,7 +11,7 @@
  */
 
 const { spawnSync } = require('node:child_process');
-const { assertProjectRef, linkArgs } = require('./lib/supabase-cli');
+const { assertProjectRef, linkArgs, supabaseCliInvocation } = require('./lib/supabase-cli');
 
 const { SUPABASE_PROJECT_ID } = process.env;
 
@@ -20,21 +20,19 @@ if (!SUPABASE_PROJECT_ID) {
   process.exit(1);
 }
 
+let cli;
 try {
   assertProjectRef(SUPABASE_PROJECT_ID);
+  // No shell: the CLI's Node entry under this Node (lib/supabase-cli.js → supabaseCliInvocation).
+  cli = supabaseCliInvocation({ from: process.cwd() });
 } catch (error) {
   console.error(error.message);
   process.exit(1);
 }
 
-const isWindows = process.platform === 'win32';
-const cmd = isWindows ? 'npx.cmd' : 'npx';
-const args = ['supabase', ...linkArgs({ workdir: 'libs/db/src', projectRef: SUPABASE_PROJECT_ID })];
+const args = [...cli.prefix, ...linkArgs({ workdir: 'libs/db/src', projectRef: SUPABASE_PROJECT_ID })];
 
-const result = spawnSync(cmd, args, {
-  stdio: 'inherit',
-  shell: isWindows,
-});
+const result = spawnSync(cli.command, args, { stdio: 'inherit' });
 
 if (result.error) {
   console.error(result.error.message);
