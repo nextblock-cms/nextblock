@@ -568,6 +568,55 @@ ship: `verify-lib-dist.js` check 14 compares the file names (not the SQL).
 
 Most releases need nothing beyond `npm run update`. These ask for a step of your own.
 
+### 0.23.10 — Docker images on Node 26, dependency refresh, Supabase CLI 3, `postgres` 4
+
+- **Docker installs run Node 26 LTS.** The `Dockerfile` (one of the files `npm run update` manages)
+  now builds and runs on `node:26-alpine` instead of `node:22-alpine`. After `npm run update`,
+  `npm run docker:up` rebuilds the image on it; there is nothing else to do. Cloud installs keep the
+  Node version their Vercel project settings pick, and a project created with `create-nextblock`
+  still runs on Node 22.12 or later.
+- **Dependencies moved to their latest compatible versions** (Next.js 16.4.6, Tiptap 3.35, Vite 8.3,
+  Vitest 5.1, Stripe 23.2, AI SDK 7.0.177, among others). `npm run update` installs them. The
+  versions still held back, and why, are in docs/05 → "Dependency versions".
+- **The `postgres` database driver moves to version 4** (porsager/postgres `^4.1.1`). `npm run update`
+  installs it, and NextBlock's own code (`/setup`, the build-time migrations, backups, the checkout's
+  stock fallback, the two `schedule-*` scripts) needs nothing from you. Code of your own that uses
+  `postgres` may: the server now types every parameter, so a `Date` where the query does not decide
+  the type needs a cast (`${date}::timestamptz`) and a `Date` written to a `timestamp` or `date`
+  column is taken as UTC; the package is an ES module, so `require('postgres')` returns
+  `{ default }` (use `(await import('postgres')).default`); `sql.array()` is gone; a `begin` sent
+  outside `sql.begin()` on a pool now fails; and a connection with no `ssl` option reads
+  `PGSSLMODE`. The driver's README ("Upgrading from v3") lists the rest.
+- **Supabase CLI 3.** It changed which database a command acts on: `db push`, `migration list`,
+  `migration repair`, `db pull`, `db dump` and `gen types` now act on the LOCAL stack unless given
+  `--remote`, every change to a hosted project needs `--yes` when the CLI cannot ask (Enter now means
+  No, and a piped `y` no longer confirms), and the CLI reads your `.env.local` itself: a
+  `SUPABASE_<PATH>` variable there overrides that key of `supabase/config.toml`, and `config push`
+  sends the overridden value.
+  - **New projects** (`npm create nextblock`) get the `supabase` devDependency at ^3.2.0 and a
+    `supabase/config.toml` written for it. The setup wizard pushes the schema with
+    `db push --include-all --remote=<your ref> --yes` (its own "Apply the database schema" question
+    is your yes) and now refuses a Project ID that is not the 20-letter Reference ID.
+  - **Existing projects need nothing.** `npm run update` changes neither your `supabase`
+    devDependency (a `^2` range never installs 3.x) nor your `supabase/config.toml`. It does update
+    `tools/deploy-supabase.js` (`npm run deploy:supabase`), which now reads the installed CLI's
+    version: on 2.x it runs `db push --linked` as before, on 3.x it names your project with
+    `--remote=<SUPABASE_PROJECT_ID>`. It also refuses a `SUPABASE_PROJECT_ID` that is not a
+    20-letter ref: CLI 3 looks any other value up as a branch name of the linked project.
+  - **To move a project to CLI 3 yourself** (optional):
+    1. `npm install --save-dev supabase@^3.2.0`.
+    2. In `supabase/config.toml`, rename the `[inbucket]` section to `[local_smtp]` (CLI 3 refuses
+       the old name for `start`, `stop`, `status` and every database command), and under
+       `[auth.email]` and `[auth.sms]` rename `enable_signup` to `enabled` (same meaning; the old
+       name still works, with a warning). `npx supabase config validate` lists anything else.
+    3. Add `--remote` to any Supabase CLI database command you run yourself against your hosted
+       project (`npx supabase migration list --remote`, `npx supabase db push --remote`), and
+       `--yes` where a script runs it. Without `--remote` the command reads or writes your local
+       stack, or fails when none is running.
+    4. Check what your `.env.local` overrides: `SUPABASE_AUTH_RATE_LIMIT_EMAIL_SENT=30` (written by
+       the scaffolder) now sets `auth.rate_limit.email_sent`, which `config.toml` also sets to 30.
+  - Docker installs do not use the Supabase CLI and are unaffected.
+
 ### 0.23.9 — Retired migration files set aside, times in your own time zone, media libraries past 1,000 files
 
 - **Migration 02048** adds UI copy only (the store's notices for add-on licenses, EN + FR) and

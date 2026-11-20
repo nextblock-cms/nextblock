@@ -7,7 +7,7 @@
 ###############################################################################
 # Stage 1 — deps: install workspace dependencies in a cache-friendly layer.
 ###############################################################################
-FROM node:22-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /workspace
 RUN apk add --no-cache libc6-compat
 # Copy only the manifests first so this layer is reused until dependencies change.
@@ -19,7 +19,7 @@ RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 ###############################################################################
 # Stage 2 — builder: compile the Next.js app into a standalone server tree.
 ###############################################################################
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /workspace
 RUN apk add --no-cache libc6-compat
 ENV NEXT_TELEMETRY_DISABLED=1 \
@@ -74,7 +74,7 @@ RUN set -eux; \
 ###############################################################################
 # Stage 3 — runner: hardened, non-root, just the standalone server.
 ###############################################################################
-FROM node:22-alpine AS runner
+FROM node:26-alpine AS runner
 WORKDIR /app
 RUN apk add --no-cache libc6-compat socat \
     && addgroup -g 1001 -S nodejs \

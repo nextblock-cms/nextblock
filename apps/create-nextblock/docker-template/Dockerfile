@@ -7,7 +7,7 @@
 ###############################################################################
 # Stage 1 — deps
 ###############################################################################
-FROM node:22-alpine AS deps
+FROM node:26-alpine AS deps
 WORKDIR /app
 RUN apk add --no-cache libc6-compat
 COPY package.json ./
@@ -16,7 +16,7 @@ RUN npm install --no-audit --no-fund
 ###############################################################################
 # Stage 2 — builder (Next.js standalone output)
 ###############################################################################
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 RUN apk add --no-cache libc6-compat
 ENV NEXT_TELEMETRY_DISABLED=1 \
@@ -48,7 +48,7 @@ RUN npm run build
 ###############################################################################
 # Stage 3 — runner (hardened, non-root)
 ###############################################################################
-FROM node:22-alpine AS runner
+FROM node:26-alpine AS runner
 WORKDIR /app
 RUN apk add --no-cache libc6-compat socat \
     && addgroup -g 1001 -S nodejs \

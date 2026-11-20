@@ -74,7 +74,10 @@ Every later sign-up gets the `USER` role.
 
 ### Database workflows
 
-- `npm run db:link`: link the Supabase CLI to the target project
+- `npm run db:link`: link the Supabase CLI to `SUPABASE_PROJECT_ID` (writes only
+  `libs/db/src/supabase/.temp/`; needs `SUPABASE_ACCESS_TOKEN` or a `supabase login`). Every
+  database script names its target with `--remote` since Supabase CLI 3 (docs/04 → "Supabase
+  CLI 3: every command names its target")
 - `npm run db:migrate:check`: preview pending remote migrations without
   applying them; it also refuses a badly named file and a forward migration that
   creates a table, view or sequence without granting on it (docs/04 → "Row Level
@@ -100,8 +103,8 @@ Every later sign-up gets the `USER` role.
   sign-ups back on (`config.toml` keeps `enable_signup = true` for local dev): turn
   "Allow new users to sign up" off again on the sandbox project afterwards (the reset
   logs an error while it is on; see "Sandbox Reset Operations")
-- `npm run db:reset`: reset the local/linked Supabase database from the db
-  workdir
+- `npm run db:reset`: reset the LOCAL Supabase database from the db workdir (the CLI's
+  default target; it passes no `--remote`)
 - `npm run db:types`: regenerate typed Supabase definitions
 - `npm run db:backup`
 - `npm run db:restore`
@@ -149,6 +152,30 @@ repo expects at least:
 > production — when unset they are derived from the service-role key (see
 > `apps/nextblock/lib/app-secrets.ts`). See [12-VERCEL-DEPLOYMENT.md](./12-VERCEL-DEPLOYMENT.md).
 
+> **Direct Postgres connections (`postgres` 4).** `/setup` (`lib/setup/schema-apply.ts`), the build
+> hook and `npm run update` (`tools/lib/migrate-core.mjs`), the checkout stock fallback
+> (`libs/ecommerce` `order-inventory.ts`), the full backup, the sandbox reset, the two `schedule-*`
+> scripts and the `*.db.test.ts` files connect with the `postgres` driver (porsager/postgres 4).
+> Keep new code to its rules:
+> - The server types every parameter. A `Date`, boolean, `bigint`, `Buffer` or array where the query
+>   does not decide the type (a select list, `VALUES` in a `FROM`, a function argument) needs a cast:
+>   `${date}::timestamptz`, `${ids}::uuid[]`. `sql.array()` is gone: pass the array with a cast.
+> - It is an ES module. A CommonJS file loads it with `const { default: postgres } = await
+>   import('postgres')`; a library's `.cjs` build gets its namespace as the default import, so
+>   `order-inventory.ts` goes through `resolvePostgresFactory` (`postgres-factory.ts`).
+> - Open a transaction only with `sql.begin()` or on a `max: 1` connection: a `begin` sent on a pool
+>   rejects (`UNSAFE_TRANSACTION`), and a `COMMIT` the server answers with a rollback rejects too.
+> - Each caller picks its TLS: an explicit `ssl` option beats the URL's `?sslmode=` and `PGSSLMODE`,
+>   and `ssl: 'require'` fails on a server without TLS (`SSL_NOT_SUPPORTED`). `/setup`, the checkout
+>   fallback and the reset require it, the backup follows the URL's `sslmode`, and migrate-core
+>   prefers it on loopback and private hosts.
+> - Engines cross driver versions. `npm run update` from 0.23.5 or earlier runs that release's
+>   `migrate-core.mjs` after installing this release's dependencies, a newer updater falls back to it
+>   when the new engine does not load, and a project that pins `postgres` 3 runs this engine on 3. So
+>   the engine keeps to calls both majors accept, as every copy since the file appeared (2026-08-12)
+>   has: `await import('postgres')`, one `max: 1` connection, `unsafe()` and queries with no `Date`,
+>   boolean or array parameter (docs/13 → "Build-time migrations").
+
 Captured by the `/setup` wizard and needed for a complete CMS:
 
 - R2 credentials for media storage. The app builds and serves without them, but
@@ -194,10 +221,13 @@ ranges are rejected, `false` denies, and only the root's field is read in a work
 | --- | --- | --- |
 | `esbuild`, `@swc/core`, `unrs-resolver` | allow | postinstall verifies/installs the platform binary the build tooling uses |
 | `sharp` | allow | checks the prebuilt image binary and builds it only when no prebuilt exists (`node install/check.js \|\| npm run build`) |
-| `supabase` | allow | the Supabase CLI downloads its binary in postinstall; `npm run db:*` needs it |
 | `nx` | allow | its own post-install bookkeeping (no-op in CI) |
 | `@parcel/watcher` | deny | only compiles from source when `npm_config_build_from_source=true`; prebuilt binaries arrive as optional deps |
 | `less` | deny | its postinstall tries `pnpm exec playwright install` on any non-CI machine; irrelevant and fails here |
+
+The Supabase CLI needs no entry: its binary arrives as a platform optional dependency
+(`@supabase/cli-<os>-<arch>`, in 2.117+ and 3.x alike), with no install script, so the
+`supabase` entry this table used to carry matched nothing and was removed with the move to 3.x.
 
 Name-only entries were chosen on purpose: a pinned `pkg@1.2.3` re-triggers the warning
 (and re-skips the script) on every routine version bump. When you add a dependency with a
@@ -209,10 +239,15 @@ becomes the root of a standalone `create-nextblock` project. `npm install-script
 ## Dependency versions: what is held back, and why
 
 Policy: every dependency sits at its npm `latest` unless the packages it has to work with
-cannot take that version. The last full sweep (2026-09-21) moved 149 of 155 outdated
-packages to latest and took `npm audit` from 104 findings (1 critical) to 0. Held
-packages and temporary overrides are listed here because `package.json` cannot carry
-comments. Re-check each row on the next sweep.
+cannot take that version. The last full sweep (2026-11-20, with the move to Node 26) moved 110
+of 118 outdated direct dependencies to latest (`postgres` 4 and the Supabase CLI 3 each with the code
+changes they needed), refreshed every indirect one inside its range
+(`npm update`), and took `npm audit` from 52 moderate findings to 45. The 45 left are two
+advisories in build tooling: `glob` up to 14.0.1 (GHSA-3g3m-2fjr-6pw4), which the `glob ^13`
+override below holds, and `minimatch` below 11.0.1 (GHSA-g3hv-75wg-m249), which consumers on
+minimatch 9 and 10 pull in. Both need a major (glob 14, minimatch 11) and, for glob, the
+scaffold-override steps below. Held packages and temporary overrides are listed here because
+`package.json` cannot carry comments. Re-check each row on the next sweep.
 
 **Held below latest**
 
@@ -220,7 +255,10 @@ comments. Re-check each row on the next sweep.
 | :-- | :-- | :-- | :-- | :-- |
 | `eslint`, `@eslint/js` | 9.39.5 (final 9.x) | 10.x | `eslint-plugin-react` 7.37.5, `eslint-plugin-import` 2.32.0 and `eslint-plugin-jsx-a11y` 6.10.2 (all at latest, loaded by Nx's `flat/react` and by `eslint-config-next`) exclude ESLint 10, and `eslint-plugin-react` crashes on it (it calls the removed `context.getFilename()`). Its maintainer asks users not to force it (jsx-eslint/eslint-plugin-react#3977). A peer-override plus `@eslint/compat` shim path works but was rejected for that reason. | All three plugins publish an ESLint 10 peer range. Then fix the ~34 findings from `@eslint/js` 10's new recommended rules (`no-useless-assignment`, `preserve-caught-error`). |
 | `typescript` | `~6.0.3` | 7.0.x | TypeScript 7.0 is the native compiler and ships no JS compiler API (`require('typescript')` exports only the version), which typescript-eslint, vite-plugin-dts, Nx and `@swc-node/register` all need. typescript-eslint also caps its peer at `<6.1.0`, hence the tilde. | TypeScript 7.1 ships its API and typescript-eslint, `@nx/js` and `unplugin-dts` adopt it. |
-| `@types/node` | `^22.20.4` | 26.x | Policy, not a block: the types must describe the oldest runtime we deploy (Docker `node:22-alpine`, Vercel 22/24). Newer types would type-check APIs that crash in production. | Docker and Vercel move to a newer Node major. |
+| `@types/node` | `^22.20.5` | 26.x | Policy, not a block: the types must describe the oldest runtime the app runs on. Docker images use `node:26-alpine` since 2026-11-20, but scaffolds still promise Node 22.12 (the CLI's `engines`) and a Vercel project runs whatever major its settings pick (22, 24 or 26). Newer types would type-check APIs that crash there. | The scaffold floor (`engines`, "Node.js floor" below) moves to a newer major. |
+| `katex` | 0.18.10 | 0.19.x | `@tiptap/extension-mathematics` (3.35.0, latest) peers `katex ^0.16.4 \|\| ^0.17.0 \|\| ^0.18.0`; 0.18.11 is deprecated. | Tiptap widens the peer range. |
+| `verdaccio` | 6.11.x | 7.x | `@nx/js` 24.0.6 peers `verdaccio ^6.0.5`. | `@nx/js` accepts 7. |
+| `@babel/core`, `@babel/preset-react` | 7.29.x | 8.x | `@nx/js` 24 depends on Babel 7 (`@babel/core ^7.29.6`, its presets and plugins), and `libs/ui` and `libs/editor` build through `@nx/react/babel`. | Nx moves to Babel 8. |
 
 **Temporary overrides in the root `package.json`**
 
@@ -238,11 +276,24 @@ is now a declared root dependency, and its override equals that spec.) For
 the same reason the `@parcel/watcher` and `less` entries in `allowScripts` are currently
 inert.
 
+**Moved off a hold: the Supabase CLI (2026-11-20).** `supabase` is on 3.x. Its breaking change
+for us was the target: `migration list`, `db push`, `migration repair` and `gen types` act on the
+LOCAL stack unless given `--remote`, every hosted write needs `--yes`, and project `.env*` files
+and `SUPABASE_<PATH>` variables now beat `config.toml`. Every script passes an explicit
+`--remote` (built in `tools/scripts/lib/supabase-cli.js`), `db:migrate:check` still runs one
+read-only command, and `config.toml` uses `[local_smtp]` and `enabled`. Details: docs/04 →
+"Supabase CLI 3: every command names its target". Scaffolds: docs/13 → "Supabase CLI 3".
+
 **Node.js floor.** 22.12. `supabase-js` 2.110+, AI SDK 7 and `@ai-sdk/*` need Node 22;
 Vite 8, Vitest 5 and the `create-nextblock` CLI (`commander` 15, `execa` 10, `chalk` 6)
 need 22.12, which the CLI declares in `engines`.
 
-Working in the monorepo, use Node 22.18 or later (`.nvmrc`). The libs' `vite.config.mts` files are
+The monorepo itself develops on Node 26 LTS: `.nvmrc` (26.13.1), both CI workflows
+(`node-version: 26`) and both Dockerfiles (`node:26-alpine`, the monorepo's and the scaffold's
+`docker-template`) moved to it on 2026-11-20, so nothing in CI runs Node 22 any more. What still
+holds the 22 line for scaffolds is `@types/node` 22 (above) and the CLI's `engines`. Below Node 26
+the monorepo needs 22.22.2 (or 24.15) for its tests, because jsdom 31 requires it, and 22.18 for
+lib builds. The libs' `vite.config.mts` files are
 ES modules in TypeScript: Vite's bundle loader, its default today, reads them on any Node, but its
 native loader imports them as they are, which needs Node's type stripping (on by default from
 22.18, and from 23.6 on the 23 line). Once Vite makes the native loader its default, a lib build on
@@ -256,8 +307,14 @@ config, so the CLI's 22.12 floor stays. Do not put the floor in an `engines` fie
 migration guide before bumping. A plain `npm install` deadlocks on tightly pinned families
 (`nx`/`@nx/*`, `@tiptap/*`, `typescript-eslint`/`@typescript-eslint/*`, `vitest`/`@vitest/*`,
 `eslint`/`@eslint/*`): delete their `node_modules/...` entries from `package-lock.json`,
-set the specs, and run `npm install`. No `--legacy-peer-deps` is needed. Validate the lock
-against Docker's npm in a temp copy with `npx -y npm@10.9.8 ci --dry-run`. Then realign
+set the specs, and run `npm install` with the npm Node 26 bundles (`npx -y npm@11.20.0 install`;
+an older global npm in `%APPDATA%\npm` shadows the bundled one on Windows). No
+`--legacy-peer-deps` is needed. Validate the lock in a temp copy with Docker's npm
+(`npx -y npm@11.20.0 ci --dry-run`) and with npm 10 (`npx -y npm@10.9.9 ci --dry-run`), for a
+Vercel project still set to Node 22. A lock written on Windows must keep the Linux binaries
+(the `os`/`cpu`-restricted `-linux-x64-gnu` / `-musl` entries of Next's SWC, Rolldown,
+lightningcss, Tailwind's oxide, sharp and Nx): compare them with `git show HEAD:package-lock.json`,
+since `npm ci --dry-run` does not notice their absence. Then realign
 `apps/nextblock/package.json` and the published libs' ranges (`libs/cortex`,
 `libs/ecommerce`, and the hard-coded deps in `libs/utils/vite.config.mts`'s `afterBuild`) to
 the root specs. Scaffolds install exactly what those manifests declare.
@@ -354,10 +411,13 @@ the target database is disposable.
 The migration-only script:
 
 - loads `.env.local` and `.env`
-- links the Supabase CLI to `SUPABASE_PROJECT_ID`
+- refuses a `SUPABASE_PROJECT_ID` that is not a 20-letter project ref
+- links the Supabase CLI to `SUPABASE_PROJECT_ID` (no password: CLI 3's `link` ignores it)
 - uses `SUPABASE_DB_PASSWORD`, `POSTGRES_PASSWORD`, `POSTGRES_URL`, or
   `DATABASE_URL` for the database password
-- runs `supabase db push` without `--include-all`
+- reads the history with `supabase migration list --remote=<ref>` and refuses it unless the
+  CLI says it read that project
+- runs `supabase db push --remote=<ref> --password <pw> --yes` without `--include-all`
 - never runs a reset, seed script, function deploy, or config push
 
 The migration set is a squashed baseline (one generation at a time — see

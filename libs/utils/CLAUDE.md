@@ -59,7 +59,10 @@ only: no build entry reaches it, so the package ships no JavaScript for it.
   globs see it. Raise the sanitize-html range in the root `package.json` and in the dist manifest
   (`vite.config.mts`) together, so scaffolds never resolve an older version than the tests ran
   (`tests/published-dependencies.test.ts` fails when they differ). Run
-  `npx vitest run libs/utils/src/lib/authored-html` after any change to the options.
+  `npx vitest run libs/utils/src/lib/authored-html` after any change to the options. The test's
+  round trips serialize through `legacyInnerHtml` (`<` and `>` left raw in attribute values, as
+  browsers did before the 2025 HTML change): parse5 8.1, and so jsdom 31, escapes them, which would
+  hide the mXSS round trips older browsers still allow. Keep it when jsdom or parse5 moves.
 - `src/lib/server-utils.ts` is server-only but must never be a `"use server"` module: that would
   make `getEmailServerConfig()` (it returns the SMTP password) callable from the browser once a
   client component imports it. It throws in a browser instead; `server-utils.test.ts` guards it.

@@ -615,6 +615,16 @@ function requiredValue(label) {
     value && String(value).trim() ? undefined : `${label} is required`;
 }
 
+// A Supabase project ref is exactly 20 lowercase letters. The Supabase CLI (3.x) looks any other
+// value up as a branch name of the linked project, so the wizard refuses it up front.
+function projectRefValue(value) {
+  const missing = requiredValue('Project Reference ID')(value);
+  if (missing) return missing;
+  return /^[a-z]{20}$/.test(String(value).trim())
+    ? undefined
+    : 'A Reference ID is 20 lowercase letters (Project Settings > General)';
+}
+
 // Read the current value of a `KEY=` line from an .env file body (handles quotes),
 // so re-runs can reuse already-generated secrets instead of regenerating them.
 function readEnvValue(envContent, key) {
@@ -648,7 +658,7 @@ async function runSetupWizard(projectDir, projectName) {
       projectId: () =>
         clack.text({
           message: 'Project ID (Project Settings > General > "Reference ID"):',
-          validate: requiredValue('Project Reference ID'),
+          validate: projectRefValue,
         }),
       postgresUrl: () =>
         clack.text({
@@ -877,7 +887,10 @@ async function runSetupWizard(projectDir, projectName) {
   // 6. Link the project and apply the schema. These are the standalone equivalents of the
   //    monorepo `npm run db:link` + `npm run db:migrate:fresh` (which do not exist in a
   //    generated project): we drive the Supabase CLI directly, authenticating with the
-  //    access token so no browser login is required.
+  //    access token so no browser login is required. The project's CLI is 3.x (the devDependency
+  //    written below, or npx's latest): its `db push` reads the LOCAL stack unless given
+  //    `--remote`, and a hosted write needs `--yes` (a piped "y" no longer confirms), so both are
+  //    explicit. The clack confirm below is the user's yes.
   const supabaseBin = await getSupabaseBinary(projectPath);
   const command = supabaseBin === 'npx' ? 'npx' : supabaseBin;
   // `--yes` skips npx's "Ok to proceed?" install prompt if it ever falls back to npx
@@ -906,7 +919,8 @@ async function runSetupWizard(projectDir, projectName) {
   try {
     await execa(
       command,
-      sbArgs(['link', '--project-ref', projectId, '--password', dbPassword]),
+      // CLI 3's link never connects to the database and ignores --password.
+      sbArgs(['link', '--project-ref', projectId]),
       { stdio: 'inherit', cwd: projectPath, env: supabaseEnv },
     );
 
@@ -914,22 +928,33 @@ async function runSetupWizard(projectDir, projectName) {
       clack.log.step(
         'Applying the database schema — this can take a minute on a fresh project...',
       );
-      await execa(command, sbArgs(['db', 'push', '--include-all']), {
-        stdio: ['pipe', 'inherit', 'inherit'],
-        cwd: projectPath,
-        input: 'y\n', // Auto-confirm the push prompt
-        env: supabaseEnv,
-      });
+      await execa(
+        command,
+        sbArgs([
+          'db',
+          'push',
+          '--include-all',
+          `--remote=${projectId}`,
+          '--password',
+          dbPassword,
+          '--yes',
+        ]),
+        {
+          stdio: 'inherit',
+          cwd: projectPath,
+          env: supabaseEnv,
+        },
+      );
 
       clack.log.success('Database schema applied.');
     } else {
       clack.log.info(
-        'Linked. Skipped schema push — run `npx supabase db push --include-all` when ready.',
+        'Linked. Skipped schema push — run `npx supabase db push --include-all --remote` when ready.',
       );
     }
   } catch (error) {
     clack.log.warn(
-      'Database setup failed. You can run `npx supabase db push --include-all` manually.',
+      'Database setup failed. You can run `npx supabase db push --include-all --remote` manually.',
     );
     if (error instanceof Error) {
       clack.note(error.message);
@@ -2019,7 +2044,7 @@ async function transformPackageJson(projectDir) {
   // `npm run test-create`); fall back to FALLBACK_OVERRIDES (./lib/fallback-overrides.js)
   // in the published CLI, where the monorepo root is not on disk.
   let rootOverrides = FALLBACK_OVERRIDES;
-  let supabaseCliVersion = '^2.117.0'; // keep in sync with the repo root devDependency
+  let supabaseCliVersion = '^3.2.0'; // keep in sync with the repo root devDependency
   try {
     const rootPkg = await fs.readJSON(resolve(REPO_ROOT, 'package.json'));
     if (rootPkg?.overrides && Object.keys(rootPkg.overrides).length > 0) {

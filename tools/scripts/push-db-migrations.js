@@ -24,6 +24,18 @@ const {
   validateMigrationNames,
 } = require('./lib/migration-naming');
 const { validateMigrationGrants } = require('./lib/migration-grants');
+// Every Supabase CLI command below comes from one module, each with an explicit `--remote=<ref>`:
+// CLI 3 targets the LOCAL stack when a script leaves the target out.
+const {
+  PROJECT_REF_RE,
+  dbPushArgs,
+  describeCliError,
+  isStaleCliRefusal,
+  linkArgs,
+  migrationListArgs,
+  migrationListTargetProblem,
+  parseMigrationList,
+} = require('./lib/supabase-cli');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -71,6 +83,10 @@ function requireEnv() {
 
   if (!process.env.SUPABASE_PROJECT_ID) {
     missing.push('SUPABASE_PROJECT_ID');
+  } else if (!PROJECT_REF_RE.test(process.env.SUPABASE_PROJECT_ID)) {
+    // The CLI would look any other value up as a branch name of the linked project.
+    log('SUPABASE_PROJECT_ID must be the project ref: exactly 20 lowercase letters (Project Settings → General).', colors.red);
+    process.exit(1);
   }
 
   // Only the link step needs an access token, and the check path no longer links.
@@ -90,6 +106,17 @@ function requireEnv() {
   }
 }
 
+/**
+ * The environment the CLI runs with: this process's, minus `SUPABASE_YES`. A `SUPABASE_YES` that
+ * dotenv copied in from `.env.local` would count as shell consent to CLI 3, and consent here is
+ * only ever the explicit `--yes` on the one command that writes.
+ */
+function cliEnv() {
+  const env = { ...process.env };
+  delete env.SUPABASE_YES;
+  return env;
+}
+
 function run(command, commandArgs, options = {}) {
   const { allowFailure = false, echoStdout = true, ...spawnOptions } = options;
   const printable = [command, ...commandArgs.map((arg) => {
@@ -103,7 +130,7 @@ function run(command, commandArgs, options = {}) {
   const capture = options.capture === true;
   const result = spawnSync(command, commandArgs, {
     cwd: repoRoot,
-    env: process.env,
+    env: cliEnv(),
     shell: process.platform === 'win32',
     stdio: capture ? 'pipe' : 'inherit',
     encoding: capture ? 'utf8' : undefined,
@@ -199,145 +226,6 @@ function assertMigrationGrants(localFiles) {
   }
 }
 
-// A version is any run of digits: the legacy generation-1 files were 14-digit, the
-// GGNNN scheme is 5-digit, and the remote history can hold both at once during a squash.
-const VERSION_PATTERN = /^\d+$/;
-
-/** Column delimiters the CLI has shipped: ASCII pipe, and box-drawing verticals. */
-const COLUMN_SPLIT = /[|│┃]/;
-
-/**
- * CLI 2.109+ wraps every text-table cell in backticks (`02005`) and renders a blank cell as
- * a backticked space, so the backticks are stripped before a cell is compared.
- */
-function splitRow(line) {
-  return line.split(COLUMN_SPLIT).map((cell) => cell.trim().replace(/^`+|`+$/g, '').trim());
-}
-
-function classifyVersions(rows) {
-  const pending = [];
-  const applied = [];
-  const remoteOnly = [];
-
-  for (const { local, remote } of rows) {
-    const hasLocal = VERSION_PATTERN.test(local);
-    const hasRemote = VERSION_PATTERN.test(remote);
-
-    if (hasLocal && hasRemote) {
-      applied.push(local);
-    } else if (hasLocal) {
-      pending.push(local);
-    } else if (hasRemote) {
-      remoteOnly.push(remote);
-    }
-  }
-
-  return { applied, pending, remoteOnly };
-}
-
-/**
- * The JSON form of `supabase migration list`: one line on stdout,
- * `{"migrations":[{"local":"02000","remote":"02000","time":"02000"}, ...],"message":"..."}`,
- * printed for `--output-format json` and, from CLI 2.109, by default whenever the CLI detects
- * an AI agent (CLAUDECODE / AI_AGENT). Stderr lines such as "Connecting to remote database..."
- * are appended to the captured output, so each line is parsed on its own. An empty local or
- * remote value marks a pending file or a remote-only version, as in the table.
- *
- * Returns null when no line holds a `migrations` array.
- */
-function parseMigrationListJson(lines) {
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('{')) {
-      continue;
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-
-    if (!parsed || !Array.isArray(parsed.migrations)) {
-      continue;
-    }
-
-    return classifyVersions(
-      parsed.migrations.map((entry) => ({
-        local: entry && entry.local != null ? String(entry.local).trim() : '',
-        remote: entry && entry.remote != null ? String(entry.remote).trim() : '',
-      })),
-    );
-  }
-
-  return null;
-}
-
-/**
- * Parse `supabase migration list` into local/remote sets.
- *
- * The JSON form (see parseMigrationListJson) is tried first. Otherwise the output is a
- * three-column table (Local | Remote | Time). A row with only a Local value is a migration
- * file that has never been applied; a row with only a Remote value is a history entry with
- * no file behind it. CLI 2.109+ wraps each table cell in backticks; splitRow strips them.
- *
- * Column positions come from the header row rather than from fixed indices 0 and 1. A table
- * rendered with an outer delimiter ("| 02005 | | |") shifts every cell by one, which would
- * classify each pending local migration as a retired remote version — and a retired version
- * is what `--reconcile-squash` reverts. Reading the header keeps the two columns identified
- * however the table is drawn.
- *
- * Returns NULL when neither a JSON `migrations` list nor a table header row is recognised.
- * Callers must treat that as a failed read and never as an empty history: "nothing parsed" and
- * "the database has no migrations" call for opposite actions, and conflating them makes this
- * command affirmatively lie about the database when the CLI changes its output.
- */
-function parseMigrationList(output) {
-  const lines = output.split('\n');
-
-  const fromJson = parseMigrationListJson(lines);
-  if (fromJson) {
-    return fromJson;
-  }
-
-  let localIndex = -1;
-  let remoteIndex = -1;
-  let headerLine = -1;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!COLUMN_SPLIT.test(lines[i])) {
-      continue;
-    }
-    const cells = splitRow(lines[i]).map((cell) => cell.toLowerCase());
-    const local = cells.indexOf('local');
-    const remote = cells.indexOf('remote');
-    if (local !== -1 && remote !== -1) {
-      localIndex = local;
-      remoteIndex = remote;
-      headerLine = i;
-      break;
-    }
-  }
-
-  if (headerLine === -1) {
-    return null;
-  }
-
-  const rows = [];
-
-  for (let i = headerLine + 1; i < lines.length; i += 1) {
-    if (!COLUMN_SPLIT.test(lines[i])) {
-      continue;
-    }
-
-    const cells = splitRow(lines[i]);
-    rows.push({ local: cells[localIndex] || '', remote: cells[remoteIndex] || '' });
-  }
-
-  return classifyVersions(rows);
-}
-
 /**
  * Ask the remote database which migrations it has already recorded.
  *
@@ -347,59 +235,58 @@ function parseMigrationList(output) {
  * "DRY RUN: migrations will *not* be pushed". A command named `check` must not be
  * able to change anything, so the check path now runs only this.
  *
- * `--output-format json` (a global flag) pins the JSON form so a human terminal and an agent
- * session read the same thing. CLI 2.107 and 2.108 accept the flag but still print the text
- * table for this command, which parseMigrationList also reads. A CLI older than 2.107
- * rejects the flag outright ("unknown flag: --output-format"); the same read-only command is
- * then re-run without it and its text table parsed, so a stale node_modules (package.json
- * pins a newer CLI) degrades to a warning instead of an unreadable history.
+ * The argv comes from `migrationListArgs` (tools/scripts/lib/supabase-cli.js): `--remote=<ref>`
+ * names the project, because Supabase CLI 3 reads the LOCAL stack when no target is given, and
+ * `--output-format json` pins the form whose `target` says which database the CLI actually read.
+ * A history whose target is not this project is refused (`migrationListTargetProblem`), so a local
+ * read can never be reported as the production history. A CLI older than 3.0 rejects `--remote`
+ * outright; that is reported as "run npm ci", never retried with an implicit target.
+ *
+ * `runSupabase(args, options)` is injectable so the tests can pin every CLI call the check path
+ * makes. Returns `{ status }` or `{ error }`; it never exits.
  */
-function isUnknownOutputFormatFlag(output) {
-  return /unknown flag: --output-format/i.test(output || '');
-}
-
-function readMigrationStatus(dbPassword, { allowFailure = false } = {}) {
-  const listArgs = ['migration', 'list', '--workdir', workdir, '--password', dbPassword];
-  let result = supabase([...listArgs, '--output-format', 'json'], {
+function readMigrationStatus({ projectRef, dbPassword, runSupabase = supabase }) {
+  const result = runSupabase(migrationListArgs({ workdir, projectRef, password: dbPassword }), {
     allowFailure: true,
     capture: true,
     echoStdout: false,
   });
 
-  if (result.failed && isUnknownOutputFormatFlag(result.output)) {
-    log(
-      'This Supabase CLI predates `--output-format`; reading the text table instead. Run `npm ci` to install the version package.json pins.',
-      colors.yellow,
-    );
-    result = supabase(listArgs, { allowFailure: true, capture: true, echoStdout: false });
-  }
-
   if (result.failed) {
-    if (allowFailure) {
-      return null;
+    if (isStaleCliRefusal(result.output)) {
+      return {
+        error: 'This Supabase CLI predates 3.0 (it has no --remote). Run `npm ci` to install the version package.json pins.',
+      };
     }
-    process.exit(1);
+    const reason = describeCliError(result.output);
+    return { error: `The \`supabase migration list\` command failed${reason ? `: ${reason}` : '.'}` };
   }
 
-  const output = result.output;
-
-  const status = parseMigrationList(output);
+  const status = parseMigrationList(result.output);
 
   if (!status) {
-    // Printed on both paths: the command itself succeeded, so a missing link is not the cause.
-    log('Could not recognise the output of `supabase migration list`.', colors.red);
-    log(
-      'Neither a JSON "migrations" list nor a "Local | Remote" header row was found, so the remote history was not read.',
-      colors.yellow,
-    );
-    if (allowFailure) {
-      return null;
-    }
-    log('Refusing to continue: an unreadable history must not be mistaken for an empty one.', colors.yellow);
-    process.exit(1);
+    // The command itself succeeded, so a missing link is not the cause.
+    return {
+      error:
+        'Could not recognise the output of `supabase migration list`: no JSON "migrations" list and no "Local | Remote" header row, so the remote history was not read.',
+    };
   }
 
-  return status;
+  const targetProblem = migrationListTargetProblem(status, projectRef);
+  if (targetProblem) {
+    return { error: `${targetProblem} Refusing to report it as the history of ${projectRef}.` };
+  }
+
+  return { status };
+}
+
+/**
+ * The whole `--check` path after the local file checks: one read-only `migration list`, nothing
+ * else. Exported for push-db-migrations.test.ts, which runs it with a recording `runSupabase` and
+ * pins the exact calls. Returns `{ status }` or `{ error }`.
+ */
+function runCheck({ projectRef, dbPassword, runSupabase = supabase }) {
+  return readMigrationStatus({ projectRef, dbPassword, runSupabase });
 }
 
 function describeVersion(version, localFiles) {
@@ -458,6 +345,7 @@ function main() {
   requireEnv();
 
   const dbPassword = getDbPassword();
+  const projectRef = process.env.SUPABASE_PROJECT_ID;
   const isCheck = args.has('--check') || args.has('--dry-run');
   const confirmed =
     args.has('--confirm') ||
@@ -470,7 +358,7 @@ function main() {
   log(isCheck ? 'Supabase migration check (read-only)' : 'Supabase migration-only push', colors.green);
   assertMigrationNaming(localFiles);
   assertMigrationGrants(localFiles);
-  log(`Target project: ${process.env.SUPABASE_PROJECT_ID}`, colors.dim);
+  log(`Target project: ${projectRef} (every Supabase CLI call below passes --remote=${projectRef})`, colors.dim);
   log(
     isCheck
       ? 'This only reads the remote migration history. It links nothing, pushes nothing, and cannot change the database.'
@@ -490,13 +378,14 @@ function main() {
   // to production. Reading the history needs an existing link, so an unlinked repo is
   // told to link explicitly rather than having it done silently underneath a "check".
   if (isCheck) {
-    const status = readMigrationStatus(dbPassword, { allowFailure: true });
+    const { status, error } = runCheck({ projectRef, dbPassword });
 
     if (!status) {
       log('');
+      log(error, colors.red);
       log('Could not read the remote migration history.', colors.red);
       log(
-        'If this project has never been linked, run `npx supabase link --project-ref <ref> --workdir libs/db/src` once.',
+        'If this project has never been linked, run `npm run db:link` once: on a network without IPv6 the CLI reaches the database through the pooler URL the link saves (or, failing that, through SUPABASE_ACCESS_TOKEN).',
         colors.yellow,
       );
       log(
@@ -514,31 +403,21 @@ function main() {
   }
 
   if (!args.has('--skip-link')) {
-    supabase([
-      'link',
-      '--project-ref',
-      process.env.SUPABASE_PROJECT_ID,
-      '--password',
-      dbPassword,
-      '--workdir',
-      workdir,
-      '--yes',
-    ]);
+    supabase(linkArgs({ workdir, projectRef }));
   }
 
-  const pushArgs = [
-    'db',
-    'push',
-    '--workdir',
-    workdir,
-    '--password',
-    dbPassword,
-    '--yes',
-  ];
+  // `--remote=<ref>` names the project the history was just read from; `--yes` is CLI 3's
+  // consent for a hosted write, given only once --confirm (below) has been checked.
+  const pushArgs = dbPushArgs({ workdir, projectRef, password: dbPassword });
 
   // Compute the guard input from the history read rather than by regex-scraping
   // `db push --dry-run` output. Same reason as above, plus it is simply more reliable.
-  const status = readMigrationStatus(dbPassword);
+  const { status, error } = readMigrationStatus({ projectRef, dbPassword });
+  if (!status) {
+    log(error, colors.red);
+    log('Refusing to continue: an unreadable history must not be mistaken for an empty one.', colors.yellow);
+    process.exit(1);
+  }
   reportMigrationStatus(status, localFiles);
 
   const pendingMigrations = status.pending.map((version) => describeVersion(version, localFiles));
@@ -612,7 +491,16 @@ function main() {
 
 // Pure helpers are exported for tests; `main()` runs only on direct execution so
 // requiring this file never touches a database.
-module.exports = { getMigrationVersion, isBaselineMigration, isUnknownOutputFormatFlag, parseMigrationList };
+module.exports = {
+  cliEnv,
+  getMigrationVersion,
+  isBaselineMigration,
+  isStaleCliRefusal,
+  parseMigrationList,
+  readMigrationStatus,
+  runCheck,
+  workdir,
+};
 
 if (require.main === module) {
   main();

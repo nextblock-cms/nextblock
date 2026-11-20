@@ -119,7 +119,7 @@ mirrors all but `db/types`).
 npx nx serve nextblock              # dev on :4200
 npx nx build nextblock              # prebuild migration hook never fails a build
 npm run lint                        # or npx nx lint <project>
-npm run security:check              # service-role boundary + action actors + sandbox guards + HTML sinks + migration lint + posture runner guard + grant-pass lockstep + generated migration copies
+npm run security:check              # service-role boundary + action actors + sandbox guards + HTML sinks + migration lint + posture runner guard + grant-pass lockstep + generated migration copies + Supabase CLI targets (read-only db:migrate:check)
 npm run security:db-posture -- --db-url postgresql://postgres:postgres@127.0.0.1:54322/postgres  # local DB only
 npx vitest run <path>               # ALWAYS pass a path (a bare run also collects the template copy); no per-project nx test targets
 npm run db:migrate:check            # ALWAYS first; read-only by construction
@@ -197,8 +197,10 @@ node tools/scripts/rehearse-release.js   # after the sync above: pack all 9 (no 
 
 ## Gotchas
 
-- Monorepo work needs Node 22.18+ (`.nvmrc`): Vite's native config loader reads the libs'
-  `vite.config.mts` with Node's type stripping, and every lib build warns on an older Node
+- The monorepo, CI and both Dockerfiles run Node 26 (`.nvmrc`); scaffolds still promise 22.12
+  (the CLI's `engines`), so `@types/node` stays on 22. Below 26, tests need 22.22.2+ (jsdom 31)
+  and lib builds 22.18+: Vite's native config loader reads the libs' `vite.config.mts` with Node's
+  type stripping, and every lib build warns on an older Node
   (`tools/vite/lib-build-plugins.mjs`). Never put the floor in `engines` of a deployed
   `package.json`: Vercel deploys an open range on its newest Node major (docs/05 → "Node.js floor").
 - npm ≥ 11.13 blocks dependency install scripts unless the ROOT `package.json` lists the

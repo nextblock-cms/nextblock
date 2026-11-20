@@ -35,7 +35,6 @@
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
-const postgres = require('postgres');
 
 const JOB_NAME = 'sandbox-reset';
 const SECRET_NAME = 'sandbox_cron_secret';
@@ -159,6 +158,8 @@ async function main() {
     process.env.DATABASE_URL;
   if (!dbUrl) fail('No database URL: set POSTGRES_URL_NON_POOLING (or POSTGRES_URL) or pass --db=...');
 
+  // postgres 4 is an ES module: require() of it returns the namespace, not the function.
+  const { default: postgres } = await import('postgres');
   const sql = postgres(dbUrl, {
     max: 1,
     ssl: 'require',

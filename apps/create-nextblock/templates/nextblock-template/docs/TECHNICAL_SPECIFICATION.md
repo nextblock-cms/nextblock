@@ -1827,7 +1827,7 @@ The application-level `apps/nextblock/tsconfig.json` registers the Next.js TypeS
 
 #### 3.1.2.2 Selection Justification
 
-TypeScript's strict mode is enumerated as a **Critical Success Factor** in Section 1.2.3.2 and enforces type safety across monorepo library boundaries. The strict posture specifically enables three architectural guarantees: compile-time verification of the block schema contract (F-024) exported from `@nextblock-cms/sdk`, sound typing of the augmented `NodeJS.ProcessEnv` declared in `libs/environment.d.ts`, and contract-consistency between `libs/db` and its Supabase-generated types produced via `supabase gen types typescript --schema public`. No dynamic-language equivalent (Python, Ruby, JavaScript) would satisfy the simultaneous requirements of React Server Component boundary enforcement, Zod-derived static inference, and multi-package versioned API surfaces.
+TypeScript's strict mode is enumerated as a **Critical Success Factor** in Section 1.2.3.2 and enforces type safety across monorepo library boundaries. The strict posture specifically enables three architectural guarantees: compile-time verification of the block schema contract (F-024) exported from `@nextblock-cms/sdk`, sound typing of the augmented `NodeJS.ProcessEnv` declared in `libs/environment.d.ts`, and contract-consistency between `libs/db` and its Supabase-generated types produced via `supabase gen types --lang typescript --schema public --remote=<ref>`. No dynamic-language equivalent (Python, Ruby, JavaScript) would satisfy the simultaneous requirements of React Server Component boundary enforcement, Zod-derived static inference, and multi-package versioned API surfaces.
 
 ### 3.1.3 JavaScript — Tooling and Configuration
 
@@ -2241,7 +2241,7 @@ Per the maintenance constraint in Section 2.4.5, these numbered files must remai
 
 #### 3.5.1.2 TypeScript Type Generation
 
-The `npm run db:types` script executes `supabase gen types typescript --schema public`, producing a strongly-typed database interface consumed by `@nextblock-cms/db`. This workflow ensures that schema changes propagate compile-time errors to library and application consumers.
+The `npm run db:types` script executes `supabase gen types --lang typescript --schema public --remote=<ref>`, producing a strongly-typed database interface consumed by `@nextblock-cms/db`. This workflow ensures that schema changes propagate compile-time errors to library and application consumers.
 
 #### 3.5.1.3 Direct SQL Fallback
 
@@ -5967,8 +5967,8 @@ The root `package.json` exposes the following migration-related scripts:
 | `db:migrate:fresh` | `node tools/scripts/push-db-migrations.js --confirm --allow-baseline-replay` | Apply the full baseline only to a brand-new empty database |
 | `db:reset` | `supabase db reset --workdir libs/db/src` | Full local reset and replay |
 | `db:link` | `dotenv + supabase-link` via `tools/scripts/supabase-link.js` | Link local workspace to remote project |
-| `db:types` | `supabase gen types typescript --schema public` via `tools/scripts/gen-db-types.js` | Regenerate `libs/db/src/lib/supabase/types.ts` |
-| `db:repair` | `supabase migration repair` | Reconcile migration ledger |
+| `db:types` | `supabase gen types --lang typescript --schema public --remote=<ref>` via `tools/scripts/gen-db-types.js` | Regenerate `libs/db/src/lib/supabase/types.ts` |
+| `db:repair` | `supabase migration repair --remote` | Reconcile migration ledger |
 | `db:backup` | `node apps/nextblock/scripts/backup.js` | Local pg_dump |
 | `db:restore` | `node apps/nextblock/scripts/restore.js` | Interactive psql restore |
 | `deploy:supabase` | `node tools/scripts/deploy-supabase.js` | CI/CD end-to-end deploy |
@@ -6294,7 +6294,7 @@ Application-layer details:
 | Currency exchange-rate sync (cron) | Service-role client updates `currencies.exchange_rate` from Frankfurter API | Daily 18:00 UTC, 30s `maxDuration` |
 | Bulk variant upsert | `upsert_product_with_variants(jsonb)` PL/pgSQL function — admin-only via `is_admin()` | Ad-hoc, CMS-triggered |
 | Migration seeds | Direct SQL in migrations `00000000000008` through `00000000000010` with `ON CONFLICT` merge logic preserving existing values | At deploy time |
-| Type regeneration | `supabase gen types typescript --schema public` | Ad-hoc after schema change |
+| Type regeneration | `supabase gen types --lang typescript --schema public --remote=<ref>` | Ad-hoc after schema change |
 | Backup export | `pg_dump --clean --if-exists --quote-all-identifiers` | Operator-initiated |
 
 The `upsert_product_with_variants(payload jsonb)` function accepts a single jsonb document and rebuilds the product, its variants, attribute terms, and variant-attribute-mapping bridge in one transaction — avoiding round-trips for large variant grids.
@@ -6422,7 +6422,7 @@ The local Supabase stack is configured through `libs/db/src/supabase/config.toml
 | `db.shadow_port` | 54320 | Migration diff shadow DB |
 | `db.major_version` | 17 | PostgreSQL 17 |
 | `studio.port` | 54323 | Supabase Studio |
-| `inbucket.port` | 54324 | Local SMTP testing |
+| `local_smtp.port` | 54324 | Local SMTP testing (Mailpit; `[inbucket]` before Supabase CLI 3) |
 | `storage.file_size_limit` | 50 MiB | Object upload cap (repo uses R2 instead) |
 
 #### 6.2.8.2 Authentication Settings
@@ -10999,7 +10999,7 @@ Three Node.js scripts orchestrate package publication:
 
 1. Load `.env.local` / `.env`
 2. Validate env: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_PROJECT_ID`, `NEXT_PUBLIC_URL`, `SUPABASE_DB_PASSWORD` (extract from `POSTGRES_URL` if absent)
-3. `npx supabase link --project-ref ${SUPABASE_PROJECT_ID} --password ${dbPassword} --workdir libs/db/src`
+3. `npx supabase link --project-ref ${SUPABASE_PROJECT_ID} --workdir libs/db/src`
 4. `node tools/scripts/push-db-migrations.js --confirm --skip-link`
 5. `npx supabase config push --workdir libs/db/src`
 6. `node apps/nextblock/tools/configure-supabase-auth.js`
@@ -11478,7 +11478,7 @@ Documented gaps (per §6.4 and §6.5):
 
 | Resource | Minimum | Recommended |
 |:--|:--|:--|
-| Node.js | Node.js 22.12 (Vitest 5, Vite 8 and the create-nextblock CLI; supabase-js and AI SDK 7 need 22) | Node.js 22 LTS (the Docker image uses `node:22-alpine`) |
+| Node.js | Node.js 22.12 (Vitest 5, Vite 8 and the create-nextblock CLI; supabase-js and AI SDK 7 need 22) | Node.js 26 LTS (the Docker images use `node:26-alpine`; the monorepo's `.nvmrc` and CI run 26) |
 | npm | | |
 | Disk | ~10 GB for `node_modules` + `dist` + `.next` + Supabase local | SSD recommended |
 | Memory | 8 GB | 16 GB+ |
@@ -11778,7 +11778,7 @@ Cross-reference: Section 4.9 (CLI Scaffolding Workflows), Section 4.10 (License 
 | Database (Postgres) | 54322 |
 | Shadow database | 54320 |
 | Studio | 54323 |
-| Inbucket (mail catcher) | 54324 |
+| Mailpit (mail catcher, `[local_smtp]`) | 54324 |
 | Pooler (Supavisor) | 54329 |
 | Verdaccio (private registry) | 4873 |
 

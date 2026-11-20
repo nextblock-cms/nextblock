@@ -26,6 +26,9 @@ const {
   isCatchupMigration,
   validateMigrationNames,
 } = require('./lib/migration-naming');
+// Every Supabase CLI command comes from one module with an explicit `--remote=<ref>`: CLI 3 targets
+// the LOCAL stack when a script leaves the target out.
+const { PROJECT_REF_RE, linkArgs, migrationRepairArgs } = require('./lib/supabase-cli');
 
 function log(message, color = colors.reset) {
   console.log(`${color}${message}${colors.reset}`);
@@ -83,6 +86,10 @@ function requireEnv() {
 
   if (!process.env.SUPABASE_PROJECT_ID) {
     missing.push('SUPABASE_PROJECT_ID');
+  } else if (!PROJECT_REF_RE.test(process.env.SUPABASE_PROJECT_ID)) {
+    // The CLI would look any other value up as a branch name of the linked project.
+    log('SUPABASE_PROJECT_ID must be the project ref: exactly 20 lowercase letters (Project Settings → General).', colors.red);
+    process.exit(1);
   }
   if (!process.env.SUPABASE_ACCESS_TOKEN) {
     missing.push('SUPABASE_ACCESS_TOKEN');
@@ -97,6 +104,22 @@ function requireEnv() {
   }
 }
 
+/**
+ * The CLI's environment without `SUPABASE_YES`: one that dotenv copied in from `.env.local` would
+ * count as shell consent to CLI 3. Consent is the explicit `--yes` on each write, passed only after
+ * confirmDestructive().
+ */
+function cliEnv() {
+  const env = { ...process.env };
+  delete env.SUPABASE_YES;
+  return env;
+}
+
+/** The target of every CLI call here. requireEnv() has checked it is a 20-letter ref. */
+function projectRef() {
+  return process.env.SUPABASE_PROJECT_ID;
+}
+
 function run(command, commandArgs) {
   const dbPassword = getDbPassword();
   const printable = [command, ...commandArgs.map((arg) => {
@@ -109,7 +132,7 @@ function run(command, commandArgs) {
   log(`Running: ${printable}`, colors.blue);
   const result = spawnSync(command, commandArgs, {
     cwd: repoRoot,
-    env: process.env,
+    env: cliEnv(),
     shell: process.platform === 'win32',
     stdio: 'inherit',
   });
@@ -126,25 +149,6 @@ function run(command, commandArgs) {
 
 function supabase(commandArgs) {
   run(npxBin, ['supabase', ...commandArgs]);
-}
-
-/** Like run(), but returns the output (null on failure) instead of inheriting stdio. */
-function runCapture(command, commandArgs) {
-  const dbPassword = getDbPassword();
-  const printable = [command, ...commandArgs.map((arg) => (arg === dbPassword ? '<db-password>' : arg))].join(' ');
-  log(`Running: ${printable}`, colors.blue);
-  const result = spawnSync(command, commandArgs, {
-    cwd: repoRoot,
-    env: process.env,
-    shell: process.platform === 'win32',
-    stdio: 'pipe',
-    encoding: 'utf8',
-  });
-  if (result.error || result.status !== 0) {
-    if (result.stderr) process.stderr.write(result.stderr);
-    return null;
-  }
-  return `${result.stdout || ''}${result.stderr || ''}`;
 }
 
 /** The catch-up file names the last version it replays in a header line. */
@@ -313,7 +317,7 @@ async function reconcileSquash({ dbPassword, isCheck, confirmed, assumeYes, migr
     process.exit(1);
   }
 
-  supabase(['link', '--project-ref', process.env.SUPABASE_PROJECT_ID, '--password', dbPassword, '--workdir', workdir, '--yes']);
+  supabase(linkArgs({ workdir, projectRef: projectRef() }));
 
   // Additive write FIRST, destructive write second. `--status` takes one value, so these cannot
   // be a single call, and run() exits the process on a non-zero status — an expired token or a
@@ -322,10 +326,10 @@ async function reconcileSquash({ dbPassword, isCheck, confirmed, assumeYes, migr
   // re-running recomputes markApplied from `pending` idempotently. The other order would leave
   // the retired rows gone with the catch-up still pending, which arms a full-generation replay.
   if (markApplied.length > 0) {
-    supabase(['migration', 'repair', ...markApplied, '--status', 'applied', '--password', dbPassword, '--workdir', workdir, '--yes']);
+    supabase(migrationRepairArgs({ versions: markApplied, status: 'applied', workdir, projectRef: projectRef(), password: dbPassword }));
   }
   if (retired.length > 0) {
-    supabase(['migration', 'repair', ...retired, '--status', 'reverted', '--password', dbPassword, '--workdir', workdir, '--yes']);
+    supabase(migrationRepairArgs({ versions: retired, status: 'reverted', workdir, projectRef: projectRef(), password: dbPassword }));
   }
   log('Squash recorded. Run `npm run db:migrate:check` next.', colors.green);
 }
@@ -581,8 +585,8 @@ async function revertVersions({ dbPassword, isCheck, confirmed, assumeYes, migra
     process.exit(1);
   }
 
-  supabase(['link', '--project-ref', process.env.SUPABASE_PROJECT_ID, '--password', dbPassword, '--workdir', workdir, '--yes']);
-  supabase(['migration', 'repair', ...versions, '--status', 'reverted', '--password', dbPassword, '--workdir', workdir, '--yes']);
+  supabase(linkArgs({ workdir, projectRef: projectRef() }));
+  supabase(migrationRepairArgs({ versions, status: 'reverted', workdir, projectRef: projectRef(), password: dbPassword }));
 
   // Re-read rather than assume. The CLI exits 0 for a version it did not actually remove, and
   // "it said Repaired" is what makes an operator move on to the next, destructive step.
@@ -792,23 +796,18 @@ async function readBaselineGeneration() {
 
 /**
  * One read of the remote history, shared by the router and the reconcile. Null when unreadable.
- * `--output-format json` matches push-db-migrations.js: the same form in a terminal and in an
- * agent session (CLI 2.109+ switches to JSON when it detects an agent).
+ * It is the same read `npm run db:migrate:check` makes (push-db-migrations.js): `migration list
+ * --remote=<ref> --output-format json`, refused unless the CLI's `target` is this project, so a
+ * local database's history can never steer a repair of the remote one.
  */
 function readRemoteStatus(dbPassword) {
-  const { parseMigrationList } = require('./push-db-migrations.js');
-  const listing = runCapture(npxBin, [
-    'supabase',
-    'migration',
-    'list',
-    '--workdir',
-    workdir,
-    '--password',
-    dbPassword,
-    '--output-format',
-    'json',
-  ]);
-  return listing ? parseMigrationList(listing) : null;
+  const { readMigrationStatus } = require('./push-db-migrations.js');
+  const { status, error } = readMigrationStatus({ projectRef: projectRef(), dbPassword });
+  if (!status) {
+    log(error, colors.red);
+    return null;
+  }
+  return status;
 }
 
 async function main() {
@@ -969,29 +968,11 @@ async function main() {
     process.exit(1);
   }
 
-  supabase([
-    'link',
-    '--project-ref',
-    process.env.SUPABASE_PROJECT_ID,
-    '--password',
-    dbPassword,
-    '--workdir',
-    workdir,
-    '--yes',
-  ]);
+  supabase(linkArgs({ workdir, projectRef: projectRef() }));
 
-  supabase([
-    'migration',
-    'repair',
-    ...versionsToMark,
-    '--status',
-    'applied',
-    '--password',
-    dbPassword,
-    '--workdir',
-    workdir,
-    '--yes',
-  ]);
+  supabase(
+    migrationRepairArgs({ versions: versionsToMark, status: 'applied', workdir, projectRef: projectRef(), password: dbPassword }),
+  );
 
   log('Migration history repaired. Run `npm run db:migrate:check` next.', colors.green);
 }

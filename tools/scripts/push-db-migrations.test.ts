@@ -4,27 +4,21 @@ import { describe, expect, it } from 'vitest';
 // so importing here never opens a database connection.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const {
+  cliEnv,
   getMigrationVersion,
   isBaselineMigration,
-  isUnknownOutputFormatFlag,
   parseMigrationList,
+  runCheck,
+  workdir,
 } = require('./push-db-migrations.js');
 
-describe('isUnknownOutputFormatFlag', () => {
-  // A CLI older than 2.107 (a stale node_modules) rejects the JSON flag; the check must
-  // notice that specific refusal and retry the plain read-only command, nothing else.
-  it('recognises the pre-2.107 refusal of --output-format', () => {
-    const usage = 'Usage:\n  supabase migration list [flags]\n\nunknown flag: --output-format\nTry rerunning the command with --debug to troubleshoot the error.\n';
-    expect(isUnknownOutputFormatFlag(usage)).toBe(true);
-  });
+type Versions = { applied: string[]; pending: string[]; remoteOnly: string[] };
 
-  it('ignores every other failure', () => {
-    expect(isUnknownOutputFormatFlag('Cannot find project ref. Have you run supabase link?')).toBe(false);
-    expect(isUnknownOutputFormatFlag('failed to connect to postgres: password authentication failed')).toBe(false);
-    expect(isUnknownOutputFormatFlag('')).toBe(false);
-    expect(isUnknownOutputFormatFlag(undefined)).toBe(false);
-  });
-});
+/** The three version lists, without the `target` the parser also reports. */
+function versionsOf(status: Versions | null): Versions | null {
+  if (!status) return status;
+  return { applied: status.applied, pending: status.pending, remoteOnly: status.remoteOnly };
+}
 
 /**
  * These cover the migration-status parser that replaced `link` + `db push --dry-run`
@@ -205,20 +199,20 @@ describe('parseMigrationList with CLI 2.109+ output', () => {
   ];
 
   it('strips backticks from table cells', () => {
-    expect(parseMigrationList(BACKTICK_TABLE.join('\n'))).toEqual(EXPECTED_MIXED);
+    expect(versionsOf(parseMigrationList(BACKTICK_TABLE.join('\n')))).toEqual(EXPECTED_MIXED);
   });
 
   it('reads a backtick table captured with CRLF line endings', () => {
-    expect(parseMigrationList(BACKTICK_TABLE.join('\r\n'))).toEqual(EXPECTED_MIXED);
+    expect(versionsOf(parseMigrationList(BACKTICK_TABLE.join('\r\n')))).toEqual(EXPECTED_MIXED);
   });
 
   it('reads the JSON line and ignores the stderr lines appended after it', () => {
-    expect(parseMigrationList(JSON_OUTPUT.join('\n'))).toEqual(EXPECTED_MIXED);
+    expect(versionsOf(parseMigrationList(JSON_OUTPUT.join('\n')))).toEqual(EXPECTED_MIXED);
   });
 
   it('reads the JSON line when stderr chatter comes first and lines end in CRLF', () => {
     const output = ['Using workdir C:\\repo\\libs\\db\\src', ...JSON_OUTPUT].join('\r\n');
-    expect(parseMigrationList(output)).toEqual(EXPECTED_MIXED);
+    expect(versionsOf(parseMigrationList(output))).toEqual(EXPECTED_MIXED);
   });
 
   it('treats an empty JSON migrations list as a real, empty history', () => {
@@ -227,6 +221,7 @@ describe('parseMigrationList with CLI 2.109+ output', () => {
       applied: [],
       pending: [],
       remoteOnly: [],
+      target: null,
     });
   });
 
@@ -270,10 +265,175 @@ describe('baseline guard', () => {
       '   02000          |                | 02000          ',
       '   02004          |                | 02004          ',
     ].join('\n');
-    expect(parseMigrationList(output)).toEqual({
+    expect(versionsOf(parseMigrationList(output))).toEqual({
       applied: [],
       pending: ['02000', '02004'],
       remoteOnly: ['00000000000000', '00000000000042'],
     });
+  });
+});
+
+// Captured from Supabase CLI 3.2.0 against a disposable local stack (2026-11-20), the migrations
+// list trimmed to a few rows. The keys stay `local` / `remote` whichever database the CLI read:
+// only `target` tells the local stack from the project.
+const CLI3_LOCAL_JSON = [
+  '{"migrations":[{"local":"02000","remote":"02000","time":"02000"},{"local":"02047","remote":"02047","time":"02047"},{"local":"02048","remote":"","time":"02048"}],"message":"Migrations listed","target":{"kind":"local","host":"127.0.0.1","port":55522}}',
+  'Target: local stack (127.0.0.1:55522)',
+].join('\n');
+const CLI3_URL_JSON = [
+  '{"migrations":[{"local":"02000","remote":"02000","time":"02000"}],"message":"Migrations listed","target":{"kind":"db-url","host":"127.0.0.1","port":55522}}',
+  'Target: custom Postgres (127.0.0.1:55522)',
+].join('\n');
+const CLI3_LOCAL_TABLE = [
+  'Target: local stack (127.0.0.1:55522)',
+  '',
+  '  ',
+  '   Local   | Local DB | Time (UTC) ',
+  '  ---------|----------|------------',
+  '   `02000` | `02000`  | `02000`    ',
+  '   `02048` | ` `      | `02048`    ',
+].join('\n');
+const REF = 'abcdefghijklmnopqrst';
+
+/** The `--remote=<ref>` shape: the target object as CLI 3.2.0 printed it for a project ref. */
+function cli3ProjectJson(projectRef: string): string {
+  return [
+    JSON.stringify({
+      migrations: [
+        { local: '', remote: '01999', time: '01999' },
+        { local: '02000', remote: '02000', time: '02000' },
+        { local: '02006', remote: '', time: '02006' },
+      ],
+      message: 'Migrations listed',
+      target: { kind: 'linked', project_ref: projectRef, environment: 'production' },
+    }),
+    `Target: project nextblock (${projectRef}) · production`,
+  ].join('\n');
+}
+
+describe('parseMigrationList with CLI 3 output', () => {
+  it('reports the target the CLI read alongside the versions', () => {
+    expect(parseMigrationList(cli3ProjectJson(REF))).toEqual({
+      ...EXPECTED_MIXED,
+      target: { kind: 'linked', project_ref: REF, environment: 'production' },
+    });
+    expect(parseMigrationList(CLI3_LOCAL_JSON)).toEqual({
+      applied: ['02000', '02047'],
+      pending: ['02048'],
+      remoteOnly: [],
+      target: { kind: 'local', host: '127.0.0.1', port: 55522 },
+    });
+    expect(parseMigrationList(CLI3_URL_JSON).target).toEqual({ kind: 'db-url', host: '127.0.0.1', port: 55522 });
+  });
+
+  it('reads the "Local DB" column CLI 3 prints for the local stack, and marks it local', () => {
+    expect(parseMigrationList(CLI3_LOCAL_TABLE)).toEqual({
+      applied: ['02000'],
+      pending: ['02048'],
+      remoteOnly: [],
+      target: { kind: 'local' },
+    });
+  });
+});
+
+/**
+ * `npm run db:migrate:check` must stay read-only by construction (AGENTS.md; docs/04 → "Why
+ * `db:migrate:check` is read-only"): on 2026-08-10 the check path's `link` + `db push --dry-run`
+ * applied a migration to production. These run the whole check path with a recording runner and
+ * pin every Supabase CLI call it makes.
+ */
+describe('the db:migrate:check call sequence', () => {
+  type Call = { args: string[]; options: Record<string, unknown> };
+
+  function record(output: string, failed = false) {
+    const calls: Call[] = [];
+    const runSupabase = (args: string[], options: Record<string, unknown>) => {
+      calls.push({ args, options });
+      return { failed, output };
+    };
+    return { calls, runSupabase };
+  }
+
+  it('makes exactly one CLI call: migration list against --remote=<ref>, as JSON', () => {
+    const { calls, runSupabase } = record(cli3ProjectJson(REF));
+    const result = runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase });
+
+    expect(calls.map((call) => call.args)).toEqual([
+      ['migration', 'list', '--workdir', workdir, `--remote=${REF}`, '--password', 'pw', '--output-format', 'json'],
+    ]);
+    expect(calls[0].options).toMatchObject({ allowFailure: true, capture: true });
+    expect(result.error).toBeUndefined();
+    expect(result.status.pending).toEqual(['02006']);
+  });
+
+  it('passes nothing that links, pushes, repairs, confirms or dry-runs', () => {
+    const { calls, runSupabase } = record(cli3ProjectJson(REF));
+    runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase });
+    const argv = calls.flatMap((call) => call.args);
+    for (const forbidden of ['link', 'push', 'repair', 'reset', 'db', '--yes', '--dry-run', '--include-all', '--linked', '--db-url', '--local']) {
+      expect(argv).not.toContain(forbidden);
+    }
+    // The password keeps CLI 3 from minting a temporary login role through the Management API.
+    expect(argv).toContain('--password');
+  });
+
+  it('refuses a history the CLI read from the local stack, even one that parses', () => {
+    for (const output of [CLI3_LOCAL_JSON, CLI3_LOCAL_TABLE]) {
+      const { calls, runSupabase } = record(output);
+      const result = runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase });
+      expect(result.status).toBeUndefined();
+      expect(result.error).toMatch(/LOCAL database/);
+      expect(calls).toHaveLength(1);
+    }
+  });
+
+  it('refuses another project, a database URL and a history with no target', () => {
+    const cases: Array<[string, RegExp]> = [
+      [cli3ProjectJson('zzzzzzzzzzzzzzzzzzzz'), /zzzzzzzzzzzzzzzzzzzz, not abcdefghijklmnopqrst/],
+      [CLI3_URL_JSON, /db-url/],
+      ['{"migrations":[{"local":"02000","remote":"02000","time":"02000"}],"message":"Migrations listed"}', /did not say/],
+    ];
+    for (const [output, reason] of cases) {
+      const { runSupabase } = record(output);
+      const result = runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase });
+      expect(result.status).toBeUndefined();
+      expect(result.error).toMatch(reason);
+    }
+  });
+
+  it('reports a pre-3.0 CLI as "run npm ci" and does not retry with an implicit target', () => {
+    const { calls, runSupabase } = record('unknown flag: --remote=abcdefghijklmnopqrst', true);
+    const result = runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase });
+    expect(result.error).toMatch(/npm ci/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("surfaces the CLI's own error from its JSON envelope", () => {
+    const { runSupabase } = record(
+      '{"target":{"kind":"linked","project_ref":"abcdefghijklmnopqrst","environment":"unverified"},"_tag":"Error","error":{"code":"DbConfigIpv6Error","message":"IPv6 is not supported on your current network"}}',
+      true,
+    );
+    expect(runCheck({ projectRef: REF, dbPassword: 'pw', runSupabase }).error).toMatch(/DbConfigIpv6Error/);
+  });
+
+  it('runs the CLI without SUPABASE_YES, so a value dotenv copied from .env.local is no consent', () => {
+    const before = process.env.SUPABASE_YES;
+    process.env.SUPABASE_YES = '1';
+    try {
+      const env = cliEnv();
+      expect(env).not.toHaveProperty('SUPABASE_YES');
+      expect(env.PATH ?? env.Path).toBeDefined();
+      expect(process.env.SUPABASE_YES).toBe('1');
+    } finally {
+      if (before === undefined) delete process.env.SUPABASE_YES;
+      else process.env.SUPABASE_YES = before;
+    }
+  });
+
+  it('builds no command at all for a malformed ref or an empty password', () => {
+    const { calls, runSupabase } = record(cli3ProjectJson(REF));
+    expect(() => runCheck({ projectRef: 'nextblock-ci', dbPassword: 'pw', runSupabase })).toThrow(/20 lowercase letters/);
+    expect(() => runCheck({ projectRef: REF, dbPassword: '', runSupabase })).toThrow(/password/);
+    expect(calls).toHaveLength(0);
   });
 });

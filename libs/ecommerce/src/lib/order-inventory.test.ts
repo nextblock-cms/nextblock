@@ -119,3 +119,12 @@ describe('the inventory rows applyOrderInventoryDeductionViaSql takes before ded
     expect(source.match(/public\.inventory_items/g)).toHaveLength(2);
   });
 });
+
+describe('the connection applyOrderInventoryDeductionViaSql opens', () => {
+  it("goes through resolvePostgresFactory, so this library's CommonJS build finds postgres 4's factory", () => {
+    const source = fallbackSource();
+    // The .cjs build's default import of postgres 4 is the module namespace (postgres-factory.ts).
+    expect(source).toContain('resolvePostgresFactory(postgres)(dbUrl, {');
+    expect(source.match(/\bpostgres\(/g) ?? []).toHaveLength(0);
+  });
+});

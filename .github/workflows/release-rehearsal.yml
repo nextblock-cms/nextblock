@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 26
           cache: npm
       - run: npm ci
       # bin/ and scripts/ only: the bare apps/create-nextblock path also collects the template's

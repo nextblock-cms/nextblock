@@ -1718,24 +1718,94 @@ probe would have written a row to the production migration history.
 now runs only `supabase migration list` — a pure read — and derives the pending set
 by diffing local files against remote history. Consequences worth keeping:
 
-- The check links nothing. An unlinked repo is told to run `supabase link` itself
+- The check links nothing. An unlinked repo is told to run `npm run db:link` itself
   rather than having project state written underneath a command called "check".
-- The check needs no `SUPABASE_ACCESS_TOKEN`, because only linking did.
+- The check needs no `SUPABASE_ACCESS_TOKEN`, because only linking did. (On a network
+  without IPv6, Supabase CLI 3 reaches the database through the pooler URL the link saved in
+  `libs/db/src/supabase/.temp/`, or looks it up with the token when there is none.)
 - The apply path derives its baseline-replay guard from the same read instead of
   regex-scraping `db push --dry-run` output, and returns early when nothing is
   pending, so `db push` is never invoked without work to do.
-- The read is `supabase migration list --output-format json`, and `parseMigrationList`
-  reads the JSON line first, then falls back to the text table. Supabase CLI 2.109
-  changed that command's output twice over: the text table wraps every cell in
-  backticks, and a detected coding agent (`CLAUDECODE`/`AI_AGENT`) gets JSON by
-  default. The old parser read the first as "0 pending" (so `db:migrate` said
-  "Nothing to apply" with migrations outstanding) and failed the second as "never been
-  linked". Output the parser cannot recognise returns `null`, never an empty history.
-  `repair-db-migration-history.js` reuses the same parser and flag.
-- `parseMigrationList` is unit-tested in `tools/scripts/push-db-migrations.test.ts`.
+- The read is exactly one command, built by `migrationListArgs`
+  (`tools/scripts/lib/supabase-cli.js`):
+  `supabase migration list --workdir libs/db/src --remote=<SUPABASE_PROJECT_ID> --password <pw> --output-format json`.
+  No `--yes`, and the child environment drops `SUPABASE_YES`. `--remote=<ref>` is required
+  since Supabase CLI 3, which reads the LOCAL stack when a command names no target (next
+  section). `--password` keeps CLI 3 from minting a temporary login role through the
+  Management API; the scripts refuse an empty one.
+- The read is refused unless the CLI's own JSON says it read this project
+  (`migrationListTargetProblem`): `target` must be `{"kind":"linked","project_ref":"<SUPABASE_PROJECT_ID>"}`.
+  A local stack's history comes back with the same `local`/`remote` keys, so without this
+  check it would read as the production history. A missing `target`, a database URL and
+  another project are refused the same way.
+- `parseMigrationList` reads the JSON line first, then falls back to the text table (whose
+  database column CLI 3 heads `Local DB` for the local stack, parsed as `target: local`).
+  Supabase CLI 2.109 had changed that command's output twice over: the text table wraps
+  every cell in backticks, and a detected coding agent (`CLAUDECODE`/`AI_AGENT`) gets JSON
+  by default. The old parser read the first as "0 pending" (so `db:migrate` said "Nothing to
+  apply" with migrations outstanding) and failed the second as "never been linked". Output
+  the parser cannot recognise returns `null`, never an empty history.
+  `repair-db-migration-history.js` reuses the same read (`readMigrationStatus`).
+- `tools/scripts/push-db-migrations.test.ts` (in `security:check`) runs the whole check path
+  with a recording runner and pins every CLI call it makes: one `migration list`, that argv,
+  nothing that links, pushes, repairs or confirms. It also holds the parser to output captured
+  from CLI 3.2.0.
 
 If a future CLI upgrade tempts you back toward `db push --dry-run` for previewing:
 don't. A command named `check` must not be able to write.
+
+#### Supabase CLI 3: every command names its target
+
+The monorepo pins `supabase` ^3.2.0 (root `package.json`; create-nextblock writes the same range
+into each new scaffold). CLI 3 changed four things the database scripts depend on:
+
+1. **Local by default.** `db push`, `db pull`, `db dump`, `migration list`/`repair`/`fetch`,
+   `gen types` and `storage *` act on the LOCAL stack unless given `--remote`, and the CLI never
+   falls back between local and remote. Hosted-only commands (`config push`, `functions deploy`,
+   `link`) still act on the linked project. `--linked`, `--project-ref` and `--db-url` are
+   deprecated aliases (removed in v4).
+2. **Consent.** Every hosted write needs `--yes` (or `SUPABASE_YES` exported in the shell) when it
+   cannot prompt; Enter now means No; a piped `y` and a `SUPABASE_YES` in a `.env` file no longer
+   confirm. Reads (`migration list`, `gen types`) never ask.
+3. **Env files and precedence.** Flag > shell env > project `.env*` > `config.toml`. The CLI reads
+   `.env.development.local`, `.env.local`, `.env.development` and `.env` from `<workdir>/supabase/`
+   and `<workdir>/`, and any `SUPABASE_<PATH>` variable overrides that config key (`config push`
+   pushes the overridden value).
+4. **Config.** `[inbucket]` is refused (renamed `[local_smtp]`); `[auth.email]` / `[auth.sms]`
+   `enable_signup` is deprecated for `enabled` (same meaning). `libs/db/src/supabase/config.toml`
+   carries the new names; `npx supabase config validate --workdir libs/db/src` checks it.
+
+How the scripts answer each:
+
+| Caller | Command | Target |
+| :-- | :-- | :-- |
+| `db:migrate:check`, `db:migrate`, `db:migrate:fresh`, `db:migrate:repair-history*` | `migration list`, `db push`, `migration repair` | `--remote=<SUPABASE_PROJECT_ID>` with `--password`; writes add `--yes`, after the scripts' own `--confirm` / prompt |
+| the same, before a write; `db:link`; `deploy:supabase` | `link --project-ref <ref> --workdir libs/db/src` | the ref (CLI 3's `link` ignores `--password`, which the scripts no longer pass) |
+| `db:types` | `gen types --lang typescript --schema public --remote=<ref>` | the ref, from the repo root with no `--workdir`: with no link there the CLI generates through the Management API, as CLI 2's `--project-id` did (a database target generates locally and unformatted) |
+| `deploy:supabase` | `config push --workdir libs/db/src --remote=<ref> --yes` | the ref |
+| `db:push:sandbox`, `db:repair`, `db:functions` (raw npm one-liners) | `db push`, `config push`, `functions deploy`, `migration repair` | bare `--remote`, last: `SUPABASE_PROJECT_ID` (from `.env.local`), else the link file, which is what CLI 2 picked by default. No `--yes`: run by hand, they ask |
+| `db:reset` | `db reset` | the local stack, by design (never run it against a shared database) |
+| CI (`security.yml`) | `start` / `stop --no-backup` on a disposable stack | local; unchanged |
+
+`tools/scripts/lib/supabase-cli.js` builds every command the scripts run, and checks
+`SUPABASE_PROJECT_ID` first: CLI 3 looks a `--remote=` or `link` value that is not 20 lowercase
+letters up as a BRANCH NAME of whatever project the directory is linked to.
+`tools/scripts/supabase-cli.test.ts` (in `security:check`) pins those argvs and fails on any npm
+script that runs a database or hosted CLI command without `--remote` (`db:reset` excepted).
+
+The root `.env.local` reaches the CLI through the scripts' environment (dotenv, `dotenv run`), so
+its variables count as shell values. Of its `SUPABASE_*` names only `SUPABASE_PROJECT_ID` maps to a
+config key (`project_id`, which `config.toml` already reads through `env()`); the CLI reads no
+`.env*` file itself under `libs/db/src`. A scaffold is different: its workdir is the project root,
+so CLI 3 reads its `.env.local` directly, where `SUPABASE_AUTH_RATE_LIMIT_EMAIL_SENT=30` overrides
+`auth.rate_limit.email_sent` (also 30 in `config.toml`).
+
+What could not be rehearsed locally is a hosted target itself. On the first real
+`npm run db:migrate:check` after the upgrade, the CLI's stderr line should read
+`Target: project <name> (<SUPABASE_PROJECT_ID>) · production`; the script refuses anything else.
+The first `npm run db:types` should rewrite `types.ts` in the usual formatted shape, with its
+`__InternalSupabase` block; an unformatted file means the CLI generated from the database directly
+instead of through the Management API.
 
 ### How to read the folder
 

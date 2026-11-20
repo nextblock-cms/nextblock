@@ -287,12 +287,37 @@ function expectSameDom(html: string): void {
 }
 
 /**
+ * `innerHTML` as browsers serialized it before the 2025 HTML change that escapes `<` and `>` in
+ * attribute values (Chrome 138; parse5 8.1, so jsdom 31's own serializer does it too). Browsers
+ * from before it are still in use and keep them raw, which is what lets markup change namespace
+ * across a round trip, so the round trips below serialize this way: the sanitizer has to hold on
+ * the weakest serializer, not on the test DOM's. Attribute values carry `<` and `>` as private-use
+ * stand-ins through the real serializer, which writes them as they are, and get them back after.
+ */
+function legacyInnerHtml(root: Element): string {
+  const LT = '';
+  const GT = '';
+  const mark = (node: Element | DocumentFragment): void => {
+    for (const element of Array.from(node.querySelectorAll('*'))) {
+      for (const attribute of Array.from(element.attributes)) {
+        if (/[<>]/.test(attribute.value)) attribute.value = attribute.value.replace(/</g, LT).replace(/>/g, GT);
+      }
+      if (element instanceof HTMLTemplateElement) mark(element.content);
+    }
+  };
+  mark(root);
+  return root.innerHTML.replace(//g, '<').replace(//g, '>');
+}
+
+/**
  * The browser's own round trip on sanitized block HTML: parse it into the page, serialize the
  * authored subtree, parse that again (the editor's getHTML, a preview). Serializing keeps `<` in
- * attribute values, so markup that changes namespace between the two parses shows up here.
+ * attribute values (`legacyInnerHtml`), so markup that changes namespace between the two parses
+ * shows up here.
  */
 function roundTrip(sanitized: string): Document {
-  return parseInPage(parseInPage(sanitized).querySelector('.authored')?.innerHTML ?? '');
+  const authored = parseInPage(sanitized).querySelector('.authored');
+  return parseInPage(authored ? legacyInnerHtml(authored) : '');
 }
 
 /** SvgNode's round trip: the markup assigned into an <svg>, serialized with its host, parsed again. */
@@ -301,7 +326,7 @@ function svgRoundTrip(markup: string): Document {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.innerHTML = markup;
   host.appendChild(svg);
-  return parseInPage(host.innerHTML);
+  return parseInPage(legacyInnerHtml(host));
 }
 
 describe('the allowlist (2026-11-04)', () => {

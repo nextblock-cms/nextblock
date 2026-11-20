@@ -73,9 +73,10 @@ api_url = "http://127.0.0.1"
 # OpenAI API Key to use for Supabase AI in the Supabase Studio.
 openai_api_key = "env(OPENAI_API_KEY)"
 
-# Email testing server. Emails sent with the local dev setup are not actually sent - rather, they
-# are monitored, and you can view the emails that would have been sent from the web interface.
-[inbucket]
+# Email testing server (Mailpit). Emails sent with the local dev setup are not actually sent - rather,
+# they are monitored, and you can view the emails that would have been sent from the web interface.
+# Supabase CLI 3 renamed this section from [inbucket] and refuses the old name.
+[local_smtp]
 enabled = true
 # Port to use for the email testing server web interface.
 port = 54324
@@ -148,8 +149,9 @@ token_verifications = 30
 # secret = ""
 
 [auth.email]
-# Allow/disallow new user signups via email to your project.
-enable_signup = true
+# Allow/disallow the email provider (sign-up and sign-in with email). [auth] enable_signup above
+# blocks new signups only. CLI 3 renamed this key from enable_signup.
+enabled = true
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
@@ -170,7 +172,7 @@ otp_expiry = 3600
 # For local/self-hosted Supabase, uncomment this block and set the SMTP_* env vars — note
 # that `port` must resolve to a valid number, so an unset SMTP_PORT breaks `supabase db push`.
 # Left commented by default so a hosted `npm run db:migrate` (which does not push config) works
-# with no SMTP env vars set; local dev falls back to the Inbucket test inbox.
+# with no SMTP env vars set; local dev falls back to the Mailpit test inbox ([local_smtp]).
 # [auth.email.smtp]
 # host = "env(SMTP_HOST)"
 # port = "env(SMTP_PORT)"
@@ -204,8 +206,9 @@ subject = "Confirm it's you"
 content_path = "./supabase/templates/reauthentication.html"
 
 [auth.sms]
-# Allow/disallow new user signups via SMS to your project.
-enable_signup = false
+# Allow/disallow the phone provider (sign-up and sign-in with a phone number). CLI 3 renamed this key
+# from enable_signup.
+enabled = false
 # If enabled, users need to confirm their phone number before signing in.
 enable_confirmations = false
 # Template for sending OTP to users

@@ -1,21 +1,26 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
+import { collectMigrations } from './migrate-core.mjs';
 import { RETIRED_MIGRATIONS, retiredMigrationFilesIn } from './retired-migrations.mjs';
 
+// The migration folder, found from this file as collectMigrations finds it (the monorepo's libs/db, from
+// here and from the CLI template's copy of this file, which `vitest run ... tools` also collects): a
+// path relative to this file reaches libs/db from apps/nextblock only.
 const here = path.dirname(fileURLToPath(import.meta.url));
-const MIGRATIONS_DIR = path.resolve(here, '../../../../libs/db/src/supabase/migrations');
-const CURRENT = readdirSync(MIGRATIONS_DIR).filter((name) => /^\d+_.*\.sql$/.test(name)).sort();
+const MIGRATIONS = collectMigrations(here).files;
+const CURRENT = MIGRATIONS.map((entry) => entry.name).sort();
 const GENERATION = Number.parseInt(CURRENT[CURRENT.length - 1].slice(0, 2), 10);
 const CATCHUP = CURRENT.find((name) => /^\d{2}000_catchup_gen\d+\.sql$/.test(name));
+const CATCHUP_DIR = MIGRATIONS.find((entry) => entry.name === CATCHUP)?.dir;
 const ALL_RETIRED = RETIRED_MIGRATIONS.flatMap((entry) => entry.files);
 
 describe('the retired migration list', () => {
   it('names every file the current catch-up replays, so a squash cannot forget its own', () => {
     expect(CATCHUP).toBeDefined();
-    const replayed = [...readFileSync(path.join(MIGRATIONS_DIR, CATCHUP), 'utf8').matchAll(/^\s*-- >>> FROM: (\S+\.sql)$/gm)].map((match) => match[1]);
+    const replayed = [...readFileSync(path.join(CATCHUP_DIR, CATCHUP), 'utf8').matchAll(/^\s*-- >>> FROM: (\S+\.sql)$/gm)].map((match) => match[1]);
     expect(replayed.length).toBeGreaterThan(0);
     const listed = new Set(RETIRED_MIGRATIONS.filter((entry) => entry.retiredBy <= GENERATION).flatMap((entry) => entry.files));
     expect(replayed.filter((name) => !listed.has(name))).toEqual([]);

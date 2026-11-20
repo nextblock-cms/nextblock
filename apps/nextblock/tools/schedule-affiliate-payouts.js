@@ -259,7 +259,8 @@ async function main() {
   const dbUrl = options.db || process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL || process.env.DATABASE_URL;
   if (!dbUrl) fail('No database URL: set POSTGRES_URL_NON_POOLING (or POSTGRES_URL) or pass --db=...');
 
-  const postgres = require('postgres');
+  // postgres 4 is an ES module: require() of it returns the namespace, not the function.
+  const { default: postgres } = await import('postgres');
   const sql = postgres(dbUrl, {
     max: 1,
     ssl: isLocalDatabaseUrl(dbUrl) ? false : 'require',

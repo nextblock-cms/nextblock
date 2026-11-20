@@ -2,6 +2,7 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
+const { assertProjectRef, configPushArgs, linkArgs } = require('./lib/supabase-cli');
 
 const colors = {
   reset: '\x1b[0m',
@@ -49,6 +50,13 @@ function checkEnv() {
   }
   if (!process.env.SUPABASE_PROJECT_ID) {
     missing.push('SUPABASE_PROJECT_ID');
+  } else {
+    try {
+      assertProjectRef(process.env.SUPABASE_PROJECT_ID);
+    } catch (error) {
+      console.error(`${colors.red}${error.message}${colors.reset}`);
+      process.exit(1);
+    }
   }
   if (!process.env.NEXT_PUBLIC_URL) {
     missing.push('NEXT_PUBLIC_URL');
@@ -99,12 +107,12 @@ async function deploy() {
     process.exit(1);
   }
 
-  const workDirFlag = '--workdir libs/db/src';
+  // Every CLI call names the project: Supabase CLI 3 targets the LOCAL stack when a database
+  // command is given no --remote (lib/supabase-cli.js). The ref was validated in checkEnv().
+  const target = { workdir: 'libs/db/src', projectRef: process.env.SUPABASE_PROJECT_ID };
 
   console.log(`${colors.green}Linking to Supabase project...${colors.reset}`);
-  runCommand(
-    `npx supabase link --project-ref ${process.env.SUPABASE_PROJECT_ID} --password ${dbPassword} ${workDirFlag} --yes`,
-  );
+  runCommand(['npx', 'supabase', ...linkArgs(target)].join(' '));
 
   console.log(
     `${colors.green}Pushing database migrations...${colors.reset}`,
@@ -114,7 +122,7 @@ async function deploy() {
   console.log(
     `${colors.green}Pushing Supabase config (Site URL: ${process.env.NEXT_PUBLIC_URL})...${colors.reset}`,
   );
-  runCommand(`npx supabase config push ${workDirFlag} --yes`);
+  runCommand(['npx', 'supabase', ...configPushArgs(target)].join(' '));
 
   console.log(
     `${colors.green}Syncing Supabase Auth SMTP + email templates...${colors.reset}`,

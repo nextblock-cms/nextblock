@@ -8,6 +8,7 @@ import {
   ECOMMERCE_INVENTORY_SETTINGS_KEY,
   normalizeEcommerceInventorySettings,
 } from './inventory-settings';
+import { resolvePostgresFactory } from './postgres-factory';
 
 type PostgresSql = postgres.Sql<Record<string, never>>;
 
@@ -38,7 +39,8 @@ async function applyOrderInventoryDeductionViaSql(orderId: string) {
     throw new Error('Missing POSTGRES_URL or DATABASE_URL for inventory fallback');
   }
 
-  const db = postgres(dbUrl, {
+  // The factory, also from this library's CommonJS build (postgres 4 is an ES module: postgres-factory.ts).
+  const db = resolvePostgresFactory(postgres)(dbUrl, {
     ssl: 'require',
     onnotice: () => {
       // Silence Postgres notices during best-effort reconciliation.

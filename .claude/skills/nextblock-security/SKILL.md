@@ -12,7 +12,7 @@ the gates pass and every checklist line that applies has been answered.
 ## 1. Run the gates
 
 ```bash
-npm run security:check        # service-role boundary, action actors, sandbox guards, HTML sinks, migration lint, posture runner guard, grant-pass lockstep, generated migration copies (~20 s)
+npm run security:check        # service-role boundary, action actors, sandbox guards, HTML sinks, migration lint, posture runner guard, grant-pass lockstep, generated migration copies, Supabase CLI targets (~20 s)
 npx vitest run <paths you touched>
 ```
 
