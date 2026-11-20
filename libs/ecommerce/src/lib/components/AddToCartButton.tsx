@@ -25,6 +25,8 @@ interface AddToCartButtonProps {
   affiliateRef?: string | null;
   /** Partner handle: the product-page links this button renders carry `?ref=<handle>`. */
   referralHandle?: string | null;
+  /** The add button's text in place of "Add to cart" ("Add Commerce Pro to cart" in an add-on notice). */
+  label?: string;
 }
 
 /** A partner handle (`a-z`, `0-9`, inner `-`, 3–32 characters), the shape of the referral `?ref=` value. */
@@ -65,6 +67,7 @@ export const AddToCartButton = ({
   quantity,
   affiliateRef,
   referralHandle,
+  label,
 }: AddToCartButtonProps) => {
   // Use useCart to get safe hydration version of addItem, 
   // or use store directly since this action is client-side interaction anyway.
@@ -203,7 +206,7 @@ export const AddToCartButton = ({
   return (
     <Button onClick={handleAddToCart} className={className}>
       <ShoppingCart className="mr-2 h-4 w-4" />
-      {t('ecommerce.add_to_cart')}
+      {label ?? t('ecommerce.add_to_cart')}
     </Button>
   );
 };

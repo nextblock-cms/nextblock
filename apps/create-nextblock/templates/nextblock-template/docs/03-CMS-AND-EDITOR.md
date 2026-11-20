@@ -242,6 +242,14 @@ delete in a banner, and the library re-renders in place with its folder and sear
 the 0.23.4 follow-up a refused single delete redirected to `/cms/media?error=…`, which
 nothing on the page reads, so the library lost its folder and search and showed nothing.
 
+The library (`app/cms/media/page.tsx`) reads every row, in pages of 1,000
+(`readAllMediaRows`, `lib/media/media-pages.ts`, ordered down to the id): its files, and one read
+of every row's folder for the navigator and its counts. Until 0.23.9 each was one request, which
+PostgREST cuts at 1,000 rows without an error: a library past 1,000 files listed only the newest
+1,000, and a folder holding only older files vanished. The "Unused files" view asks `media_usage`
+about every listed file in batches of 500 (`MEDIA_USAGE_BATCH_SIZE`); any failed batch fails the
+whole view. The CMS transfer's media map pages the same way.
+
 ### Where an image is used
 
 Before anyone deletes, the library says where each file is used: `public.media_usage`

@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 
+import { LocalDateTime } from '../../../components/LocalDateTime';
 import { saveStoreContactEmail } from '../inquiries/actions';
 import {
   createVisitorLink,
@@ -238,9 +239,7 @@ export default function MessagesClient({
                     <p className="text-xs text-muted-foreground">
                       {item.senderName || 'Anonymous'}
                       {item.senderEmail ? ` · ${item.senderEmail}` : ''} ·{' '}
-                      <span suppressHydrationWarning>
-                        {new Date(item.lastActivityAt).toLocaleString()}
-                      </span>
+                      <LocalDateTime value={item.lastActivityAt} />
                     </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
@@ -408,9 +407,7 @@ export default function MessagesClient({
                           ? message.author_name || 'You'
                           : openThread.senderName || 'Visitor'}
                       </span>
-                      <time className="text-[10px] text-muted-foreground" suppressHydrationWarning>
-                        {new Date(message.created_at).toLocaleString()}
-                      </time>
+                      <LocalDateTime className="text-[10px] text-muted-foreground" value={message.created_at} />
                     </div>
                     <p className="whitespace-pre-wrap text-sm">{message.body}</p>
                     {/*

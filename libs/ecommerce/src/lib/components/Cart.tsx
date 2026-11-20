@@ -14,7 +14,8 @@ import {
 import { Minus, Plus, Trash2 } from 'lucide-react';
 import { getCartItemActivePrice, useCartSubtotal } from '../cart-store';
 import { useCart } from '../use-cart';
-import { isDigitalItem } from '../types';
+import { isDigitalItem, type Product } from '../types';
+import { CartAddonNotices } from './AddonRequirementNotice';
 import Link from 'next/link';
 import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { usePriceFormatter } from '../use-price-formatter';
@@ -23,7 +24,15 @@ import { useCurrency } from '../CurrencyProvider';
 import { getTrialSummary } from '../trials';
 import { CouponForm } from './CouponForm';
 
-export const Cart = () => {
+interface CartProps {
+  /**
+   * The store products that sell what an add-on in the cart requires (Commerce Pro, for the
+   * Affiliates add-on), loaded by the cart block: each gets an add button in the add-on notice.
+   */
+  addonBaseProducts?: Product[];
+}
+
+export const Cart = ({ addonBaseProducts }: CartProps = {}) => {
   // Locale-aware: see use-price-formatter.ts.
   const formatPrice = usePriceFormatter();
   const store = useCart((state) => state);
@@ -100,7 +109,8 @@ export const Cart = () => {
       <h1 className="mb-8 text-3xl font-bold">{t('ecommerce.shopping_cart')}</h1>
 
       <div className="grid gap-12 lg:grid-cols-12 lg:items-start">
-        <div className="lg:col-span-8">
+        <div className="space-y-4 lg:col-span-8">
+          <CartAddonNotices baseProducts={addonBaseProducts} items={items} />
           <div className="rounded-lg border overflow-hidden">
             <Table>
               <TableHeader>

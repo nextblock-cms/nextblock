@@ -14,6 +14,8 @@ import {
   resolvePriceRangeForCurrency,
 } from '../currency';
 import { getTrialSummary } from '../trials';
+import { getProductAddonBases } from '../product-addons';
+import { Puzzle } from 'lucide-react';
 
 import { resolveTranslatedText } from '../variation-utils';
 
@@ -112,6 +114,14 @@ export const ProductCard = ({
   const onSaleLabelRaw = t('ecommerce.on_sale');
   const onSaleLabel = onSaleLabelRaw === 'ecommerce.on_sale' ? 'On Sale' : onSaleLabelRaw;
   const trialSummary = getTrialSummary(product, t);
+  // An add-on license (Affiliates needs Commerce Pro) says so on its card: ../product-addons.ts.
+  const [addonBase] = getProductAddonBases(product);
+  const addonBadgeRaw = addonBase ? t('ecommerce.addon_requires_badge', { base: addonBase.shortName }) : null;
+  const addonBadge = addonBase
+    ? addonBadgeRaw === 'ecommerce.addon_requires_badge'
+      ? `Requires ${addonBase.shortName}`
+      : addonBadgeRaw
+    : null;
 
   // Freemius pricing resolution
   const firstPlan = product.freemius_plans?.[0];
@@ -199,6 +209,12 @@ export const ProductCard = ({
              {product.title}
            </h3>
         </Link>
+        {addonBadge ? (
+          <p className="mb-2 inline-flex w-fit items-center gap-1 rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-900 dark:border-amber-500/40 dark:bg-amber-950/40 dark:text-amber-100">
+            <Puzzle aria-hidden="true" className="h-3 w-3 shrink-0" />
+            {addonBadge}
+          </p>
+        ) : null}
 
         {/* Rating stars display */}
         <div className="flex items-center gap-1 mb-2 mt-0.5 text-xs text-muted-foreground min-h-[1.25rem] select-none">

@@ -27,7 +27,11 @@ first-boot wizard under `app/setup`. Standalone projects are a copy of this dire
 - `lib/cron/cron-secret.ts`: `isCronRequestAuthorized()` for any route that checks `CRON_SECRET`
   (constant-time; never compare the header with `===`).
 - `lib/i18n/translation-pages.ts`: `readAllTranslationRows()` for any read of many
-  `translations` rows (PostgREST stops at 1000).
+  `translations` rows (PostgREST stops at 1000); `lib/media/media-pages.ts`: `readAllMediaRows()`
+  for `media` (the library, the CMS transfer's media map).
+- `lib/commerce/addon-base-products.ts`: the store products an add-on license requires (Commerce Pro
+  for Affiliates), loaded by the product details, cart and checkout blocks and the `/cart` and
+  `/checkout` routes for the add-on notices (libs/ecommerce `product-addons.ts`; docs/15 → "On the store").
 - Media usage (docs/03 → "Deleting media"): `lib/media/media-usage.ts` (`findMediaUsage`, server-only,
   the service-role call of `public.media_usage`, 02045; call it only after `getCmsActor()` found
   staff, and show anyone but an ADMIN its answer through `withoutAdminOnlyLabels`) and the
@@ -113,9 +117,12 @@ Standalone: `npm run dev`, `npm run build`.
 
 ## Rules
 - Import `z` from `lib/zod-config.ts` (jitless; the prod CSP bans eval).
-- A client component the server also renders prints a timestamp with `components/LocalDateTime.tsx`,
-  never `toLocaleString()`: the server's time zone and locale are not the browser's, and React throws
-  #418 and re-renders the page (`/cms/media/[id]/edit` did; `MediaEditForm.hydration.test.tsx`).
+- A client component the server also renders prints a timestamp with `components/LocalDateTime.tsx`
+  (`format` for a date alone), never `toLocaleString()`: the server's time zone and locale are not the
+  browser's, and React throws #418 and re-renders the page (`/cms/media/[id]/edit` did;
+  `MediaEditForm.hydration.test.tsx`). `suppressHydrationWarning` is no fix: React keeps the server's
+  text (Messages, Interactions and `/thread` showed UTC). Guard: `tools/scripts/client-locale-format.test.ts`
+  (an allow-list says why each remaining `toLocale*String()` call never reaches the first render).
 - Server modules `import 'server-only'`; set `export const runtime = 'nodejs'` on Node-only route handlers.
 - Browser bundles resolve `postcss` to the empty `lib/browser-stubs/postcss.cjs` (`next.config.js` →
   `turbopack.resolveAlias`): sanitize-html requires it but never calls it. No client code may use

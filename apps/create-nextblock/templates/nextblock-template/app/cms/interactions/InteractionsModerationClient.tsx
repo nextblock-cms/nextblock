@@ -28,6 +28,7 @@ import {
   Mail
 } from "lucide-react";
 import Link from "next/link";
+import { LocalDateTime } from "../../../components/LocalDateTime";
 
 interface InteractionsModerationClientProps {
   initialInteractions: any[];
@@ -278,7 +279,6 @@ export default function InteractionsModerationClient({
         {filteredInteractions.length > 0 ? (
           filteredInteractions.map((item) => {
             const authorName = item.profiles?.full_name || "Anonymous";
-            const dateStr = new Date(item.created_at).toLocaleString();
             const targetName = item.products?.title || item.posts?.title || "Unknown Target";
             const targetUrl = item.product_id
               ? `/product/${item.products?.slug}`
@@ -319,8 +319,8 @@ export default function InteractionsModerationClient({
                           {item.type}
                         </Badge>
                       </div>
-                      <span className="text-[10px] text-muted-foreground mt-1.5 block" suppressHydrationWarning>
-                        {dateStr}
+                      <span className="text-[10px] text-muted-foreground mt-1.5 block">
+                        <LocalDateTime value={item.created_at} />
                       </span>
                     </div>
                   </div>

@@ -12,6 +12,15 @@ e-Transfer, Wise or a bank transfer) and records in the CMS. Partners who prefer
 e-Transfer are paid by hand. A sale is only ever paid with money of its own mode (a test-mode sale
 is never paid with live money), and an open payment dispute holds its commission.
 
+**An add-on for NextBlock Commerce Pro.** Partners earn a share of store sales, so the program runs
+only on a site with an active
+[Commerce Pro license](https://nextblock.dev/product/nextblock-commerce-pro-commerce-license),
+sold separately, beside its own
+[Affiliates license](https://nextblock.dev/product/nextblock-affiliates-creator-storefronts-affiliates-license).
+The CMS (Settings → Packages) offers the Affiliates trial and checkout only once Commerce Pro is
+active, and while Commerce Pro is off the program pauses and keeps its partners, storefronts and
+ledger.
+
 What the package holds:
 
 - the domain contract: row types, tier and commission math in integer minor units, handles,

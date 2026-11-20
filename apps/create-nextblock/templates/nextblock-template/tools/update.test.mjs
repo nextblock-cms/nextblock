@@ -1300,3 +1300,71 @@ describe("npm run update's schema step and the migration engine it runs on", () 
     for (const name of SHIPPED_CALLS) expect(typeof engine[name], name).toBe('function');
   });
 });
+
+// A standalone project keeps the migration files it was scaffolded with, and each update only adds the
+// release's: one scaffolded before a squash still holds the retired generation's files, which the
+// appliers refuse over an empty history and would run again if their versions were not recorded. Since
+// the release after 0.23.8, every run moves NextBlock's (by exact name, ./lib/retired-migrations.mjs) to
+// supabase/migrations-retired, before the schema step; a project's own migrations stay.
+describe('npm run update and the retired migration files in supabase/migrations', () => {
+  const NEXT_CONFIG = addPostcssBrowserAlias(SCAFFOLD_0_23_3).text;
+  const CURRENT = ['02000_catchup_gen1.sql', '02001_baseline_schema.sql', '02047_product_draft_publish_stock_marker.sql'];
+  const RETIRED = [
+    '00000000000003_baseline_seed.sql',
+    '00000000000004_default_logo_email_safe.sql',
+    '00000000000004_setup_media.sql',
+    '20250513194738_setup_roles_and_profiles.sql',
+  ];
+  const OWN = ['20261201120000_add_loyalty_points.sql', '00000000000045_my_table.sql'];
+  const migrationsOf = (site, dir = 'migrations') => {
+    const folder = path.join(site.project, 'supabase', dir);
+    return existsSync(folder) ? readdirSync(folder).sort() : [];
+  };
+  const sqlFiles = (names) => Object.fromEntries(names.map((name) => [path.join('supabase', 'migrations', name), `-- ${name}\n`]));
+
+  it("moves NextBlock's retired files out, keeps the project's own, and a second run changes nothing", SPAWNS, () => {
+    const site = makeProject(NEXT_CONFIG);
+    writeFiles(site.project, sqlFiles([...CURRENT, ...RETIRED, ...OWN]));
+
+    const first = runUpdate(site);
+    expect(first.status, first.output).toBe(0);
+    expect(first.output).toContain('Moved 4 retired NextBlock migration file(s)');
+    expect(migrationsOf(site)).toEqual([...CURRENT, ...OWN].sort());
+    expect(migrationsOf(site, 'migrations-retired')).toEqual([...RETIRED, 'README.md'].sort());
+    expect(readFileSync(path.join(site.project, 'supabase', 'migrations-retired', RETIRED[1]), 'utf8')).toBe(`-- ${RETIRED[1]}\n`);
+
+    const second = runUpdate(site);
+    expect(second.status, second.output).toBe(0);
+    expect(second.output).not.toContain('retired NextBlock migration');
+    expect(migrationsOf(site)).toEqual([...CURRENT, ...OWN].sort());
+  });
+
+  it('says what it would move under --check, and moves nothing', SPAWNS, () => {
+    const site = makeProject(NEXT_CONFIG);
+    writeFiles(site.project, sqlFiles([...CURRENT, ...RETIRED]));
+
+    const check = runUpdate(site, ['--check']);
+    expect(check.status, check.output).toBe(0);
+    expect(check.output).toContain('Would move 4 retired NextBlock migration file(s)');
+    expect(migrationsOf(site)).toEqual([...CURRENT, ...RETIRED].sort());
+    expect(existsSync(path.join(site.project, 'supabase', 'migrations-retired'))).toBe(false);
+  });
+
+  it('moves nothing from a folder without the catch-up that retires them, and never overwrites a different copy', SPAWNS, () => {
+    const behind = makeProject(NEXT_CONFIG);
+    writeFiles(behind.project, sqlFiles(RETIRED));
+    const run = runUpdate(behind);
+    expect(run.status, run.output).toBe(0);
+    expect(migrationsOf(behind)).toEqual([...RETIRED].sort());
+
+    // Moved once already, then a different copy came back (a checkout of an old commit, say).
+    const site = makeProject(NEXT_CONFIG);
+    writeFiles(site.project, { ...sqlFiles([...CURRENT, RETIRED[1], RETIRED[2]]), [path.join('supabase', 'migrations-retired', RETIRED[1])]: '-- an earlier copy\n', [path.join('supabase', 'migrations-retired', RETIRED[2])]: `-- ${RETIRED[2]}\n` });
+    const again = runUpdate(site);
+    expect(again.status, again.output).toBe(0);
+    expect(again.output).toContain('Moved 1 retired NextBlock migration file(s)');
+    expect(again.output).toContain('1 retired migration file(s) stayed in supabase/migrations');
+    expect(migrationsOf(site)).toEqual([...CURRENT, RETIRED[1]].sort());
+    expect(readFileSync(path.join(site.project, 'supabase', 'migrations-retired', RETIRED[1]), 'utf8')).toBe('-- an earlier copy\n');
+  });
+});

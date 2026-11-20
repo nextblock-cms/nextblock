@@ -5,6 +5,7 @@ import { Button, Input, Label } from '@nextblock-cms/ui';
 import { reviewScriptCode, type ScriptReview } from '@nextblock-cms/utils/script-safety';
 import { toast } from 'sonner';
 
+import { LocalDateTime } from '../../../../../components/LocalDateTime';
 import {
   SITE_SCRIPT_LOAD_STRATEGIES,
   SITE_SCRIPT_PLACEMENTS,
@@ -328,7 +329,7 @@ function RevisionHistory({
                       </span>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      {new Date(revision.created_at).toLocaleString()}
+                      <LocalDateTime value={revision.created_at} />
                       {' — '}
                       {describeSiteScriptRevision(revision)}
                     </p>

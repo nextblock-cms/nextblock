@@ -25,7 +25,7 @@ vi.mock('@nextblock-cms/db/server', () => ({
 }));
 
 import { MAX_OBJECT_KEY_LENGTH } from '../storage/upload-policy';
-import { MAX_SEARCHED_KEYS_PER_MEDIA_ROW, findMediaUsage } from './media-usage';
+import { MAX_SEARCHED_KEYS_PER_MEDIA_ROW, MEDIA_USAGE_BATCH_SIZE, findMediaUsage } from './media-usage';
 import { isMediaUnused, summarizeMediaUsage, type MediaUsage } from './media-usage-format';
 
 const A = 'a1111111-1111-4111-8111-11111111111a';
@@ -99,6 +99,35 @@ describe('findMediaUsage', () => {
   it('asks nothing for no rows', async () => {
     await expect(findMediaUsage([])).resolves.toEqual(new Map());
     expect(mocks.rpc).not.toHaveBeenCalled();
+  });
+
+  it(`asks about a library past 1000 files in batches of ${MEDIA_USAGE_BATCH_SIZE}, and answers for every file`, async () => {
+    const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const rows = Array.from({ length: 1200 }, (_, n) => ({ id: uuid(n), object_key: `uploads/${n}.webp` }));
+    answerEveryId({ [uuid(1199)]: { total: 1, by_kind: { block: 1 }, sites: [] } });
+
+    const usage = await findMediaUsage(rows);
+
+    const batches = mocks.rpc.mock.calls.map((call) => Object.keys((call[1] as { p_media: Record<string, string[]> }).p_media));
+    expect(batches.map((ids) => ids.length)).toEqual([500, 500, 200]);
+    expect(batches.flat()).toEqual(rows.map((row) => row.id));
+    expect(usage.size).toBe(1200);
+    expect(isMediaUnused(entry(usage, uuid(0)))).toBe(true);
+    expect(isMediaUnused(entry(usage, uuid(1199)))).toBe(false);
+  });
+
+  it('throws when any batch fails, so a later batch never reads as unused', async () => {
+    const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const rows = Array.from({ length: 600 }, (_, n) => ({ id: uuid(n), object_key: `uploads/${n}.webp` }));
+    answerEveryId();
+    mocks.rpc.mockImplementationOnce(async (_fn: string, args: { p_media: Record<string, string[]> }) => ({
+      data: Object.fromEntries(Object.keys(args.p_media).map((id) => [id, { total: 0, by_kind: {}, sites: [] }])),
+      error: null,
+    }));
+    mocks.rpc.mockImplementationOnce(async () => ({ data: null, error: { message: 'canceling statement due to statement timeout' } }));
+
+    await expect(findMediaUsage(rows)).rejects.toThrow('could not be checked: canceling statement due to statement timeout');
+    expect(mocks.rpc).toHaveBeenCalledTimes(2);
   });
 
   it('throws when the lookup fails, answers another shape, or leaves a row out', async () => {

@@ -124,3 +124,25 @@ describe('ProductGrid on a partner storefront', () => {
     expect(html.match(/loading="eager"/g)).toHaveLength(2);
   });
 });
+
+describe('ProductCard for an add-on license', () => {
+  // 2026-11-19: the Affiliates license needs Commerce Pro; its card says so before anyone adds it.
+  const license = (freemiusProductId: string) =>
+    ({
+      ...product('license', '55555555-5555-4555-8555-555555555555'),
+      product_type: 'digital',
+      payment_provider: 'freemius',
+      freemius_product_id: freemiusProductId,
+    }) as Product;
+
+  it('carries a "Requires Commerce Pro" badge on the Affiliates license', () => {
+    const html = renderToStaticMarkup(<ProductCard product={license('43273')} />);
+    expect(html).toContain('Requires Commerce Pro');
+  });
+
+  it('carries none on Commerce Pro itself or on any other product', () => {
+    for (const card of [license('24851'), license('28609'), license('99999'), SOAP]) {
+      expect(renderToStaticMarkup(<ProductCard product={card} />)).not.toContain('Requires');
+    }
+  });
+});

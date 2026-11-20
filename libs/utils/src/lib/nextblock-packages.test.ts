@@ -4,10 +4,13 @@ import {
   NEXTBLOCK_PACKAGES,
   describePackageOffer,
   formatPackagePrice,
+  getAddonBaseFreemiusProductIds,
   getPackageByFreemiusId,
   getPackageById,
+  getRequiredPackagesForFreemiusProduct,
   hasPackageCheckout,
   missingPackageRequirements,
+  shortPackageName,
 } from './nextblock-packages';
 
 describe('NextBlock package offers', () => {
@@ -107,6 +110,25 @@ describe('NextBlock Affiliates & Creator Storefronts', () => {
     expect(missingPackageRequirements(affiliates, (id) => id === 'ecommerce')).toEqual([]);
     expect(missingPackageRequirements(NEXTBLOCK_PACKAGES.ecommerce, () => false)).toEqual([]);
     expect(missingPackageRequirements(NEXTBLOCK_PACKAGES['cortex-ai'], () => false)).toEqual([]);
+  });
+
+  // 2026-11-19: the storefront marks an add-on license wherever it can be bought (card, product page,
+  // cart, checkout, Freemius window), so a buyer does not take Affiliates for a standalone product.
+  it("names the packages a store product needs beside it, by the product's Freemius id", () => {
+    expect(getRequiredPackagesForFreemiusProduct(affiliates.fm_product_id)).toEqual([NEXTBLOCK_PACKAGES.ecommerce]);
+    expect(getRequiredPackagesForFreemiusProduct(Number(affiliates.fm_product_id))).toEqual([NEXTBLOCK_PACKAGES.ecommerce]);
+    expect(getRequiredPackagesForFreemiusProduct(` ${affiliates.fm_product_id} `)).toEqual([NEXTBLOCK_PACKAGES.ecommerce]);
+    expect(getRequiredPackagesForFreemiusProduct(NEXTBLOCK_PACKAGES.ecommerce.fm_product_id)).toEqual([]);
+    expect(getRequiredPackagesForFreemiusProduct(NEXTBLOCK_PACKAGES['cortex-ai'].fm_product_id)).toEqual([]);
+    // Any other store's Freemius products, and products without one.
+    for (const other of ['99999', '', '   ', null, undefined]) expect(getRequiredPackagesForFreemiusProduct(other)).toEqual([]);
+    expect(getAddonBaseFreemiusProductIds()).toEqual([NEXTBLOCK_PACKAGES.ecommerce.fm_product_id]);
+  });
+
+  it('shortens a package name for a sentence or a badge', () => {
+    expect(shortPackageName(NEXTBLOCK_PACKAGES.ecommerce.name)).toBe('Commerce Pro');
+    expect(shortPackageName(NEXTBLOCK_PACKAGES['cortex-ai'].name)).toBe('Cortex AI');
+    expect(shortPackageName('Something Else')).toBe('Something Else');
   });
 
   it('only requires registered packages, never itself, and never in a cycle', () => {

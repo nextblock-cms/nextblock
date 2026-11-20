@@ -8,6 +8,7 @@ import { useTranslations } from '@nextblock-cms/utils/translations-context';
 import { CheckCircle2, Loader2, Send } from 'lucide-react';
 
 import { AuthBotProtection } from '../../components/auth/AuthBotProtection';
+import { LocalDateTime } from '../../components/LocalDateTime';
 import { submitThreadReply, type ThreadReplyState } from '../actions/threadActions';
 
 export interface ThreadMessage {
@@ -117,9 +118,7 @@ export default function ThreadView({
                 <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   {fromVisitor ? label('thread.you') : message.author_name || 'Support'}
                 </span>
-                <time className="text-xs text-muted-foreground" suppressHydrationWarning>
-                  {new Date(message.created_at).toLocaleString()}
-                </time>
+                <LocalDateTime className="text-xs text-muted-foreground" value={message.created_at} />
               </div>
               <p className="whitespace-pre-wrap break-words text-sm text-foreground">{message.body}</p>
             </li>

@@ -21,6 +21,7 @@ import {
   getCustomBlockDefinitionCacheTag,
 } from "../custom-block-definitions";
 import { withProductDraftFormMarker } from "../visual-editing/product-draft-meta";
+import { readAllMediaRows } from "../media/media-pages";
 
 import {
   createPageRevision,
@@ -316,9 +317,15 @@ async function isEcommerceContentAvailable(supabase: SupabaseAny) {
 }
 
 async function loadMediaMaps(supabase: SupabaseAny) {
-  const { data, error } = await supabase
-    .from("media")
-    .select("id, object_key");
+  // Paged: one PostgREST request stops at 1000 rows without an error, and an import against a
+  // library past 1000 files could not resolve the media of the rows beyond them.
+  const { data, error } = await readAllMediaRows<{ id: unknown; object_key: unknown }>((from, to) =>
+    supabase
+      .from("media")
+      .select("id, object_key")
+      .order("id", { ascending: true })
+      .range(from, to)
+  );
 
   if (error) {
     throw new Error(`Failed to load media references: ${error.message}`);
@@ -327,7 +334,7 @@ async function loadMediaMaps(supabase: SupabaseAny) {
   const byId = new Map<string, { id: string; object_key: string | null }>();
   const byObjectKey = new Map<string, { id: string; object_key: string | null }>();
 
-  for (const media of data || []) {
+  for (const media of data) {
     const id = String((media as any).id);
     const objectKey = typeof (media as any).object_key === "string" ? (media as any).object_key : null;
     byId.set(id, { id, object_key: objectKey });

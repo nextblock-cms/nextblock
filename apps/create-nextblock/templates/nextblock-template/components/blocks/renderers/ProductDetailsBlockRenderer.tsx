@@ -10,6 +10,8 @@ import {
   LazyProductReviewsSection,
 } from "../../commerce/LazyCommerceClients";
 import PaymentReadinessBoundary from "../../commerce/PaymentReadinessBoundary";
+import { getRequiredPackagesForFreemiusProduct } from "@nextblock-cms/utils/nextblock-packages";
+import { loadAddonBaseProducts } from "../../../lib/commerce/addon-base-products";
 
 interface ProductDetailsBlockRendererProps {
   visualEditAttributes?: VisualEditAttributes;
@@ -34,16 +36,23 @@ export default async function ProductDetailsBlockRenderer({
   // Default to purchasable: a store that is set up correctly must never be degraded by
   // a lookup that failed for some unrelated reason.
   let canPurchase = true;
-  
+  // An add-on license (Affiliates needs Commerce Pro): the products it needs, for the notice above
+  // its purchase controls. Read only for an add-on.
+  let addonBaseProducts: Awaited<ReturnType<typeof loadAddonBaseProducts>> = [];
+
   if (excludeProductId) {
     const { data: productInfo } = await supabase
       .from('products')
-      .select('slug, payment_provider')
+      .select('slug, payment_provider, freemius_product_id')
       .eq('id', excludeProductId)
       .maybeSingle();
 
     if (productInfo) {
       productSlug = productInfo.slug;
+
+      if (getRequiredPackagesForFreemiusProduct(productInfo.freemius_product_id).length > 0) {
+        addonBaseProducts = await loadAddonBaseProducts(languageId);
+      }
 
       const provider = productInfo.payment_provider;
       if (provider === 'stripe' || provider === 'freemius') {
@@ -154,6 +163,7 @@ export default async function ProductDetailsBlockRenderer({
         reviewsNode={excludeProductId ? <LazyProductReviewsSection productId={excludeProductId} /> : undefined}
         canPurchase={canPurchase}
         purchaseFallbackNode={purchaseFallbackNode}
+        addonBaseProducts={addonBaseProducts}
       />
       </PaymentReadinessBoundary>
     </div>

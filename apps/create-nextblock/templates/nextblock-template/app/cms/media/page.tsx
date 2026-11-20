@@ -16,6 +16,7 @@ import { getPublicMediaBaseUrl } from "../../../lib/media/resolveMediaUrl";
 import { getCmsActor, isCmsStaffRole } from "../../../lib/auth/cms-actor";
 import { findMediaUsage } from "../../../lib/media/media-usage";
 import { countMediaHistoryUses, isMediaUnused } from "../../../lib/media/media-usage-format";
+import { readAllMediaRows } from "../../../lib/media/media-pages";
 
 type MediaSearchParams = { folder?: string; folderPrefix?: string; q?: string; usage?: string };
 
@@ -67,67 +68,77 @@ async function resolveUnusedView(mediaItems: Media[]): Promise<{
   }
 }
 
+/**
+ * Every file matching the folder and search, newest first. Paged (readAllMediaRows): PostgREST answers
+ * one request with at most 1000 rows and drops the rest without an error, so a library past 1000 files
+ * listed only the newest 1000. The order ends on `id` so the pages neither skip nor repeat a row.
+ */
 async function getMediaItems(folder?: string, folderPrefix?: string, search?: string): Promise<Media[]> {
   const supabase = createClient();
-  let query = supabase
-    .from("media")
-    .select("*")
-    .order("created_at", { ascending: false });
+  const term = search?.trim() ?? "";
+  const { data, error } = await readAllMediaRows<Media>((from, to) => {
+    let query = supabase
+      .from("media")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
 
-  if (folder && folder.trim()) {
-    query = query.eq('folder', folder);
-  } else if (folderPrefix && folderPrefix.trim()) {
-    query = query.ilike('folder', `${folderPrefix}%`);
-  }
+    if (folder && folder.trim()) {
+      query = query.eq('folder', folder);
+    } else if (folderPrefix && folderPrefix.trim()) {
+      query = query.ilike('folder', `${folderPrefix}%`);
+    }
 
-  if (search && search.trim()) {
-    const term = search.trim();
-    query = query.or(`file_name.ilike.%${term}%,description.ilike.%${term}%`);
-  }
+    if (term) {
+      query = query.or(`file_name.ilike.%${term}%,description.ilike.%${term}%`);
+    }
 
-  const { data, error } = await query;
+    return query.range(from, to);
+  });
 
   if (error) {
     console.error("Error fetching media items:", error);
     return [];
   }
-  return data || [];
+  return data;
 }
 
-async function getDistinctFolders(search?: string): Promise<string[]> {
+/**
+ * The folder of every file, in folder order: one paged read serves both the folder list and the
+ * counts (each read past PostgREST's 1000 rows lost the folders that sort last, and their counts).
+ */
+async function getFolderValues(): Promise<string[] | null> {
   const supabase = createClient();
-  const { data, error } = await supabase
-    .from("media")
-    .select("folder")
-    .order("folder", { ascending: true });
+  const { data, error } = await readAllMediaRows<{ folder: string | null }>((from, to) =>
+    supabase
+      .from("media")
+      .select("folder")
+      .order("folder", { ascending: true })
+      .order("id", { ascending: true })
+      .range(from, to)
+  );
   if (error) {
     console.error("Error fetching folders:", error);
-    return [];
+    return null;
   }
-  let folders = (data || [])
-    .map((r: any) => r.folder)
-    .filter((f: any) => typeof f === 'string' && f.length > 0);
-  if (search && search.trim()) {
-    const t = search.trim().toLowerCase();
-    folders = folders.filter((f: string) => f.toLowerCase().includes(t));
-  }
-  // Ensure trailing slash for consistency
-  return Array.from(new Set(folders.map((f: string) => (f.endsWith('/') ? f : f + '/'))));
+  return data
+    .map((row) => row.folder)
+    .filter((folder): folder is string => typeof folder === 'string' && folder.length > 0);
 }
 
-async function getFolderCounts(): Promise<Record<string, number>> {
-  const supabase = createClient();
-  const { data, error } = await supabase
-    .from("media")
-    .select("folder");
-  if (error) {
-    console.error("Error fetching folder counts:", error);
-    return {};
+function distinctFolders(folderValues: readonly string[], search?: string): string[] {
+  let folders = [...folderValues];
+  if (search && search.trim()) {
+    const t = search.trim().toLowerCase();
+    folders = folders.filter((f) => f.toLowerCase().includes(t));
   }
+  // Ensure trailing slash for consistency
+  return Array.from(new Set(folders.map((f) => (f.endsWith('/') ? f : f + '/'))));
+}
+
+function folderCounts(folderValues: readonly string[]): Record<string, number> {
   const counts: Record<string, number> = {};
-  (data || []).forEach((row: any) => {
-    const f: string | null = row.folder;
-    if (!f || typeof f !== 'string' || f.length === 0) return;
+  for (const f of folderValues) {
     const norm = f.endsWith('/') ? f : `${f}/`;
     // accumulate counts for each prefix in the path
     const parts = norm.replace(/^\/+/, '').split('/').filter(Boolean);
@@ -137,7 +148,7 @@ async function getFolderCounts(): Promise<Record<string, number>> {
       const key = `${prefix}/`;
       counts[key] = (counts[key] || 0) + 1;
     }
-  });
+  }
   return counts;
 }
 
@@ -149,11 +160,12 @@ export default async function CmsMediaLibraryPage(props: { searchParams?: Promis
   const selectedFolderPrefix = searchParams.folderPrefix;
   const searchQuery = searchParams.q;
   const showUnused = searchParams.usage === "unused";
-  const [mediaItems, folders, folderCounts] = await Promise.all([
+  const [mediaItems, folderValues] = await Promise.all([
     getMediaItems(selectedFolder, selectedFolderPrefix, searchQuery),
-    getDistinctFolders(searchQuery),
-    getFolderCounts(),
+    getFolderValues(),
   ]);
+  const folders = folderValues ? distinctFolders(folderValues, searchQuery) : [];
+  const counts = folderValues ? folderCounts(folderValues) : {};
   const { listed, unusedView, usageError } = showUnused
     ? await resolveUnusedView(mediaItems)
     : { listed: mediaItems, unusedView: null, usageError: null };
@@ -179,7 +191,7 @@ export default async function CmsMediaLibraryPage(props: { searchParams?: Promis
 
       {/* Compact folder navigator with top tabs and subfolder pills */}
       <div className="mt-2">
-        <FolderNavigator basePath="/cms/media" folders={folders} selectedFolder={selectedFolder || ''} selectedPrefix={selectedFolderPrefix || ''} counts={folderCounts} searchTerm={searchQuery || ''} />
+        <FolderNavigator basePath="/cms/media" folders={folders} selectedFolder={selectedFolder || ''} selectedPrefix={selectedFolderPrefix || ''} counts={counts} searchTerm={searchQuery || ''} />
       </div>
 
       {/* The media grid and empty state are now handled by MediaGridClient. The key remounts it when

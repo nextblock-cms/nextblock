@@ -1652,6 +1652,34 @@ describeDb('public.publish_product_draft on a real database (migration 02043)', 
       expect(result.stock_adjusted).toEqual([]);
     });
 
+    it('values without a baseline over SKUs without an inventory row: the publish creates each row first (02046), then writes the quantities as typed', async () => {
+      const red = `ST-OR-${RUN}-${randomUUID().slice(0, 4)}`;
+      const blue = `ST-OB-${RUN}-${randomUUID().slice(0, 4)}`;
+      // Neither SKU has an inventory row (a product saved before shared inventory): its stock is the variant's.
+      const seeded = await seedProduct({
+        variants: [
+          { sku: red, price: 5900, stock: 5, terms: [terms.Red] },
+          { sku: blue, price: 5900, stock: 3, terms: [terms.Blue] },
+        ],
+        draftBlocks: [],
+      });
+      expect(await inventoryOf([red, blue])).toEqual({});
+      // A draft an earlier version saved (no baseline): Red typed from 5 to 8, Blue left at 3.
+      const values = buildProductDraftPublishValues(
+        formValues(seeded, {
+          variants: [formVariant(red, 59, 8, [terms.Red], seeded.variantIds[red]), formVariant(blue, 59, 3, [terms.Blue], seeded.variantIds[blue])],
+        })
+      );
+      expect(values.stock_baseline).toBeNull();
+
+      const result = await publish(owner, { productId: seeded.productId, ...(await readForPublish(seeded)), values, blocks: [] });
+
+      expect(await inventoryOf([red, blue])).toEqual({ [red]: 8, [blue]: 3 });
+      expect(await shownStockOf(seeded.productId)).toEqual({ product: 11, variants: { [red]: 8, [blue]: 3 } });
+      // Written as the draft holds them, like any value without a baseline: nothing to name.
+      expect(result.stock_adjusted).toEqual([]);
+    });
+
     /**
      * Migration 02047: which publish a baseline was loaded against. Every product-values publish moves
      * public.product_stock_publishes.publish_count and records what it did with each SKU (its baseline

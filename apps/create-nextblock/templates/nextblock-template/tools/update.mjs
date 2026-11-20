@@ -39,8 +39,10 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -65,6 +67,13 @@ try {
   ({ applyPostcssBrowserAlias, describePostcssBrowserAlias } = await import('./lib/postcss-browser-alias.mjs'));
 } catch {
   /* tools/lib/postcss-browser-alias.mjs is missing */
+}
+// Same for the list of retired migration files: without it supabase/migrations stays as it is.
+let retiredMigrationFilesIn = () => [];
+try {
+  ({ retiredMigrationFilesIn } = await import('./lib/retired-migrations.mjs'));
+} catch {
+  /* tools/lib/retired-migrations.mjs is missing */
 }
 
 const UPSTREAM_URL = 'https://github.com/nextblock-cms/nextblock.git';
@@ -911,6 +920,82 @@ function refreshProjectMigrations(projectRoot) {
   if (existsSync(fromConfig) && !existsSync(destConfig)) copyInto(fromConfig, destConfig);
 
   return { ok: true, copied };
+}
+
+const RETIRED_MIGRATIONS_DIR = path.join('supabase', 'migrations-retired');
+const RETIRED_MIGRATIONS_README = `# Retired NextBlock migrations
+
+\`npm run update\` moved these files here from supabase/migrations. NextBlock shipped them in a
+migration generation it has since squashed, and nothing reads this folder: the current
+generation's catch-up migration carries their SQL and replays what a database lacks. In
+supabase/migrations they could only do harm (the migration appliers refuse an empty history while
+one is listed, and a file whose version is not recorded would run again). You may delete this folder.
+`;
+
+/**
+ * Move NextBlock's retired migration files (./lib/retired-migrations.mjs: exact names, so a project's
+ * own migrations stay) out of <project>/supabase/migrations into supabase/migrations-retired, once that
+ * folder holds the catch-up of the generation that retired them. Never deletes a file: one already
+ * moved once (supabase/migrations-retired holds the same contents) is only removed from
+ * supabase/migrations, and one whose contents differ stays where it is (`kept`). Under --check
+ * (`dryRun`) it moves nothing and says what it would move. Runs before the schema step on every run, a
+ * project already on the latest release included: the update that brings this runs the updater from
+ * before it, which has none.
+ */
+function setAsideRetiredMigrations(projectRoot, { dryRun = false } = {}) {
+  const dir = path.join(projectRoot, 'supabase', 'migrations');
+  let names;
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return { files: [], moved: [], kept: [], dryRun };
+  }
+  const files = retiredMigrationFilesIn(names);
+  if (files.length === 0 || dryRun) return { files, moved: [], kept: [], dryRun };
+
+  const target = path.join(projectRoot, RETIRED_MIGRATIONS_DIR);
+  mkdirSync(target, { recursive: true });
+  const readme = path.join(target, 'README.md');
+  if (!existsSync(readme)) writeFileSync(readme, RETIRED_MIGRATIONS_README, 'utf8');
+
+  const moved = [];
+  const kept = [];
+  for (const name of files) {
+    const from = path.join(dir, name);
+    const to = path.join(target, name);
+    if (existsSync(to)) {
+      if (sameContents(from, to)) {
+        unlinkSync(from);
+        moved.push(name);
+      } else {
+        kept.push(name);
+      }
+      continue;
+    }
+    renameSync(from, to);
+    moved.push(name);
+  }
+  return { files, moved, kept, dryRun };
+}
+
+/** Print what setAsideRetiredMigrations() did, or would do under --check. */
+function reportRetiredMigrations({ files, moved, kept, dryRun }) {
+  if (files.length === 0) return;
+  const listed = (names) => (names.length <= 3 ? names.join(', ') : `${names[0]} … ${names[names.length - 1]}`);
+  if (dryRun) {
+    info(`Would move ${files.length} retired NextBlock migration file(s) (${listed(files)}) from supabase/migrations to supabase/migrations-retired.`);
+    return;
+  }
+  if (moved.length > 0) {
+    good(`Moved ${moved.length} retired NextBlock migration file(s) (${listed(moved)}) from supabase/migrations to supabase/migrations-retired.`);
+    info('The catch-up migration replays their work, and nothing reads that folder: you may delete it.');
+  }
+  if (kept.length > 0) {
+    warn(
+      `${kept.length} retired migration file(s) stayed in supabase/migrations: supabase/migrations-retired already holds a different file of the same name (${listed(kept)}).`,
+    );
+    info('Compare the two copies, then delete the one in supabase/migrations.');
+  }
 }
 
 /** Warn when a NextBlock package is missing from next.config.js transpilePackages. */
@@ -1982,6 +2067,11 @@ async function main() {
       // After the file sync, so lib/browser-stubs/postcss.cjs is on disk before anything points at it.
       reportPostcssBrowserAlias(applyPostcssBrowserAlias(install.root));
     }
+  }
+
+  // Before the schema step, so this run's engine no longer lists NextBlock's retired migration files.
+  if (install.layout === 'standalone') {
+    reportRetiredMigrations(setAsideRetiredMigrations(install.root, { dryRun: flags.check }));
   }
 
   let schemaOk = true;

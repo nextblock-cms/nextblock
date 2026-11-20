@@ -89,6 +89,26 @@ describe('PackageCard', () => {
     expect(mocks.dialog).toHaveBeenCalledTimes(1);
   });
 
+  // 2026-11-19: the blocked card still linked to the add-on's own page on nextblock.dev, where it
+  // could be bought without Commerce Pro. It points at the Commerce Pro card instead.
+  it('links a blocked add-on to its base card, never to its own purchase page', () => {
+    const blocked = renderToStaticMarkup(
+      <PackageCard isActive={false} missingRequirements={[COMMERCE]} pkg={NEXTBLOCK_PACKAGES.affiliates} />
+    );
+    expect(blocked).not.toContain(NEXTBLOCK_PACKAGES.affiliates.purchase_url);
+    expect(blocked).not.toContain('Or purchase on nextblock.dev');
+    expect(blocked).toContain('href="#package-ecommerce"');
+    expect(blocked).toContain('Start with Commerce Pro');
+
+    const base = renderToStaticMarkup(<PackageCard isActive={false} pkg={NEXTBLOCK_PACKAGES.ecommerce} />);
+    expect(base).toContain('id="package-ecommerce"');
+
+    const open = renderToStaticMarkup(
+      <PackageCard isActive={false} missingRequirements={[]} pkg={NEXTBLOCK_PACKAGES.affiliates} />
+    );
+    expect(open).toContain(NEXTBLOCK_PACKAGES.affiliates.purchase_url);
+  });
+
   it('shows an active add-on as paused while its base is off', () => {
     const html = renderToStaticMarkup(
       <PackageCard isActive licenseKey="key-9999" missingRequirements={[COMMERCE]} pkg={NEXTBLOCK_PACKAGES.affiliates} />

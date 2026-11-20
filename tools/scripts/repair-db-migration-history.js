@@ -1,6 +1,7 @@
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const dotenv = require('dotenv');
 const readline = require('readline');
 
@@ -349,11 +350,11 @@ async function routeSquashOrAutoDetect(options) {
     log('Could not read the remote migration history, so the squash check was skipped.', colors.yellow);
     log('If this project has never been linked, run `npx supabase link --project-ref <ref> --workdir libs/db/src` once.', colors.dim);
     log('');
-    return false;
+    return { handled: false, status: null };
   }
 
   if (status.remoteOnly.length === 0) {
-    return false;
+    return { handled: false, status };
   }
 
   const retired = [...status.remoteOnly].sort();
@@ -370,14 +371,14 @@ async function routeSquashOrAutoDetect(options) {
     log('--through given, so the auto-detect level below is yours. The retired versions above are', colors.yellow);
     log('still there and `supabase db push` will keep refusing until they are reconciled.', colors.yellow);
     log('');
-    return false;
+    return { handled: false, status };
   }
 
   if (options.isCheck) {
     log('Showing the squash reconcile plan instead:', colors.green);
     log('');
     await reconcileSquash({ ...options, status });
-    return true;
+    return { handled: true, status };
   }
 
   if (!options.assumeYes && !process.stdin.isTTY) {
@@ -397,7 +398,46 @@ async function routeSquashOrAutoDetect(options) {
   }
   log('');
   await reconcileSquash({ ...options, status });
-  return true;
+  return { handled: true, status };
+}
+
+// ---------------------------------------------------------------------------
+// The auto-detect repair on a database that never crossed the last squash.
+//
+// The repair records this generation's versions and leaves the catch-up pending (it must run,
+// never be recorded). The catch-up decides what to replay from the retired versions the history
+// records, and a wiped history records none: on a database that never crossed (its
+// site_settings.migration_baseline_generation unset or below the folder's generation) it would
+// then replay the entire retired generation over the content. db:migrate refuses an empty history
+// and points here, so this is the last gate: refuse, and say to restore the history instead. The
+// rule is migrate-core's emptyHistoryRefusal, the one every applier honours (the build hook,
+// `npm run update`, /setup), passed in because that module is ESM.
+// ---------------------------------------------------------------------------
+
+/**
+ * Why the auto-detect repair must not run on this database, or null when it may.
+ *
+ * @param {object} options
+ * @param {string[]} options.names the folder's migration file names
+ * @param {{ readable: boolean, generation: number | null }} options.baseline readBaselineGeneration()
+ * @param {boolean} options.catchupRecorded the history records the catch-up already: it will not
+ *   run again, so it replays nothing (a catch-up recorded without running is --revert's business)
+ * @param {(names: string[], generation: number | null) => null | { message: string }} options.emptyHistoryRefusal
+ * @returns {string | null}
+ */
+function autoDetectRefusal({ names, baseline, catchupRecorded, emptyHistoryRefusal }) {
+  if (catchupRecorded) {
+    return null;
+  }
+  if (!baseline.readable) {
+    return (
+      'site_settings.migration_baseline_generation could not be read (set NEXT_PUBLIC_SUPABASE_URL and a ' +
+      'Supabase key), so this command cannot tell whether the catch-up it leaves pending would replay a ' +
+      'retired squash generation over this database. Nothing was changed.'
+    );
+  }
+  const refusal = emptyHistoryRefusal(names, baseline.generation);
+  return refusal ? refusal.message : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +861,8 @@ async function main() {
     process.exit(1);
   }
 
-  if (await routeSquashOrAutoDetect({ ...modeOptions, warnOnly: Boolean(override) })) {
+  const route = await routeSquashOrAutoDetect({ ...modeOptions, warnOnly: Boolean(override) });
+  if (route.handled) {
     return;
   }
   let ceiling = override;
@@ -851,6 +892,30 @@ async function main() {
   // would have replayed. That asymmetry is the whole lesson of this script, so it is enforced
   // here rather than left to the ceiling arithmetic or to whoever passed --through.
   const catchupVersions = migrations.filter((m) => isCatchupMigration(m.fileName)).map((m) => m.version);
+
+  // A database that never crossed the last squash: the catch-up left pending would replay the whole
+  // retired generation over it (autoDetectRefusal). Read-only, so --check reports it too.
+  const { emptyHistoryRefusal } = await import(
+    pathToFileURL(path.join(repoRoot, 'apps/nextblock/tools/lib/migrate-core.mjs')).href
+  );
+  const refusal = autoDetectRefusal({
+    names: migrations.map((m) => m.fileName),
+    baseline: await readBaselineGeneration(),
+    catchupRecorded: Boolean(route.status && catchupVersions.some((version) => route.status.applied.includes(version))),
+    emptyHistoryRefusal,
+  });
+  if (refusal) {
+    log('Refusing the auto-detect repair on this database. Nothing was changed.', colors.red);
+    log(refusal, colors.yellow);
+    log(
+      'This command records only this generation\'s versions and leaves the catch-up pending, so the catch-up would ' +
+        'still replay the whole retired generation. Restore the history instead (docs/04-DATABASE-AND-AUTH.md, ' +
+        '"How a squash crosses live databases").',
+      colors.yellow,
+    );
+    process.exit(1);
+  }
+
   const versionsToMark = migrations
     .filter((m) => !isCatchupMigration(m.fileName))
     .map((m) => m.version)
@@ -931,7 +996,11 @@ async function main() {
   log('Migration history repaired. Run `npm run db:migrate:check` next.', colors.green);
 }
 
-main().catch((error) => {
-  log(error instanceof Error ? error.stack || error.message : String(error), colors.red);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    log(error instanceof Error ? error.stack || error.message : String(error), colors.red);
+    process.exit(1);
+  });
+}
+
+module.exports = { autoDetectRefusal };

@@ -510,6 +510,7 @@ Supabase CLI, the rules are the same:
 >   — take the offer; the plain repair is for a wiped history on a database at the current
 >   generation. On one that never crossed the last squash, restore the history instead: the repair
 >   records only this generation's versions, and the catch-up would then replay the retired one.
+>   Since 0.23.9 `repair-history` refuses that database itself (`--check` says so too).
 > - **Standalone project** (`npm create nextblock`): `db:migrate` and `db:migrate:repair-history`
 >   exist only in the monorepo's root `package.json`, and nothing here needs them. Leave retired
 >   versions in the history (`npm run update` lists them on every run). An empty history over a
@@ -517,7 +518,11 @@ Supabase CLI, the rules are the same:
 >   is written to survive (docs/04 → "Production migration policy"), and the catch-up skips itself
 >   there. One the appliers refuse needs its history restored, or, when the refusal names only
 >   retired files on a database that crossed already, those files removed from
->   `supabase/migrations` (they came with the scaffold; nothing needs them). Only the Supabase CLI objects to retired versions: if you run it on this
+>   `supabase/migrations` (they came with the scaffold; nothing needs them). Since 0.23.9 every
+>   `npm run update` moves NextBlock's own retired files (by exact name) to
+>   `supabase/migrations-retired`, which nothing reads, before its schema step; a file of your own
+>   stays, whatever its number. Their versions then have no file, which is the state the Supabase CLI
+>   objects to below. Only the Supabase CLI objects to retired versions: if you run it on this
 >   database, `supabase db push` refuses while they remain and prints the
 >   `supabase migration repair --status reverted …` command that removes them. Run it only once
 >   the catch-up has run (it is recorded, and `site_settings.migration_baseline_generation` holds
@@ -562,6 +567,43 @@ ship: `verify-lib-dist.js` check 14 compares the file names (not the SQL).
 ## Upgrade notes
 
 Most releases need nothing beyond `npm run update`. These ask for a step of your own.
+
+### 0.23.9 — Retired migration files set aside, times in your own time zone, media libraries past 1,000 files
+
+- **Migration 02048** adds UI copy only (the store's notices for add-on licenses, EN + FR) and
+  applies like any other migration ("Build-time migrations" above). Copy you edited under CMS →
+  Translations stays as it is. The notices show only on a store that carries NextBlock's own
+  license products (nextblock.dev, and the public sandbox, whose reset imports them): no other store
+  changes.
+- **Retired migration files leave `supabase/migrations`** (projects made with `npm create
+  nextblock`). A project scaffolded before a migration squash still holds the retired generation's
+  files there, which nothing needs ("The contract every applier honours" above). `npm run update`
+  now moves NextBlock's own (exact names, `tools/lib/retired-migrations.mjs`) to
+  `supabase/migrations-retired` before its schema step, and leaves your own migrations alone,
+  whatever their numbers. The update that brings 0.23.9 runs the updater you had, which does not
+  do this, so **run `npm run update` once more afterwards** (`--check` lists what it would move).
+  Commit the move with the rest; the new folder is safe to delete. Their versions stay recorded in
+  the migration history, which the updater, the build hook and `/setup` ignore. If you also run the
+  Supabase CLI on that database, `supabase db push` now refuses while those versions have no file:
+  once the catch-up has run (`site_settings.migration_baseline_generation` holds `2`), run the
+  `supabase migration repair --status reverted …` command it prints ("The contract every applier
+  honours" above).
+- **`npm run db:migrate:repair-history` refuses a database that never crossed the last squash**
+  (monorepo installs): restore the migration history instead (docs/04 → "How a squash crosses live
+  databases").
+- **Times in your own time zone.** The CMS Messages and Interactions screens, the Site Scripts
+  history, the trusted devices under Security, the trial end on the Packages screen and the public
+  message thread (`/thread/…`) printed times the way the server formats them (UTC on Vercel), or
+  could make React rebuild the page (error #418). They now show the server's UTC text while the page
+  loads, then the viewer's own.
+- **Media libraries past 1,000 files.** The library listed only the newest 1,000 files, a folder
+  holding only older files vanished from its navigator, and the counts stopped there; the CMS
+  transfer's media map stopped there too. All of it reads every row now, and the "Unused files"
+  view asks about them in batches of 500. A library of many thousands of files lists them all on
+  one page: narrow it with a folder or a search.
+- **Working in the monorepo:** use Node 22.18 or later (`.nvmrc`). Lib builds on an older Node
+  print a warning: Vite's native config loader, which it will make its default, cannot read the
+  `vite.config.mts` files there (docs/05 → "Node.js floor").
 
 ### 0.23.7 — Product stock at scale, a stock backfill, a published change applied once, products created in part
 

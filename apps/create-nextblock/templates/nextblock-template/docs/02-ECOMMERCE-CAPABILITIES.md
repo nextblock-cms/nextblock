@@ -628,6 +628,13 @@ outside a refusal or a relay named with its reason (`DEVELOPER_KEY_CALLERS`).
 - builds a Freemius checkout URL with the validated `billing_cycle`, including
   sandbox parameters when enabled
 
+An **add-on license** (a product whose Freemius product is a NextBlock package that `requires`
+another: Affiliates needs Commerce Pro) says so on its card, its product page, in the cart and the
+checkout, and in the Freemius window's title (`libs/ecommerce/src/lib/product-addons.ts`,
+`components/AddonRequirementNotice.tsx`; docs/15 → "On the store"). Only a store carrying
+NextBlock's own license products has such products (nextblock.dev, and the public sandbox, whose
+reset imports them): no other store shows any of it, and nothing blocks the checkout.
+
 Freemius charges its own plan price for the cycle the checkout opens on, so the
 order records that price, not `products.price`. The sync sets `products.price`
 to the annual price, falling back to monthly or lifetime only when there is no

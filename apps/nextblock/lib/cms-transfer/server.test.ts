@@ -19,8 +19,9 @@ function makeServiceClient() {
   return {
     from: (table: string) => {
       let op = "select";
+      let page: [number, number] | null = null;
       const query: Record<string, unknown> = {};
-      const rows = () => {
+      const allRows = () => {
         if (table === "languages") return [{ id: 1, code: "en", name: "English" }];
         if (table === "products") {
           return [
@@ -37,7 +38,13 @@ function makeServiceClient() {
         }
         return [];
       };
+      // A paged read (`.range()`, the media map) gets its page; anything else every row.
+      const rows = () => (page ? allRows().slice(page[0], page[1] + 1) : allRows());
       for (const method of ["select", "eq", "order", "in"]) query[method] = () => query;
+      query.range = (from: number, to: number) => {
+        page = [from, to];
+        return query;
+      };
       for (const method of ["insert", "update", "upsert", "delete"]) {
         query[method] = (values: unknown) => {
           op = method;

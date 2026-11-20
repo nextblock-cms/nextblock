@@ -498,21 +498,32 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
     navigation = buildNavigationTrees(Array.isArray(data) ? data : [], languagesById);
   }
 
-  // Media: count + which of it is the bundled demo imagery.
-  const { data: mediaRows } = await supabase
+  // Media: the newest 500 as a sample, the total, and which of it is the bundled demo imagery. The
+  // total and the demo imagery are asked for on their own: the demo images are the oldest rows, so a
+  // library past 500 files left them out of the sample (and the count stopped at 500).
+  const { data: mediaRows, count: mediaTotal } = await supabase
     .from('media')
-    .select('id, object_key, file_name, description, created_at')
+    .select('id, object_key, file_name, description, created_at', { count: 'exact' })
     .order('created_at', { ascending: false })
     .limit(500);
   const media = (Array.isArray(mediaRows) ? mediaRows : []) as any[];
-  const seededMediaCount = media.filter((row) => NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS.has(String(row.object_key))).length;
+  const { data: seededMediaRows } = await supabase
+    .from('media')
+    .select('id, object_key')
+    .in('object_key', [...NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS]);
+  const seededMediaCount = (Array.isArray(seededMediaRows) ? seededMediaRows : []).length;
 
   // Active logo (pinned id, else newest).
   const { data: logoRows } = await supabase.from('logos').select('id, name, media_id, created_at').order('created_at', { ascending: false });
   const logos = (Array.isArray(logoRows) ? logoRows : []) as any[];
   const pinnedLogoId = typeof settings.get('active_logo_id') === 'string' ? (settings.get('active_logo_id') as string) : null;
   const activeLogo = (pinnedLogoId ? logos.find((row) => row.id === pinnedLogoId) : null) ?? logos[0] ?? null;
-  const activeLogoMedia = activeLogo ? media.find((row) => row.id === activeLogo.media_id) ?? null : null;
+  let activeLogoMedia = activeLogo ? media.find((row) => row.id === activeLogo.media_id) ?? null : null;
+  if (activeLogo?.media_id && !activeLogoMedia) {
+    // A logo older than the sample (the seeded NextBlock logo is among the oldest files).
+    const { data: logoMediaRow } = await supabase.from('media').select('id, object_key').eq('id', activeLogo.media_id).maybeSingle();
+    activeLogoMedia = logoMediaRow ?? null;
+  }
   const activeLogoObjectKey = activeLogoMedia ? String(activeLogoMedia.object_key) : null;
 
   // The site-wide share preview (Branding screen, or update_site_identity social_image).
@@ -587,7 +598,7 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
     counts: {
       customBlocks: ((customBlocksResult.data ?? []) as any[]).length,
       drafts: ((draftsResult.data ?? []) as any[]).length,
-      media: media.length,
+      media: typeof mediaTotal === 'number' ? mediaTotal : media.length,
       pages: typeof pagesResult.count === 'number' ? pagesResult.count : pages.length,
       posts: typeof postsResult.count === 'number' ? postsResult.count : posts.length,
       products: products.length,
@@ -629,7 +640,7 @@ export async function executeGetSiteOverview(input: GetSiteOverviewInput, contex
       name: String(row.name ?? ''),
     })),
     media: {
-      count: media.length,
+      count: typeof mediaTotal === 'number' ? mediaTotal : media.length,
       sample: parsed.includeMedia
         ? media.slice(0, 40).map((row) => ({
             altText: row.description ?? null,
@@ -1110,7 +1121,12 @@ async function planSiteReset(
   let mediaToDelete: string[] = [];
   let logosToDelete: string[] = [];
   if (scope.seededMedia || scope.identity) {
-    const { data: mediaRows } = await supabase.from('media').select('id, object_key');
+    // Only the bundled demo images, asked for by key: a read of every row stops at PostgREST's 1000
+    // and could leave seeded images out of the reset.
+    const { data: mediaRows } = await supabase
+      .from('media')
+      .select('id, object_key')
+      .in('object_key', [...NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS]);
     const seededMedia = ((Array.isArray(mediaRows) ? mediaRows : []) as any[]).filter((row) =>
       NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS.has(String(row.object_key))
     );

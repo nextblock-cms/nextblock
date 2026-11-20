@@ -21,6 +21,13 @@ const MEDIA_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 export const MAX_SEARCHED_KEYS_PER_MEDIA_ROW = 17;
 
 /**
+ * Media rows asked about per call of public.media_usage. The library's "Unused files" view asks about
+ * every file it lists, and it lists past PostgREST's 1000 rows since it pages its read: batches keep
+ * each call one statement of bounded size (a library of 3000 files makes six calls).
+ */
+export const MEDIA_USAGE_BATCH_SIZE = 500;
+
+/**
  * The keys to search for a row: every key its delete would remove (ownedMediaStorageKeys), or null when
  * the lookup cannot search them all. Anyone with staff access can write a row's object_key and variants
  * (RLS lets a WRITER insert their own row over PostgREST, and nothing checks the keys there), so they are
@@ -106,17 +113,23 @@ export async function findMediaUsage(rows: readonly MediaUsageSubject[]): Promis
   const service = getServiceRoleSupabaseClient() as unknown as {
     rpc: (fn: string, args: Record<string, unknown>) => Promise<{ data: unknown; error: { message: string } | null }>;
   };
-  const { data, error } = await service.rpc('media_usage', { p_media: input });
-  if (error) {
-    throw new Error(`Where this media is used could not be checked: ${error.message}`);
-  }
+  // All or nothing: any batch that fails throws, so no caller reads part of the answer as the whole.
+  const usage = new Map<string, MediaUsage>();
+  for (let start = 0; start < ids.length; start += MEDIA_USAGE_BATCH_SIZE) {
+    const batchIds = ids.slice(start, start + MEDIA_USAGE_BATCH_SIZE);
+    const batch: Record<string, string[]> = {};
+    for (const id of batchIds) batch[id] = input[id] ?? [];
+    const { data, error } = await service.rpc('media_usage', { p_media: batch });
+    if (error) {
+      throw new Error(`Where this media is used could not be checked: ${error.message}`);
+    }
 
-  let usage: Map<string, MediaUsage>;
-  try {
-    usage = parseMediaUsageAnswer(data, ids);
-  } catch (parseError) {
-    const reason = parseError instanceof Error ? parseError.message : String(parseError);
-    throw new Error(`Where this media is used could not be checked: ${reason}.`);
+    try {
+      for (const [id, entry] of parseMediaUsageAnswer(data, batchIds)) usage.set(id, entry);
+    } catch (parseError) {
+      const reason = parseError instanceof Error ? parseError.message : String(parseError);
+      throw new Error(`Where this media is used could not be checked: ${reason}.`);
+    }
   }
 
   for (const id of unchecked) {

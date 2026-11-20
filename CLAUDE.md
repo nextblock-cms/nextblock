@@ -197,6 +197,10 @@ node tools/scripts/rehearse-release.js   # after the sync above: pack all 9 (no 
 
 ## Gotchas
 
+- Monorepo work needs Node 22.18+ (`.nvmrc`): Vite's native config loader reads the libs'
+  `vite.config.mts` with Node's type stripping, and every lib build warns on an older Node
+  (`tools/vite/lib-build-plugins.mjs`). Never put the floor in `engines` of a deployed
+  `package.json`: Vercel deploys an open range on its newest Node major (docs/05 → "Node.js floor").
 - npm ≥ 11.13 blocks dependency install scripts unless the ROOT `package.json` lists the
   package under `allowScripts` (`"name": true`, or `"name@1.2.3": true`; semver ranges are
   rejected, and only the root's field counts in the workspace). Adding a dependency with a
@@ -287,7 +291,8 @@ node tools/scripts/rehearse-release.js   # after the sync above: pack all 9 (no 
   `.order(<unique column>).range()`. `translations` passed 1000 with 02031 (raw `sign_in` /
   `theme_switcher` keys on every page): read it with `readAllTranslationRows`
   (`apps/nextblock/lib/i18n/translation-pages.ts`), which
-  `tools/scripts/translations-pagination.test.ts` enforces.
+  `tools/scripts/translations-pagination.test.ts` enforces. `media` likewise: `readAllMediaRows`
+  (`apps/nextblock/lib/media/media-pages.ts`; the library listed only its newest 1000 files until 0.23.9).
 - Public reads (page/post data, translated slugs, layout chrome) go through `unstable_cache`
   (`lib/public-content-cache.ts`, 5 min, evicted by `revalidatePath` + `revalidatePublicContent`)
   wrapped in React `cache()`. `export const fetchCache = 'force-no-store'` on a route segment

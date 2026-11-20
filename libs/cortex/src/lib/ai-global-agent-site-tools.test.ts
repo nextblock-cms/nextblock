@@ -27,6 +27,7 @@ class MockQuery {
   private operation: 'delete' | 'insert' | 'select' | 'update' | 'upsert' = 'select';
   private payload: MockRow | MockRow[] | null = null;
   private single: 'maybe' | 'one' | null = null;
+  private countRequested = false;
 
   constructor(
     private readonly database: MockDatabase,
@@ -34,7 +35,9 @@ class MockQuery {
     private readonly writes: Array<{ op: string; table: string }>
   ) {}
 
-  select() {
+  /** `{ count: 'exact' }` answers the matching rows' total beside the (limited) rows, as PostgREST does. */
+  select(_columns?: string, options?: { count?: string }) {
+    this.countRequested = options?.count === 'exact';
     return this;
   }
 
@@ -152,9 +155,10 @@ class MockQuery {
     }
 
     let data = rows.filter((row) => this.matches(row));
+    const count = this.countRequested ? data.length : undefined;
     if (this.limitCount !== null) data = data.slice(0, this.limitCount);
     if (this.single) return { data: data[0] ?? null, error: null };
-    return { data, error: null };
+    return count === undefined ? { data, error: null } : { count, data, error: null };
   }
 }
 
@@ -227,6 +231,30 @@ function expectConfirmation(result: unknown) {
 }
 
 describe('get_site_overview', () => {
+  it('past 500 files, still counts them all and finds the demo images and the logo older than the newest 500', async () => {
+    // The mock keeps insertion order for "newest first": 600 newer uploads, then the seeded files.
+    const uploads = Array.from({ length: 600 }, (_, n) => ({
+      id: `upload-${n}`,
+      object_key: `uploads/${n}.webp`,
+      file_name: `${n}.webp`,
+      created_at: '2026-01-01',
+    }));
+    const { supabase } = createMockSupabase({
+      media: [
+        ...uploads,
+        { id: SEED_LOGO_MEDIA, object_key: 'images/nextblock-logo-button-tiny.png', file_name: 'logo.png', created_at: '2024-01-01' },
+        { id: 'seed-cover', object_key: 'images/NBcover.webp', file_name: 'NBcover.webp', created_at: '2024-01-01' },
+      ],
+    });
+
+    const overview = await executeGetSiteOverview({}, { supabase });
+
+    expect(overview.counts.media).toBe(602);
+    expect(overview.media).toMatchObject({ count: 602, seededCount: 2 });
+    expect(overview.seeded).toMatchObject({ logo: true, media: 2 });
+    expect(overview.identity.activeLogo).toMatchObject({ id: 'logo-1', isSeeded: true, objectKey: 'images/nextblock-logo-button-tiny.png' });
+  });
+
   it('summarizes languages, content, navigation, identity, and the seeded demo content', async () => {
     const { supabase } = createMockSupabase();
 

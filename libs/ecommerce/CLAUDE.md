@@ -169,6 +169,13 @@ entry: providers, webhooks, `payment-config`, readiness, product actions, CMS pa
   `updated_at` (no trigger does; the sitemap and the app's pre-0.23.4 draft rule read it), as the
   product RPC, the Freemius sync and `copyProductFromLanguage` do (`providers/freemius.test.ts`,
   `product-actions.test.ts`).
+- An add-on license (its `freemius_product_id` is a NextBlock package with `requires`: Affiliates
+  needs Commerce Pro) is recognized by `product-addons.ts` through the registry's deep subpath
+  (`@nextblock-cms/utils/nextblock-packages`, client-safe): `ProductCard` shows a badge,
+  `ProductDetailsLayout`, `Cart` and `Checkout` an `AddonRequirementNotice` (the app passes
+  `addonBaseProducts` for the add button and link), and the Freemius window takes the add-on title.
+  A notice informs and never blocks a checkout (an owner of the base buys the add-on alone).
+  Copy: `ecommerce.addon_*` (02048).
 - Stripe checkout (`providers/stripe.ts`, the standalone `stripe/checkout.ts`) hands out a
   session's URL only once its order stores `stripe_session_id`: the app's success page finds a
   Stripe order only through that column and asks Stripe about no other id. A failed write (error

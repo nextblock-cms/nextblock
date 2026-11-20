@@ -714,9 +714,12 @@ async function updateJsonColumns(params: {
 
   for (let from = 0; ; from += pageSize) {
     const to = from + pageSize - 1;
+    // Ordered by the id column, which the loop never changes: without an order, each page is the
+    // table's physical order, which the loop's own updates rewrite, so pages skipped or repeated rows.
     const { data, error } = await client
       .from(params.table)
       .select([params.idColumn, ...params.columns].join(","))
+      .order(params.idColumn, { ascending: true })
       .range(from, to);
 
     if (error) {
@@ -769,9 +772,11 @@ async function rewriteMediaBaseUrls(params: {
   const pageSize = 500;
 
   for (let from = 0; ; from += pageSize) {
+    // Ordered by id, as in updateJsonColumns: the updates below rewrite the physical order.
     const { data, error } = await client
       .from("media")
       .select("id, file_path, variants")
+      .order("id", { ascending: true })
       .range(from, from + pageSize - 1);
 
     if (error) {

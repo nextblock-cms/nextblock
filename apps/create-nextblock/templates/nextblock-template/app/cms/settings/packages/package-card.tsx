@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import { useState } from 'react';
 import { Loader2, CheckCircle, ExternalLink, FlaskConical, KeyRound, Sparkles } from 'lucide-react';
 
+import { LocalDateTime } from '../../../../components/LocalDateTime';
 import { PackageCheckoutDialog } from './PackageCheckoutDialog';
 
 const isSandbox = process.env.NEXT_PUBLIC_IS_SANDBOX === 'true';
@@ -36,15 +37,17 @@ function shortPackageName(name: string): string {
     return name.replace(/^NextBlock(?:™)?\s+/, '');
 }
 
-function formatDate(value: string) {
+/**
+ * A Freemius date (`2026-12-19 10:00:00`, UTC without a zone) or an ISO one, as ISO text, or the
+ * value itself when it is neither: `new Date()` would read the Freemius form in the reader's own
+ * time zone, which differs between the server and the browser.
+ */
+function toIsoTimestamp(value: string): string {
     const parsed = Date.parse(value.includes('T') || /z$/i.test(value) ? value : `${value.replace(' ', 'T')}Z`);
-
-    if (!Number.isFinite(parsed)) {
-        return value;
-    }
-
-    return new Date(parsed).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+    return Number.isFinite(parsed) ? new Date(parsed).toISOString() : value;
 }
+
+const TRIAL_END_FORMAT: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'long', year: 'numeric' };
 
 export function PackageCard({ pkg, isActive, isExpired = false, licenseKey, provenance, missingRequirements = [] }: PackageCardProps) {
     const [loading, setLoading] = useState(false);
@@ -83,7 +86,7 @@ export function PackageCard({ pkg, isActive, isExpired = false, licenseKey, prov
         <>
             {canCheckout && !blocked ? <PackageCheckoutDialog onOpenChange={setCheckoutOpen} open={checkoutOpen} pkg={pkg} /> : null}
 
-            <div className="border rounded-lg p-6 flex flex-col justify-between h-full bg-card shadow-sm">
+            <div className="border rounded-lg p-6 flex flex-col justify-between h-full bg-card shadow-sm scroll-mt-24" id={`package-${pkg.id}`}>
                 <div>
                     <div className="flex justify-between items-start mb-4">
                         <div>
@@ -146,7 +149,11 @@ export function PackageCard({ pkg, isActive, isExpired = false, licenseKey, prov
                         <div className="flex flex-col gap-3">
                             <div className="text-xs text-muted-foreground">
                                 License: <span className="font-mono bg-muted px-1 rounded">{licenseKey ? `•••• ${licenseKey.slice(-4)}` : '••••'}</span>
-                                {trialEndsAt ? <span className="block mt-1">Trial ends {formatDate(trialEndsAt)} · then {offer.priceLine}</span> : null}
+                                {trialEndsAt ? (
+                                    <span className="block mt-1">
+                                        Trial ends <LocalDateTime format={TRIAL_END_FORMAT} value={toIsoTimestamp(trialEndsAt)} /> · then {offer.priceLine}
+                                    </span>
+                                ) : null}
                             </div>
                             <Button variant="outline" size="sm" onClick={handleDeactivate} disabled={loading || isSandbox} className="w-full text-destructive hover:text-destructive">
                                 {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Deactivate License'}
@@ -186,15 +193,25 @@ export function PackageCard({ pkg, isActive, isExpired = false, licenseKey, prov
                                         ? `Start free ${pkg.trial.days}-day trial`
                                         : 'Buy license'}
                             </Button>
-                            <a
-                                className="inline-flex items-center justify-center text-xs text-muted-foreground hover:underline"
-                                href={pkg.purchase_url}
-                                rel="noopener noreferrer"
-                                target="_blank"
-                            >
-                                Or purchase on nextblock.dev
-                                <ExternalLink className="ml-1 w-3 h-3" />
-                            </a>
+                            {blocked ? (
+                                // Not this add-on's own page: buying it first is the mistake to prevent.
+                                <a
+                                    className="inline-flex items-center justify-center text-xs text-muted-foreground hover:underline"
+                                    href={`#package-${missingRequirements[0]?.id}`}
+                                >
+                                    Start with {shortPackageName(missingRequirements[0]?.name ?? '')}
+                                </a>
+                            ) : (
+                                <a
+                                    className="inline-flex items-center justify-center text-xs text-muted-foreground hover:underline"
+                                    href={pkg.purchase_url}
+                                    rel="noopener noreferrer"
+                                    target="_blank"
+                                >
+                                    Or purchase on nextblock.dev
+                                    <ExternalLink className="ml-1 w-3 h-3" />
+                                </a>
+                            )}
                         </div>
                     )}
                 </div>

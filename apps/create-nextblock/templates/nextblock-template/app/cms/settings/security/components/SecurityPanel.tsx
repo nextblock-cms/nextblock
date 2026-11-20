@@ -22,6 +22,7 @@ import {
   Spinner,
 } from '@nextblock-cms/ui';
 import { Message } from '../../../../../components/form-message';
+import { LocalDateTime } from '../../../../../components/LocalDateTime';
 import {
   MAX_TRUSTED_DEVICE_DAYS,
   MIN_TRUSTED_DEVICE_DAYS,
@@ -48,17 +49,8 @@ type EnrollMode = 'idle' | 'totp' | 'email';
  */
 const RESEND_COOLDOWN_SECONDS = 30;
 
-function formatDate(value: string): string {
-  try {
-    return new Date(value).toLocaleDateString(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-    });
-  } catch {
-    return value;
-  }
-}
+/** The panel renders on the server too: dates go through LocalDateTime (React #418 otherwise). */
+const DEVICE_DATE_FORMAT: Intl.DateTimeFormatOptions = { year: 'numeric', month: 'short', day: 'numeric' };
 
 export default function SecurityPanel({ data }: { data: SecurityPanelData }) {
   const router = useRouter();
@@ -425,8 +417,8 @@ export default function SecurityPanel({ data }: { data: SecurityPanelData }) {
                       {device.browser_metadata || 'Unknown device'}
                     </p>
                     <p className="text-xs text-slate-500">
-                      Trusted {formatDate(device.created_at)} · expires{' '}
-                      {formatDate(device.expires_at)}
+                      Trusted <LocalDateTime format={DEVICE_DATE_FORMAT} value={device.created_at} /> · expires{' '}
+                      <LocalDateTime format={DEVICE_DATE_FORMAT} value={device.expires_at} />
                     </p>
                   </div>
                   <Button

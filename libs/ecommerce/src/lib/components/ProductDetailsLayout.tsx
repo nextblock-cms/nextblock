@@ -26,8 +26,9 @@ import {
 } from '../variation-utils';
 import { useCurrency } from '../CurrencyProvider';
 import { resolveEffectivePriceForCurrency } from '../currency';
-import { isDigitalProduct } from '../types';
+import { isDigitalProduct, type Product } from '../types';
 import { getTrialSummary } from '../trials';
+import { ProductAddonNotice } from './AddonRequirementNotice';
 
 type ProductVisualEditingField =
   | 'title'
@@ -53,6 +54,11 @@ interface ProductDetailsLayoutProps {
   canPurchase?: boolean;
   /** Rendered in place of the buy controls when `canPurchase` is false. */
   purchaseFallbackNode?: React.ReactNode;
+  /**
+   * The store products that sell what this product requires, when it is an add-on license
+   * (`../product-addons.ts`): the purchase card then opens on a notice linking to them.
+   */
+  addonBaseProducts?: Product[];
 }
 
 function buildProductVisualEditAttributes(
@@ -127,6 +133,7 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
   reviewsNode,
   canPurchase = true,
   purchaseFallbackNode,
+  addonBaseProducts,
 }) => {
   const product = useProduct();
   const { t, lang } = useTranslations();
@@ -492,6 +499,7 @@ export const ProductDetailsLayout: React.FC<ProductDetailsLayoutProps> = ({
             {/* Opaque on purpose: this card is above the fold, and `backdrop-blur-*` there costs
                 a compositing pass on the first frame (project rule). */}
             <div className="p-5 rounded-2xl bg-card border border-border/80 shadow-md space-y-4">
+              <ProductAddonNotice baseProducts={addonBaseProducts} product={product} />
               {!canPurchase ? (
                 purchaseFallbackNode
               ) : isFreemius ? (

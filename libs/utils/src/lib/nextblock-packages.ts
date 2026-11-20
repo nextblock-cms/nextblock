@@ -117,6 +117,37 @@ export function missingPackageRequirements(
     .filter((required): required is PackageDef => required !== undefined && !isActive(required.id));
 }
 
+/** "NextBlock™ Commerce Pro" reads as "Commerce Pro" inside a sentence or a badge. */
+export function shortPackageName(name: string): string {
+  return name.replace(/^NextBlock(?:™)?\s+/, '');
+}
+
+/**
+ * The packages a store product needs beside it when it sells an add-on license (its Freemius product
+ * is a package with `requires`: Affiliates needs Commerce Pro), in registry order; [] for any other
+ * product. Only a store carrying NextBlock's own license products has these Freemius ids
+ * (nextblock.dev, and the public sandbox, whose reset imports them), so every other store gets [] for
+ * every product. The storefront says so on the product card, the product page, the cart and the
+ * checkout.
+ */
+export function getRequiredPackagesForFreemiusProduct(freemiusProductId: string | number | null | undefined): PackageDef[] {
+  const pkg = freemiusProductId === null || freemiusProductId === undefined ? undefined : getPackageByFreemiusId(freemiusProductId);
+  if (!pkg) return [];
+  const requires: readonly string[] = pkg.requires;
+  return requires
+    .map((packageId) => getPackageById(packageId))
+    .filter((base): base is PackageDef => base !== undefined && base.fm_product_id.trim() !== '');
+}
+
+/** The Freemius product id of every package some add-on requires, once each, in registry order. */
+export function getAddonBaseFreemiusProductIds(): string[] {
+  const ids = new Set<string>();
+  for (const pkg of Object.values(NEXTBLOCK_PACKAGES)) {
+    for (const base of getRequiredPackagesForFreemiusProduct(pkg.fm_product_id)) ids.add(base.fm_product_id.trim());
+  }
+  return [...ids];
+}
+
 /**
  * True when the package can be bought or trialed from the dashboard (it has a Freemius product
  * and plan). A package without one is activated by a license key or the sandbox key only, so

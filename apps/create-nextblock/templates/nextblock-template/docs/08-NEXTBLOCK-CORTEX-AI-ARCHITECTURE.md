@@ -2588,6 +2588,12 @@ whose `object_key` is a bundled `images/*` demo asset, the seeded logo, the
 `NextBlock™ CMS` site title, and a copyright line containing "Nextblock CMS". The
 result's `nextSteps` tell the model what to do about it.
 
+The media sample is the newest 500 rows; the total (`count: 'exact'`), the demo images
+(`.in('object_key', NEXTBLOCK_SEED_MEDIA_OBJECT_KEYS)`) and the active logo's row are read on
+their own, and `reset_site_content` finds the demo images the same way. The demo images are the
+oldest rows, so until 2026-11-19 a library past 500 files reported no demo imagery and a count of
+500, and a reset past PostgREST's 1,000 rows could leave demo images behind.
+
 ## Validation: what Cortex checks before JSONB reaches the database
 
 The Pydantic-shaped layer here is Zod. Every layer a payload crosses:

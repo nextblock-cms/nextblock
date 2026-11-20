@@ -1656,9 +1656,13 @@ production or shared database change.
   `npm run db:migrate:repair-history:check`, then `npm run db:migrate:repair-history`
   (it auto-detects the applied high-water mark from the tables that exist), then rerun
   `npm run db:migrate:check`. It never marks the catch-up applied, whatever it detects. That
-  suits a database at the folder's generation, where the catch-up left pending skips itself; on
-  one that never crossed (`site_settings.migration_baseline_generation` unset), restore the
-  history instead ("How a squash crosses live databases").
+  suits a database at the folder's generation, where the catch-up left pending skips itself. On
+  one that never crossed (`site_settings.migration_baseline_generation` unset or below the folder's
+  generation) the command refuses, `--check` included, and nothing is recorded: restore the history
+  instead ("How a squash crosses live databases"). It applies the appliers' own rule
+  (`emptyHistoryRefusal` in `apps/nextblock/tools/lib/migrate-core.mjs`, through `autoDetectRefusal`),
+  refuses too when the marker cannot be read, and lets a history that records the catch-up already
+  through (that catch-up will not run again; one recorded without running is `--revert`'s business).
 - `--through=<version>` overrides the detected level. It must name an exact version in the
   current folder — versions are compared as strings, so `2014` would sort above every `02xxx`
   and sweep the whole generation, and a retired 14-digit version is meaningless here; both are
@@ -1805,7 +1809,12 @@ and are what the next squash repeats with `G = 3`.
    - negative seed test: delete a `site_settings` row on a populated database, re-run the
      seed file, the row stays deleted.
 6. **Swap the folder.** Delete every file of the old generation, copy the five new ones in,
-   run `npx vitest run tools/scripts` (the naming test now enforces the new generation).
+   run `npx vitest run tools/scripts` (the naming test now enforces the new generation). Append
+   the deleted files' names to `RETIRED_MIGRATIONS` in `apps/nextblock/tools/lib/retired-migrations.mjs`
+   in a new entry with `retiredBy: G`: standalone projects keep the files they were scaffolded with,
+   and `npm run update` moves the listed ones out of their `supabase/migrations` once it holds the
+   new catch-up. `retired-migrations.test.mjs` fails while a file the new catch-up replays is
+   missing there.
 7. **Regenerate the artifacts:** `npm run generate:migrations-bundle && npm run
    generate:sandbox`. A squash never changes the schema, so `npm run db:types` must
    produce no diff.

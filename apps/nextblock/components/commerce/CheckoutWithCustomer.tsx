@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { Checkout } from '@nextblock-cms/ecommerce/components/Checkout';
 import type { CheckoutCustomerDefaults } from '@nextblock-cms/ecommerce';
+import type { Product } from '@nextblock-cms/ecommerce/types';
 
 import { getCheckoutCustomerDefaults } from '../../app/actions/checkoutCustomerActions';
 import { useAuth } from '../../context/AuthContext';
@@ -16,7 +17,7 @@ import { useLabel } from '../../lib/i18n/use-label';
  * and none of their saved addresses prefilled. Guests render at once; a signed-in shopper
  * waits for one server action, because Checkout reads `initialCustomer` only on mount.
  */
-export default function CheckoutWithCustomer() {
+export default function CheckoutWithCustomer({ addonBaseProducts }: { addonBaseProducts?: Product[] } = {}) {
   const { user, isLoading } = useAuth();
   const label = useLabel();
   const [customer, setCustomer] = useState<CheckoutCustomerDefaults | null>(null);
@@ -52,5 +53,11 @@ export default function CheckoutWithCustomer() {
     );
   }
 
-  return <Checkout key={customer.isAuthenticated ? 'customer' : 'guest'} initialCustomer={customer} />;
+  return (
+    <Checkout
+      key={customer.isAuthenticated ? 'customer' : 'guest'}
+      addonBaseProducts={addonBaseProducts}
+      initialCustomer={customer}
+    />
+  );
 }

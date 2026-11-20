@@ -16,18 +16,36 @@ const mocks = vi.hoisted(() => ({
   profileRole: 'ADMIN',
   rows: [] as Array<Record<string, unknown>>,
   findMediaUsage: vi.fn(),
+  /** Every media read: its columns, its ordering and the page it asked for (PostgREST caps a page at 1000). */
+  mediaReads: [] as Array<{ select: string; order: string[]; range: [number, number] | null }>,
 }));
 
 function makeSupabase() {
   return {
     auth: { getUser: async () => ({ data: { user: { id: 'u1' } } }) },
     from: (table: string) => {
+      const read = { select: '', order: [] as string[], range: null as [number, number] | null };
+      if (table === 'media') mocks.mediaReads.push(read);
       const answer = () => {
         if (table === 'profiles') return { data: { role: mocks.profileRole }, error: null };
-        return { data: mocks.rows, error: null };
+        if (!read.range) return { data: mocks.rows.slice(0, 1000), error: null };
+        const [from, to] = read.range;
+        return { data: mocks.rows.slice(from, Math.min(to + 1, from + 1000)), error: null };
       };
       const chain: Record<string, unknown> = {};
-      for (const method of ['select', 'eq', 'order', 'in', 'ilike', 'or']) chain[method] = () => chain;
+      for (const method of ['eq', 'in', 'ilike', 'or']) chain[method] = () => chain;
+      chain.select = (columns: string) => {
+        read.select = columns;
+        return chain;
+      };
+      chain.order = (column: string) => {
+        read.order.push(column);
+        return chain;
+      };
+      chain.range = (from: number, to: number) => {
+        read.range = [from, to];
+        return chain;
+      };
       chain.single = async () => (table === 'media' ? { data: mocks.rows[0] ?? null, error: null } : answer());
       chain.then = (resolve: (value: unknown) => unknown, reject?: (reason: unknown) => unknown) =>
         Promise.resolve(answer()).then(resolve, reject);
@@ -59,6 +77,7 @@ vi.mock('./actions', () => ({ updateMediaItem: vi.fn() }));
 
 import CmsMediaLibraryPage from './page';
 import EditMediaPage from './[id]/edit/page';
+import FolderNavigator from './components/FolderNavigator';
 import MediaGridClient from './components/MediaGridClient';
 import MediaUsageList from './components/MediaUsageList';
 
@@ -103,6 +122,7 @@ async function gridProps(searchParams: Record<string, string>) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.mediaReads = [];
   mocks.actor = { userId: 'u1', role: 'ADMIN' };
   mocks.profileRole = 'ADMIN';
   mocks.rows = [row(USED), row(UNUSED), row(HISTORY)];
@@ -155,6 +175,44 @@ describe('/cms/media?usage=unused', () => {
     expect(mocks.findMediaUsage).not.toHaveBeenCalled();
     expect(props.initialMediaItems).toEqual(mocks.rows);
     expect(props.unusedView).toBeNull();
+  });
+});
+
+describe('/cms/media past 1000 files (PostgREST answers at most 1000 rows a request)', () => {
+  const uuid = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+  beforeEach(() => {
+    // 2500 files; the last 600 (beyond the second page) are the only ones in archive/2019/.
+    mocks.rows = Array.from({ length: 2500 }, (_, n) => ({
+      ...row(uuid(n)),
+      folder: n < 1900 ? 'uploads/' : 'archive/2019/',
+    }));
+  });
+
+  it('lists every file, and every folder with its full count, through paged reads in a total order', async () => {
+    const tree = await CmsMediaLibraryPage({ searchParams: Promise.resolve({}) });
+    const grid = findElement(tree, MediaGridClient);
+    const navigator = findElement(tree, FolderNavigator);
+
+    expect((grid?.props.initialMediaItems as unknown[]).length).toBe(2500);
+    expect(navigator?.props.folders).toEqual(['uploads/', 'archive/2019/']);
+    expect(navigator?.props.counts).toEqual({ 'uploads/': 1900, 'archive/': 600, 'archive/2019/': 600 });
+
+    // Each read asks for consecutive pages until one comes back empty, ordered down to the id.
+    const fileReads = mocks.mediaReads.filter((read) => read.select === '*');
+    const folderReads = mocks.mediaReads.filter((read) => read.select === 'folder');
+    expect(fileReads.map((read) => read.range)).toEqual([[0, 999], [1000, 1999], [2000, 2999], [2500, 3499]]);
+    expect(folderReads).toHaveLength(4);
+    for (const read of [...fileReads, ...folderReads]) expect(read.order.at(-1)).toBe('id');
+  });
+
+  it('asks where every listed file is used, past 1000, for the Unused view', async () => {
+    mocks.findMediaUsage.mockResolvedValue(new Map());
+
+    await gridProps({ usage: 'unused' });
+
+    expect(mocks.findMediaUsage).toHaveBeenCalledTimes(1);
+    expect((mocks.findMediaUsage.mock.calls[0][0] as unknown[]).length).toBe(2500);
   });
 });
 

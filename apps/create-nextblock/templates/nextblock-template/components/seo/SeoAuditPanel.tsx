@@ -519,7 +519,7 @@ export function SeoAuditPanel({
             className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400"
           />
           <p>
-            This document is too large for the live audit ({sourceLength.toLocaleString()}{' '}
+            This document is too large for the live audit ({sourceLength.toLocaleString('en-US')}{' '}
             characters). Grading it on every pause would freeze the editor, so the analysis is
             paused until there is less text to read.
           </p>

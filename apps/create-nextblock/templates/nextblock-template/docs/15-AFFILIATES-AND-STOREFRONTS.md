@@ -189,6 +189,34 @@ Affiliates card always says "Add-on for Commerce Pro." While Commerce Pro is not
 - An active Affiliates card shows a **Paused** badge instead of Active, with "Paused until
   Commerce Pro is active: nothing runs, and its data is kept." The license and **Deactivate
   License** stay.
+- The inactive card's link below the button points at the Commerce Pro card ("Start with Commerce
+  Pro", `#package-ecommerce`; every card carries `id="package-<id>"`), never at the add-on's own
+  page on nextblock.dev, where it could be bought without Commerce Pro.
+
+### On the store (nextblock.dev)
+
+The store says the license is an add-on wherever it can be bought, so nobody buys it taking it for
+a standalone product. `getRequiredPackagesForFreemiusProduct()` (the registry) recognizes a store
+product by its Freemius product id, and `libs/ecommerce/src/lib/product-addons.ts` turns that into
+notices (`components/AddonRequirementNotice.tsx`); only a store carrying NextBlock's own license
+products has these ids (nextblock.dev, and the public sandbox, whose reset imports them), so no
+other store shows any of it:
+
+- the product card: a "Requires Commerce Pro" badge under the title;
+- the product page: a notice at the top of the purchase card ("Add-on for NextBlock™ Commerce Pro",
+  the license it needs, a link to the Commerce Pro product);
+- the cart and the checkout: while Commerce Pro is not in the cart, a notice naming the add-on with
+  an **Add Commerce Pro to cart** button and a link. It informs and never blocks: a Commerce Pro
+  owner buys the add-on alone;
+- the Freemius window: titled "<product> (Commerce Pro add-on)".
+
+The product page, the cart and checkout blocks, and the `/cart` and `/checkout` routes load the
+Commerce Pro product in the page's language (`apps/nextblock/lib/commerce/addon-base-products.ts`;
+the routes read it from proxy.ts's `x-user-locale`); without it a notice still shows, without the
+button or link. The copy is `ecommerce.addon_*` (migration 02048, EN + FR). The Freemius
+side is the vendor's: never rename the product or plan (see the checklist above); put "Requires an
+active NextBlock Commerce Pro license on the same site" first in the plan's features list, which the
+Freemius checkout shows.
 
 ### Activating it
 

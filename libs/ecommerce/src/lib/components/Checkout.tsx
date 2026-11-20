@@ -34,7 +34,8 @@ import { usePaymentReadiness } from '../PaymentReadinessProvider';
 import { getShippingEstimates } from '../server-actions/shipping-actions';
 import { getTaxEstimate } from '../server-actions/tax-actions';
 import type { ResolvedShippingMethod } from '../shipping/resolver';
-import { type CartItem, isDigitalItem } from '../types';
+import { type CartItem, isDigitalItem, type Product } from '../types';
+import { CartAddonNotices, useAddonCheckoutWindowTitle } from './AddonRequirementNotice';
 import { countryUsesStructuredStates, getStatesForCountry, getSubdivisionLabel } from '../states';
 import {
   addressesMatch,
@@ -54,6 +55,11 @@ const CHECKOUT_DRAFT_STORAGE_KEY = 'nextblock-checkout-draft-v1';
 
 interface CheckoutProps {
   initialCustomer?: CheckoutCustomerDefaults;
+  /**
+   * The store products that sell what an add-on in the cart requires (Commerce Pro, for the
+   * Affiliates add-on), loaded by the checkout block: each gets an add button in the add-on notice.
+   */
+  addonBaseProducts?: Product[];
 }
 
 type AddressState = ReturnType<typeof buildAddressState>;
@@ -308,7 +314,7 @@ function CheckoutSection({
   );
 }
 
-export const Checkout = ({ initialCustomer }: CheckoutProps) => {
+export const Checkout = ({ initialCustomer, addonBaseProducts }: CheckoutProps) => {
   // Locale-aware: see use-price-formatter.ts.
   const formatPrice = usePriceFormatter();
   const [trialPreferences, setTrialPreferences] = useState<Record<string, 'free' | 'paid'>>({});
@@ -344,6 +350,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
 
   const store = useCart((state) => state);
   const { t, lang } = useTranslations();
+  const addonCheckoutWindowTitle = useAddonCheckoutWindowTitle();
   const { activeCurrencyCode, currencies } = useCurrency();
   const paymentReadiness = usePaymentReadiness();
   const items = store?.items ?? [];
@@ -946,8 +953,12 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
           public_key: cp.public_key,
           sandbox: cp.sandbox,
         };
+        // An add-on license says so in the Freemius window too ("… (Commerce Pro add-on)"); one
+        // Freemius line is paid per window.
+        const addonWindowTitle = checkoutItems.length === 1 ? addonCheckoutWindowTitle(checkoutItems[0]) : null;
         const openConfig = {
           name: t('ecommerce.checkout_overlay_title'),
+          ...(addonWindowTitle ? { title: addonWindowTitle } : {}),
           plan_id: cp.plan_id,
           ...(cp.billing_cycle ? { billing_cycle: cp.billing_cycle } : {}),
           ...(cp.trial ? { trial: cp.trial } : {}),
@@ -1530,6 +1541,7 @@ export const Checkout = ({ initialCustomer }: CheckoutProps) => {
                 badgeLabel={freemiusLicenseCountLabel}
               >
                 <div className="space-y-3">
+                  <CartAddonNotices baseProducts={addonBaseProducts} items={items} />
                   {freemiusItems.map((item) => {
                     const activePrice = getCartItemActivePrice(item, {
                       currencyCode: activeCurrencyCode,

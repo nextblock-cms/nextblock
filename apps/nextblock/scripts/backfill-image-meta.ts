@@ -6,6 +6,7 @@ import { Readable } from 'stream';
 import { getPlaiceholder } from 'plaiceholder';
 import 'dotenv/config';
 import * as dotenv from 'dotenv';
+import { readAllMediaRows } from '../lib/media/media-pages';
 
 dotenv.config({ path: '.env.local' });
 
@@ -57,8 +58,10 @@ async function backfillImageMeta() {
 
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-  // Fetch all media records
-  const { data: mediaItems, error } = await supabase.from('media').select('id, object_key, width');
+  // Fetch all media records, in pages: one PostgREST request stops at 1000 rows without an error.
+  const { data: mediaItems, error } = await readAllMediaRows<{ id: string; object_key: string; width: number | null }>(
+    (from, to) => supabase.from('media').select('id, object_key, width').order('id', { ascending: true }).range(from, to)
+  );
 
   if (error) {
     console.error('Error fetching media items:', error);

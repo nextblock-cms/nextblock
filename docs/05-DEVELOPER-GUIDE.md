@@ -242,6 +242,16 @@ inert.
 Vite 8, Vitest 5 and the `create-nextblock` CLI (`commander` 15, `execa` 10, `chalk` 6)
 need 22.12, which the CLI declares in `engines`.
 
+Working in the monorepo, use Node 22.18 or later (`.nvmrc`). The libs' `vite.config.mts` files are
+ES modules in TypeScript: Vite's bundle loader, its default today, reads them on any Node, but its
+native loader imports them as they are, which needs Node's type stripping (on by default from
+22.18, and from 23.6 on the 23 line). Once Vite makes the native loader its default, a lib build on
+an older Node fails before it starts, so every lib build already prints a warning on one
+(`nativeConfigLoaderNodeWarning`, `tools/vite/lib-build-plugins.mjs`). Scaffolds run no Vite
+config, so the CLI's 22.12 floor stays. Do not put the floor in an `engines` field of a
+`package.json` a deployment reads (the root one included): Vercel deploys an open range such as
+`>=22.18.0` on its newest Node major, not the one the project settings choose.
+
 **How to run the next sweep.** `npm outdated`, then check each major's peer ranges and
 migration guide before bumping. A plain `npm install` deadlocks on tightly pinned families
 (`nx`/`@nx/*`, `@tiptap/*`, `typescript-eslint`/`@typescript-eslint/*`, `vitest`/`@vitest/*`,
@@ -734,6 +744,17 @@ through `useTranslations()`. Two rules keep raw keys and English out of French p
 
 Shop prices go through `usePriceFormatter()` (`libs/ecommerce/src/lib/use-price-formatter.ts`),
 which binds `formatPrice` to the visitor's locale; the bare helper defaults to `en-US`.
+
+Timestamps in a client component go through `LocalDateTime` (`apps/nextblock/components/LocalDateTime.tsx`;
+`format` for a date alone). The server renders client components too, in UTC and its own locale,
+so `toLocaleString()` printed a text the browser's hydration disagreed with: React error #418 and a
+page rebuilt in the browser. `suppressHydrationWarning` only hides that, and React then keeps the
+server's text: the Messages, Interactions and public thread pages showed every time in UTC.
+`LocalDateTime` prints the same UTC text on both sides while hydrating, then the viewer's own.
+`tools/scripts/client-locale-format.test.ts` fails on a `toLocale*String()` call in a
+`'use client'` module outside its allow-list (each entry says why its call never reaches the first
+render: browser-only state, data fetched after mount, a click handler, or an explicit locale and
+time zone).
 
 The public surface was audited against Vercel's Web Interface Guidelines in September 2026.
 The full `file:line` report, what was fixed and what is still open, is in

@@ -10,6 +10,33 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
+ * Why this Node cannot run Vite's native config loader on the libs' configs, or null when it can.
+ *
+ * The configs are ES modules written in TypeScript (`vite.config.mts`). Vite reads them with its
+ * bundle loader today, which works on any Node; its native loader imports them as they are, which
+ * needs Node's TypeScript type stripping, on by default from Node 22.18 (23.6 on the 23 line). When
+ * Vite makes the native loader its default, a lib build on an older Node fails before it starts, so
+ * every lib build says so ahead of time (docs/05 → "Node.js floor"). Scaffolds run no Vite config:
+ * the create-nextblock floor (22.12, in its `engines`) stays.
+ *
+ * @param {string} [version] process.versions.node
+ * @returns {string | null}
+ */
+export function nativeConfigLoaderNodeWarning(version = process.versions.node) {
+  const [major = 0, minor = 0] = String(version).split('.').map((part) => Number.parseInt(part, 10) || 0);
+  const supported = major > 23 || (major === 23 && minor >= 6) || (major === 22 && minor >= 18);
+  return supported
+    ? null
+    : `Node ${version}: Vite's native config loader, which reads the libs' vite.config.mts files, needs Node 22.18 or later. ` +
+        'Builds still work on the bundle loader Vite uses today; upgrade Node before Vite makes the native loader its default (docs/05-DEVELOPER-GUIDE.md, "Node.js floor").';
+}
+
+{
+  const warning = process.env['VITEST'] ? null : nativeConfigLoaderNodeWarning();
+  if (warning) console.warn(`[nextblock] ${warning}`);
+}
+
+/**
  * Put `'use client';` at the top of every entry chunk, in every output format.
  *
  * For libraries that bundle into a single entry (ui, editor). Rolldown drops module-level
